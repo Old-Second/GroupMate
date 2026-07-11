@@ -7,3 +7,7 @@ server/static/live2dw/*
 prompts/*
 !prompts/.gitkeep
 node_modules/
+
+# Deployment runtime state and downloaded native assets
+data/
+resources/simple/
