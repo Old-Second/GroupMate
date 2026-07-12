@@ -502,7 +502,7 @@ test('legacy trusted context overrides untrusted tool arguments without mutating
   assert.deepEqual(toolArgs, originalArgs)
 })
 
-test('model core delegates both legacy tool loops to the execution seam', async () => {
+test('model core delegates the retained OpenAI-compatible tool loop to the execution seam', async () => {
   const source = await readFile(new URL('../../model/core.js', import.meta.url), 'utf8')
 
   assert.match(source, /import \{ executeLegacyToolCall \} from '\.\/legacy\/tool-execution\.js'/)
@@ -514,7 +514,7 @@ test('model core delegates both legacy tool loops to the execution seam', async 
   assert.doesNotMatch(source, /\bfunction isSuccessfulToolResult\b/)
   assert.doesNotMatch(source, /\bfunction shouldFinalizeAfterTool\b/)
   const executionOptions = extractObjectCallOptions(source, 'executeLegacyToolCall({')
-  assert.equal(executionOptions.length, 2)
+  assert.equal(executionOptions.length, 1)
   for (const options of executionOptions) {
     assert.match(options, /requestedName:\s*name/)
     assert.match(options, /(?:^|,)\s*fullFuncMap\s*(?=,|$)/)
@@ -528,21 +528,21 @@ test('model core delegates both legacy tool loops to the execution seam', async 
 
   assert.equal(
     source.match(/const\s*\{\s*toolName,\s*result:\s*functionResult\s*\}\s*=\s*await executeLegacyToolCall\(\{/g)?.length ?? 0,
-    2
+    1
   )
   assert.doesNotMatch(source, /function\s+resolveToolCall\s*\(/)
   assert.doesNotMatch(source, /\bisLegacyToolExecutable\s*\(/)
   assert.equal(
     source.match(/appendToolTrace\(smartTrace,\s*toolName,\s*args,\s*functionResult\)/g)?.length ?? 0,
-    2
+    1
   )
-  assert.equal(source.match(/option\.name\s*=\s*toolName/g)?.length ?? 0, 2)
+  assert.equal(source.match(/option\.name\s*=\s*toolName/g)?.length ?? 0, 1)
   assert.equal(
     source.match(/option\.toolCallId\s*=\s*msg\.toolCalls\?\.\[0\]\?\.id\s*\|\|\s*toolName\.trim\(\)/g)?.length ?? 0,
-    2
+    1
   )
   assert.equal(
     source.match(/shouldFinalizeAfterTool\(toolName,\s*functionResult\)/g)?.length ?? 0,
-    2
+    1
   )
 })

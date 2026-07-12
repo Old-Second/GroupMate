@@ -3,9 +3,6 @@ import _ from 'lodash'
 import { Config } from './config.js'
 import { ChatGPTAPI } from './openai/chatgpt-api.js'
 import { newFetch } from './proxy.js'
-import { CustomGoogleGeminiClient } from '../client/CustomGoogleGeminiClient.js'
-import XinghuoClient from './xinghuo/xinghuo.js'
-import { QwenApi } from './alibaba/qwen-api.js'
 
 // 代码参考：https://github.com/yeyang52/yenai-plugin/blob/b50b11338adfa5a4ef93912eefd2f1f704e8b990/model/api/funApi.js#L25
 export const translateLangSupports = [
@@ -107,106 +104,40 @@ export async function translateOld (msg, to = 'auto') {
  * @param msg 要翻译的
  * @param from 语种
  * @param to 语种
- * @param ai ai来源，支持openai, gemini, xh, qwen
  * @returns {Promise<*|string>}
  */
-export async function translate (msg, to = 'auto', from = 'auto', ai = Config.translateSource) {
+export async function translate (msg, to = 'auto', from = 'auto') {
   try {
     let lang = '中'
     if (to !== 'auto') {
       lang = translateLangSupports.find(item => item.abbr == to)?.code
     }
-    if (!lang) return `未找到翻译的语种，支持的语言为：\n${translateLangSupports.map(item => item.abbr).join('，')}\n`
-    // if ai is not in the list, throw error
-    if (!['openai', 'gemini', 'xh', 'qwen'].includes(ai)) throw new Error('ai来源错误')
-    let system = `You will be provided with a sentence in the language with language code [${from}], and your task is to translate it into [${lang}]. Just print the result without any other words.`
+    if (!lang) {
+      return `未找到翻译的语种，支持的语言为：\n${translateLangSupports.map(item => item.abbr).join('，')}\n`
+    }
+    const system = `You will be provided with a sentence in the language with language code [${from}], and your task is to translate it into [${lang}]. Just print the result without any other words.`
     if (Array.isArray(msg)) {
-      let result = []
-      for (let i = 0; i < msg.length; i++) {
-        let item = msg[i]
-        let res = await translate(item, to, from, ai)
-        result.push(res)
+      const result = []
+      for (const item of msg) {
+        result.push(await translate(item, to, from))
       }
       return result
     }
-    switch (ai) {
-      case 'openai': {
-        let api = new ChatGPTAPI({
-          apiBaseUrl: Config.openAiBaseUrl,
-          apiKey: Config.apiKey,
-          fetch: newFetch
-        })
-        const res = await api.sendMessage(msg, {
-          systemMessage: system,
-          completionParams: {
-            model: 'gpt-3.5-turbo'
-          }
-        })
-        return res.text
+
+    const api = new ChatGPTAPI({
+      apiBaseUrl: Config.openAiBaseUrl,
+      apiKey: Config.apiKey,
+      fetch: newFetch
+    })
+    const response = await api.sendMessage(msg, {
+      systemMessage: system,
+      completionParams: {
+        model: Config.model
       }
-      case 'gemini': {
-        let client = new CustomGoogleGeminiClient({
-          key: Config.getGeminiKey(),
-          model: Config.geminiModel,
-          baseUrl: Config.geminiBaseUrl,
-          debug: Config.debug
-        })
-        let option = {
-          stream: false,
-          onProgress: (data) => {
-            if (Config.debug) {
-              logger.info(data)
-            }
-          },
-          system
-        }
-        let res = await client.sendMessage(msg, option)
-        return res.text
-      }
-      case 'xh': {
-        let client = new XinghuoClient({
-          ssoSessionId: Config.xinghuoToken
-        })
-        let response = await client.sendMessage(msg, { system })
-        return response.text
-      }
-      case 'qwen': {
-        let completionParams = {
-          parameters: {
-            top_p: Config.qwenTopP || 0.5,
-            top_k: Config.qwenTopK || 50,
-            seed: Config.qwenSeed > 0 ? Config.qwenSeed : Math.floor(Math.random() * 114514),
-            temperature: Config.qwenTemperature || 1,
-            enable_search: !!Config.qwenEnableSearch
-          }
-        }
-        if (Config.qwenModel) {
-          completionParams.model = Config.qwenModel
-        }
-        let opts = {
-          apiKey: Config.qwenApiKey,
-          debug: false,
-          systemMessage: system,
-          completionParams,
-          fetch: newFetch
-        }
-        let client = new QwenApi(opts)
-        let option = {
-          timeoutMs: 600000,
-          completionParams
-        }
-        let result
-        try {
-          result = await client.sendMessage(msg, option)
-        } catch (err) {
-          logger.error(err)
-          throw new Error(err)
-        }
-        return result.text
-      }
-    }
-  } catch (e) {
-    logger.error(e)
+    })
+    return response.text
+  } catch (error) {
+    logger.error(error)
     logger.info('基于LLM的翻译失败，转用老版翻译')
     return await translateOld(msg, to)
   }

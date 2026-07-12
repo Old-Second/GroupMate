@@ -13,7 +13,6 @@ import {
   renderUrl,
   randomString
 } from '../utils/common.js'
-import SydneyAIClient from '../utils/SydneyAIClient.js'
 import { convertSpeaker, speakers as vitsRoleList } from '../utils/tts.js'
 import md5 from 'md5'
 import path from 'path'
@@ -24,7 +23,6 @@ import { supportConfigurations as azureRoleList } from '../utils/tts/microsoft-a
 import fetch from 'node-fetch'
 import { newFetch } from '../utils/proxy.js'
 import { createServer, runServer, stopServer } from '../server/index.js'
-import { BingAIClient } from '../client/CopilotAIClient.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 import {
   providerModeMigrationEvent,
@@ -830,60 +828,9 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async saveBingToken () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    if (token.length < 100) {
-      await this.reply('Bing Token格式错误，请确定获取了有效的_U Cookie或完整的Cookie', true)
-      this.finish('saveBingToken')
-      return
-    }
-    let cookie
-    if (token?.indexOf('=') > -1) {
-      cookie = token
-    }
-    const bingAIClient = new SydneyAIClient({
-      userToken: token, // "_U" cookie from bing.com
-      cookie,
-      debug: Config.debug
-    })
-    // 异步就好了，不卡着这个context了
-    bingAIClient.createNewConversation().then(async res => {
-      if (res.clientId) {
-        logger.info('bing token 有效')
-      } else {
-        logger.error('bing token 无效', res)
-        // 移除无效token
-        if (await redis.exists('CHATGPT:BING_TOKENS') != 0) {
-          let bingToken = JSON.parse(await redis.get('CHATGPT:BING_TOKENS'))
-          const element = bingToken.findIndex(element => element.token === token)
-          if (element >= 0) {
-            bingToken[element].State = '异常'
-            await redis.set('CHATGPT:BING_TOKENS', JSON.stringify(bingToken))
-          }
-        }
-        await this.reply(`经检测，Bing Token无效。来自Bing的错误提示：${res.result?.message}`)
-      }
-    })
-    let bingToken = []
-    if (await redis.exists('CHATGPT:BING_TOKENS') != 0) {
-      bingToken = JSON.parse(await redis.get('CHATGPT:BING_TOKENS'))
-      if (!bingToken.some(element => element.token === token)) {
-        bingToken.push({
-          Token: token,
-          State: '正常',
-          Usage: 0
-        })
-      }
-    } else {
-      bingToken = [{
-        Token: token,
-        State: '正常',
-        Usage: 0
-      }]
-    }
-    await redis.set('CHATGPT:BING_TOKENS', JSON.stringify(bingToken))
-    await this.reply('Bing Token设置成功', true)
     this.finish('saveBingToken')
+    await this.reply(unsupportedProviderMessage, true)
+    return false
   }
 
   async deleteBingToken () {
@@ -1899,14 +1846,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async refreshBingAi () {
-    if (Config.bingAiRefreshToken) {
-      let client = new BingAIClient(Config.bingAiToken, Config.sydneyReverseProxy, Config.debug, Config._2captchaKey, Config.bingAiClientId, Config.bingAiScope, Config.bingAiRefreshToken, Config.bingAiOid, Config.bingReasoning)
-      let json = await client.doRefreshToken()
-      if (json.refresh_token) {
-        logger.mark('Bing AI Token Refreshed')
-      } else {
-        logger.mark('Failed to refresh Bing AI Token')
-      }
-    }
+    return false
   }
 }
