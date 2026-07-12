@@ -79,7 +79,7 @@ export function supportGuoba () {
         {
           field: 'closeBrowserAfterRender',
           label: '图片渲染后关闭 Chromium',
-          bottomHelpMessage: '降低 Chromium 常驻内存，但每次图片回复需要重新启动浏览器、响应更慢。修改后无需重启。',
+          bottomHelpMessage: '降低 GroupMate 图片渲染的常驻开销；独占浏览器会关闭，共享浏览器只断开连接，避免影响 Yunzai 其他插件。下次渲染需要重新连接或启动浏览器，响应更慢。修改后无需重启。',
           component: 'Switch'
         },
         {

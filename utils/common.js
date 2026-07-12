@@ -13,6 +13,10 @@ import AzureTTS, { supportConfigurations as azureRoleList } from './tts/microsof
 import { translate } from './translate.js'
 import uploadRecord from './uploadRecord.js'
 import Version from './version.js'
+import {
+  createBrowserReleaseLog,
+  releaseBrowserAfterRender
+} from '../dist/runtime/browser-release.js'
 import { createChatErrorLog } from '../dist/runtime/safe-chat-logging.js'
 import fetch, { FormData, fileFromSync } from 'node-fetch'
 import https from 'https'
@@ -370,10 +374,12 @@ export async function renderUrl (e, url, renderCfg = {}) {
       logger.warn(createChatErrorLog({ mode: 'picture_cleanup', error }))
     })
     if (Config.closeBrowserAfterRender && _puppeteer.browser) {
-      await _puppeteer.browser.close().catch(error => {
-        logger.warn(createChatErrorLog({ mode: 'picture_cleanup', error }))
+      const releaseResult = await releaseBrowserAfterRender({
+        browser: _puppeteer.browser,
+        reportFailure: (error) => logger.warn(createChatErrorLog({ mode: 'picture_cleanup', error }))
       })
-      _puppeteer.browser = false
+      if (Config.debug) logger.info(createBrowserReleaseLog(releaseResult))
+      if (releaseResult !== 'failed') _puppeteer.browser = false
     }
   }
 

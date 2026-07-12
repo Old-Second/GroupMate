@@ -32,9 +32,18 @@ test('chat picture mode delegates one-shot rendering to the TypeScript coordinat
 test('local Chromium rendering always closes its page and optionally its browser', async () => {
   const source = await readFile(new URL('../../utils/common.js', import.meta.url), 'utf8')
 
+  const releaseImport = source.match(
+    /import\s*\{(?<names>[^}]*)\}\s*from '\.\.\/dist\/runtime\/browser-release\.js'/
+  )
+  assert.ok(releaseImport)
+  assert.match(releaseImport.groups.names, /\breleaseBrowserAfterRender\b/)
+  assert.match(releaseImport.groups.names, /\bcreateBrowserReleaseLog\b/)
   assert.match(source, /finally\s*\{/)
   assert.match(source, /await page\?\.close\(\)/)
   assert.match(source, /if \(Config\.closeBrowserAfterRender && _puppeteer\.browser\)/)
+  assert.match(source, /await releaseBrowserAfterRender\(\{/)
+  assert.match(source, /logger\.info\(createBrowserReleaseLog\(releaseResult\)\)/)
+  assert.doesNotMatch(source, /_puppeteer\.browser\.close\(\)/)
   assert.doesNotMatch(source, /\$\{url\}图片生成失败/)
 })
 
@@ -47,4 +56,5 @@ test('low-memory browser cleanup is present in defaults, example config, and Guo
   assert.equal(exampleConfig.closeBrowserAfterRender, true)
   assert.match(guoba, /field:\s*'closeBrowserAfterRender'/)
   assert.match(guoba, /关闭 Chromium/)
+  assert.match(guoba, /共享浏览器/)
 })
