@@ -1,8 +1,23 @@
 {
-  "name": "chatgpt-plugin",
-  "version": "2.8.1",
+  "name": "groupmate",
+  "version": "0.1.0",
+  "description": "A group-native conversational participant and task runtime for Yunzai",
   "type": "module",
-  "author": "ikechan8370",
+  "author": "Old-Second",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Old-Second/GroupMate.git"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/unit/*.test.js test/characterization/*.test.js",
+    "test:unit": "node --test --test-concurrency=1 test/unit/*.test.js",
+    "test:characterization": "node --test --test-concurrency=1 test/characterization/*.test.js"
+  },
   "dependencies": {
     "@azure/openai": "^1.0.0-beta.1",
     "@fastify/cookie": "^8.3.0",
