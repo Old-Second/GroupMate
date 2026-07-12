@@ -209,6 +209,81 @@ const requiredGuobaFields = [
   'enableChatSuno'
 ] as const
 
+const expectedGuobaGroups = [
+  {
+    label: '基础与运行',
+    fields: [
+      'toggleMode', 'assistantLabel', 'enablePrivateChat', 'enableRobotAt',
+      'proxy', 'defaultTimeoutMs', 'debug'
+    ]
+  },
+  {
+    label: '模型与会话',
+    fields: [
+      'apiKey', 'openAiBaseUrl', 'model', 'promptPrefixOverride', 'temperature',
+      'apiStream', 'apiMaxToken', 'apiThinkingMode', 'apiReasoningEffort',
+      'forwardReasoning', 'openAiForceUseReverse', 'enableGroupContext',
+      'groupContextLength', 'groupContextTip', 'groupMerge',
+      'conversationPreserveTime'
+    ]
+  },
+  {
+    label: '群聊参与',
+    fields: [
+      'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt',
+      'enableBYM', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
+      'bymReasoningEffort', 'bymPreset', 'bymFuckList', 'bymFuckBlacklist',
+      'bymFuckPrompt', 'bymFuckRecall', 'bymFuckRecallTime'
+    ]
+  },
+  {
+    label: '工具与搜索',
+    fields: [
+      'smartMode', 'enableToolPrivateSend', 'enableToolCrossGroupSend',
+      'enableToolVideoDownload', 'toolVideoMaxMB', 'serpSource', 'tavilyApiKey',
+      'azSerpKey', 'imageSearchSource', 'braveSearchApiKey', 'amapKey',
+      'githubAPIKey', 'extraUrl'
+    ]
+  },
+  {
+    label: '权限与内容安全',
+    fields: ['whitelist', 'blacklist', 'promptBlockWords', 'blockWords', 'imgOcr']
+  },
+  {
+    label: '回复与图片',
+    fields: [
+      'quoteReply', 'defaultUsePicture', 'autoUsePicture',
+      'autoUsePictureThreshold', 'chatViewWidth', 'toneStyle', 'chatViewBotName',
+      'cloudDPR', 'closeBrowserAfterRender', 'headless', 'chromePath',
+      'chromeTimeoutMS'
+    ]
+  },
+  {
+    label: '渲染服务与外观',
+    fields: [
+      'viewHost', 'cloudRender', 'serverHost', 'serverPort', 'showQRCode',
+      'enableToolbox', 'groupAdminPage', 'live2d', 'live2dModel',
+      'live2dOption_scale', 'live2dOption_positionX', 'live2dOption_positionY',
+      'live2dOption_rotation', 'live2dOption_alpha'
+    ]
+  },
+  {
+    label: '语音回复',
+    fields: [
+      'defaultUseTTS', 'alsoSendText', 'ttsMode', 'ttsRegex',
+      'ttsAutoFallbackThreshold', 'cloudTranscode', 'cloudMode',
+      'defaultTTSRole', 'ttsSpace', 'huggingFaceReverseProxy', 'autoJapanese',
+      'noiseScale', 'noiseScaleW', 'lengthScale', 'voicevoxSpace',
+      'voicevoxTTSSpeaker', 'azureTTSKey', 'azureTTSRegion', 'azureTTSSpeaker',
+      'azureTTSEmotion', 'enhanceAzureTTSEmotion'
+    ]
+  },
+  {
+    label: '表情与音乐',
+    fields: ['emojiBaseURL', 'sunoSessToken', 'sunoClientToken', 'enableChatSuno']
+  }
+] as const
+
 async function readSource (file: string): Promise<string> {
   return await readFile(path.join(root, file), 'utf8')
 }
@@ -309,6 +384,34 @@ test('Guoba external service fields provide actionable setup references', () => 
   const serpOptions = serpSource?.componentProps?.options as Array<{ label: string, value: string }>
   assert.match(serpSource?.bottomHelpMessage ?? '', /退役.*Tavily/)
   assert.match(serpOptions.find(option => option.value === 'azure')?.label ?? '', /退役/)
+})
+
+test('Guoba groups supported settings into nine functional sections', () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  })
+  const groups: Array<{ label: string, fields: string[] }> = []
+
+  for (const schema of schemas) {
+    if (schema.component === 'Divider') {
+      groups.push({ label: schema.label, fields: [] })
+    } else if (schema.field) {
+      assert.ok(groups.length > 0, `${schema.field} must follow a Guoba divider`)
+      groups.at(-1)?.fields.push(schema.field)
+    }
+  }
+
+  assert.deepEqual(
+    groups,
+    expectedGuobaGroups.map(group => ({ label: group.label, fields: [...group.fields] }))
+  )
+  assert.deepEqual(
+    expectedGuobaGroups.flatMap(group => group.fields).sort(),
+    [...requiredGuobaFields].sort(),
+    'the layout must preserve the complete supported field set'
+  )
 })
 
 test('management and help no longer advertise removed providers', async () => {
