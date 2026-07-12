@@ -722,6 +722,10 @@ export async function getUserReplySetting (e) {
 
 export async function getImg (e) {
   // 取消息中的图片、at的头像、回复的图片，放入e.img
+  if (Array.isArray(e.groupmateMessageInputImages)) {
+    e.img = e.groupmateMessageInputImages
+    return e.img
+  }
   if (e.at && !e.source) {
     e.img = [`https://q1.qlogo.cn/g?b=qq&s=0&nk=${e.at}`]
   }

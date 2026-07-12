@@ -39,11 +39,13 @@ import {
   selectLegacyPresentationMode
 } from '../model/legacy/reply-presenter.js'
 import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
+import { buildModelMessageInput } from '../dist/runtime/message-input.js'
 import { presentPictureReply } from '../dist/runtime/picture-reply.js'
 import {
   createChatErrorLog,
   createChatRequestLog,
-  createChatResponseLog
+  createChatResponseLog,
+  createMessageInputLog
 } from '../dist/runtime/safe-chat-logging.js'
 
 let version = Config.version
@@ -607,6 +609,17 @@ export class chatgpt extends plugin {
           }
         }
       }
+    }
+    const messageInput = await buildModelMessageInput({
+      event: e,
+      currentPrompt: prompt
+    })
+    prompt = messageInput.prompt
+    if (messageInput.hasReply) {
+      e.groupmateMessageInputImages = messageInput.imageUrls
+    }
+    if (Config.debug) {
+      logger.info(createMessageInputLog(messageInput))
     }
     let userSetting = await getUserReplySetting(this.e)
     let useTTS = !!userSetting.useTTS
