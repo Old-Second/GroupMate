@@ -16,7 +16,8 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 test/unit/*.test.js test/characterization/*.test.js",
     "test:unit": "node --test --test-concurrency=1 test/unit/*.test.js",
-    "test:characterization": "node --test --test-concurrency=1 test/characterization/*.test.js"
+    "test:characterization": "node --test --test-concurrency=1 test/characterization/*.test.js",
+    "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
   "dependencies": {
     "@azure/openai": "^1.0.0-beta.1",
