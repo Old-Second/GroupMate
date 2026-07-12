@@ -1,0 +1,7 @@
+data: {"id":"fixture-stream-text","choices":[{"delta":{"role":"assistant"}}]}
+
+data: {"id":"fixture-stream-text","choices":[{"delta":{"content":"fixture stream response"}}]}
+
+data: [DONE]
+
+: fixture end

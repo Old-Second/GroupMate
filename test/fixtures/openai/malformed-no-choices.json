@@ -1,0 +1,6 @@
+{
+  "id": "fixture-malformed",
+  "detail": {
+    "message": "fixture malformed response"
+  }
+}
