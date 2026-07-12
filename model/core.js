@@ -64,6 +64,7 @@ import {
   createChatResponseLog,
   createToolExecutionLog
 } from '../dist/runtime/safe-chat-logging.js'
+import { shouldFinalizeAfterTool } from '../dist/runtime/tool-loop-policy.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -73,20 +74,6 @@ export const roleMap = {
 const defaultPropmtPrefix = ', a large language model trained by OpenAI. You answer as concisely as possible for each response (e.g. don’t be verbose). It is very important that you answer as concisely as possible, so please remember this. If you are generating a list, do not have too many items. Keep the number of items short.'
 const MAX_SMART_TOOL_CALLS = 8
 const MAX_TOOL_RESULT_TRACE_LENGTH = 4000
-const SIDE_EFFECT_TOOL_NAMES = new Set([
-  'editCard',
-  'jinyan',
-  'kickOut',
-  'setTitle',
-  'sendPicture',
-  'sendVideo',
-  'sendAvatar',
-  'sendMusic',
-  'sendMessage',
-  'sendDice',
-  'sendAudioMessage',
-  'sendRPS'
-])
 function getConversationScope (e, userId = e.sender?.user_id) {
   return resolveLegacyConversationScope({
     isGroup: e.isGroup,
@@ -152,21 +139,6 @@ function finalizeSmartTrace (msg, trace) {
     msg.thinking_text = trace.join('\n\n')
   }
   return msg
-}
-
-function isSuccessfulToolResult (result) {
-  const text = String(result || '').trim().toLowerCase()
-  return Boolean(text) &&
-    !text.startsWith('failed') &&
-    !text.startsWith('you are not allowed') &&
-    !text.startsWith('the user is not admin') &&
-    !text.includes(' failed:') &&
-    !text.includes('failed to ') &&
-    !text.includes('cannot ')
-}
-
-function shouldFinalizeAfterTool (name, result) {
-  return SIDE_EFFECT_TOOL_NAMES.has(name) && isSuccessfulToolResult(result)
 }
 
 async function handleSystem (e, system, settings) {

@@ -506,6 +506,13 @@ test('model core delegates both legacy tool loops to the execution seam', async 
   const source = await readFile(new URL('../../model/core.js', import.meta.url), 'utf8')
 
   assert.match(source, /import \{ executeLegacyToolCall \} from '\.\/legacy\/tool-execution\.js'/)
+  assert.match(
+    source,
+    /import \{ shouldFinalizeAfterTool \} from '\.\.\/dist\/runtime\/tool-loop-policy\.js'/
+  )
+  assert.doesNotMatch(source, /\bconst SIDE_EFFECT_TOOL_NAMES\b/)
+  assert.doesNotMatch(source, /\bfunction isSuccessfulToolResult\b/)
+  assert.doesNotMatch(source, /\bfunction shouldFinalizeAfterTool\b/)
   const executionOptions = extractObjectCallOptions(source, 'executeLegacyToolCall({')
   assert.equal(executionOptions.length, 2)
   for (const options of executionOptions) {
