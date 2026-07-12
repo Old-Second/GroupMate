@@ -24,7 +24,13 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts --no-optional
       - run: pnpm test
+      - run: node --check apps/chat.js
       - run: node --check model/core.js
       - run: node --check model/legacy/conversation-scope.js
       - run: node --check model/legacy/tool-visibility.js
+      - run: node --check model/legacy/reply-presenter.js
+      - run: node --check model/legacy/tool-execution.js
+      - run: node --check scripts/memory-scenario.mjs
+      - run: node --check scripts/measure-memory.mjs
+      - run: node --check scripts/smoke-openai-compatible.mjs
       - run: git diff --check "$(git rev-list --max-parents=0 HEAD)"..HEAD
