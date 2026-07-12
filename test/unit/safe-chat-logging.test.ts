@@ -42,6 +42,7 @@ test('safe chat log summaries expose bounded metadata without message content', 
   })
   const error = createChatErrorLog({
     mode: 'api',
+    category: 'provider_rate_limited',
     error: {
       name: 'ChatGPTError',
       code: 'rate_limit',
@@ -82,6 +83,7 @@ test('safe chat log summaries expose bounded metadata without message content', 
   assert.deepEqual(error, {
     event: 'chat.error',
     mode: 'api',
+    category: 'provider_rate_limited',
     error: 'ChatGPTError',
     code: 'rate_limit',
     statusCode: 429
@@ -98,6 +100,34 @@ test('safe chat log summaries expose bounded metadata without message content', 
 
   const serialized = JSON.stringify({ request, response, tool, error, messageInput })
   assert.doesNotMatch(serialized, /secret|private|123456|https:|conversation|arguments/)
+})
+
+test('safe chat error logging does not invoke hostile metadata accessors', async () => {
+  const { createChatErrorLog } = await import(pathToFileURL(runtimePath).href)
+  let accessorCalls = 0
+  const hostile = Object.create(null)
+  for (const key of ['statusCode', 'status', 'name', 'code']) {
+    Object.defineProperty(hostile, key, {
+      get () {
+        accessorCalls += 1
+        throw new Error(`hostile ${key}`)
+      }
+    })
+  }
+
+  assert.deepEqual(createChatErrorLog({
+    mode: 'api',
+    category: 'provider_unknown_error',
+    error: hostile
+  }), {
+    event: 'chat.error',
+    mode: 'api',
+    category: 'provider_unknown_error',
+    error: 'unknown',
+    code: 'unknown',
+    statusCode: null
+  })
+  assert.equal(accessorCalls, 0)
 })
 
 test('active chat sources do not pass raw conversation values to loggers', () => {

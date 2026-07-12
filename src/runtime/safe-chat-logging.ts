@@ -1,3 +1,5 @@
+import { readChatErrorMetadata } from './chat-error-presentation.js'
+
 type UnknownRecord = Record<string, unknown>
 
 interface ChatRequestLogInput {
@@ -19,6 +21,7 @@ interface ToolExecutionLogInput {
 interface ChatErrorLogInput {
   mode?: unknown
   error?: unknown
+  category?: unknown
 }
 
 interface MessageInputLogInput {
@@ -91,19 +94,16 @@ export function createToolExecutionLog ({ name, result }: ToolExecutionLogInput)
   } as const
 }
 
-export function createChatErrorLog ({ mode, error }: ChatErrorLogInput) {
-  const value = isRecord(error) ? error : {}
-  const status = value.statusCode ?? value.status
-  const statusCode = typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
-    ? status
-    : null
+export function createChatErrorLog ({ mode, error, category }: ChatErrorLogInput) {
+  const metadata = readChatErrorMetadata(error)
 
   return {
     event: 'chat.error',
     mode: getSafeMode(mode),
-    error: getSafeToken(value.name),
-    code: getSafeToken(value.code),
-    statusCode
+    category: getSafeToken(category),
+    error: getSafeToken(metadata.name),
+    code: getSafeToken(metadata.code),
+    statusCode: metadata.statusCode
   } as const
 }
 

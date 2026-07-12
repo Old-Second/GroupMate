@@ -51,6 +51,7 @@ import {
   createChatResponseLog,
   createMessageInputLog
 } from '../dist/runtime/safe-chat-logging.js'
+import { getChatErrorPresentation } from '../dist/runtime/chat-error-presentation.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -1067,22 +1068,20 @@ export class chatgpt extends plugin {
         await sendTextReply()
       }
     } catch (err) {
-      logger.error(createChatErrorLog({ mode: use, error: err }))
+      const presentation = getChatErrorPresentation(err)
+      logger.error(createChatErrorLog({
+        mode: use,
+        error: err,
+        category: presentation.code
+      }))
       if (use === 'api3') {
         // 异常了也要腾地方（todo 大概率后面的也会异常，要不要一口气全杀了）
         await redis.lPop('CHATGPT:CHAT_QUEUE', 0)
       }
-      if (err === 'Error: {"detail":"Conversation not found"}') {
+      if (presentation.resetConversation) {
         await this.destroyConversations(err)
-        await this.reply('当前对话异常，已经清除，请重试', true, { recallMsg: e.isGroup ? 10 : 0 })
-      } else {
-        let errorMessage = err?.message || err?.data?.message || (typeof (err) === 'object' ? JSON.stringify(err) : err) || '未能确认错误类型！'
-        if (errorMessage.length < 200) {
-          await this.reply(`出现错误：${errorMessage}`, true, { recallMsg: e.isGroup ? 10 : 0 })
-        } else {
-          await this.renderImage(e, use, `出现异常,错误信息如下 \n \`\`\`${errorMessage}\`\`\``, prompt)
-        }
       }
+      await this.reply(presentation.message, true)
     }
   }
 

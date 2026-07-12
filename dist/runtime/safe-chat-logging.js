@@ -1,3 +1,4 @@
+import { readChatErrorMetadata } from './chat-error-presentation.js';
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
 }
@@ -50,18 +51,15 @@ export function createToolExecutionLog({ name, result }) {
         resultCharacters: getStringLength(result)
     };
 }
-export function createChatErrorLog({ mode, error }) {
-    const value = isRecord(error) ? error : {};
-    const status = value.statusCode ?? value.status;
-    const statusCode = typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
-        ? status
-        : null;
+export function createChatErrorLog({ mode, error, category }) {
+    const metadata = readChatErrorMetadata(error);
     return {
         event: 'chat.error',
         mode: getSafeMode(mode),
-        error: getSafeToken(value.name),
-        code: getSafeToken(value.code),
-        statusCode
+        category: getSafeToken(category),
+        error: getSafeToken(metadata.name),
+        code: getSafeToken(metadata.code),
+        statusCode: metadata.statusCode
     };
 }
 export function createMessageInputLog(input) {
