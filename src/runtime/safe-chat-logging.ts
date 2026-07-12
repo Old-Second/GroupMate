@@ -21,6 +21,15 @@ interface ChatErrorLogInput {
   error?: unknown
 }
 
+interface MessageInputLogInput {
+  prompt?: unknown
+  imageUrls?: unknown
+  hasReply?: unknown
+  replyResolved?: unknown
+  currentSegmentCount?: unknown
+  replySegmentCount?: unknown
+}
+
 function isRecord (value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null
 }
@@ -33,6 +42,12 @@ function getSafeMode (mode: unknown): string {
 
 function getStringLength (value: unknown): number {
   return typeof value === 'string' ? value.length : 0
+}
+
+function getSafeCount (value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0
 }
 
 function getSafeToken (value: unknown): string {
@@ -89,5 +104,17 @@ export function createChatErrorLog ({ mode, error }: ChatErrorLogInput) {
     error: getSafeToken(value.name),
     code: getSafeToken(value.code),
     statusCode
+  } as const
+}
+
+export function createMessageInputLog (input: MessageInputLogInput) {
+  return {
+    event: 'chat.input.context',
+    hasReply: input.hasReply === true,
+    replyResolved: input.replyResolved === true,
+    currentSegmentCount: getSafeCount(input.currentSegmentCount),
+    replySegmentCount: getSafeCount(input.replySegmentCount),
+    imageCount: Array.isArray(input.imageUrls) ? input.imageUrls.length : 0,
+    promptCharacters: getStringLength(input.prompt)
   } as const
 }

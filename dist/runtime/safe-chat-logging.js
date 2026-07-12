@@ -9,6 +9,11 @@ function getSafeMode(mode) {
 function getStringLength(value) {
     return typeof value === 'string' ? value.length : 0;
 }
+function getSafeCount(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+        ? value
+        : 0;
+}
 function getSafeToken(value) {
     return typeof value === 'string' && /^[a-z0-9_.-]{1,64}$/i.test(value)
         ? value
@@ -57,5 +62,16 @@ export function createChatErrorLog({ mode, error }) {
         error: getSafeToken(value.name),
         code: getSafeToken(value.code),
         statusCode
+    };
+}
+export function createMessageInputLog(input) {
+    return {
+        event: 'chat.input.context',
+        hasReply: input.hasReply === true,
+        replyResolved: input.replyResolved === true,
+        currentSegmentCount: getSafeCount(input.currentSegmentCount),
+        replySegmentCount: getSafeCount(input.replySegmentCount),
+        imageCount: Array.isArray(input.imageUrls) ? input.imageUrls.length : 0,
+        promptCharacters: getStringLength(input.prompt)
     };
 }

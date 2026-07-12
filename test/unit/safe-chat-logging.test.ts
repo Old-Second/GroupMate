@@ -15,7 +15,8 @@ test('safe chat log summaries expose bounded metadata without message content', 
     createChatRequestLog,
     createChatResponseLog,
     createChatErrorLog,
-    createToolExecutionLog
+    createToolExecutionLog,
+    createMessageInputLog
   } = await import(pathToFileURL(runtimePath).href)
   assert.equal(typeof createToolExecutionLog, 'function')
   assert.equal(typeof createChatErrorLog, 'function')
@@ -49,6 +50,15 @@ test('safe chat log summaries expose bounded metadata without message content', 
       stack: 'private stack'
     }
   })
+  const messageInput = createMessageInputLog({
+    prompt: secretPrompt,
+    imageUrls: ['https://private.example/image'],
+    hasReply: true,
+    replyResolved: true,
+    currentSegmentCount: 2,
+    replySegmentCount: 3,
+    error: new Error('private input error')
+  })
 
   assert.deepEqual(request, {
     event: 'chat.request',
@@ -76,8 +86,17 @@ test('safe chat log summaries expose bounded metadata without message content', 
     code: 'rate_limit',
     statusCode: 429
   })
+  assert.deepEqual(messageInput, {
+    event: 'chat.input.context',
+    hasReply: true,
+    replyResolved: true,
+    currentSegmentCount: 2,
+    replySegmentCount: 3,
+    imageCount: 1,
+    promptCharacters: secretPrompt.length
+  })
 
-  const serialized = JSON.stringify({ request, response, tool, error })
+  const serialized = JSON.stringify({ request, response, tool, error, messageInput })
   assert.doesNotMatch(serialized, /secret|private|123456|https:|conversation|arguments/)
 })
 
