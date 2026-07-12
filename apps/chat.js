@@ -32,6 +32,12 @@ import { getProxy } from '../utils/proxy.js'
 import { generateSuggestedResponse } from '../utils/chat.js'
 import Core from '../model/core.js'
 import { collectProcessors } from '../utils/postprocessors/BasicProcessor.js'
+import {
+  buildLegacyQuoteForwardMessages,
+  buildLegacyThinkingForwardMessages,
+  presentLegacyReply,
+  selectLegacyPresentationMode
+} from '../model/legacy/reply-presenter.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -58,43 +64,11 @@ const newFetch = (url, options = {}) => {
   return fetch(url, mergedOptions)
 }
 
-function buildThinkingForwardMessages (thinking, thinkingSegments) {
-  if (Array.isArray(thinkingSegments) && thinkingSegments.length > 0) {
-    return thinkingSegments.map(item => String(item || '').trim()).filter(Boolean)
-  }
-  if (!thinking) {
-    return []
-  }
-  return String(thinking)
-    .split(/\n{2,}(?=【(?:模型思考|工具调用)[^】]*】)/)
-    .map(item => item.trim())
-    .filter(Boolean)
-}
-
 function getConversationScope (e, userId = e.sender?.user_id) {
   if (e.isGroup) {
     return Config.groupMerge ? `group:${e.group_id}` : `group:${e.group_id}:user:${userId}`
   }
   return `private:${userId}`
-}
-
-async function replyWithoutRecallingUserMessage (e, msg, quote, data = {}) {
-  const recallMsg = Number(data?.recallMsg) || 0
-  const safeData = {
-    ...data,
-    recallMsg: 0
-  }
-  const res = await e.reply(msg, quote, safeData)
-  if (recallMsg > 0 && res?.message_id) {
-    setTimeout(() => {
-      if (e.group?.recallMsg) {
-        e.group.recallMsg(res.message_id).catch(err => logger.warn('撤回机器人消息失败', err))
-      } else if (e.friend?.recallMsg) {
-        e.friend.recallMsg(res.message_id).catch(err => logger.warn('撤回机器人消息失败', err))
-      }
-    }, recallMsg * 1000)
-  }
-  return res
 }
 
 export class chatgpt extends plugin {
@@ -243,26 +217,16 @@ export class chatgpt extends plugin {
       ]
     })
     this.toggleMode = toggleMode
-    this.reply = async (msg, quote, data) => {
-      if (!Config.enableMd) {
-        return replyWithoutRecallingUserMessage(e, msg, quote, data)
-      }
-      let handler = e.runtime?.handler || {}
-      const btns = await handler.call('chatgpt.button.post', this.e, data)
-      if (btns) {
-        const btnElement = {
-          type: 'button',
-          content: btns
-        }
-        if (Array.isArray(msg)) {
-          msg.push(btnElement)
-        } else {
-          msg = [msg, btnElement]
-        }
-      }
-
-      return replyWithoutRecallingUserMessage(e, msg, quote, data)
-    }
+    this.reply = async (msg, quote, data) => presentLegacyReply({
+      event: e,
+      message: msg,
+      quote,
+      data,
+      markdownEnabled: Config.enableMd,
+      handler: e.runtime?.handler || {},
+      logger,
+      schedule: setTimeout
+    })
   }
 
   /**
@@ -946,7 +910,15 @@ export class chatgpt extends plugin {
       for (let quote of quotemessage) {
         if (quote.imageLink) imgUrls.push(quote.imageLink)
       }
-      if (useTTS) {
+      const presentationMode = selectLegacyPresentationMode({
+        useTTS,
+        forcePictureMode,
+        userPictureMode: userSetting.usePicture,
+        autoPicture: Config.autoUsePicture,
+        responseLength: response.length,
+        autoPictureThreshold: Config.autoUsePictureThreshold
+      })
+      if (presentationMode === 'tts') {
         // 缓存数据
         this.cacheContent(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls)
         if (response === 'Sorry, I think we need to move on! Click “New topic” to chat about something else.') {
@@ -998,7 +970,7 @@ export class chatgpt extends plugin {
           }
           await this.reply(responseText, e.isGroup)
           if (quotemessage.length > 0) {
-            this.reply(await makeForwardMsg(this.e, quotemessage.map(msg => `${msg.text} - ${msg.url}`)))
+            this.reply(await makeForwardMsg(this.e, buildLegacyQuoteForwardMessages(quotemessage)))
           }
           if (Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
             this.reply(`建议的回复：\n${chatMessage.suggestedResponses}`)
@@ -1010,7 +982,7 @@ export class chatgpt extends plugin {
         } else {
           await this.reply('合成语音发生错误~')
         }
-      } else if (forcePictureMode || userSetting.usePicture || (Config.autoUsePicture && response.length > Config.autoUsePictureThreshold)) {
+      } else if (presentationMode === 'picture') {
         try {
           await this.renderImage(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls)
         } catch (err) {
@@ -1041,7 +1013,7 @@ export class chatgpt extends plugin {
         }
         // await this.reply(responseText, e.isGroup)
         if (quotemessage.length > 0) {
-          this.reply(await makeForwardMsg(this.e, quotemessage.map(msg => `${msg.text} - ${msg.url}`)))
+          this.reply(await makeForwardMsg(this.e, buildLegacyQuoteForwardMessages(quotemessage)))
         }
         if (chatMessage?.conversation && Config.enableSuggestedResponses && !chatMessage.suggestedResponses && Config.apiKey) {
           try {
@@ -1058,7 +1030,7 @@ export class chatgpt extends plugin {
         })
         if (thinking) {
           if (Config.forwardReasoning) {
-            let thinkingForward = await common.makeForwardMsg(e, buildThinkingForwardMessages(thinking, thinkingSegments), '思考过程')
+            let thinkingForward = await common.makeForwardMsg(e, buildLegacyThinkingForwardMessages(thinking, thinkingSegments), '思考过程')
             this.reply(thinkingForward)
           } else {
             logger.mark('思考过程', thinking)
