@@ -902,7 +902,7 @@ export function supportGuoba () {
         {
           field: 'cloudTranscode',
           label: '云转码API地址',
-          bottomHelpMessage: '目前只支持node-silk语音转码，可在本地node-silk无法使用时尝试使用云端资源转码',
+          bottomHelpMessage: '可选；留空时直接交给当前 QQ 适配器处理。仅在自建转码服务可用时填写，单次请求最多等待 10 秒',
           component: 'Input'
         },
         {

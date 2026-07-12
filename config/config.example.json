@@ -85,7 +85,7 @@
   "whitelist": [],
   "blacklist": [],
   "ttsRegex": "/匹配规则/匹配模式",
-  "cloudTranscode": "https://silk.201666.xyz",
+  "cloudTranscode": "",
   "cloudRender": false,
   "cloudMode": "url",
   "cloudDPR": 1,

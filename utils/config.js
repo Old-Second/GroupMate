@@ -128,7 +128,7 @@ const defaultConfig = {
   // slackCozeEnableGlobalPreset: true,
   // slackCozeGlobalPreset: '',
   // slackCozeSpecifiedChannel: '',
-  cloudTranscode: 'https://silk.201666.xyz',
+  cloudTranscode: '',
   cloudRender: false,
   cloudMode: 'url',
   cloudDPR: 1,

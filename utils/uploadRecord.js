@@ -10,6 +10,7 @@ import child_process from 'child_process'
 import { Config } from './config.js'
 import path from 'path'
 import { mkdirs, getUin } from './common.js'
+import { withCloudTranscodeTimeout } from '../dist/runtime/cloud-transcode.js'
 let module
 try {
   module = await import('oicq')
@@ -87,10 +88,11 @@ async function uploadRecord (recordUrl, ttsMode = 'vits-uma-genshin-honkai', ign
           formData.append('file', new File([buffer], 'audio.wav'))
         }
         const cloudUrl = new URL(Config.cloudTranscode)
-        const resultres = await fetch(`${cloudUrl}audio`, {
+        const resultres = await withCloudTranscodeTimeout(signal => fetch(`${cloudUrl}audio`, {
           method: 'POST',
-          body: formData
-        })
+          body: formData,
+          signal
+        }))
         let t = await resultres.arrayBuffer()
         try {
           result = {
@@ -104,13 +106,14 @@ async function uploadRecord (recordUrl, ttsMode = 'vits-uma-genshin-honkai', ign
         }
       } else {
         const cloudUrl = new URL(Config.cloudTranscode)
-        const resultres = await fetch(`${cloudUrl}audio`, {
+        const resultres = await withCloudTranscodeTimeout(signal => fetch(`${cloudUrl}audio`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ recordUrl })
-        })
+          body: JSON.stringify({ recordUrl }),
+          signal
+        }))
         let t = await resultres.text()
         try {
           result = JSON.parse(t)

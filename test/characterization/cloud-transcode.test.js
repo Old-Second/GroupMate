@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import { test } from 'node:test'
+
+const projectUrl = new URL('../../', import.meta.url)
+
+test('cloud transcoding is disabled unless the user explicitly configures it', async () => {
+  const configSource = await readFile(new URL('utils/config.js', projectUrl), 'utf8')
+  const exampleConfig = JSON.parse(
+    await readFile(new URL('config/config.example.json', projectUrl), 'utf8')
+  )
+  const guobaSource = await readFile(new URL('guoba.support.js', projectUrl), 'utf8')
+
+  assert.match(configSource, /cloudTranscode:\s*''/)
+  assert.equal(exampleConfig.cloudTranscode, '')
+  assert.match(guobaSource, /留空时直接交给当前 QQ 适配器处理/)
+})
+
+test('both cloud transcode uploads use the TypeScript timeout boundary', async () => {
+  const source = await readFile(new URL('utils/uploadRecord.js', projectUrl), 'utf8')
+
+  assert.match(
+    source,
+    /import\s*\{\s*withCloudTranscodeTimeout\s*\}\s*from '\.\.\/dist\/runtime\/cloud-transcode\.js'/
+  )
+  assert.equal(
+    source.match(/withCloudTranscodeTimeout\(signal => fetch\(`/g)?.length,
+    2
+  )
+  assert.equal(source.match(/method:\s*'POST',[\s\S]{0,160}signal/g)?.length, 2)
+})
