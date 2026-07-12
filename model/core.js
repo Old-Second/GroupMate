@@ -57,6 +57,8 @@ import { BingAIClient } from '../client/CopilotAIClient.js'
 import Keyv from 'keyv'
 import crypto from 'crypto'
 import {GithubAPITool} from '../utils/tools/GithubTool.js'
+import { resolveLegacyConversationScope } from './legacy/conversation-scope.js'
+import { isLegacyToolExecutable } from './legacy/tool-visibility.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -80,19 +82,13 @@ const SIDE_EFFECT_TOOL_NAMES = new Set([
   'sendAudioMessage',
   'sendRPS'
 ])
-const MANAGEMENT_TOOL_NAMES = new Set([
-  'editCard',
-  'jinyan',
-  'kickOut',
-  'setTitle',
-  'handleMsg'
-])
-
 function getConversationScope (e, userId = e.sender?.user_id) {
-  if (e.isGroup) {
-    return Config.groupMerge ? `group:${e.group_id}` : `group:${e.group_id}:user:${userId}`
-  }
-  return `private:${userId}`
+  return resolveLegacyConversationScope({
+    isGroup: e.isGroup,
+    groupId: e.group_id,
+    userId,
+    groupMerge: Config.groupMerge
+  })
 }
 
 async function getRequesterGroupRole (e, userId = e.sender?.user_id) {
@@ -110,10 +106,6 @@ async function getRequesterGroupRole (e, userId = e.sender?.user_id) {
 async function isRequesterMaster (e, userId = e.sender?.user_id) {
   const masters = await getMasterQQ()
   return Array.isArray(masters) && masters.map(item => String(item)).includes(String(userId))
-}
-
-function isManagementToolAvailable (funcMap, toolName) {
-  return !MANAGEMENT_TOOL_NAMES.has(toolName) || Boolean(funcMap[toolName])
 }
 
 function disableFunctionCalling (completionParams = {}) {
@@ -638,7 +630,7 @@ class Core {
             let functionResult
             if (!resolvedTool.tool?.exec) {
               functionResult = `tool ${name} is unavailable. Available tool names: ${Object.keys(fullFuncMap).join(', ')}`
-            } else if (!isManagementToolAvailable(funcMap, resolvedTool.name)) {
+            } else if (!isLegacyToolExecutable({ toolName: resolvedTool.name, executableTools: funcMap })) {
               functionResult = `tool ${resolvedTool.name} is unavailable in this chat scene or for the current requester permission`
             } else {
               functionResult = await resolvedTool.tool.exec.bind(this)(Object.assign({
@@ -887,7 +879,7 @@ class Core {
             let functionResult
             if (!resolvedTool.tool?.exec) {
               functionResult = `tool ${name} is unavailable. Available tool names: ${Object.keys(fullFuncMap).join(', ')}`
-            } else if (!isManagementToolAvailable(funcMap, resolvedTool.name)) {
+            } else if (!isLegacyToolExecutable({ toolName: resolvedTool.name, executableTools: funcMap })) {
               functionResult = `tool ${resolvedTool.name} is unavailable in this chat scene or for the current requester permission`
             } else {
               functionResult = await resolvedTool.tool.exec.bind(this)(Object.assign({
