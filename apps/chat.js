@@ -219,6 +219,7 @@ export class chatgpt extends plugin {
     this.toggleMode = toggleMode
     this.reply = async (msg, quote, data) => presentLegacyReply({
       event: e,
+      handlerEvent: this.e,
       message: msg,
       quote,
       data,

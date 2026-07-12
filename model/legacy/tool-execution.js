@@ -13,6 +13,7 @@ export async function executeLegacyToolCall ({
   fullFuncMap,
   executableTools,
   toolArgs,
+  trustedContext,
   event,
   receiver,
   authorize = isLegacyToolExecutable
@@ -29,7 +30,7 @@ export async function executeLegacyToolCall ({
       result: `tool ${requestedName} is unavailable. Available tool names: ${Object.keys(fullFuncMap).join(', ')}`
     }
   }
-  if (!authorize({ toolName: resolvedName, executableTools })) {
+  if (!authorize({ toolName: resolvedName, executableTools: executableTools || {} })) {
     return {
       toolName,
       outcome: 'denied',
@@ -41,6 +42,10 @@ export async function executeLegacyToolCall ({
     toolName,
     outcome: 'executed',
     executed: true,
-    result: await tool.exec.call(receiver, toolArgs, event)
+    result: await tool.exec.call(
+      receiver,
+      trustedContext === undefined ? toolArgs : { ...toolArgs, ...trustedContext },
+      event
+    )
   }
 }

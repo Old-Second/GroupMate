@@ -135,6 +135,77 @@ test('legacy private reply schedules friend recall when no group exists', async 
   assert.deepEqual(calls.friendRecalls, ['fixture-bot-message'])
 })
 
+test('legacy markdown handler uses the dynamic event while reply and recall stay on the reply event', async () => {
+  for (const isGroup of [true, false]) {
+    const { calls, event, logger, plugin } = createLegacyYunzaiFake({ isGroup })
+    const handlerCalls = []
+    const handlerTransportCalls = []
+    const handlerEvent = {
+      event_id: `fixture-handler-${isGroup ? 'group' : 'friend'}-event`,
+      async reply () {
+        handlerTransportCalls.push('reply')
+        return { message_id: 'fixture-handler-message' }
+      },
+      group: {
+        recallMsg (messageId) {
+          handlerTransportCalls.push(`group:${messageId}`)
+          return Promise.resolve()
+        }
+      },
+      friend: {
+        recallMsg (messageId) {
+          handlerTransportCalls.push(`friend:${messageId}`)
+          return Promise.resolve()
+        }
+      }
+    }
+    const handler = {
+      async call (name, receivedEvent, data) {
+        handlerCalls.push({ name, receivedEvent, data })
+        return [{ text: 'fixture dynamic button' }]
+      }
+    }
+    const data = { recallMsg: 1, marker: 'fixture-dynamic-event' }
+
+    await presentLegacyReply({
+      event,
+      handlerEvent,
+      message: 'fixture response',
+      quote: true,
+      data,
+      markdownEnabled: true,
+      handler,
+      logger,
+      schedule: plugin.schedule
+    })
+
+    assert.equal(handlerCalls.length, 1)
+    assert.equal(handlerCalls[0].name, 'chatgpt.button.post')
+    assert.strictEqual(handlerCalls[0].receivedEvent, handlerEvent)
+    assert.strictEqual(handlerCalls[0].data, data)
+    assert.deepEqual(calls.replies, [{
+      message: [
+        'fixture response',
+        { type: 'button', content: [{ text: 'fixture dynamic button' }] }
+      ],
+      quote: true,
+      data: { recallMsg: 0, marker: 'fixture-dynamic-event' }
+    }])
+
+    assert.equal(calls.schedules[0].delay, 1000)
+    calls.schedules[0].callback()
+    assert.deepEqual(
+      calls.groupRecalls,
+      isGroup ? ['fixture-bot-message'] : []
+    )
+    assert.deepEqual(
+      calls.friendRecalls,
+      isGroup ? [] : ['fixture-bot-message']
+    )
+    assert.deepEqual(handlerTransportCalls, [])
+  }
+})
+
 test('chat app delegates only the characterized presenter decisions to the legacy seam', async () => {
   const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
   const presenterImport = source.match(
@@ -153,6 +224,7 @@ test('chat app delegates only the characterized presenter decisions to the legac
   assert.equal(source.match(/\bpresentLegacyReply\(\{/g)?.length ?? 0, 1)
   const presenterOptions = extractObjectCallOptions(source, 'presentLegacyReply({')
   assert.match(presenterOptions, /event:\s*e/)
+  assert.match(presenterOptions, /handlerEvent:\s*this\.e/)
   assert.match(presenterOptions, /message:\s*msg/)
   assert.match(presenterOptions, /quote,/)
   assert.match(presenterOptions, /data,/)

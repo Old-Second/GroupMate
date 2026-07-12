@@ -123,12 +123,17 @@ export async function runOnlineOpenAISmoke ({
 }
 
 export function formatOnlineSmokeFailure (error) {
-  let code
+  let codeDescriptor
   try {
-    code = error?.code
+    if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+      codeDescriptor = Object.getOwnPropertyDescriptor(error, 'code')
+    }
   } catch {
-    code = undefined
+    codeDescriptor = undefined
   }
+  const code = codeDescriptor && Object.hasOwn(codeDescriptor, 'value')
+    ? codeDescriptor.value
+    : undefined
 
   return {
     ok: false,

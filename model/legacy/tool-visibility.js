@@ -7,5 +7,9 @@ const LEGACY_MANAGEMENT_TOOLS = new Set([
 ])
 
 export function isLegacyToolExecutable ({ toolName, executableTools }) {
-  return !LEGACY_MANAGEMENT_TOOLS.has(toolName) || Boolean(executableTools[toolName])
+  return !LEGACY_MANAGEMENT_TOOLS.has(toolName) || Boolean(
+    executableTools &&
+    Object.hasOwn(executableTools, toolName) &&
+    executableTools[toolName]
+  )
 }

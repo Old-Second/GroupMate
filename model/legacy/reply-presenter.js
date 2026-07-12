@@ -34,6 +34,7 @@ export function selectLegacyPresentationMode ({
 
 export async function presentLegacyReply ({
   event,
+  handlerEvent = event,
   message,
   quote,
   data,
@@ -44,7 +45,7 @@ export async function presentLegacyReply ({
 }) {
   let payload = message
   if (markdownEnabled) {
-    const buttons = await handler.call('chatgpt.button.post', event, data)
+    const buttons = await handler.call('chatgpt.button.post', handlerEvent, data)
     if (buttons) {
       const button = { type: 'button', content: buttons }
       if (Array.isArray(payload)) payload.push(button)

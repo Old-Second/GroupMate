@@ -617,10 +617,11 @@ class Core {
               requestedName: name,
               fullFuncMap,
               executableTools: funcMap,
-              toolArgs: Object.assign({
+              toolArgs: args,
+              trustedContext: {
                 isAdmin,
                 sender
-              }, args),
+              },
               event: e,
               receiver: this
             })
@@ -868,10 +869,11 @@ class Core {
               requestedName: name,
               fullFuncMap,
               executableTools: funcMap,
-              toolArgs: Object.assign({
+              toolArgs: args,
+              trustedContext: {
                 isAdmin,
                 sender
-              }, args),
+              },
               event: e,
               receiver: this
             })

@@ -445,18 +445,30 @@ test('failure formatting whitelists only fixed online smoke codes', () => {
   assertContainsNoSensitiveValues(output)
 })
 
-test('failure formatting handles a throwing code getter with a fixed code', () => {
+test('failure formatting never executes an untrusted code getter', () => {
   const attackerControlledError = {}
+  let codeReads = 0
   Object.defineProperty(attackerControlledError, 'code', {
     get () {
-      throw new Error(sensitiveValues.join(' '))
+      codeReads++
+      return 'ONLINE_OPENAI_DISABLED'
     }
   })
 
   const output = JSON.stringify(formatOnlineSmokeFailure(attackerControlledError))
 
   assert.equal(output, '{"ok":false,"code":"ONLINE_OPENAI_FAILED"}')
+  assert.equal(codeReads, 0)
   assertContainsNoSensitiveValues(output)
+})
+
+test('failure formatting ignores inherited online smoke codes', () => {
+  const inheritedError = Object.create({ code: 'ONLINE_OPENAI_DISABLED' })
+
+  assert.deepEqual(formatOnlineSmokeFailure(inheritedError), {
+    ok: false,
+    code: 'ONLINE_OPENAI_FAILED'
+  })
 })
 
 test('disabled online smoke runs through a symlinked process entry point', async t => {

@@ -12,6 +12,177 @@ const TOOL_ALIASES = {
   kickout: 'kickOut'
 }
 
+for (const toolName of MANAGEMENT_TOOL_NAMES) {
+  test(`legacy default authorization denies ${toolName} when executable tools are missing`, async () => {
+    let executionCalls = 0
+
+    const result = await executeLegacyToolCall({
+      requestedName: toolName,
+      fullFuncMap: {
+        [toolName]: {
+          exec: async () => {
+            executionCalls++
+            return 'unexpected execution'
+          }
+        }
+      },
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.deepEqual(result, {
+      toolName,
+      outcome: 'denied',
+      executed: false,
+      result: `tool ${toolName} is unavailable in this chat scene or for the current requester permission`
+    })
+    assert.equal(executionCalls, 0)
+  })
+
+  test(`legacy default authorization denies inherited ${toolName} entries`, async () => {
+    let executionCalls = 0
+    const executableTools = Object.create({
+      [toolName]: { inherited: true }
+    })
+
+    const result = await executeLegacyToolCall({
+      requestedName: toolName,
+      fullFuncMap: {
+        [toolName]: {
+          exec: async () => {
+            executionCalls++
+            return 'unexpected execution'
+          }
+        }
+      },
+      executableTools,
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.equal(Object.hasOwn(executableTools, toolName), false)
+    assert.equal(result.outcome, 'denied')
+    assert.equal(result.executed, false)
+    assert.equal(executionCalls, 0)
+  })
+
+  test(`legacy default authorization executes ${toolName} once when advertised`, async () => {
+    let executionCalls = 0
+
+    const result = await executeLegacyToolCall({
+      requestedName: toolName,
+      fullFuncMap: {
+        [toolName]: {
+          exec: async () => {
+            executionCalls++
+            return 'fixture default authorization result'
+          }
+        }
+      },
+      executableTools: { [toolName]: { fixture: true } },
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.deepEqual(result, {
+      toolName,
+      outcome: 'executed',
+      executed: true,
+      result: 'fixture default authorization result'
+    })
+    assert.equal(executionCalls, 1)
+  })
+}
+
+for (const [requestedName, resolvedName] of Object.entries(TOOL_ALIASES)) {
+  test(`legacy default authorization denies alias ${requestedName} after resolving to ${resolvedName}`, async () => {
+    let executionCalls = 0
+
+    const result = await executeLegacyToolCall({
+      requestedName,
+      fullFuncMap: {
+        [resolvedName]: {
+          exec: async () => {
+            executionCalls++
+            return 'unexpected execution'
+          }
+        }
+      },
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.deepEqual(result, {
+      toolName: resolvedName,
+      outcome: 'denied',
+      executed: false,
+      result: `tool ${resolvedName} is unavailable in this chat scene or for the current requester permission`
+    })
+    assert.equal(executionCalls, 0)
+  })
+
+  test(`legacy default authorization denies alias ${requestedName} when ${resolvedName} is inherited`, async () => {
+    let executionCalls = 0
+    const executableTools = Object.create({
+      [resolvedName]: { inherited: true }
+    })
+
+    const result = await executeLegacyToolCall({
+      requestedName,
+      fullFuncMap: {
+        [resolvedName]: {
+          exec: async () => {
+            executionCalls++
+            return 'unexpected execution'
+          }
+        }
+      },
+      executableTools,
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.equal(Object.hasOwn(executableTools, resolvedName), false)
+    assert.equal(result.toolName, resolvedName)
+    assert.equal(result.outcome, 'denied')
+    assert.equal(result.executed, false)
+    assert.equal(executionCalls, 0)
+  })
+
+  test(`legacy default authorization executes alias ${requestedName} once after resolving to ${resolvedName}`, async () => {
+    let executionCalls = 0
+
+    const result = await executeLegacyToolCall({
+      requestedName,
+      fullFuncMap: {
+        [resolvedName]: {
+          exec: async () => {
+            executionCalls++
+            return 'fixture default alias result'
+          }
+        }
+      },
+      executableTools: { [resolvedName]: { fixture: true } },
+      toolArgs: { fixture: true },
+      event: { fixture: true },
+      receiver: { fixture: true }
+    })
+
+    assert.deepEqual(result, {
+      toolName: resolvedName,
+      outcome: 'executed',
+      executed: true,
+      result: 'fixture default alias result'
+    })
+    assert.equal(executionCalls, 1)
+  })
+}
+
 function extractObjectCallOptions (source, marker) {
   const calls = []
   let searchFrom = 0
@@ -291,6 +462,46 @@ test('legacy blank resolved name keeps the original downstream identity', async 
   assert.deepEqual(authorizationNames, [''])
 })
 
+test('legacy trusted context overrides untrusted tool arguments without mutating them', async () => {
+  const toolArgs = {
+    isAdmin: true,
+    sender: { user_id: 'forged-sender' },
+    target: 'fixture-target'
+  }
+  const originalArgs = structuredClone(toolArgs)
+  const trustedContext = {
+    isAdmin: false,
+    sender: 'trusted-sender'
+  }
+  let receivedArgs
+
+  const result = await executeLegacyToolCall({
+    requestedName: 'jinyan',
+    fullFuncMap: {
+      jinyan: {
+        exec: async args => {
+          receivedArgs = args
+          return 'fixture trusted context result'
+        }
+      }
+    },
+    executableTools: { jinyan: { fixture: true } },
+    toolArgs,
+    trustedContext,
+    event: { fixture: true },
+    receiver: { fixture: true }
+  })
+
+  assert.equal(result.outcome, 'executed')
+  assert.deepEqual(receivedArgs, {
+    isAdmin: false,
+    sender: 'trusted-sender',
+    target: 'fixture-target'
+  })
+  assert.notEqual(receivedArgs, toolArgs)
+  assert.deepEqual(toolArgs, originalArgs)
+})
+
 test('model core delegates both legacy tool loops to the execution seam', async () => {
   const source = await readFile(new URL('../../model/core.js', import.meta.url), 'utf8')
 
@@ -301,9 +512,11 @@ test('model core delegates both legacy tool loops to the execution seam', async 
     assert.match(options, /requestedName:\s*name/)
     assert.match(options, /(?:^|,)\s*fullFuncMap\s*(?=,|$)/)
     assert.match(options, /executableTools:\s*funcMap/)
-    assert.match(options, /toolArgs:\s*Object\.assign\(\{\s*isAdmin,\s*sender\s*\},\s*args\)/s)
+    assert.match(options, /toolArgs:\s*args/)
+    assert.match(options, /trustedContext:\s*\{\s*isAdmin,\s*sender\s*\}/s)
     assert.match(options, /event:\s*e/)
     assert.match(options, /receiver:\s*this/)
+    assert.doesNotMatch(options, /\bauthorize\s*:/)
   }
 
   assert.equal(
