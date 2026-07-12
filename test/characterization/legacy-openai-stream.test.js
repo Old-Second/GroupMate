@@ -40,15 +40,18 @@ test('legacy stream assembles reasoning and one fragmented tool call', async t =
   assert.equal(requests[0].options.method, 'POST')
   assert.equal(requests[0].options.headers.Authorization, 'Bearer fixture-key')
   assert.equal(requests[0].options.headers['Content-Type'], 'application/json')
-  const body = JSON.parse(requests[0].options.body)
-  assert.equal(body.model, 'fixture-model')
-  assert.equal(body.stream, true)
-  assert.equal(body.max_completion_tokens, 4096)
-  assert.deepEqual(body.messages, [
-    { role: 'system', content: 'fixture system' },
-    { role: 'user', content: 'fixture question' }
-  ])
-  assert.deepEqual(body.tools, [])
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    max_completion_tokens: 4096,
+    model: 'fixture-model',
+    temperature: 1,
+    top_p: 1,
+    tools: [],
+    messages: [
+      { role: 'system', content: 'fixture system' },
+      { role: 'user', content: 'fixture question' }
+    ],
+    stream: true
+  })
   assert.deepEqual(progress, [
     { reasoning: 'fixture ', toolCalls: [] },
     { reasoning: 'fixture checking ', toolCalls: [] },

@@ -10,10 +10,12 @@ test('legacy conversation scope keeps private, merged group, and per-user group 
   assert.equal(resolveLegacyConversationScope({ isGroup: true, groupId: '8', userId: '7', groupMerge: false }), 'group:8:user:7')
 })
 
-test('legacy management tool execution requires the filtered map', () => {
-  assert.equal(isLegacyToolExecutable({ toolName: 'kickOut', executableTools: {} }), false)
-  assert.equal(isLegacyToolExecutable({ toolName: 'kickOut', executableTools: { kickOut: async () => {} } }), true)
-})
+for (const toolName of ['editCard', 'jinyan', 'kickOut', 'setTitle', 'handleMsg']) {
+  test(`legacy management tool ${toolName} execution requires the filtered map`, () => {
+    assert.equal(isLegacyToolExecutable({ toolName, executableTools: {} }), false)
+    assert.equal(isLegacyToolExecutable({ toolName, executableTools: { [toolName]: async () => {} } }), true)
+  })
+}
 
 test('legacy non-management tool execution is not constrained by the filtered map', () => {
   assert.equal(isLegacyToolExecutable({ toolName: 'website', executableTools: {} }), true)

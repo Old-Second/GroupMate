@@ -57,11 +57,14 @@ function assertParsedFixtureSafe (value, label) {
 function assertSseDataIsSynthetic (content, label) {
   const parser = createParser(event => {
     if (event.type !== 'event' || event.data === '[DONE]') return
+    let data
     try {
-      assertParsedFixtureSafe(JSON.parse(event.data), label)
+      data = JSON.parse(event.data)
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error
+      throw new SyntaxError(`${label} contains non-JSON SSE data event`, { cause: error })
     }
+    assertParsedFixtureSafe(data, label)
   })
   parser.feed(`${content}\n\n`)
 }
@@ -111,12 +114,26 @@ test('fixture detector rejects userinfo URLs with a real hostname', () => {
 
 test('fixture detector checks synthetic prompt data in SSE events', () => {
   assert.throws(() => assertFixtureSafe(
+    'data: private question\n\n',
+    'SSE non-JSON data'
+  ), {
+    name: 'SyntaxError',
+    message: 'SSE non-JSON data contains non-JSON SSE data event'
+  })
+  assert.throws(() => assertFixtureSafe(
     'data: {"messages":[{"role":"user","content":"private question"}]}\n\n',
     'SSE private prompt'
   ))
   assert.doesNotThrow(() => assertFixtureSafe(
     'data: {"messages":[{"role":"user","content":"fixture question"}]}\n\n',
     'SSE synthetic prompt'
+  ))
+})
+
+test('fixture detector allows SSE comments and the DONE sentinel', () => {
+  assert.doesNotThrow(() => assertFixtureSafe(
+    ': fixture keep-alive\n\ndata: [DONE]\n\n',
+    'SSE control records'
   ))
 })
 
