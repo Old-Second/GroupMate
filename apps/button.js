@@ -1,5 +1,6 @@
 import plugin from '../../../lib/plugins/plugin.js'
 import { Config } from '../utils/config.js'
+import { pluginId } from '../dist/runtime/plugin-context.js'
 
 const PLUGIN_CHAT = 'ChatGpt 对话'
 const PLUGIN_MANAGEMENT = 'ChatGPT-Plugin 管理'
@@ -45,7 +46,7 @@ export class ChatGPTButtonHandler extends plugin {
     super({
       name: 'chatgpt按钮处理器',
       priority: -100,
-      namespace: 'chatgpt-plugin',
+      namespace: pluginId,
       handler: [{
         key: 'chatgpt.button.post',
         fn: 'btnHandler'

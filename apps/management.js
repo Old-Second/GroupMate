@@ -25,6 +25,7 @@ import fetch from 'node-fetch'
 import { newFetch } from '../utils/proxy.js'
 import { createServer, runServer, stopServer } from '../server/index.js'
 import { BingAIClient } from '../client/CopilotAIClient.js'
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 
 export class ChatgptManagement extends plugin {
   constructor (e) {
@@ -1008,7 +1009,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     let packageJson = fs.readFileSync(`${_path}/package.json`)
     packageJson = JSON.parse(String(packageJson))
     const packageName = '@google/generative-ai@0.1.1'
-    const patchLoc = 'plugins/chatgpt-plugin/patches/@google__generative-ai@0.1.1.patch'
+    const patchLoc = resolvePluginPath('patches', '@google__generative-ai@0.1.1.patch')
     if (!packageJson.pnpm) {
       packageJson.pnpm = {
         patchedDependencies: {
@@ -1583,7 +1584,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     if (await redis.exists('CHATGPT:USE') != 0) {
       redisConfig.useMode = await redis.get('CHATGPT:USE')
     }
-    const filepath = path.join('plugins/chatgpt-plugin/resources/view', 'setting_view.json')
+    const filepath = resolvePluginPath('resources', 'view', 'setting_view.json')
     const configView = JSON.parse(fs.readFileSync(filepath, 'utf8'))
     const configJson = JSON.stringify({
       chatConfig: Config,

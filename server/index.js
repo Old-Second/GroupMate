@@ -11,6 +11,7 @@ import websocketclient from 'ws'
 import { Config } from '../utils/config.js'
 import { UserInfo, GetUser, AddUser, ReplaceUsers } from './modules/user_data.js'
 import { getPublicIP, getUserData, getMasterQQ, randomString, getUin } from '../utils/common.js'
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 
 import webRoute from './modules/web_route.js'
 import webUser from './modules/user.js'
@@ -18,7 +19,6 @@ import webPrompt from './modules/prompts.js'
 import Guoba from './modules/guoba.js'
 import SettingView from './modules/setting_view.js'
 
-const __dirname = path.resolve()
 const isTrss = Array.isArray(Bot.uin)
 
 // 无法访问端口的情况下创建与media的通讯
@@ -137,7 +137,7 @@ export async function createServer () {
     origin: '*'
   })
   await server.register(fstatic, {
-    root: path.join(__dirname, 'plugins/chatgpt-plugin/server/static/')
+    root: resolvePluginPath('server', 'static')
   })
   await server.register(websocket, {
     cors: true,
@@ -172,7 +172,7 @@ export async function createServer () {
   server.post('/help', async (request, reply) => {
     const body = request.body || {}
     if (body.use) {
-      const dir = 'plugins/chatgpt-plugin/resources'
+      const dir = resolvePluginPath('resources')
       const filename = 'help.json'
       const filepath = path.join(dir, filename)
       let data = fs.readFileSync(filepath, 'utf8')

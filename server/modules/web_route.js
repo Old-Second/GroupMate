@@ -1,19 +1,23 @@
 import { UserInfo } from './user_data.js'
 import fs from 'fs'
+import { resolvePluginPath } from '../../dist/runtime/plugin-context.js'
+
+const pagePath = resolvePluginPath('server', 'static', 'page.html')
+const indexPath = resolvePluginPath('server', 'static', 'index.html')
 
 async function routes(fastify, options) {
     fastify.get('/page/*', async (request, reply) => {
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
     fastify.get('/version', async (request, reply) => {
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
     fastify.get('/auth/*', async (request, reply) => {
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
@@ -23,7 +27,7 @@ async function routes(fastify, options) {
         if (!user) {
             reply.redirect(301, '/auth/login')
         }
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
@@ -36,7 +40,7 @@ async function routes(fastify, options) {
         if (user.autho === 'admin') {
             reply.redirect(301, '/admin/settings')
         }
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
@@ -46,7 +50,7 @@ async function routes(fastify, options) {
         if (!user || user.autho != 'admin') {
             reply.redirect(301, '/admin/')
         }
-        const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/page.html')
+        const stream = fs.createReadStream(pagePath)
         reply.type('text/html').send(stream)
         return reply
     })
@@ -67,7 +71,7 @@ async function routes(fastify, options) {
     })
     fastify.setNotFoundHandler((request, reply) => {
         if (request.method == 'GET') {
-            const stream = fs.createReadStream('plugins/chatgpt-plugin/server/static/index.html')
+            const stream = fs.createReadStream(indexPath)
             reply.type('text/html').send(stream)
         } else {
             reply.code(404).send(new Error('Not Found'))

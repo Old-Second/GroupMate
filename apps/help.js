@@ -1,6 +1,7 @@
 import plugin from '../../../lib/plugins/plugin.js'
 import { Config } from '../utils/config.js'
 import { render } from '../utils/common.js'
+import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
 let version = Config.version
 let helpData = [
   {
@@ -337,6 +338,6 @@ export class help extends plugin {
   }
 
   async help (e) {
-    await render(e, 'chatgpt-plugin', 'help/index', { helpData, version })
+    await render(e, pluginDirectoryName, 'help/index', { helpData, version })
   }
 }

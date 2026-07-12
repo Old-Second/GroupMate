@@ -1,12 +1,13 @@
 import plugin from '../../../lib/plugins/plugin.js'
 import { Config } from '../utils/config.js'
+import { pluginId } from '../dist/runtime/plugin-context.js'
 
 export class ChatGPTMarkdownHandler extends plugin {
   constructor () {
     super({
       name: 'chatgptmd处理器',
       priority: -100,
-      namespace: 'chatgpt-plugin',
+      namespace: pluginId,
       handler: [{
         key: 'chatgpt.markdown.convert',
         fn: 'mdHandler'

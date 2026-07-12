@@ -1,32 +1,35 @@
 import _ from 'lodash'
 import fs from 'fs'
+import path from 'node:path'
 import { mkdirs } from './common.js'
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
+
+const promptsDirectory = resolvePluginPath('prompts')
+
 export function readPrompts () {
-  const _path = process.cwd()
   let prompts = []
-  if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/prompts`)) {
-    if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/prompts`)) {
-      const files = fs.readdirSync(`${_path}/plugins/chatgpt-plugin/prompts`)
-      const txtFiles = files.filter(file => file.endsWith('.txt'))
-      txtFiles.forEach(txtFile => {
-        let name = _.trimEnd(txtFile, '.txt')
-        const content = fs.readFileSync(`${_path}/plugins/chatgpt-plugin/prompts/${txtFile}`, 'utf8')
-        let example = []
-        try {
-          if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/prompts/${name}_example.json`)) {
-            example = fs.readFileSync(`${_path}/plugins/chatgpt-plugin/prompts/${name}_example.json`, 'utf8')
-            example = JSON.parse(example)
-          }
-        } catch (err) {
-          logger.debug(err)
+  if (fs.existsSync(promptsDirectory)) {
+    const files = fs.readdirSync(promptsDirectory)
+    const txtFiles = files.filter(file => file.endsWith('.txt'))
+    txtFiles.forEach(txtFile => {
+      let name = _.trimEnd(txtFile, '.txt')
+      const content = fs.readFileSync(path.join(promptsDirectory, txtFile), 'utf8')
+      let example = []
+      try {
+        const examplePath = path.join(promptsDirectory, `${name}_example.json`)
+        if (fs.existsSync(examplePath)) {
+          example = fs.readFileSync(examplePath, 'utf8')
+          example = JSON.parse(example)
         }
-        prompts.push({
-          name,
-          content,
-          example
-        })
+      } catch (err) {
+        logger.debug(err)
+      }
+      prompts.push({
+        name,
+        content,
+        example
       })
-    }
+    })
   }
   return prompts
 }
@@ -45,23 +48,21 @@ export function getPromptByName (name) {
 }
 
 export function saveOnePrompt (name, content, examples) {
-  const _path = process.cwd()
-  mkdirs(`${_path}/plugins/chatgpt-plugin/prompts`)
-  let filePath = `${_path}/plugins/chatgpt-plugin/prompts/${name}.txt`
+  mkdirs(promptsDirectory)
+  let filePath = path.join(promptsDirectory, `${name}.txt`)
   fs.writeFileSync(filePath, content)
   if (examples) {
-    let examplePath = `${_path}/plugins/chatgpt-plugin/prompts/${name}_example.json`
+    let examplePath = path.join(promptsDirectory, `${name}_example.json`)
     fs.writeFileSync(examplePath, JSON.stringify(examples))
   }
 }
 
 export function deleteOnePrompt (name) {
-  const _path = process.cwd()
-  mkdirs(`${_path}/plugins/chatgpt-plugin/prompts`)
-  let filePath = `${_path}/plugins/chatgpt-plugin/prompts/${name}.txt`
+  mkdirs(promptsDirectory)
+  let filePath = path.join(promptsDirectory, `${name}.txt`)
   fs.unlinkSync(filePath)
   try {
-    let examplePath = `${_path}/plugins/chatgpt-plugin/prompts/${name}_example.json`
+    let examplePath = path.join(promptsDirectory, `${name}_example.json`)
     fs.unlinkSync(examplePath)
   } catch (err) {}
 }

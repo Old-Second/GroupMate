@@ -1,5 +1,6 @@
 import fs from 'fs'
 import lodash from 'lodash'
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 export const defaultChatGPTAPI = 'https://chat3.avocado.wiki/backend-api/conversation'
 export const officialChatGPTAPI = 'https://chat3.avocado.wiki/backend-api/conversation'
 // Reverse proxy of https://api.openai.com
@@ -235,10 +236,12 @@ const defaultConfig = {
   githubAPIKey: '',
   version: 'v2.8.4'
 }
-const _path = process.cwd()
+const configJsonPath = resolvePluginPath('config', 'config.json')
+const legacyConfigPath = resolvePluginPath('config', 'config.js')
+const legacyIndexPath = resolvePluginPath('config', 'index.js')
 let config = {}
-if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/config/config.json`)) {
-  const fullPath = fs.realpathSync(`${_path}/plugins/chatgpt-plugin/config/config.json`)
+if (fs.existsSync(configJsonPath)) {
+  const fullPath = fs.realpathSync(configJsonPath)
   const data = fs.readFileSync(fullPath)
   if (data) {
     try {
@@ -248,30 +251,30 @@ if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/config/config.json`)) {
       logger.warn('chatgpt插件即将使用默认配置')
     }
   }
-} else if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/config/config.js`)) {
+} else if (fs.existsSync(legacyConfigPath)) {
   // 旧版本的config.js，读取其内容，生成config.json，然后删掉config.js
-  const fullPath = fs.realpathSync(`${_path}/plugins/chatgpt-plugin/config/config.js`)
+  const fullPath = fs.realpathSync(legacyConfigPath)
   config = (await import(`file://${fullPath}`)).default
   try {
     logger.warn('[ChatGPT-Plugin]发现旧版本config.js文件，正在读取其内容并转换为新版本config.json文件')
     // 读取其内容，生成config.json
-    fs.writeFileSync(`${_path}/plugins/chatgpt-plugin/config/config.json`, JSON.stringify(config, null, 2))
+    fs.writeFileSync(configJsonPath, JSON.stringify(config, null, 2))
     // 删掉config.js
-    fs.unlinkSync(`${_path}/plugins/chatgpt-plugin/config/config.js`)
+    fs.unlinkSync(legacyConfigPath)
     logger.info('[ChatGPT-Plugin]配置文件转换处理完成')
   } catch (err) {
     logger.error('[ChatGPT-Plugin]转换旧版配置文件失败，建议手动清理旧版config.js文件，并转为使用新版config.json格式', err)
   }
-} else if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/config/index.js`)) {
+} else if (fs.existsSync(legacyIndexPath)) {
   // 兼容旧版本
-  const fullPath = fs.realpathSync(`${_path}/plugins/chatgpt-plugin/config/index.js`)
+  const fullPath = fs.realpathSync(legacyIndexPath)
   config = (await import(`file://${fullPath}`)).Config
   try {
     logger.warn('[ChatGPT-Plugin]发现旧版本config.js文件，正在读取其内容并转换为新版本config.json文件')
     // 读取其内容，生成config.json
-    fs.writeFileSync(`${_path}/plugins/chatgpt-plugin/config/config.json`, JSON.stringify(config, null, 2))
+    fs.writeFileSync(configJsonPath, JSON.stringify(config, null, 2))
     // index.js
-    fs.unlinkSync(`${_path}/plugins/chatgpt-plugin/config/index.js`)
+    fs.unlinkSync(legacyIndexPath)
     logger.info('[ChatGPT-Plugin]配置文件转换处理完成')
   } catch (err) {
     logger.error('[ChatGPT-Plugin]转换旧版配置文件失败，建议手动清理旧版index.js文件，并转为使用新版config.json格式', err)
@@ -279,7 +282,7 @@ if (fs.existsSync(`${_path}/plugins/chatgpt-plugin/config/config.json`)) {
 }
 config = Object.assign({}, defaultConfig, config)
 config.version = defaultConfig.version
-// const latestTag = execSync(`cd ${_path}/plugins/chatgpt-plugin && git describe --tags --abbrev=0`).toString().trim()
+// const latestTag = execSync(`git -C ${resolvePluginPath()} describe --tags --abbrev=0`).toString().trim()
 // config.version = latestTag
 
 export const Config = new Proxy(config, {
@@ -306,7 +309,7 @@ export const Config = new Proxy(config, {
       }
     })
     try {
-      fs.writeFileSync(`${_path}/plugins/chatgpt-plugin/config/config.json`, JSON.stringify(change, null, 2), { flag: 'w' })
+      fs.writeFileSync(configJsonPath, JSON.stringify(change, null, 2), { flag: 'w' })
     } catch (err) {
       logger.error(err)
       return false

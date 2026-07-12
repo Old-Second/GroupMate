@@ -1,6 +1,7 @@
 import { Config } from '../config.js'
 import fs from 'fs'
 import nodejieba from '@node-rs/jieba'
+import { resolvePluginPath } from '../../dist/runtime/plugin-context.js'
 
 class Tokenizer {
   async getHistory (e, groupId, date = new Date(), duration = 0, userId) {
@@ -80,8 +81,7 @@ class Tokenizer {
     let durationStr = duration > 0 ? `${duration}小时` : '今日'
     logger.mark(`聊天记录拉取完成，获取到${durationStr}内${chats.length}条聊天记录，准备分词中`)
 
-    const _path = process.cwd()
-    let stopWordsPath = `${_path}/plugins/chatgpt-plugin/utils/wordcloud/cn_stopwords.txt`
+    let stopWordsPath = resolvePluginPath('utils', 'wordcloud', 'cn_stopwords.txt')
     const data = fs.readFileSync(stopWordsPath)
     const stopWords = String(data)?.split('\n') || []
     let chatContent = chats

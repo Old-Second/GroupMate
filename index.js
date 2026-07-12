@@ -1,9 +1,14 @@
 import fs from 'node:fs'
 import { Config } from './utils/config.js'
 import { createServer, runServer } from './server/index.js'
+import {
+  pluginDisplayName,
+  repositoryUrl,
+  resolvePluginPath
+} from './dist/runtime/plugin-context.js'
 
 logger.info('**************************************')
-logger.info('chatgpt-plugin加载中')
+logger.info(`${pluginDisplayName}加载中`)
 
 if (!global.segment) {
   try {
@@ -13,7 +18,7 @@ if (!global.segment) {
   }
 }
 
-const files = fs.readdirSync('./plugins/chatgpt-plugin/apps').filter(file => file.endsWith('.js'))
+const files = fs.readdirSync(resolvePluginPath('apps')).filter(file => file.endsWith('.js'))
 
 let ret = []
 
@@ -45,11 +50,10 @@ if (Config.enableToolbox) {
 } else {
   logger.info('提示：当前配置未开启chatgpt工具箱，可通过锅巴或`#chatgpt开启工具箱`指令开启')
 }
-logger.info('chatgpt-plugin加载成功')
+logger.info(`${pluginDisplayName}加载成功`)
 logger.info(`当前版本${Config.version}`)
-logger.info('仓库地址 https://github.com/ikechan8370/chatgpt-plugin')
+logger.info(`仓库地址 ${repositoryUrl}`)
 logger.info('文档地址 https://www.yunzai.chat')
-logger.info('插件群号 559567232')
 logger.info('**************************************')
 
 export { apps }

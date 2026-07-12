@@ -25,15 +25,15 @@ GroupMate 是一个运行在 Yunzai 体系中的 QQ 群原生交互项目。它�
 - pnpm 10
 - 可加载 Yunzai 插件的运行环境，例如 TRSS-Yunzai
 
-项目没有独立的启动命令，必须由 Yunzai 加载。由于部分旧版路径仍固定使用 `plugins/chatgpt-plugin`，部署时暂时需要保留这个目录名。
+项目没有独立的启动命令，必须由 Yunzai 加载。插件目录使用 `plugins/GroupMate`，运行时会根据实际安装位置解析配置、模板和静态资源。
 
 ## 安装
 
 在 Yunzai 根目录执行：
 
 ```bash
-git clone https://github.com/Old-Second/GroupMate.git ./plugins/chatgpt-plugin
-cd ./plugins/chatgpt-plugin
+git clone https://github.com/Old-Second/GroupMate.git ./plugins/GroupMate
+cd ./plugins/GroupMate
 pnpm install --frozen-lockfile
 ```
 

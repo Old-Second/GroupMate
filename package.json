@@ -14,8 +14,10 @@
   },
   "packageManager": "pnpm@10.32.1",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/unit/*.test.js test/characterization/*.test.js",
-    "test:unit": "node --test --test-concurrency=1 test/unit/*.test.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "pnpm run build && node --test --test-concurrency=1 test/unit/*.test.js test/characterization/*.test.js && pnpm run test:ts",
+    "test:unit": "pnpm run build && node --test --test-concurrency=1 test/unit/*.test.js && pnpm run test:ts",
+    "test:ts": "tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*.test.js",
     "test:characterization": "node --test --test-concurrency=1 test/characterization/*.test.js",
     "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
@@ -60,8 +62,10 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@types/node": "^18.19.130",
     "ts-node": "^10.9.1",
-    "ts-node-register": "^1.0.0"
+    "ts-node-register": "^1.0.0",
+    "typescript": "^5.9.3"
   },
   "pnpm": {
     "patchedDependencies": {

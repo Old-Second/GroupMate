@@ -13,6 +13,7 @@ import VoiceVoxTTS from '../utils/tts/voicevox.js'
 import { URL } from 'node:url'
 import { getBots } from '../utils/bot.js'
 import {CustomGoogleGeminiClient} from "../client/CustomGoogleGeminiClient.js";
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 
 let useSilk = false
 try {
@@ -352,8 +353,7 @@ ${translateLangLabels}
       await this.reply(image, true)
       return true
     }
-    const _path = process.cwd()
-    const fullPath = fs.realpathSync(`${_path}/plugins/chatgpt-plugin/resources/emojiData.json`)
+    const fullPath = fs.realpathSync(resolvePluginPath('resources', 'emojiData.json'))
     const data = fs.readFileSync(fullPath)
     let emojDataJson = JSON.parse(data)
     logger.mark(`合成emoji：${left} ${right}`)

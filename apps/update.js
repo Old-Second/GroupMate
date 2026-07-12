@@ -4,6 +4,11 @@ import { createRequire } from 'module'
 import _ from 'lodash'
 import { Restart } from '../../other/restart.js'
 import {} from '../utils/common.js'
+import {
+  pluginDisplayName,
+  pluginRoot,
+  repositoryUrl
+} from '../dist/runtime/plugin-context.js'
 
 const require = createRequire(import.meta.url)
 const { exec, execSync } = require('child_process')
@@ -22,7 +27,7 @@ export class Update extends plugin {
       priority: 1000,
       rule: [
         {
-          reg: '^#?(chatgpt|柴特寄批踢|GPT|ChatGPT|柴特鸡批踢|Chat|CHAT|CHATGPT|柴特|ChatGPT-Plugin|ChatGPT-plugin|chatgpt-plugin)(插件)?(强制)?更新$',
+          reg: '^#?(groupmate|GroupMate|GROUPMATE|chatgpt|柴特寄批踢|GPT|ChatGPT|柴特鸡批踢|Chat|CHAT|CHATGPT|柴特|ChatGPT-Plugin|ChatGPT-plugin|chatgpt-plugin)(插件)?(强制)?更新$',
           fnc: 'update'
         }
       ]
@@ -67,35 +72,36 @@ export class Update extends plugin {
    * @returns
    */
   async runUpdate (isForce) {
-    let command = 'git -C ./plugins/chatgpt-plugin/ pull --no-rebase'
+    const quotedPluginRoot = JSON.stringify(pluginRoot)
+    let command = `git -C ${quotedPluginRoot} pull --no-rebase`
     if (isForce) {
-      command = `git -C ./plugins/chatgpt-plugin/ checkout . && ${command}`
+      command = `git -C ${quotedPluginRoot} checkout . && ${command}`
       this.e.reply('正在执行强制更新操作，请稍等')
     } else {
       this.e.reply('正在执行更新操作，请稍等')
     }
     /** 获取上次提交的commitId，用于获取日志时判断新增的更新日志 */
-    this.oldCommitId = await this.getcommitId('chatgpt-plugin')
+    this.oldCommitId = await this.getcommitId()
     uping = true
     let ret = await this.execSync(command)
     uping = false
 
     if (ret.error) {
-      logger.mark(`${this.e.logFnc} 更新失败：chatgpt-plugin`)
+      logger.mark(`${this.e.logFnc} 更新失败：${pluginDisplayName}`)
       this.gitErr(ret.error, ret.stdout)
       return false
     }
 
     /** 获取插件提交的最新时间 */
-    let time = await this.getTime('chatgpt-plugin')
+    let time = await this.getTime()
 
     if (/(Already up[ -]to[ -]date|已经是最新的)/.test(ret.stdout)) {
-      await this.reply(`chatgpt-plugin已经是最新版本\n最后更新时间：${time}`)
+      await this.reply(`${pluginDisplayName}已经是最新版本\n最后更新时间：${time}`)
     } else {
-      await this.reply(`chatgpt-plugin\n最后更新时间：${time}`)
+      await this.reply(`${pluginDisplayName}\n最后更新时间：${time}`)
       this.isUp = true
-      /** 获取chatgpt组件的更新日志 */
-      let log = await this.getLog('chatgpt-plugin')
+      /** 获取GroupMate组件的更新日志 */
+      let log = await this.getLog()
       await this.reply(log)
     }
 
@@ -109,8 +115,9 @@ export class Update extends plugin {
    * @param {string} plugin 插件名称
    * @returns
    */
-  async getLog (plugin = '') {
-    let cm = `cd ./plugins/${plugin}/ && git log  -20 --oneline --pretty=format:"%h||[%cd]  %s" --date=format:"%m-%d %H:%M"`
+  async getLog () {
+    const quotedPluginRoot = JSON.stringify(pluginRoot)
+    let cm = `git -C ${quotedPluginRoot} log -20 --oneline --pretty=format:"%h||[%cd]  %s" --date=format:"%m-%d %H:%M"`
 
     let logAll
     try {
@@ -137,10 +144,9 @@ export class Update extends plugin {
     if (log.length <= 0) return ''
 
     let end = ''
-    end =
-      '更多详细信息，请前往github查看\nhttps://github.com/ikechan8370/chatgpt-plugin'
+    end = `更多详细信息，请前往github查看\n${repositoryUrl}`
 
-    log = await this.makeForwardMsg(`chatgpt-plugin更新日志，共${line}条`, log, end)
+    log = await this.makeForwardMsg(`${pluginDisplayName}更新日志，共${line}条`, log, end)
 
     return log
   }
@@ -150,8 +156,8 @@ export class Update extends plugin {
    * @param {string} plugin 插件名称
    * @returns
    */
-  async getcommitId (plugin = '') {
-    let cm = `git -C ./plugins/${plugin}/ rev-parse --short HEAD`
+  async getcommitId () {
+    let cm = `git -C ${JSON.stringify(pluginRoot)} rev-parse --short HEAD`
 
     let commitId = await execSync(cm, { encoding: 'utf-8' })
     commitId = _.trim(commitId)
@@ -164,8 +170,8 @@ export class Update extends plugin {
    * @param {string} plugin 插件名称
    * @returns
    */
-  async getTime (plugin = '') {
-    let cm = `cd ./plugins/${plugin}/ && git log -1 --oneline --pretty=format:"%cd" --date=format:"%m-%d %H:%M"`
+  async getTime () {
+    let cm = `git -C ${JSON.stringify(pluginRoot)} log -1 --oneline --pretty=format:"%cd" --date=format:"%m-%d %H:%M"`
 
     let time = ''
     try {
@@ -224,7 +230,7 @@ export class Update extends plugin {
       return msg.join('\n')
     }
 
-    let dec = 'chatgpt-plugin 更新日志'
+    let dec = `${pluginDisplayName} 更新日志`
     /** 处理描述 */
     if (typeof (forwardMsg.data) === 'object') {
       let detail = forwardMsg.data?.meta?.detail

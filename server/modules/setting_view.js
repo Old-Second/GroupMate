@@ -1,7 +1,7 @@
 import { UserInfo } from './user_data.js'
 import { supportGuoba } from '../../guoba.support.js'
 import fs from 'fs'
-import path from 'path'
+import { resolvePluginPath } from '../../dist/runtime/plugin-context.js'
 
 function getAttributeValues(obj, attributeName, results = []) {
     if (Array.isArray(obj)) {
@@ -26,7 +26,7 @@ async function SettingView(fastify, options) {
         if (!user) {
             reply.send({ err: '未登录' })
         } else if (user.autho === 'admin') {
-            const filepath = path.join('plugins/chatgpt-plugin/resources/view', 'setting_view.json')
+            const filepath = resolvePluginPath('resources', 'view', 'setting_view.json')
             let configView = JSON.parse(fs.readFileSync(filepath, 'utf8'))
 
             // 从锅巴配置获取额外配置视图

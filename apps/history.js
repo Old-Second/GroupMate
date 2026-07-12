@@ -2,6 +2,7 @@ import plugin from '../../../lib/plugins/plugin.js'
 import { render, getUin } from '../utils/common.js'
 import { Config } from '../utils/config.js'
 import { KeyvFile } from 'keyv-file'
+import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
 
 async function getKeyv () {
   let Keyv
@@ -88,7 +89,7 @@ export class history extends plugin {
       await e.reply('无聊天记录', e.isGroup)
       return true
     }
-    await render(e, 'chatgpt-plugin', 'content/History/index', {
+    await render(e, pluginDirectoryName, 'content/History/index', {
       version: Config.version,
       user: {
         qq: queryUser,

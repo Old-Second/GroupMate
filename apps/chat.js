@@ -38,6 +38,7 @@ import {
   presentLegacyReply,
   selectLegacyPresentationMode
 } from '../model/legacy/reply-presenter.js'
+import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -1273,7 +1274,7 @@ export class chatgpt extends plugin {
         logger.mark('all conversations: ', conversations)
       }
       //    let conversationsFirst10 = conversations.slice(0, 10)
-      await render(e, 'chatgpt-plugin', 'conversation/chatgpt', {
+      await render(e, pluginDirectoryName, 'conversation/chatgpt', {
         conversations,
         version
       })

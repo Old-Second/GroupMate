@@ -3,6 +3,7 @@ import { Config } from '../utils/config.js'
 import { getMasterQQ, limitString, makeForwardMsg, maskQQ, getUin } from '../utils/common.js'
 import { deleteOnePrompt, getPromptByName, readPrompts, saveOnePrompt } from '../utils/prompts.js'
 import AzureTTS from '../utils/tts/microsoft-azure.js'
+import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 export class help extends plugin {
   constructor (e) {
     super({
@@ -439,6 +440,6 @@ export class help extends plugin {
   }
 
   async helpPrompt () {
-    await this.reply('设定目录为/plugins/chatgpt-plugin/prompts，将会读取该目录下的所有[设定名].txt文件作为设定列表', true)
+    await this.reply(`设定目录为${resolvePluginPath('prompts')}，将会读取该目录下的所有[设定名].txt文件作为设定列表`, true)
   }
 }

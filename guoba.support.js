@@ -2,6 +2,7 @@ import { Config } from './utils/config.js'
 import { speakers } from './utils/tts.js'
 import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-azure.js'
 import { supportConfigurations as voxRoleList } from './utils/tts/voicevox.js'
+import { pluginId, repositoryUrl } from './dist/runtime/plugin-context.js'
 // 支持锅巴
 export function supportGuoba () {
   return {
@@ -9,14 +10,14 @@ export function supportGuoba () {
     // 如果你的插件没有在插件库里，那么需要填上补充信息
     // 如果存在的话，那么填不填就无所谓了，填了就以你的信息为准
     pluginInfo: {
-      name: 'chatgpt-plugin',
-      title: 'ChatGPT-Plugin',
-      author: '@ikechan8370',
-      authorLink: 'https://github.com/ikechan8370',
-      link: 'https://github.com/ikechan8370/chatgpt-plugin',
+      name: pluginId,
+      title: 'GroupMate',
+      author: 'Old-Second',
+      authorLink: 'https://github.com/Old-Second',
+      link: repositoryUrl,
       isV3: true,
       isV2: false,
-      description: '基于OpenAI最新推出的chatgpt和微软的 New bing通过api进行聊天的插件，需自备openai账号或有New bing访问权限的必应账号',
+      description: '自然参与 QQ 群聊、执行授权群管理并完成简单任务的群原生智能成员',
       // 显示图标，此为个性化配置
       // 图标可在 https://icon-sets.iconify.design 这里进行搜索
       icon: 'simple-icons:openai',
