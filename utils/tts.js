@@ -3,6 +3,7 @@ import fetch from 'node-fetch'
 import _ from 'lodash'
 import { wrapTextByLanguage } from './common.js'
 import { getProxy } from './proxy.js'
+import { buildVitsGenerateRequest } from '../dist/runtime/vits-gradio.js'
 let proxy = getProxy()
 
 const newFetch = (url, options = {}) => {
@@ -72,7 +73,7 @@ export async function generateVitsAudio (text, speaker = '随机', language = '�
   logger.info(`正在使用接口${url}`)
   let response = await newFetch(url, {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: JSON.stringify(buildVitsGenerateRequest(body.data)),
     headers: {
       'content-type': 'application/json'
     }
