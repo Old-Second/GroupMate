@@ -4,7 +4,6 @@ import { getMasterQQ, limitString, makeForwardMsg, maskQQ, getUin } from '../uti
 import { deleteOnePrompt, getPromptByName, readPrompts, saveOnePrompt } from '../utils/prompts.js'
 import AzureTTS from '../utils/tts/microsoft-azure.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
-import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
 export class help extends plugin {
   constructor (e) {
     super({
@@ -76,11 +75,7 @@ export class help extends plugin {
       name: 'API默认',
       content: Config.promptPrefixOverride
     }
-    let defaultSydneyPrompt = {
-      name: 'Sydney默认',
-      content: Config.sydney
-    }
-    prompts.push(...[defaultPrompt, defaultSydneyPrompt])
+    prompts.push(defaultPrompt)
     prompts.push(...readPrompts())
     console.log(prompts)
     e.reply(await makeForwardMsg(e, prompts.map(p => `《${p.name}》\n${limitString(p.content, 100)}`), '设定列表'))
@@ -94,11 +89,6 @@ export class help extends plugin {
         prompt = {
           name: 'API默认',
           content: Config.promptPrefixOverride
-        }
-      } else if (promptName === 'Sydney默认') {
-        prompt = {
-          name: 'Sydney默认',
-          content: Config.sydney
         }
       } else {
         await e.reply('没有这个设定', true)
@@ -118,11 +108,6 @@ export class help extends plugin {
           name: 'API默认',
           content: Config.promptPrefixOverride
         }
-      } else if (promptName === 'Sydney默认') {
-        prompt = {
-          name: 'Sydney默认',
-          content: Config.sydney
-        }
       } else {
         e.msg = `#chatgpt导入设定${promptName}`
         await this.importPrompt(e)
@@ -133,45 +118,13 @@ export class help extends plugin {
         }
       }
     }
-    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
-    const keyMap = {
-      api: 'promptPrefixOverride',
-      bing: 'sydney',
-      claude: 'claudeSystemPrompt',
-      qwen: 'promptPrefixOverride',
-      gemini: 'geminiPrompt',
-      xh: 'xhPrompt'
-    }
-
-    if (keyMap[use]) {
-      if (Config.ttsMode === 'azure') {
-        Config[keyMap[use]] = prompt.content + '\n' + await AzureTTS.getEmotionPrompt(e)
-        logger.warn(Config[keyMap[use]])
-      } else {
-        Config[keyMap[use]] = prompt.content
-      }
-      if (use === 'xh') {
-        Config.xhPromptSerialize = false
-      }
-      if (use === 'bing') {
-        /**
-         * @type {{user: string, bot: string}[]} examples
-         */
-        let examples = prompt.example
-        for (let i = 1; i <= 3; i++) {
-          Config[`chatExampleUser${i}`] = ''
-          Config[`chatExampleBot${i}`] = ''
-        }
-        for (let i = 1; i <= examples.length; i++) {
-          Config[`chatExampleUser${i}`] = examples[i - 1].user
-          Config[`chatExampleBot${i}`] = examples[i - 1].bot
-        }
-      }
-      await redis.set(`CHATGPT:PROMPT_USE_${use}`, promptName)
-      await e.reply(`你当前正在使用${use}模式，已将该模式设定应用为"${promptName}"。更该设定后建议结束对话以使设定更好生效`, true)
+    if (Config.ttsMode === 'azure') {
+      Config.promptPrefixOverride = prompt.content + '\n' + await AzureTTS.getEmotionPrompt(e)
     } else {
-      await e.reply(`你当前正在使用${use}模式，该模式不支持设定。支持设定的模式有：API、必应、Claude、通义千问、星火和Gemini`, true)
+      Config.promptPrefixOverride = prompt.content
     }
+    await redis.set('CHATGPT:PROMPT_USE_api', promptName)
+    await e.reply(`已将 OpenAI-compatible 设定应用为"${promptName}"。更改设定后建议结束对话以使设定更好生效`, true)
   }
 
   async removePrompt (e) {
@@ -241,7 +194,7 @@ export class help extends plugin {
       // await this.reply('本机器人存在其他人正在上传设定，请稍后')
       // return
     }
-    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
+    const use = 'api'
     let currentUse = e.msg.replace(/^#(chatgpt|ChatGPT)(上传|分享|共享)设定/, '')
     if (!currentUse) {
       currentUse = await redis.get(`CHATGPT:PROMPT_USE_${use}`)
@@ -330,7 +283,7 @@ export class help extends plugin {
       title: currentUse,
       prompt: content,
       qq: master || (getUin(this.e) + ''), // 上传者设定为主人qq或机器人qq
-      use: extraData.use === 'bing' ? 'Bing' : 'ChatGPT',
+      use: 'ChatGPT',
       r18,
       description,
       examples

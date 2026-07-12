@@ -6,7 +6,6 @@ const runtimeModeFiles = [
   'apps/chat.js',
   'model/conversation.js',
   'apps/management.js',
-  'apps/prompts.js',
   'apps/history.js'
 ]
 
