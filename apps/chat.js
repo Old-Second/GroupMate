@@ -42,6 +42,10 @@ import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
 import { buildModelMessageInput } from '../dist/runtime/message-input.js'
 import { presentPictureReply } from '../dist/runtime/picture-reply.js'
 import {
+  shouldFallbackVitsToText,
+  shouldSendTtsText
+} from '../dist/runtime/tts-presentation.js'
+import {
   createChatErrorLog,
   createChatRequestLog,
   createChatResponseLog,
@@ -1002,9 +1006,19 @@ export class chatgpt extends plugin {
         }
         // 处理多行回复有时候只会读第一行和azure语音会读出一些标点符号的问题
         ttsResponse = ttsResponse.replace(/[-:_；*;\n]/g, '，')
+        const ttsTextFallback = shouldFallbackVitsToText({
+          ttsMode: Config.ttsMode,
+          textCharacters: ttsResponse.length,
+          threshold: Config.ttsAutoFallbackThreshold
+        })
+        const sendTtsText = shouldSendTtsText({
+          alsoSendText: Config.alsoSendText,
+          textCharacters: ttsResponse.length,
+          threshold: Config.ttsAutoFallbackThreshold
+        })
         // 先把文字回复发出去，避免过久等待合成语音
-        if (Config.alsoSendText || ttsResponse.length > parseInt(Config.ttsAutoFallbackThreshold)) {
-          if (Config.ttsMode === 'vits-uma-genshin-honkai' && ttsResponse.length > parseInt(Config.ttsAutoFallbackThreshold)) {
+        if (sendTtsText) {
+          if (ttsTextFallback) {
             await this.reply('回复的内容过长，已转为文本模式')
           }
           let responseText = await convertFaces(response, Config.enableRobotAt, e)
@@ -1023,11 +1037,13 @@ export class chatgpt extends plugin {
             this.reply(`建议的回复：\n${chatMessage.suggestedResponses}`)
           }
         }
-        const sendable = await generateAudio(this.e, ttsResponse, emotion, emotionDegree)
-        if (sendable) {
-          await this.reply(sendable)
-        } else {
-          await this.reply('合成语音发生错误~')
+        if (!ttsTextFallback) {
+          const sendable = await generateAudio(this.e, ttsResponse, emotion, emotionDegree)
+          if (sendable) {
+            await this.reply(sendable)
+          } else {
+            await this.reply('合成语音发生错误~')
+          }
         }
       } else if (presentationMode === 'picture') {
         const pictureReplyResult = await presentPictureReply({
