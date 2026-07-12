@@ -43,7 +43,6 @@ import { ImageCaptionTool } from '../utils/tools/ImageCaptionTool.js'
 import { ChatGPTAPI } from '../utils/openai/chatgpt-api.js'
 import { newFetch } from '../utils/proxy.js'
 import {GithubAPITool} from '../utils/tools/GithubTool.js'
-import { resolveLegacyConversationScope } from './legacy/conversation-scope.js'
 import { executeLegacyToolCall } from './legacy/tool-execution.js'
 import {
   createChatErrorLog,
@@ -51,6 +50,7 @@ import {
   createToolExecutionLog
 } from '../dist/runtime/safe-chat-logging.js'
 import { shouldFinalizeAfterTool } from '../dist/runtime/tool-loop-policy.js'
+import { createLegacySessionBridge } from '../dist/runtime/legacy-session-bridge.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -60,13 +60,9 @@ export const roleMap = {
 const defaultPropmtPrefix = ', a large language model trained by OpenAI. You answer as concisely as possible for each response (e.g. don’t be verbose). It is very important that you answer as concisely as possible, so please remember this. If you are generating a list, do not have too many items. Keep the number of items short.'
 const MAX_SMART_TOOL_CALLS = 8
 const MAX_TOOL_RESULT_TRACE_LENGTH = 4000
-function getConversationScope (e, userId = e.sender?.user_id) {
-  return resolveLegacyConversationScope({
-    isGroup: e.isGroup,
-    groupId: e.group_id,
-    userId,
-    groupMerge: Config.groupMerge
-  })
+async function clearCurrentConversation (e) {
+  const bridge = createLegacySessionBridge({ redis, logger })
+  await bridge.delete(e, Config.groupMerge)
 }
 
 async function getRequesterGroupRole (e, userId = e.sender?.user_id) {
@@ -355,7 +351,7 @@ class Core {
     } catch (err) {
       if (err.message?.indexOf('context_length_exceeded') > 0) {
         logger.warn(createChatErrorLog({ mode: use, error: err }))
-        await redis.del(`CHATGPT:CONVERSATIONS:${getConversationScope(e)}`)
+        await clearCurrentConversation(e)
         await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
         await e.reply('字数超限啦，将为您自动结束本次对话。')
         return null
@@ -372,7 +368,7 @@ class Core {
     } catch (err) {
       if (err.message?.indexOf('context_length_exceeded') > 0) {
         logger.warn(createChatErrorLog({ mode: use, error: err }))
-        await redis.del(`CHATGPT:CONVERSATIONS:${getConversationScope(e)}`)
+        await clearCurrentConversation(e)
         await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
         await e.reply('字数超限啦，将为您自动结束本次对话。')
         return null

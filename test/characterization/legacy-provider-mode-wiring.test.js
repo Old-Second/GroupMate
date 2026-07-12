@@ -4,7 +4,6 @@ import { test } from 'node:test'
 
 const runtimeModeFiles = [
   'apps/chat.js',
-  'model/conversation.js',
   'apps/management.js',
   'apps/history.js'
 ]
@@ -38,11 +37,9 @@ test('every persisted global provider mode read passes through the runtime polic
 
 test('user mode and imported mode values are resolved without persisting migrations', async () => {
   const chatSource = await readProjectFile('apps/chat.js')
-  const conversationSource = await readProjectFile('model/conversation.js')
   const managementSource = await readProjectFile('apps/management.js')
 
   assert.match(chatSource, /resolveProviderModeForRuntime\([^\n]*userData\.mode/)
-  assert.match(conversationSource, /resolveProviderModeForRuntime\([^\n]*userData\.mode/)
   assert.match(managementSource, /resolveProviderMode\(redisConfig\.useMode\)/)
   assert.doesNotMatch(
     managementSource,

@@ -23,7 +23,6 @@ import {
 import fetch from 'node-fetch'
 import { convertSpeaker, speakers } from '../utils/tts.js'
 import { convertFaces } from '../utils/face.js'
-import { ConversationManager, originalValues } from '../model/conversation.js'
 import { getProxy } from '../utils/proxy.js'
 import { generateSuggestedResponse } from '../utils/chat.js'
 import Core from '../model/core.js'
@@ -48,6 +47,14 @@ import {
 } from '../dist/runtime/safe-chat-logging.js'
 import { getChatErrorPresentation } from '../dist/runtime/chat-error-presentation.js'
 import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
+import { createLegacySessionBridge } from '../dist/runtime/legacy-session-bridge.js'
+import {
+  endAllConversations as endAllConversationSessions,
+  endConversation,
+  joinConversation as joinConversationSession,
+  listConversations,
+  originalValues
+} from '../dist/runtime/conversation-manager.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -72,13 +79,6 @@ const newFetch = (url, options = {}) => {
   }
 
   return fetch(url, mergedOptions)
-}
-
-function getConversationScope (e, userId = e.sender?.user_id) {
-  if (e.isGroup) {
-    return Config.groupMerge ? `group:${e.group_id}` : `group:${e.group_id}:user:${userId}`
-  }
-  return `private:${userId}`
 }
 
 export class chatgpt extends plugin {
@@ -167,6 +167,7 @@ export class chatgpt extends plugin {
       logger,
       schedule: setTimeout
     })
+    this.sessionBridge = createLegacySessionBridge({ redis, logger })
   }
 
   /**
@@ -175,21 +176,8 @@ export class chatgpt extends plugin {
    * @returns {Promise<void>}
    */
   async getConversations (e) {
-    // todo 根据use返回不同的对话列表
-    let keys = await redis.keys('CHATGPT:CONVERSATIONS:*')
-    if (!keys || keys.length === 0) {
-      await this.reply('当前没有人正在与机器人对话', true)
-    } else {
-      let response = '当前对话列表：(格式为【开始时间 ｜ qq昵称 ｜ 对话长度 ｜ 最后活跃时间】)\n'
-      await Promise.all(keys.map(async (key) => {
-        let conversation = await redis.get(key)
-        if (conversation) {
-          conversation = JSON.parse(conversation)
-          response += `${conversation.ctime} ｜ ${conversation.sender.nickname} ｜ ${conversation.num} ｜ ${conversation.utime} \n`
-        }
-      }))
-      await this.reply(`${response}`, true)
-    }
+    const result = await listConversations({ bridge: this.sessionBridge, event: e })
+    await this.reply(result.message, result.quote)
   }
 
   /**
@@ -198,13 +186,22 @@ export class chatgpt extends plugin {
    * @returns {Promise<void>}
    */
   async destroyConversations (e) {
-    let manager = new ConversationManager(e)
-    await manager.endConversation.bind(this)(e)
+    await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
+    const result = await endConversation({
+      bridge: this.sessionBridge,
+      event: e,
+      groupMerge: Config.groupMerge,
+      toggleMode: Config.toggleMode
+    })
+    await this.reply(result.message, result.quote)
   }
 
   async endAllConversations (e) {
-    let manager = new ConversationManager(e)
-    await manager.endAllConversations.bind(this)(e)
+    const result = await endAllConversationSessions({
+      bridge: this.sessionBridge,
+      event: e
+    })
+    await this.reply(result.message, result.quote)
   }
 
   async switch2Picture (e) {
@@ -536,23 +533,14 @@ export class chatgpt extends plugin {
     if (Config.debug) {
       logger.info(createChatRequestLog({ mode: use, stream: Config.apiStream, prompt }))
     }
-    const conversationScope = getConversationScope(e)
-    const key = `CHATGPT:CONVERSATIONS:${conversationScope}`
-    const ctime = new Date()
-    let previousConversation = await redis.get(key)
-    previousConversation = previousConversation
-      ? JSON.parse(previousConversation)
-      : {
-          sender: e.sender,
-          ctime,
-          utime: ctime,
-          num: 0,
-          messages: [{
-            role: 'system',
-            content: 'You are an AI assistant that helps people find information.'
-          }],
-          conversation: {}
-        }
+    let previousConversation = await this.sessionBridge.loadOrCreate({
+      event: e,
+      groupMerge: Config.groupMerge,
+      initialMessages: [{
+        role: 'system',
+        content: 'You are an AI assistant that helps people find information.'
+      }]
+    })
     const conversation = {
       messages: previousConversation.messages,
       conversationId: previousConversation.conversation?.conversationId,
@@ -585,14 +573,15 @@ export class chatgpt extends plugin {
       }
       if (!chatMessage.error) {
         previousConversation.num += 1
-        previousConversation.utime = new Date()
-        await redis.set(
-          key,
-          JSON.stringify(previousConversation),
-          Config.conversationPreserveTime > 0
-            ? { EX: Config.conversationPreserveTime }
-            : {}
-        )
+        previousConversation.utime = new Date().toISOString()
+        await this.sessionBridge.save({
+          event: e,
+          groupMerge: Config.groupMerge,
+          snapshot: previousConversation,
+          ttlSeconds: Config.conversationPreserveTime > 0
+            ? Config.conversationPreserveTime
+            : undefined
+        })
       }
       let response = chatMessage?.text?.replace('\n\n\n', '\n')
       let postProcessors = await collectProcessors('post')
@@ -917,25 +906,17 @@ export class chatgpt extends plugin {
   }
 
   async joinConversation (e) {
-    const ats = e.message.filter(message => message.type === 'at')
-    if (ats.length === 0) {
-      await this.reply('指令错误，使用本指令时请同时@某人', true)
-      return false
-    }
-    const at = ats[0]
-    const targetName = _.trimStart(at.text, '@')
-    const target = await redis.get(
-      'CHATGPT:CONVERSATIONS:' + getConversationScope(e, at.qq)
-    )
-    if (!target) {
-      await this.reply(`${targetName}当前未开启对话，无法加入`, true)
-      return false
-    }
-    await redis.set(
-      'CHATGPT:CONVERSATIONS:' + getConversationScope(e),
-      target
-    )
-    await this.reply(`加入${targetName}的对话成功`)
+    const result = await joinConversationSession({
+      bridge: this.sessionBridge,
+      event: e,
+      groupMerge: Config.groupMerge,
+      toggleMode: Config.toggleMode,
+      ttlSeconds: Config.conversationPreserveTime > 0
+        ? Config.conversationPreserveTime
+        : undefined
+    })
+    await this.reply(result.message, result.quote)
+    return result.success
   }
 
   async totalAvailable (e) {

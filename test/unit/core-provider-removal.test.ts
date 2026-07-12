@@ -58,7 +58,7 @@ test('core runtime contains only the OpenAI-compatible provider path', async () 
 
 test('chat and conversation entry points no longer expose provider-specific runtime branches', async () => {
   const chat = await readSource('apps/chat.js')
-  const conversation = await readSource('model/conversation.js')
+  const conversation = await readSource('src/runtime/conversation-manager.ts')
 
   for (const marker of [
     "fnc: 'chatglm'",
@@ -85,7 +85,7 @@ test('chat and conversation entry points no longer expose provider-specific runt
   ]) {
     assert.equal(conversation.includes(marker), false, `${marker} must not be read, scanned or deleted`)
   }
-  assert.equal(conversation.includes('CHATGPT:CONVERSATIONS:'), true)
+  assert.equal(conversation.includes('CHATGPT:CONVERSATIONS:'), false)
 })
 
 test('provider-specific runtime files are deleted', async () => {
