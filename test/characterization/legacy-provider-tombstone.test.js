@@ -32,6 +32,8 @@ const removedProviderCommands = [
   '#chatgpt设置星火模型',
   '#chatgpt设置Bing设定',
   '#chatgpt必应禁用搜索',
+  '#必应结束对话',
+  '#gemini结束全部对话',
   '#chatgpt设置翻译来源qwen'
 ]
 

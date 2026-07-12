@@ -2,6 +2,7 @@ import { getUin, getUserData } from '../utils/common.js'
 import { Config } from '../utils/config.js'
 import { KeyvFile } from 'keyv-file'
 import _ from 'lodash'
+import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
 
 export const originalValues = ['星火', '通义千问', '克劳德', '克劳德2', '必应', 'api', 'API', 'api3', 'API3', 'glm', '双子星', '双子座', '智谱']
 export const correspondingValues = ['xh', 'qwen', 'claude', 'claude2', 'bing', 'api', 'api', 'api3', 'api3', 'chatglm', 'gemini', 'gemini', 'chatglm4']
@@ -13,9 +14,9 @@ export class ConversationManager {
     console.log(match[1])
     let use
     if (match[1] && match[1] != 'chatgpt') {
-      use = correspondingValues[originalValues.indexOf(match[1])]
+      use = resolveProviderModeForRuntime(correspondingValues[originalValues.indexOf(match[1])], logger)
     } else {
-      use = (userData.mode === 'default' ? null : userData.mode) || await redis.get('CHATGPT:USE')
+      use = resolveProviderModeForRuntime((userData.mode === 'default' ? null : userData.mode) || await redis.get('CHATGPT:USE'), logger)
     }
     console.log(use)
     await redis.del(`CHATGPT:WRONG_EMOTION:${(e.isGroup && Config.groupMerge) ? e.group_id.toString() : e.sender.user_id}`)
@@ -221,9 +222,9 @@ export class ConversationManager {
     console.log(match[1])
     let use
     if (match[1] && match[1] != 'chatgpt') {
-      use = correspondingValues[originalValues.indexOf(match[1])]
+      use = resolveProviderModeForRuntime(correspondingValues[originalValues.indexOf(match[1])], logger)
     } else {
-      use = await redis.get('CHATGPT:USE') || 'api'
+      use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     }
     console.log(use)
     let deleted = 0

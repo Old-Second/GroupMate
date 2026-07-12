@@ -26,6 +26,12 @@ import { newFetch } from '../utils/proxy.js'
 import { createServer, runServer, stopServer } from '../server/index.js'
 import { BingAIClient } from '../client/CopilotAIClient.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
+import {
+  providerModeMigrationEvent,
+  resolveProviderMode,
+  resolveProviderModeForRuntime,
+  unsupportedProviderMessage
+} from '../dist/runtime/provider-mode-policy.js'
 
 export class ChatgptManagement extends plugin {
   constructor (e) {
@@ -915,12 +921,11 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async useBrowserBasedSolution (e) {
-    await redis.set('CHATGPT:USE', 'browser')
-    await this.reply('已切换到基于浏览器的解决方案，如果已经对话过建议执行`#结束对话`避免引起404错误')
+    return await this.unsupportedProviderMode()
   }
 
   async useOpenAIAPIBasedSolution (e) {
-    let use = await redis.get('CHATGPT:USE')
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     if (use !== 'api') {
       await redis.set('CHATGPT:USE', 'api')
       await this.reply('已切换到基于OpenAI API的解决方案，如果已经对话过建议执行`#结束对话`避免引起404错误')
@@ -930,78 +935,40 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async useChatGLMSolution (e) {
-    await redis.set('CHATGPT:USE', 'chatglm')
-    await this.reply('已切换到ChatGLM-6B解决方案，如果已经对话过建议执行`#结束对话`避免引起404错误')
+    return await this.unsupportedProviderMode()
   }
 
   async useReversedAPIBasedSolution2 (e) {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'api3') {
-      await redis.set('CHATGPT:USE', 'api3')
-      await this.reply('已切换到基于第三方Reversed Conversastion API(API3)的解决方案')
-    } else {
-      await this.reply('当前已经是API3模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useBingSolution (e) {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'bing') {
-      await redis.set('CHATGPT:USE', 'bing')
-      await this.reply('已切换到基于微软Copilot(必应)的解决方案，如果已经对话过务必执行`#结束对话`避免引起404错误')
-    } else {
-      await this.reply('当前已经是必应Bing模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useClaudeAPIBasedSolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'claude') {
-      await redis.set('CHATGPT:USE', 'claude')
-      await this.reply('已切换到基于ClaudeAPI的解决方案')
-    } else {
-      await this.reply('当前已经是Claude模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useClaudeAISolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'claude2') {
-      await redis.set('CHATGPT:USE', 'claude2')
-      await this.reply('已切换到基于claude.ai的解决方案')
-    } else {
-      await this.reply('当前已经是claude.ai模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useGeminiSolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'gemini') {
-      await redis.set('CHATGPT:USE', 'gemini')
-      await this.reply('已切换到基于Google Gemini的解决方案')
-    } else {
-      await this.reply('当前已经是gemini模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useXinghuoBasedSolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'xh') {
-      await redis.set('CHATGPT:USE', 'xh')
-      await this.reply('已切换到基于星火的解决方案')
-    } else {
-      await this.reply('当前已经是星火模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useAzureBasedSolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'azure') {
-      await redis.set('CHATGPT:USE', 'azure')
-      await this.reply('已切换到基于Azure的解决方案')
-    } else {
-      await this.reply('当前已经是Azure模式了')
-    }
+    return await this.unsupportedProviderMode()
+  }
+
+  async unsupportedProviderMode () {
+    await this.reply(unsupportedProviderMessage)
+    return true
   }
 
   async patchGemini () {
@@ -1056,23 +1023,11 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async useQwenSolution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'qwen') {
-      await redis.set('CHATGPT:USE', 'qwen')
-      await this.reply('已切换到基于通义千问的解决方案')
-    } else {
-      await this.reply('当前已经是通义千问模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async useGLM4Solution () {
-    let use = await redis.get('CHATGPT:USE')
-    if (use !== 'chatglm4') {
-      await redis.set('CHATGPT:USE', 'chatglm4')
-      await this.reply('已切换到基于ChatGLM的解决方案')
-    } else {
-      await this.reply('当前已经是ChatGLM模式了')
-    }
+    return await this.unsupportedProviderMode()
   }
 
   async changeBingTone (e) {
@@ -1119,7 +1074,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async modeHelp () {
-    let mode = await redis.get('CHATGPT:USE')
+    let mode = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     const modeMap = {
       // browser: '浏览器',
       azure: 'Azure',
@@ -1582,7 +1537,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
       redisConfig.turnConfirm = await redis.get('CHATGPT:CONFIRM') === 'on'
     }
     if (await redis.exists('CHATGPT:USE') != 0) {
-      redisConfig.useMode = await redis.get('CHATGPT:USE')
+      redisConfig.useMode = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     }
     const filepath = resolvePluginPath('resources', 'view', 'setting_view.json')
     const configView = JSON.parse(fs.readFileSync(filepath, 'utf8'))
@@ -1648,13 +1603,18 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
             await redis.set('CHATGPT:CONFIRM', redisConfig.turnConfirm ? 'on' : 'off')
           }
           if (redisConfig.useMode != null) {
-            changeConfig.push({
-              item: 'useMode',
-              value: redisConfig.useMode,
-              old: await redis.get('CHATGPT:USE'),
-              type: 'redis'
-            })
-            await redis.set('CHATGPT:USE', redisConfig.useMode)
+            const importedMode = resolveProviderMode(redisConfig.useMode)
+            if (importedMode.migrated) {
+              logger.info(providerModeMigrationEvent)
+            } else {
+              changeConfig.push({
+                item: 'useMode',
+                value: importedMode.mode,
+                old: resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger),
+                type: 'redis'
+              })
+              await redis.set('CHATGPT:USE', importedMode.mode)
+            }
           }
           await this.reply(await makeForwardMsg(this.e, changeConfig.map(msg => `修改项:${msg.item}\n旧数据\n\n${msg.old}\n\n新数据\n ${msg.value}`)))
         } catch (error) {
@@ -1807,7 +1767,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async queryConfig (e) {
-    let use = await redis.get('CHATGPT:USE')
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     let config = []
     config.push(`当前模式：${use}`)
     config.push(`\n当前API模型：${Config.model}`)

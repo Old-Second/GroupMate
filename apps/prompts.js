@@ -4,6 +4,7 @@ import { getMasterQQ, limitString, makeForwardMsg, maskQQ, getUin } from '../uti
 import { deleteOnePrompt, getPromptByName, readPrompts, saveOnePrompt } from '../utils/prompts.js'
 import AzureTTS from '../utils/tts/microsoft-azure.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
+import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
 export class help extends plugin {
   constructor (e) {
     super({
@@ -132,7 +133,7 @@ export class help extends plugin {
         }
       }
     }
-    let use = await redis.get('CHATGPT:USE') || 'api'
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     const keyMap = {
       api: 'promptPrefixOverride',
       bing: 'sydney',
@@ -240,7 +241,7 @@ export class help extends plugin {
       // await this.reply('本机器人存在其他人正在上传设定，请稍后')
       // return
     }
-    let use = await redis.get('CHATGPT:USE') || 'api'
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     let currentUse = e.msg.replace(/^#(chatgpt|ChatGPT)(上传|分享|共享)设定/, '')
     if (!currentUse) {
       currentUse = await redis.get(`CHATGPT:PROMPT_USE_${use}`)

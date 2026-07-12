@@ -52,6 +52,7 @@ import {
   createMessageInputLog
 } from '../dist/runtime/safe-chat-logging.js'
 import { getChatErrorPresentation } from '../dist/runtime/chat-error-presentation.js'
+import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -284,7 +285,7 @@ export class chatgpt extends plugin {
 
   async deleteConversation (e) {
     let ats = e.message.filter(m => m.type === 'at')
-    let use = await redis.get('CHATGPT:USE') || 'api'
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     if (use !== 'api3') {
       await this.reply('本功能当前仅支持API3模式', true)
       return false
@@ -565,7 +566,7 @@ export class chatgpt extends plugin {
     }
     // 获取用户配置
     const userData = await getUserData(e.user_id)
-    const use = (userData.mode === 'default' ? null : userData.mode) || await redis.get('CHATGPT:USE') || 'api'
+    const use = resolveProviderModeForRuntime((userData.mode === 'default' ? null : userData.mode) || await redis.get('CHATGPT:USE'), logger)
     // 自动化插件本月已发送xx条消息更新太快，由于延迟和缓存问题导致不同客户端不一样，at文本和获取的card不一致。因此单独处理一下
     prompt = prompt.replace(/^｜本月已发送\d+条消息/, '')
     await this.abstractChat(e, prompt, use, forcePictureMode)
@@ -1290,7 +1291,7 @@ export class chatgpt extends plugin {
   }
 
   async getAllConversations (e) {
-    const use = await redis.get('CHATGPT:USE')
+    const use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     if (use === 'api3') {
       let conversations = await getConversations(e.sender.user_id, newFetch)
       if (Config.debug) {
@@ -1315,7 +1316,7 @@ export class chatgpt extends plugin {
 
   async joinConversation (e) {
     let ats = e.message.filter(m => m.type === 'at')
-    let use = await redis.get('CHATGPT:USE') || 'api'
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     // if (use !== 'api3') {
     //   await this.reply('本功能当前仅支持API3模式', true)
     //   return false
@@ -1345,7 +1346,7 @@ export class chatgpt extends plugin {
   }
 
   async attachConversation (e) {
-    const use = await redis.get('CHATGPT:USE')
+    const use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     if (use !== 'api3') {
       await this.reply('该功能目前仅支持API3模式')
     } else {

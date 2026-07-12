@@ -3,6 +3,7 @@ import { render, getUin } from '../utils/common.js'
 import { Config } from '../utils/config.js'
 import { KeyvFile } from 'keyv-file'
 import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
+import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
 
 async function getKeyv () {
   let Keyv
@@ -31,7 +32,7 @@ export class history extends plugin {
   }
 
   async history (e) {
-    let use = await redis.get('CHATGPT:USE') || 'api'
+    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     let chat = []
     let filtered = e.message.filter(m => m.type === 'at').filter(m => m.qq !== getUin(e))
     let queryUser = e.sender.user_id

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  providerModeMigrationEvent,
   resolveProviderMode,
+  resolveProviderModeForRuntime,
   unsupportedProviderMessage
 } from '../../src/runtime/provider-mode-policy.js'
 
@@ -76,4 +78,36 @@ test('exports the fixed unsupported provider message', () => {
     unsupportedProviderMessage,
     '该模型模式已不再支持，GroupMate 当前仅支持 OpenAI-compatible API'
   )
+})
+
+test('runtime resolution logs only fixed migration metadata for an old mode', () => {
+  const events: unknown[] = []
+
+  const mode = resolveProviderModeForRuntime('gemini', {
+    info (event: unknown) {
+      events.push(event)
+    }
+  })
+
+  assert.equal(mode, 'api')
+  assert.deepEqual(events, [{
+    event: 'provider.mode.migrated',
+    migrated: true
+  }])
+  assert.equal(events[0], providerModeMigrationEvent)
+  assert.doesNotMatch(JSON.stringify(events), /gemini/)
+})
+
+test('runtime resolution does not log supported defaults', () => {
+  let calls = 0
+  const logger = {
+    info () {
+      calls += 1
+    }
+  }
+
+  assert.equal(resolveProviderModeForRuntime(undefined, logger), 'api')
+  assert.equal(resolveProviderModeForRuntime('default', logger), 'api')
+  assert.equal(resolveProviderModeForRuntime('api', logger), 'api')
+  assert.equal(calls, 0)
 })

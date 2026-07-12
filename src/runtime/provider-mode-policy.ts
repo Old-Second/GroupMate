@@ -3,6 +3,15 @@ export interface ProviderModeResolution {
   migrated: boolean
 }
 
+export interface ProviderModeLogger {
+  info: (event: Readonly<ProviderModeMigrationEvent>) => unknown
+}
+
+interface ProviderModeMigrationEvent {
+  event: 'provider.mode.migrated'
+  migrated: true
+}
+
 export const unsupportedProviderMessage =
   '该模型模式已不再支持，GroupMate 当前仅支持 OpenAI-compatible API'
 
@@ -14,6 +23,7 @@ const providerSettingCommand = String.raw`#chatgpt(?:(?:设置|查看)(?:bing|�
 const bingManagementCommand = String.raw`#chatgpt(?:(?:必应|bing)切换|(?:必应|bing)(?:(?:开启|关闭)建议(?:回复)?|(?:开启|关闭|启用|禁用|禁止)搜索)|(?:copilot|bing|必应)配置方法)`
 const geminiManagementCommand = String.raw`#chatgpt(?:开启|关闭)gemini(?:搜索|代码执行)`
 const providerTranslationCommand = String.raw`#(?:chatgpt)?(?:设置|修改)翻译来源(?:gemini|星火|通义千问|xh|qwen)`
+const providerConversationCommand = String.raw`#?(?:星火|xh|通义千问|qwen|克劳德2?|claude(?:2|\.ai)?|必应|bing|api3|glm|chatglm4?|gemini|双子星|双子座|智谱(?:清言)?)(?:结束|新开|摧毁|毁灭|完结)(?:全部)?对话`
 
 export const legacyProviderCommandPattern = new RegExp(
   `^(?:${[
@@ -24,7 +34,8 @@ export const legacyProviderCommandPattern = new RegExp(
     providerSettingCommand,
     bingManagementCommand,
     geminiManagementCommand,
-    providerTranslationCommand
+    providerTranslationCommand,
+    providerConversationCommand
   ].join('|')})`,
   'i'
 )
@@ -38,4 +49,21 @@ export function resolveProviderMode (value: unknown): ProviderModeResolution {
     return { mode: 'api', migrated: false }
   }
   return { mode: 'api', migrated: true }
+}
+
+export const providerModeMigrationEvent: Readonly<ProviderModeMigrationEvent> =
+  Object.freeze({
+    event: 'provider.mode.migrated',
+    migrated: true
+  })
+
+export function resolveProviderModeForRuntime (
+  value: unknown,
+  logger?: ProviderModeLogger
+): 'api' {
+  const resolution = resolveProviderMode(value)
+  if (resolution.migrated && logger) {
+    logger.info(providerModeMigrationEvent)
+  }
+  return resolution.mode
 }
