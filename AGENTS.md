@@ -7,8 +7,9 @@ This repository is an ES-module Yunzai plugin. `index.js` discovers and loads co
 ## Build, Test, and Development Commands
 
 - `pnpm install` installs required and optional dependencies; Node.js 18 or newer is recommended.
+- `pnpm run build` compiles project-owned TypeScript from `src/` into the committed `dist/` runtime artifacts used by the memory-constrained deployment host.
 - `pnpm test` runs the deterministic offline `node:test` suite with concurrency 1.
-- Run the plugin from a Yunzai checkout at `plugins/chatgpt-plugin`, then restart Yunzai to exercise changes. This package has no standalone `start` or `build` script.
+- Run the plugin from a Yunzai checkout at `plugins/GroupMate`, then restart Yunzai to exercise changes. This package has no standalone `start` script.
 - `node --check apps/chat.js` performs a quick syntax check on a changed JavaScript file.
 - `git diff --check` catches whitespace errors before submission.
 
@@ -40,7 +41,8 @@ Never commit API keys, tokens, cookies, chat history, or generated data. Real co
 
 ## Deployment Context & Remote Safety
 
-- This checkout was copied from the SSH host alias `my`. Its deployed counterpart is `/root/trss-Yunzai/plugins/chatgpt-plugin`.
+- This checkout was copied from the SSH host alias `my`. Its active deployed counterpart is `/root/trss-Yunzai/plugins/GroupMate`.
+- The preserved legacy plugin is `/root/trss-Yunzai/disabled-plugins/chatgpt-plugin`. Keep it outside `/root/trss-Yunzai/plugins/` so Yunzai cannot discover it; do not delete or modify it during routine GroupMate deployments.
 - The plugin runs inside the QQ bot project at `/root/trss-Yunzai`; architecture and compatibility decisions must account for that host project, not just this standalone checkout.
 - The remote server has extremely limited memory. Keep remote inspection and verification low-cost and narrowly scoped. Do not run dependency installation, builds, broad test suites, full-tree scans, or other memory-intensive commands on the remote host.
 - Treat the remote host as read-only unless the user explicitly authorizes a deployment or remote edit. Develop and perform lightweight static verification locally first.
@@ -51,6 +53,16 @@ Never commit API keys, tokens, cookies, chat history, or generated data. Real co
 - A long-term memory system is a required future subsystem, but it is outside the first implementation phase. Define stable memory interfaces, provenance, consent, user/group isolation, and migration boundaries now so it can be added later without replacing the agent kernel.
 - The active provider scope is OpenAI-compatible API only. Keep the project-owned model adapter boundary so Anthropic API or other providers can be added later if needed, but do not integrate them now.
 - During this refactor, remove existing non-OpenAI-compatible provider implementations, commands, configuration schema fields, example settings, and management UI entries. Do not rewrite or delete unknown keys from the user's ignored real configuration file; obsolete real-config fields may remain unused.
+
+### Repeatable Remote Deployment Workflow
+
+1. Complete local focused tests, `pnpm test`, syntax checks for touched legacy JavaScript, and `git diff --check`. Build TypeScript locally and commit the reviewed `dist/` output. Push `groupmate` to `origin` when GitHub is reachable.
+2. Prepare a versioned staging directory outside the plugin scan path, such as `/root/trss-Yunzai/.groupmate-deploy/<commit>/`. Populate it from the exact committed tree. Prefer a shallow GitHub checkout; when GitHub is unavailable, transfer a verified `git archive` plus complete `git bundle` and initialize a normal Git worktree from the bundle.
+3. Copy only ignored runtime state from the preserved legacy installation: `config/config.json`, `prompts/`, `data/`, `resources/simple/`, and optional `server/static/live2dw/`. Copy the existing `node_modules` link tree with `cp -a`. Never run `pnpm install`, a build, or the full test suite on the remote host.
+4. Before switching, verify the commit, a clean Git worktree, byte-identical real configuration, dependency resolution, and runtime plugin identity. Do not print configuration values, endpoints, model names, keys, QQ identifiers, or conversation data.
+5. Use the explicit Node path `/root/.nvm/versions/node/v22.14.0/bin` for non-login SSH commands. Stop the `TRSS-Yunzai` PM2 process, move any active legacy directory to `disabled-plugins`, move the staged tree atomically to `/root/trss-Yunzai/plugins/GroupMate`, repeat the lightweight path/dependency check, and restart the existing PM2 process.
+6. If the post-move check, restart, or startup validation fails, stop PM2, move the failed GroupMate directory back outside `plugins/`, restore the preserved legacy directory to its original plugin path, and restart PM2. Never leave both plugins inside the scan path.
+7. Validate one GroupMate load start and success, zero legacy plugin loads, PM2 `online`, Guoba identity/config callbacks, preserved configuration, a clean deployed Git tree, and one bounded redacted OpenAI-compatible smoke request. Treat QQ conversation and authorized side-effect checks as a separate manual gate requiring explicit targets.
 
 ## Product Identity & Refactoring History
 
