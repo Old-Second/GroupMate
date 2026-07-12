@@ -1,0 +1,9 @@
+data: {"id":"fixture-stream-1","choices":[{"delta":{"role":"assistant","reasoning_content":"checking "}}]}
+
+data: {"id":"fixture-stream-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}
+
+data: {"id":"fixture-stream-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Wuhan\"}"}}]}}]}
+
+data: [DONE]
+
+: fixture end
