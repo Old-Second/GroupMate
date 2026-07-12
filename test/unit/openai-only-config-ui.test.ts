@@ -276,6 +276,41 @@ test('Guoba exposes every supported user-facing configuration with an explanatio
   }
 })
 
+test('Guoba external service fields provide actionable setup references', () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  })
+  const fields = new Map(schemas.flatMap(schema =>
+    schema.field ? [[schema.field, schema] as const] : []
+  ))
+  const expectedReferences = {
+    amapKey: 'https://lbs.amap.com/api/webservice/guide/create-project/get-key',
+    azSerpKey: 'https://learn.microsoft.com/en-us/lifecycle/announcements/bing-search-api-retirement',
+    tavilyApiKey: 'https://app.tavily.com/home',
+    braveSearchApiKey: 'https://api-dashboard.search.brave.com/app/keys',
+    extraUrl: 'https://github.com/ikechan8370/chatgpt-plugin-extras',
+    githubAPIKey: 'https://github.com/settings/personal-access-tokens',
+    ttsSpace: 'https://huggingface.co/spaces/ikechan8370/vits-uma-genshin-honkai',
+    voicevoxSpace: 'https://github.com/VOICEVOX/voicevox_engine',
+    azureTTSKey: 'https://portal.azure.com/'
+  } as const
+
+  for (const [field, reference] of Object.entries(expectedReferences)) {
+    assert.match(
+      fields.get(field)?.bottomHelpMessage ?? '',
+      new RegExp(reference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      `${field} must provide its setup or status reference`
+    )
+  }
+
+  const serpSource = fields.get('serpSource')
+  const serpOptions = serpSource?.componentProps?.options as Array<{ label: string, value: string }>
+  assert.match(serpSource?.bottomHelpMessage ?? '', /退役.*Tavily/)
+  assert.match(serpOptions.find(option => option.value === 'azure')?.label ?? '', /退役/)
+})
+
 test('management and help no longer advertise removed providers', async () => {
   const combined = [
     await readSource('apps/management.js'),

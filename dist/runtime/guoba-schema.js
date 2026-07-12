@@ -61,14 +61,14 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('enableToolCrossGroupSend', '允许工具跨会话发送', '允许非主人通过工具向非当前群或用户发送内容；默认关闭，主人不受限制。', 'Switch'),
         field('enableToolVideoDownload', '允许下载并发送视频', '开启后视频工具可以下载并上传文件；关闭时只发送信息和链接。', 'Switch'),
         field('toolVideoMaxMB', '视频下载上限 MB', '视频工具允许下载的单文件大小上限，避免耗尽磁盘和内存。', 'InputNumber', { min: 1, max: 200 }),
-        field('amapKey', '高德地图 Key', '地图和天气相关工具使用的高德开放平台密钥。', 'InputPassword'),
-        field('azSerpKey', 'Azure Search Key', '网页搜索来源选择 Azure Search 时使用的密钥。', 'InputPassword'),
-        field('tavilyApiKey', 'Tavily Key', '网页或图片搜索来源选择 Tavily 时使用的密钥。', 'InputPassword'),
-        field('braveSearchApiKey', 'Brave Search Key', '图片搜索来源选择 Brave 时使用的密钥。', 'InputPassword'),
-        field('serpSource', '网页搜索来源', '选择联网网页搜索工具使用的后端。', 'Select', {
+        field('amapKey', '高德地图 Key', '用于地图和天气工具，请创建“Web 服务”类型 Key：https://lbs.amap.com/api/webservice/guide/create-project/get-key', 'InputPassword'),
+        field('azSerpKey', 'Bing Web Search Key（已退役）', '仅兼容旧配置；Bing Search API 已于 2025-08-11 退役，无法新申请，建议改用 Tavily。微软公告：https://learn.microsoft.com/en-us/lifecycle/announcements/bing-search-api-retirement', 'InputPassword'),
+        field('tavilyApiKey', 'Tavily API Key', '用于网页搜索和图片搜索。获取或管理 Key：https://app.tavily.com/home', 'InputPassword'),
+        field('braveSearchApiKey', 'Brave Search API Key', '用于图片搜索。获取或管理 Key：https://api-dashboard.search.brave.com/app/keys', 'InputPassword'),
+        field('serpSource', '网页搜索来源', 'Bing Web Search 已退役，推荐使用 Tavily；兼容公益源不保证可用性和长期维护。', 'Select', {
             options: [
                 { label: 'Tavily', value: 'tavily' },
-                { label: 'Azure Search', value: 'azure' },
+                { label: 'Bing Web Search（已退役）', value: 'azure' },
                 { label: '兼容公益源', value: 'ikechan8370' }
             ]
         }),
@@ -80,8 +80,8 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
                 { label: '兼容公益源', value: 'ikechan8370' }
             ]
         }),
-        field('extraUrl', '额外工具服务地址', '部分扩展搜索和处理工具使用的兼容服务根地址。'),
-        field('githubAPIKey', 'GitHub Token', '可选，用于提高 GitHub 工具的 API 限额；请使用最小权限 Token。', 'InputPassword'),
+        field('extraUrl', '额外工具服务地址', 'OCR、图片处理等扩展工具使用的兼容服务根地址，需自行部署；搭建参考：https://github.com/ikechan8370/chatgpt-plugin-extras'),
+        field('githubAPIKey', 'GitHub Token', '可选，用于提高 GitHub 工具的 API 限额；请生成最小权限、设置有效期的 Token：https://github.com/settings/personal-access-tokens', 'InputPassword'),
         divider('访问控制与内容安全'),
         field('blockWords', '输出屏蔽词', '模型回复包含任一词时不发送；使用逗号、分号或竖线分隔，短语中的空格会保留。', 'InputTextArea'),
         field('promptBlockWords', '输入屏蔽词', '用户输入包含任一词时拒绝请求；使用逗号、分号或竖线分隔，短语中的空格会保留。', 'InputTextArea'),
@@ -124,11 +124,11 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
             ]
         }),
         field('defaultTTSRole', 'VITS 默认角色', 'VITS 语音回复默认使用的角色；随机会在当前角色列表中选择。', 'Select', { options: vitsRoleOptions }),
-        field('ttsSpace', 'VITS 服务地址', 'VITS Gradio 兼容服务根地址，不要附加 /api/generate。'),
+        field('ttsSpace', 'VITS 服务地址', '填写 VITS Gradio 兼容服务根地址，不要附加 /api/generate；可复制示例 Space 后查看自己的 API 地址：https://huggingface.co/spaces/ikechan8370/vits-uma-genshin-honkai'),
         field('huggingFaceReverseProxy', 'VITS Hugging Face 反代', '可选的 Hugging Face Space 请求和文件下载反代地址；没有自建反代时留空。'),
-        field('voicevoxSpace', 'VoiceVox 服务地址', 'VoiceVox 兼容服务根地址。'),
+        field('voicevoxSpace', 'VoiceVox 服务地址', '填写可访问的 VOICEVOX Engine HTTP 根地址，例如 http://127.0.0.1:50021；自建参考：https://github.com/VOICEVOX/voicevox_engine'),
         field('voicevoxTTSSpeaker', 'VoiceVox 默认角色', 'VoiceVox 语音回复默认使用的角色和风格。', 'Select', { options: voicevoxRoleOptions }),
-        field('azureTTSKey', 'Azure TTS Key', 'Microsoft Speech 服务密钥，只用于 Azure TTS，不属于模型 Provider。', 'InputPassword'),
+        field('azureTTSKey', 'Azure TTS Key', '在 Azure 门户创建 Speech 服务后填写 Key，并同步配置下方区域：https://portal.azure.com/；该密钥只用于语音合成，不属于模型 Provider。', 'InputPassword'),
         field('azureTTSRegion', 'Azure TTS 区域', 'Microsoft Speech 资源所在区域，例如 eastasia。'),
         field('azureTTSSpeaker', 'Azure TTS 默认角色', 'Azure TTS 默认使用的语音角色。', 'Select', { options: azureRoleOptions }),
         field('azureTTSEmotion', 'Azure TTS 情绪', '根据模型输出的情绪标记选择 Azure TTS 说话风格。', 'Switch'),
