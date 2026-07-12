@@ -12,11 +12,11 @@ const execFileAsync = promisify(execFile)
 const maxFileBytes = 524288
 const maxTotalBytes = 8388608
 
-test('legacy inventory finds every model provider scheduled for removal', async () => {
+test('provider inventory reports every category throughout removal', async () => {
   const result = await scanProviderSurface(new URL('../../', import.meta.url))
   const byId = Object.fromEntries(result.hits.map(item => [item.id, item.hits]))
   for (const id of ['chatgptWeb', 'bing', 'claude', 'gemini', 'qwen', 'chatglm', 'xinghuo', 'azureOpenai']) {
-    assert.ok(byId[id].length > 0, `${id} must have baseline hits`)
+    assert.ok(Array.isArray(byId[id]), `${id} must remain an audited category`)
   }
   assert.ok(byId.openaiCompatible.length > 0)
   assert.ok(result.bytesRead > 0)

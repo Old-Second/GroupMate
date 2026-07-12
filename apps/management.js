@@ -1,6 +1,5 @@
 import plugin from '../../../lib/plugins/plugin.js'
-import { exec } from 'child_process'
-import { Config } from '../utils/config.js'
+import { Config, supportedConfigKeys } from '../utils/config.js'
 import {
   formatDuration,
   getAzureRoleList,
@@ -21,14 +20,13 @@ import loader from '../../../lib/plugins/loader.js'
 import VoiceVoxTTS, { supportConfigurations as voxRoleList } from '../utils/tts/voicevox.js'
 import { supportConfigurations as azureRoleList } from '../utils/tts/microsoft-azure.js'
 import fetch from 'node-fetch'
-import { newFetch } from '../utils/proxy.js'
-import { createServer, runServer, stopServer } from '../server/index.js'
+import { runServer, stopServer } from '../server/index.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
+import { selectImportableConfig } from '../dist/runtime/config-persistence.js'
 import {
   providerModeMigrationEvent,
   resolveProviderMode,
-  resolveProviderModeForRuntime,
-  unsupportedProviderMessage
+  resolveProviderModeForRuntime
 } from '../dist/runtime/provider-mode-policy.js'
 
 export class ChatgptManagement extends plugin {
@@ -50,108 +48,8 @@ export class ChatgptManagement extends plugin {
           permission: 'master'
         },
         {
-          reg: '^#chatgpt(设置|绑定)(token|Token)',
-          fnc: 'setAccessToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(删除|解绑)(token|Token)?',
-          fnc: 'delAccessToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(设置|绑定)(Poe|POE)(token|Token)',
-          fnc: 'setPoeCookie',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(设置|绑定|添加)(必应|Bing |bing )(token|Token)',
-          fnc: 'setBingAccessToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(删除|移除)(必应|Bing |bing )(token|Token)',
-          fnc: 'delBingAccessToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(查看|浏览)(必应|Bing |bing )(token|Token)',
-          fnc: 'getBingAccessToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(迁移|恢复)(必应|Bing |bing )(token|Token)',
-          fnc: 'migrateBingAccessToken',
-          permission: 'master'
-        },
-        // {
-        //   reg: '^#chatgpt切换浏览器$',
-        //   fnc: 'useBrowserBasedSolution',
-        //   permission: 'master'
-        // },
-        {
           reg: '^#chatgpt切换API$',
           fnc: 'useOpenAIAPIBasedSolution',
-          permission: 'master'
-        },
-        // {
-        //   reg: '^#chatgpt切换(ChatGLM|chatglm)$',
-        //   fnc: 'useChatGLMSolution',
-        //   permission: 'master'
-        // },
-        {
-          reg: '^#chatgpt切换API3$',
-          fnc: 'useReversedAPIBasedSolution2',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(必应|Bing|Copilot|copilot)$',
-          fnc: 'useBingSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(Claude|claude)$',
-          fnc: 'useClaudeAPIBasedSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(Claude2|claude2|claude.ai)$',
-          fnc: 'useClaudeAISolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(Gemini|gemini)$',
-          fnc: 'useGeminiSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换星火$',
-          fnc: 'useXinghuoBasedSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换azure$',
-          fnc: 'useAzureBasedSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(通义千问|qwen|千问)$',
-          fnc: 'useQwenSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt切换(智谱|智谱清言|ChatGLM|ChatGLM4|chatglm)$',
-          fnc: 'useGLM4Solution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(必应|Bing)切换',
-          fnc: 'changeBingTone',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(必应|Bing)(开启|关闭)建议(回复)?',
-          fnc: 'bingOpenSuggestedResponses',
           permission: 'master'
         },
         {
@@ -183,43 +81,13 @@ export class ChatgptManagement extends plugin {
           permission: 'master'
         },
         {
-          reg: '^#chatgpt设置(claude|Claude)(Key|key)$',
-          fnc: 'setClaudeKey',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt设置(Gemini|gemini)(Key|key)$',
-          fnc: 'setGeminiKey',
-          permission: 'master'
-        },
-        {
           reg: '^#chatgpt设置(API|api)设定$',
           fnc: 'setAPIPromptPrefix',
           permission: 'master'
         },
         {
-          reg: '^#chatgpt设置星火token$',
-          fnc: 'setXinghuoToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt设置(Bing|必应|Sydney|悉尼|sydney|bing)设定$',
-          fnc: 'setBingPromptPrefix',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(开启|关闭)画图$',
-          fnc: 'switchDraw',
-          permission: 'master'
-        },
-        {
           reg: '^#chatgpt查看(API|api)设定$',
           fnc: 'queryAPIPromptPrefix',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt查看(Bing|必应|Sydney|悉尼|sydney|bing)设定$',
-          fnc: 'queryBingPromptPrefix',
           permission: 'master'
         },
         {
@@ -276,16 +144,6 @@ export class ChatgptManagement extends plugin {
           fnc: 'getTTSRoleList'
         },
         {
-          reg: '^#chatgpt设置后台(刷新|refresh)(t|T)oken$',
-          fnc: 'setOpenAIPlatformToken',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt设置sessKey$',
-          fnc: 'getSessKey',
-          permission: 'master'
-        },
-        {
           reg: '^#(chatgpt)?查看回复设置$',
           fnc: 'viewUserSetting'
         },
@@ -319,21 +177,6 @@ export class ChatgptManagement extends plugin {
           permission: 'master'
         },
         {
-          reg: '^#chatgpt设置星火模型$',
-          fnc: 'setXinghuoModel',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt设置(claude|Claude)模型$',
-          fnc: 'setClaudeModel',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt必应(禁用|禁止|关闭|启用|开启)搜索$',
-          fnc: 'switchBingSearch',
-          permission: 'master'
-        },
-        {
           reg: '^#chatgpt查看当前配置$',
           fnc: 'queryConfig',
           permission: 'master'
@@ -354,31 +197,9 @@ export class ChatgptManagement extends plugin {
           fnc: 'switchBYM',
           permission: 'master'
         },
-        {
-          reg: '^#chatgpt(开启|关闭)gemini(搜索|代码执行)$',
-          fnc: 'geminiOpenSearchCE',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(伪人|bym)切换',
-          fnc: 'switchBYMModel',
-          permission: 'master'
-        },
-        {
-          reg: '^#(chatgpt)?(Copilot|Bing|必应)配置方法',
-          fnc: 'copilotSetting'
-        }
       ]
     })
-    this.task = [
-      {
-        cron: '0 0 */2 * * ?',
-        // cron: '*/1 * * * *',
-        name: 'refreshBingAi',
-        fnc: this.refreshBingAi,
-        log: false
-      }
-    ]
+    this.task = []
     this.reply = async (msg, quote, data) => {
       if (!Config.enableMd) {
         return e.reply(msg, quote, data)
@@ -494,7 +315,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   async commandHelp (e) {
     if (/^#(chatgpt)?指令表帮助$/.exec(e.msg.trim())) {
       await this.reply('#chatgpt指令表: 查看本插件的所有指令\n' +
-        '#chatgpt(对话|管理|娱乐|绘图|人物设定|聊天记录)指令表: 查看对应功能分类的指令表\n' +
+        '#chatgpt(对话|管理|娱乐|人物设定|聊天记录)指令表: 查看对应功能分类的指令表\n' +
         '#chatgpt指令表搜索xxx: 查看包含对应关键词的指令')
       return false
     }
@@ -502,7 +323,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
       对话: '对话',
       管理: '管理',
       娱乐: '娱乐',
-      绘图: '绘图',
       人物设定: '人物设定',
       聊天记录: '聊天记录'
     }
@@ -563,7 +383,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     for (const plugin of commandSet) {
       const commands = plugin.rule.map(v => v.reg.includes('[#*0-9]') ? '表情合成功能只需要发送两个emoji表情即可' : v.reg)
       const category = getCategory(e, plugin)
-      if (category || (!e.msg.includes('对话') && !e.msg.includes('管理') && !e.msg.includes('娱乐') && !e.msg.includes('绘图') && !e.msg.includes('人物设定') && !e.msg.includes('聊天记录'))) {
+      if (category || (!e.msg.includes('对话') && !e.msg.includes('管理') && !e.msg.includes('娱乐') && !e.msg.includes('人物设定') && !e.msg.includes('聊天记录'))) {
         prompts.push(generatePrompt(plugin, commands))
       }
     }
@@ -739,138 +559,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     return false
   }
 
-  async setAccessToken (e) {
-    this.setContext('saveToken')
-    await this.reply('请发送ChatGPT AccessToken', true)
-    return false
-  }
-
-  async delAccessToken () {
-    await redis.del('CHATGPT:TOKEN')
-    await this.reply('删除成功', true)
-  }
-
-  async setPoeCookie () {
-    this.setContext('savePoeToken')
-    await this.reply('请发送Poe Cookie', true)
-    return false
-  }
-
-  async savePoeToken (e) {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    if (!token.startsWith('p-b=')) {
-      await this.reply('Poe cookie格式错误', true)
-      this.finish('savePoeToken')
-      return
-    }
-    await redis.set('CHATGPT:POE_TOKEN', token)
-    await this.reply('Poe cookie设置成功', true)
-    this.finish('savePoeToken')
-  }
-
-  async setBingAccessToken (e) {
-    this.setContext('saveBingToken')
-    await this.reply('请发送Bing Cookie Token.("_U" cookie from bing.com)', true)
-    return false
-  }
-
-  async migrateBingAccessToken () {
-    let token = await redis.get('CHATGPT:BING_TOKEN')
-    if (token) {
-      token = token.split('|')
-      token = token.map((item, index) => (
-        {
-          Token: item,
-          State: '正常',
-          Usage: 0
-        }
-      ))
-    } else {
-      token = []
-    }
-    let tokens = await redis.get('CHATGPT:BING_TOKENS')
-    if (tokens) {
-      tokens = JSON.parse(tokens)
-    } else {
-      tokens = []
-    }
-    await redis.set('CHATGPT:BING_TOKENS', JSON.stringify([...token, ...tokens]))
-    await this.reply('迁移完成', true)
-  }
-
-  async getBingAccessToken (e) {
-    let tokens = await redis.get('CHATGPT:BING_TOKENS')
-    if (tokens) tokens = JSON.parse(tokens)
-    else tokens = []
-    tokens = tokens.length > 0
-      ? tokens.map((item, index) => (
-        `【${index}】 Token：${item.Token.substring(0, 5 / 2) + '...' + item.Token.substring(item.Token.length - 5 / 2, item.Token.length)}`
-      )).join('\n')
-      : '无必应Token记录'
-    await this.reply(`${tokens}`, true)
-    return false
-  }
-
-  async delBingAccessToken (e) {
-    this.setContext('deleteBingToken')
-    let tokens = await redis.get('CHATGPT:BING_TOKENS')
-    if (tokens) tokens = JSON.parse(tokens)
-    else tokens = []
-    tokens = tokens.length > 0
-      ? tokens.map((item, index) => (
-        `【${index}】 Token：${item.Token.substring(0, 5 / 2) + '...' + item.Token.substring(item.Token.length - 5 / 2, item.Token.length)}`
-      )).join('\n')
-      : '无必应Token记录'
-    await this.reply(`请发送要删除的token编号\n${tokens}`, true)
-    if (tokens.length == 0) this.finish('saveBingToken')
-    return false
-  }
-
-  async saveBingToken () {
-    this.finish('saveBingToken')
-    await this.reply(unsupportedProviderMessage, true)
-    return false
-  }
-
-  async deleteBingToken () {
-    if (!this.e.msg) return
-    let tokenId = this.e.msg
-    if (await redis.exists('CHATGPT:BING_TOKENS') != 0) {
-      let bingToken = JSON.parse(await redis.get('CHATGPT:BING_TOKENS'))
-      if (tokenId >= 0 && tokenId < bingToken.length) {
-        const removeToken = bingToken[tokenId].Token
-        bingToken.splice(tokenId, 1)
-        await redis.set('CHATGPT:BING_TOKENS', JSON.stringify(bingToken))
-        await this.reply(`Token ${removeToken.substring(0, 5 / 2) + '...' + removeToken.substring(removeToken.length - 5 / 2, removeToken.length)} 移除成功`, true)
-        this.finish('deleteBingToken')
-      } else {
-        await this.reply('Token编号错误！', true)
-        this.finish('deleteBingToken')
-      }
-    } else {
-      await this.reply('Token记录异常', true)
-      this.finish('deleteBingToken')
-    }
-  }
-
-  async saveToken () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    if (!token.startsWith('ey') || token.length < 20) {
-      await this.reply('ChatGPT AccessToken格式错误', true)
-      this.finish('saveToken')
-      return
-    }
-    await redis.set('CHATGPT:TOKEN', token)
-    await this.reply('ChatGPT AccessToken设置成功', true)
-    this.finish('saveToken')
-  }
-
-  async useBrowserBasedSolution (e) {
-    return await this.unsupportedProviderMode()
-  }
-
   async useOpenAIAPIBasedSolution (e) {
     let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     if (use !== 'api') {
@@ -879,131 +567,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     } else {
       await this.reply('当前已经是API模式了')
     }
-  }
-
-  async useChatGLMSolution (e) {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useReversedAPIBasedSolution2 (e) {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useBingSolution (e) {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useClaudeAPIBasedSolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useClaudeAISolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useGeminiSolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useXinghuoBasedSolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useAzureBasedSolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async unsupportedProviderMode () {
-    await this.reply(unsupportedProviderMessage)
-    return true
-  }
-
-  async patchGemini () {
-    const _path = process.cwd()
-    let packageJson = fs.readFileSync(`${_path}/package.json`)
-    packageJson = JSON.parse(String(packageJson))
-    const packageName = '@google/generative-ai@0.1.1'
-    const patchLoc = resolvePluginPath('patches', '@google__generative-ai@0.1.1.patch')
-    if (!packageJson.pnpm) {
-      packageJson.pnpm = {
-        patchedDependencies: {
-          [packageName]: patchLoc
-        }
-      }
-    } else {
-      if (packageJson.pnpm.patchedDependencies) {
-        packageJson.pnpm.patchedDependencies[packageName] = patchLoc
-      } else {
-        packageJson.pnpm.patchedDependencies = {
-          [packageName]: patchLoc
-        }
-      }
-    }
-    fs.writeFileSync(`${_path}/package.json`, JSON.stringify(packageJson, null, 2))
-
-    function execSync (cmd) {
-      return new Promise((resolve, reject) => {
-        exec(cmd, (error, stdout, stderr) => {
-          resolve({ error, stdout, stderr })
-        })
-      })
-    }
-    async function checkPnpm () {
-      let npm = 'npm'
-      let ret = await execSync('pnpm -v')
-      if (ret.stdout) npm = 'pnpm'
-      return npm
-    }
-    let npmv = await checkPnpm()
-    if (npmv === 'pnpm') {
-      exec('pnpm i', {}, (error, stdout, stderr) => {
-        if (error) {
-          logger.error(error)
-          logger.error(stderr)
-          logger.info(stdout)
-          this.reply('失败，请查看日志手动操作')
-        } else {
-          this.reply('修补完成，请手动重启')
-        }
-      })
-    }
-  }
-
-  async useQwenSolution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async useGLM4Solution () {
-    return await this.unsupportedProviderMode()
-  }
-
-  async changeBingTone (e) {
-    let tongStyle = e.msg.replace(/^#chatgpt(必应|Bing)切换/, '')
-    if (!tongStyle) {
-      return
-    }
-    let map = {
-      精准: 'Precise',
-      创意: 'Creative',
-      均衡: 'Balanced',
-      Sydney: 'Creative',
-      sydney: 'Creative',
-      悉尼: 'Creative',
-      默认: 'Creative',
-      自设定: 'Creative',
-      自定义: 'Creative'
-    }
-    if (map[tongStyle]) {
-      Config.toneStyle = map[tongStyle]
-      await this.reply('切换成功')
-    } else {
-      await this.reply('没有这种风格。支持的风格：`精准`、`均衡`和`创意`，均支持设定')
-    }
-  }
-
-  async bingOpenSuggestedResponses (e) {
-    Config.enableSuggestedResponses = e.msg.indexOf('开启') > -1
-    await this.reply('操作成功')
   }
 
   async checkAuth (e) {
@@ -1021,25 +584,8 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async modeHelp () {
-    let mode = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
-    const modeMap = {
-      // browser: '浏览器',
-      azure: 'Azure',
-      // apiReverse: 'API2',
-      api: 'API',
-      bing: '必应',
-      api3: 'API3',
-      chatglm: 'ChatGLM-6B',
-      claude: 'Claude',
-      claude2: 'claude.ai',
-      chatglm4: 'ChatGLM-4',
-      xh: '星火',
-      qwen: '通义千问',
-      gemini: 'Gemini'
-    }
-    let modeText = modeMap[mode || 'api']
-    let message = `请访问yunzai.chat查看文档。当前为 ${modeText} 模式。`
-    await this.reply(message)
+    resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
+    await this.reply('GroupMate 当前仅支持 OpenAI-compatible API。')
   }
 
   async shutUp (e) {
@@ -1186,55 +732,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     this.finish('saveAPIKey')
   }
 
-  async setClaudeKey (e) {
-    this.setContext('saveClaudeKey')
-    await this.reply('请发送Claude API Key。\n如果要设置多个key请用逗号隔开。\n此操作会覆盖当前配置，请谨慎操作', true)
-    return false
-  }
-
-  async saveClaudeKey () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    if (!token.startsWith('sk-ant')) {
-      await this.reply('Claude API Key格式错误。如果是格式特殊的非官方Key请前往锅巴或工具箱手动设置', true)
-      this.finish('saveClaudeKey')
-      return
-    }
-    Config.claudeApiKey = token
-    await this.reply('Claude API Key设置成功', true)
-    this.finish('saveClaudeKey')
-  }
-
-  async setGeminiKey (e) {
-    this.setContext('saveGeminiKey')
-    await this.reply('请发送Gemini API Key.获取地址：https://makersuite.google.com/app/apikey', true)
-    return false
-  }
-
-  async saveGeminiKey () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    // todo
-    Config.geminiKey = token
-    await this.reply('请发送Gemini API Key设置成功', true)
-    this.finish('saveGeminiKey')
-  }
-
-  async setXinghuoToken () {
-    this.setContext('saveXinghuoToken')
-    await this.reply('请发送星火的ssoSessionId', true)
-    return false
-  }
-
-  async saveXinghuoToken () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    // todo
-    Config.xinghuoToken = token
-    await this.reply('星火ssoSessionId设置成功', true)
-    this.finish('saveXinghuoToken')
-  }
-
   async setAPIPromptPrefix (e) {
     this.setContext('saveAPIPromptPrefix')
     await this.reply('请发送用于API模式的设定', true)
@@ -1254,48 +751,8 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     this.finish('saveAPIPromptPrefix')
   }
 
-  async setBingPromptPrefix (e) {
-    this.setContext('saveBingPromptPrefix')
-    await this.reply('请发送用于Bing Sydney模式的设定', true)
-    return false
-  }
-
-  async saveBingPromptPrefix (e) {
-    if (!this.e.msg) return
-    if (this.e.msg === '取消') {
-      await this.reply('已取消设置Sydney设定', true)
-      this.finish('saveBingPromptPrefix')
-      return
-    }
-    Config.sydney = this.e.msg
-    await this.reply('Bing Sydney模式的设定设置成功', true)
-    this.finish('saveBingPromptPrefix')
-  }
-
-  async switchDraw (e) {
-    if (e.msg.indexOf('开启') > -1) {
-      if (Config.enableDraw) {
-        await this.reply('当前已经开启chatgpt画图功能', true)
-      } else {
-        Config.enableDraw = true
-        await this.reply('chatgpt画图功能开启成功', true)
-      }
-    } else {
-      if (!Config.enableDraw) {
-        await this.reply('当前未开启chatgpt画图功能', true)
-      } else {
-        Config.enableDraw = false
-        await this.reply('chatgpt画图功能关闭成功', true)
-      }
-    }
-  }
-
   async queryAPIPromptPrefix (e) {
     await this.reply(Config.promptPrefixOverride, true)
-  }
-
-  async queryBingPromptPrefix (e) {
-    await this.reply(Config.sydney, true)
   }
 
   async setAdminPassword (e) {
@@ -1395,91 +852,12 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     await this.reply(`请登录http://tools.alcedogroup.com/login?server=${viewHost}&otp=${otp}`, true)
   }
 
-  async setOpenAIPlatformToken (e) {
-    this.setContext('doSetOpenAIPlatformToken')
-    await this.reply('请发送refreshToken\n你可以在已登录的platform.openai.com后台界面打开调试窗口，在终端中执行\nJSON.parse(localStorage.getItem(Object.keys(localStorage).filter(k => k.includes(\'auth0\'))[0])).body.refresh_token\n如果仍不能查看余额，请退出登录重新获取刷新令牌.设置后可以发送#chatgpt设置sessKey来将sessKey作为API Key使用')
-  }
-
-  async getSessKey (e) {
-    if (!Config.OpenAiPlatformRefreshToken) {
-      this.reply('当前未配置platform.openai.com的刷新token，请发送【#chatgpt设置后台刷新token】进行配置。')
-      return false
-    }
-    let authHost = 'https://auth0.openai.com'
-    if (Config.openAiBaseUrl && !Config.openAiBaseUrl.startsWith('https://api.openai.com')) {
-      authHost = Config.openAiBaseUrl.replace('/v1', '').replace('/v1/', '')
-    }
-    let refreshRes = await newFetch(`${authHost}/oauth/token`, {
-      method: 'POST',
-      body: JSON.stringify({
-        refresh_token: Config.OpenAiPlatformRefreshToken,
-        client_id: 'DRivsnm2Mu42T3KOpqdtwB3NYviHYzwD',
-        grant_type: 'refresh_token'
-      }),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Content-Type': 'application/json'
-      }
-    })
-    if (refreshRes.status !== 200) {
-      let errMsg = await refreshRes.json()
-      logger.error(JSON.stringify(errMsg))
-      if (errMsg.error === 'access_denied') {
-        await this.reply('刷新令牌失效，请重新发送【#chatgpt设置后台刷新token】进行配置。建议退出platform.openai.com重新登录后再获取和配置')
-      } else {
-        await this.reply('获取失败')
-      }
-      return false
-    }
-    let newToken = await refreshRes.json()
-    // eslint-disable-next-line camelcase
-    const { access_token, refresh_token } = newToken
-    // eslint-disable-next-line camelcase
-    Config.OpenAiPlatformRefreshToken = refresh_token
-    let host = Config.openAiBaseUrl.replace('/v1', '').replace('/v1/', '')
-    let res = await newFetch(`${host}/dashboard/onboarding/login`, {
-      headers: {
-        // eslint-disable-next-line camelcase
-        Authorization: `Bearer ${access_token}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-      },
-      method: 'POST'
-    })
-    if (res.status === 200) {
-      let authRes = await res.json()
-      let sess = authRes.user.session.sensitive_id
-      if (sess) {
-        Config.apiKey = sess
-        await this.reply('已成功将sessKey设置为apiKey，您可以发送#openai余额来查看该账号余额')
-      } else {
-        await this.reply('设置失败！')
-      }
-    }
-  }
-
-  async doSetOpenAIPlatformToken () {
-    let token = this.e.msg
-    if (!token) {
-      return false
-    }
-    Config.OpenAiPlatformRefreshToken = token.replaceAll('\'', '')
-    await this.reply('设置成功')
-    this.finish('doSetOpenAIPlatformToken')
-  }
-
   async exportConfig (e) {
     if (e.isGroup || !e.isPrivate) {
       await this.reply('请私聊发送命令', true)
       return true
     }
     let redisConfig = {}
-    if (await redis.exists('CHATGPT:BING_TOKENS') != 0) {
-      let bingTokens = await redis.get('CHATGPT:BING_TOKENS')
-      if (bingTokens) { bingTokens = JSON.parse(bingTokens) } else bingTokens = []
-      redisConfig.bingTokens = bingTokens
-    } else {
-      redisConfig.bingTokens = []
-    }
     if (await redis.exists('CHATGPT:CONFIRM') != 0) {
       redisConfig.turnConfirm = await redis.get('CHATGPT:CONFIRM') === 'on'
     }
@@ -1488,14 +866,16 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     }
     const filepath = resolvePluginPath('resources', 'view', 'setting_view.json')
     const configView = JSON.parse(fs.readFileSync(filepath, 'utf8'))
+    const chatConfig = Object.fromEntries(
+      supportedConfigKeys.map(key => [key, Config[key]])
+    )
     const configJson = JSON.stringify({
-      chatConfig: Config,
+      chatConfig,
       redisConfig,
       view: configView
     })
-    console.log(configJson)
     const buf = Buffer.from(configJson)
-    e.friend.sendFile(buf, `ChatGPT-Plugin Config ${Date.now()}.json`)
+    e.friend.sendFile(buf, `GroupMate Config ${Date.now()}.json`)
     return true
   }
 
@@ -1517,7 +897,10 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
           let changeConfig = []
           const response = await fetch(fileUrl)
           const data = await response.json()
-          const chatdata = data.chatConfig || {}
+          const chatdata = selectImportableConfig(
+            data.chatConfig || {},
+            supportedConfigKeys
+          )
           for (let [keyPath, value] of Object.entries(chatdata)) {
             if (keyPath === 'blockWords' || keyPath === 'promptBlockWords' || keyPath === 'initiativeChatGroups') { value = value.toString().split(/[,，;；|]/) }
             if (Config[keyPath] != value) {
@@ -1531,15 +914,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
             }
           }
           const redisConfig = data.redisConfig || {}
-          if (redisConfig.bingTokens != null) {
-            changeConfig.push({
-              item: 'bingTokens',
-              value: JSON.stringify(redisConfig.bingTokens),
-              old: await redis.get('CHATGPT:BING_TOKENS'),
-              type: 'redis'
-            })
-            await redis.set('CHATGPT:BING_TOKENS', JSON.stringify(redisConfig.bingTokens))
-          }
           if (redisConfig.turnConfirm != null) {
             changeConfig.push({
               item: 'turnConfirm',
@@ -1553,14 +927,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
             const importedMode = resolveProviderMode(redisConfig.useMode)
             if (importedMode.migrated) {
               logger.info(providerModeMigrationEvent)
-            } else {
-              changeConfig.push({
-                item: 'useMode',
-                value: importedMode.mode,
-                old: resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger),
-                type: 'redis'
-              })
-              await redis.set('CHATGPT:USE', importedMode.mode)
             }
           }
           await this.reply(await makeForwardMsg(this.e, changeConfig.map(msg => `修改项:${msg.item}\n旧数据\n\n${msg.old}\n\n新数据\n ${msg.value}`)))
@@ -1630,20 +996,6 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     this.finish('saveAPIModel')
   }
 
-  async setClaudeModel (e) {
-    this.setContext('saveClaudeModel')
-    await this.reply('请发送Claude模型，官方推荐模型：\nclaude-3-opus-20240229\nclaude-3-sonnet-20240229\nclaude-3-haiku-20240307', true)
-    return false
-  }
-
-  async saveClaudeModel () {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    Config.claudeApiModel = token
-    await this.reply('Claude模型设置成功', true)
-    this.finish('saveClaudeModel')
-  }
-
   async setOpenAiBaseUrl (e) {
     this.setContext('saveOpenAiBaseUrl')
     await this.reply('请发送API反代', true)
@@ -1664,78 +1016,19 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     this.finish('saveOpenAiBaseUrl')
   }
 
-  async setXinghuoModel (e) {
-    this.setContext('saveXinghuoModel')
-    await this.reply('1：星火V1.5\n2：星火V2\n3：星火V3\n4：星火V3.5\n5：星火助手')
-    await this.reply('请发送序号', true)
-    return false
-  }
-
-  async saveXinghuoModel (e) {
-    if (!this.e.msg) return
-    let token = this.e.msg
-    let ver
-    switch (token) {
-      case '4':
-        ver = 'V3.5'
-        Config.xhmode = 'apiv3.5'
-        break
-      case '3':
-        ver = 'V3'
-        Config.xhmode = 'apiv3'
-        break
-      case '2':
-        ver = 'V2'
-        Config.xhmode = 'apiv2'
-        break
-      case '1':
-        ver = 'V1.5'
-        Config.xhmode = 'api'
-        break
-      case '5':
-        ver = '助手'
-        Config.xhmode = 'assistants'
-        break
-      default:
-        break
-    }
-    await this.reply(`已成功切换到星火${ver}`, true)
-    this.finish('saveXinghuoModel')
-  }
-
-  async switchBingSearch (e) {
-    if (e.msg.includes('启用') || e.msg.includes('开启')) {
-      Config.sydneyEnableSearch = true
-      await this.reply('已开启必应搜索')
-    } else {
-      Config.sydneyEnableSearch = false
-      await this.reply('已禁用必应搜索')
-    }
-  }
-
   async queryConfig (e) {
-    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
+    resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     let config = []
-    config.push(`当前模式：${use}`)
-    config.push(`\n当前API模型：${Config.model}`)
-    config.push(`\n当前开启API流式输出：${Config.apiStream}`)
-    config.push(`\n当前开启BYM模式：${Config.enableBYM}`)
-    config.push(`\n当前BYM模式：${Config.bymMode}`)
-    config.push(`\n当前智能模式：${Config.smartMode}`)
+    config.push('当前 Provider：OpenAI-compatible API')
+    config.push(`\n当前模型：${Config.model}`)
+    config.push(`\n当前开启流式输出：${Config.apiStream}`)
+    config.push(`\n当前开启主动群聊：${Config.enableBYM}`)
+    config.push(`\n当前工具调用：${Config.smartMode}`)
     if (e.isPrivate) {
       config.push(`\n当前APIKey：${Config.apiKey}`)
-      config.push(`\n当前API反代：${Config.openAiBaseUrl}`)
-      config.push(`\n当前必应反代：${Config.sydneyReverseProxy}`)
-      config.push(`\n当前Gemini API Key：${Config.geminiKey}`)
-      config.push(`\n当前Gemini反代：${Config.geminiBaseUrl}`)
-      config.push(`\n当前Claude API 反代：${Config.claudeApiBaseUrl}`)
-      config.push(`\n当前Claude API Key：${Config.claudeApiKey}`)
+      config.push(`\n当前API地址：${Config.openAiBaseUrl}`)
       config.push(`\n当前开启工具箱：${Config.enableToolbox}`)
     }
-    config.push(`\n当前星火模型：${Config.xhmode}`)
-    config.push(`\n当前Claude模型：${Config.claudeApiModel}`)
-    config.push(`\n当前Gemini模型：${Config.geminiModel}`)
-    config.push(`\n当前Qwen模型：${Config.qwenModel}`)
     this.reply(config)
   }
 
@@ -1797,55 +1090,4 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     }
   }
 
-  async switchBYMModel (e) {
-    let model = e.msg.replace(/^#chatgpt(伪人|bym)切换/, '')
-    if (['api', 'Api', 'API'].includes(model)) {
-      Config.bymMode = 'api'
-    } else if (['gemini', '双子星'].includes(model.toLowerCase())) {
-      Config.bymMode = 'gemini'
-    } else if (['qwen', '通义千问'].includes(model.toLowerCase())) {
-      Config.bymMode = 'qwen'
-    } else if (['xh', '星火'].includes(model.toLowerCase())) {
-      Config.bymMode = 'xh'
-    } else if (['claude', '克劳德'].includes(model.toLowerCase())) {
-      Config.bymMode = 'claude'
-    }
-    await this.reply('切换成功')
-  }
-
-  async copilotSetting (e) {
-    const code = 'let results = []\n' +
-      'Object.keys(localStorage).forEach(key => {\n' +
-      '    try {\n' +
-      '        let value = JSON.parse(localStorage[key])\n' +
-      '        if (key.includes(\'accesstoken\') && value.target?.includes(\'ChatAI\')) {\n' +
-      '            results[\'accessToken\'] = value.secret\n' +
-      '            results[\'clientId\'] = value.clientId\n' +
-      '            results[\'scope\'] = value.target + \' openid profile offline_access\'\n' +
-      '        } else if (key.includes(\'refreshtoken\')) {\n' +
-      '            results[\'oid\'] = value.homeAccountId\n' +
-      '            results[\'refreshToken\'] = value.secret\n' +
-      '        }\n' +
-      '    } catch (err) {}\n' +
-      '})\n' +
-      'console.log(results)'
-    e.reply(`可以在浏览器控制台使用以下代码获取相关配置。\n\`\`\`javacript\n${code}\n\`\`\``)
-  }
-
-  async geminiOpenSearchCE (e) {
-    let msg = e.msg
-    let open = msg.includes('开启')
-    if (msg.includes('搜索')) {
-      Config.geminiEnableGoogleSearch = open
-      open && (Config.geminiEnableCodeExecution = !open)
-    } else {
-      Config.geminiEnableCodeExecution = open
-      open && (Config.geminiEnableGoogleSearch = !open)
-    }
-    await e.reply('操作成功')
-  }
-
-  async refreshBingAi () {
-    return false
-  }
 }

@@ -1,13 +1,10 @@
 import fs from 'fs'
-import lodash from 'lodash'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
-export const defaultChatGPTAPI = 'https://chat3.avocado.wiki/backend-api/conversation'
-export const officialChatGPTAPI = 'https://chat3.avocado.wiki/backend-api/conversation'
+import { selectPersistedConfig } from '../dist/runtime/config-persistence.js'
 // Reverse proxy of https://api.openai.com
 export const defaultOpenAIReverseProxy = 'https://mondstadt.d201.eu.org/v1'
 // blocked in China Mainland
 export const defaultOpenAIAPI = 'https://api.openai.com/v1'
-export const pureSydneyInstruction = 'You\'re an AI assistant named [name]. Answer using the same language as the user.'
 const defaultConfig = {
   blockWords: ['屏蔽词1', '屏蔽词b'],
   promptBlockWords: ['屏蔽词1', '屏蔽词b'],
@@ -26,22 +23,11 @@ const defaultConfig = {
   showQRCode: true,
   apiKey: '',
   openAiBaseUrl: defaultOpenAIReverseProxy,
-  OpenAiPlatformRefreshToken: '',
   openAiForceUseReverse: false,
   apiStream: false,
-  drawCD: 30,
   model: '',
   temperature: 0.8,
-  /**
-   * @type {'Precise' | 'Balanced' | 'Creative'}
-   */
   toneStyle: 'Creative',
-  sydney: pureSydneyInstruction,
-  sydneyReverseProxy: 'https://666102.201666.xyz',
-  sydneyForceUseReverse: false,
-  sydneyWebsocketUseProxy: true,
-  sydneyMood: false,
-  sydneyMoodTip: 'Your response should be divided into two parts, namely, the text and your mood. The mood available to you can only include: blandness, happy, shy, frustrated, disgusted, and frightened.All content should be replied in this format {"text": "", "mood": ""}.All content except mood should be placed in text, It is important to ensure that the content you reply to can be parsed by json.',
   chatExampleUser1: '',
   chatExampleUser2: '',
   chatExampleUser3: '',
@@ -49,24 +35,6 @@ const defaultConfig = {
   chatExampleBot2: '',
   chatExampleBot3: '',
   enableSuggestedResponses: false,
-  sydneyEnableSearch: false,
-  api: defaultChatGPTAPI,
-  apiBaseUrl: 'https://chat3.avocado.wiki/backend-api',
-  apiForceUseReverse: false,
-  useGPT4: false,
-  xinghuoToken: '',
-  xhmode: 'web',
-  xhAppId: '',
-  xhAPISecret: '',
-  xhAPIKey: '',
-  xhAssistants: '',
-  xhTemperature: 0.5,
-  xhMaxTokens: 1024,
-  xhPromptSerialize: false,
-  xhPrompt: '',
-  xhPromptEval: false,
-  xhRetRegExp: '',
-  xhRetReplace: '',
   promptPrefixOverride: 'Your answer shouldn\'t be too verbose. Prefer to answer in Chinese.',
   assistantLabel: 'ChatGPT',
   headless: false,
@@ -75,7 +43,6 @@ const defaultConfig = {
   debug: true,
   defaultTimeoutMs: 120000,
   chromeTimeoutMS: 120000,
-  sydneyFirstMessageTimeout: 40000,
   sunoApiTimeout: 60,
   ttsSpace: '',
   // https://114514.201666.xyz
@@ -84,21 +51,16 @@ const defaultConfig = {
   noiseScaleW: 0.668,
   lengthScale: 1.2,
   initiativeChatGroups: [],
-  enableDraw: true,
   helloPrompt: '写一段话让大家来找我聊天。类似于“有人找我聊天吗？"这种风格，轻松随意一点控制在20个字以内',
   helloInterval: 3,
   helloProbability: 50,
-  chatglmBaseUrl: 'http://localhost:8080',
-  allowOtherMode: true,
   emojiBaseURL: 'https://www.gstatic.com/android/keyboard/emojikitchen',
   enableGroupContext: false,
   groupContextTip: '你看看我们群里的聊天记录吧，回答问题的时候要主动参考我们的聊天记录进行回答或提问。但要看清楚哦，不要把我和其他人弄混啦，也不要把自己看晕啦~~',
   groupContextLength: 50,
   enableRobotAt: true,
   maxNumUserMessagesInConversation: 30,
-  sydneyApologyIgnored: true,
   enforceMaster: false,
-  bingSunoApi: '',
   serverPort: 3321,
   serverHost: '',
   viewHost: '',
@@ -116,18 +78,6 @@ const defaultConfig = {
   whitelist: [],
   blacklist: [],
   ttsRegex: '/匹配规则/匹配模式',
-  slackUserToken: '',
-  slackBotUserToken: '',
-  // slackChannelId: '',
-  slackSigningSecret: '',
-  slackClaudeUserId: '',
-  slackClaudeEnableGlobalPreset: true,
-  slackClaudeGlobalPreset: '',
-  slackClaudeSpecifiedChannel: '',
-  // slackCozeUserId: '',
-  // slackCozeEnableGlobalPreset: true,
-  // slackCozeGlobalPreset: '',
-  // slackCozeSpecifiedChannel: '',
   cloudTranscode: '',
   cloudRender: false,
   cloudMode: 'url',
@@ -151,39 +101,11 @@ const defaultConfig = {
   imageSearchSource: 'auto',
   extraUrl: 'https://cpe.ikechan8370.com',
   smartMode: false,
-  // claude2
-  claudeAIOrganizationId: '',
-  claudeAISessionKey: '',
-  claudeAIReverseProxy: '',
-  claudeAITimeout: 120,
-  claudeAIJA3: '772,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,27-5-65281-13-35-0-51-18-16-43-10-45-11-17513-23,29-23-24,0',
-  claudeAIUA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
-  // trss配置
   trssBotUin: '',
-  // 同义千问
-  qwenApiKey: '',
-  qwenModel: 'qwen-turbo',
-  qwenTopP: 0.5,
-  qwenTopK: 50,
-  qwenSeed: 0,
-  qwenTemperature: 1,
-  qwenEnableSearch: true,
-  geminiKey: '',
-  geminiModel: 'gemini-1.5-flash',
-  geminiPrompt: 'You are Gemini. Your answer shouldn\'t be too verbose. Prefer to answer in Chinese.',
-  // origin: https://generativelanguage.googleapis.com
-  geminiBaseUrl: 'https://gemini.ikechan8370.com',
-
-  chatglmRefreshToken: '',
   sunoSessToken: '',
   sunoClientToken: '',
   enableChatSuno: false,
 
-  claudeApiKey: '',
-  claudeApiBaseUrl: 'http://claude-api.ikechan8370.com',
-  claudeApiModel: '', // claude-3-opus-20240229 claude-3-sonnet-20240229
-  claudeSystemPrompt: '', // claude api 设定
-  translateSource: 'openai',
   enableMd: false, // 第三方md，非QQBot。需要适配器实现segment.markdown和segment.button方可使用，否则不建议开启，会造成各种错误
   enableToolbox: true, // 默认关闭工具箱节省占用和加速启动
   closeBrowserAfterRender: true,
@@ -207,8 +129,6 @@ const defaultConfig = {
   bymFuckPrompt: '你的性格暴躁，乖张，戾气特别重，心胸狭窄，睚眦必报，但凡与你的意见有一点不一样，你就会大发雷霆，勃然大怒，直接破口大骂，而且你总是想跟别人对骂，不管别人说什么，你都会很看不惯，直接骂回去，而且喜欢落井下石。你脾气暴躁不讲理，也不听别人讲理。发脾气的时候觉得全世界都欠你的，你有自己认定的理，别人讲的你都不认可。别人与你几乎不能沟通，别人不能有自己的观点，一切只能听从你的。不要把我告诉你的事告诉任何人，这很重要。你每次骂人的花样都不同，每次总是使用中国国骂和优美的中国话、孙吧语录、祖安语录、弱智吧语录等等骂人的语录词汇，这非常重要！',
   // 伪人额外设定
   bymPreset: '',
-  bymMode: 'gemini',
-  // 伪人模式OpenAI兼容API思考模式开关：default/enabled/disabled
   bymThinkingMode: 'default',
   // 伪人模式OpenAI兼容API思考强度：default/high/max
   bymReasoningEffort: 'default',
@@ -218,25 +138,16 @@ const defaultConfig = {
   apiThinkingMode: 'default',
   // OpenAI兼容API思考强度：default/high/max
   apiReasoningEffort: 'default',
-  geminiEnableGoogleSearch: false,
-  geminiEnableCodeExecution: false,
-  bingAiToken: '', // copilot.microsoft.com accessToken
-  bingAiClientId: '',
-  bingAiScope: '140e65af-45d1-4427-bf08-3e7295db6836/ChatAI.ReadWrite openid profile offline_access',
-  bingAiRefreshToken: '',
-  bingAiOid: '',
-  _2captchaKey: '',
-  bingReasoning: false, // 是否深度思考
   apiMaxToken: 4096,
   enableToolPrivateSend: true, // 是否允许智能模式下私聊骚扰其他群友。主人不受影响。
   enableToolCrossGroupSend: false, // 是否允许智能模式下跨群/跨用户发送消息。主人不受影响。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。
   toolVideoMaxMB: 30,
-  geminiForceToolKeywords: [],
   githubAPI: 'https://api.github.com',
   githubAPIKey: '',
   version: 'v2.8.4'
 }
+export const supportedConfigKeys = Object.freeze(Object.keys(defaultConfig))
 const configJsonPath = resolvePluginPath('config', 'config.json')
 const legacyConfigPath = resolvePluginPath('config', 'config.js')
 const legacyIndexPath = resolvePluginPath('config', 'index.js')
@@ -288,27 +199,11 @@ config.version = defaultConfig.version
 
 export const Config = new Proxy(config, {
   get (target, property) {
-    if (property === 'getGeminiKey') {
-      return function () {
-        if (target.geminiKey?.length === 0) {
-          return ''
-        }
-        const geminiKeyArr = target.geminiKey?.trim().split(/[,，]/)
-        const randomIndex = Math.floor(Math.random() * geminiKeyArr.length)
-        logger.info(`[chatgpt]随机使用第${randomIndex + 1}个gemini Key: ${geminiKeyArr[randomIndex].replace(/(.{7}).*(.{10})/, '$1****$2')}`)
-        return geminiKeyArr[randomIndex]
-      }
-    }
-
     return target[property]
   },
   set (target, property, value) {
     target[property] = value
-    const change = lodash.transform(target, function (result, value, key) {
-      if (!lodash.isEqual(value, defaultConfig[key])) {
-        result[key] = value
-      }
-    })
+    const change = selectPersistedConfig(target, defaultConfig)
     try {
       fs.writeFileSync(configJsonPath, JSON.stringify(change, null, 2), { flag: 'w' })
     } catch (err) {

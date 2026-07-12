@@ -5,7 +5,6 @@ import { Config } from '../utils/config.js'
 import AzureTTS from '../utils/tts/microsoft-azure.js'
 import VoiceVoxTTS from '../utils/tts/voicevox.js'
 import {
-  completeJSON,
   formatDate,
   formatDate2,
   generateAudio,
@@ -676,13 +675,7 @@ export class chatgpt extends plugin {
           await redis.set(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`, '1')
         }
       }
-      if (Config.sydneyMood) {
-        let tempResponse = completeJSON(response)
-        if (tempResponse.text) response = tempResponse.text
-        if (tempResponse.mood) mood = tempResponse.mood
-      } else {
-        mood = ''
-      }
+      mood = ''
       // 检索是否有屏蔽词
       const blockWord = Config.blockWords.find(word => response.toLowerCase().includes(word.toLowerCase()))
       if (blockWord) {
