@@ -7,6 +7,7 @@ This repository is an ES-module Yunzai plugin. `index.js` discovers and loads co
 ## Build, Test, and Development Commands
 
 - `pnpm install` installs required and optional dependencies; Node.js 18 or newer is recommended.
+- `pnpm test` runs the deterministic offline `node:test` suite with concurrency 1.
 - Run the plugin from a Yunzai checkout at `plugins/chatgpt-plugin`, then restart Yunzai to exercise changes. This package has no standalone `start` or `build` script.
 - `node --check apps/chat.js` performs a quick syntax check on a changed JavaScript file.
 - `git diff --check` catches whitespace errors before submission.
@@ -19,7 +20,7 @@ Follow the existing JavaScript style: two-space indentation, single quotes, no s
 
 ## Testing Guidelines
 
-No automated test runner or coverage threshold is currently configured. For every change, run syntax checks on touched files and manually exercise the affected command or provider in a development Yunzai instance. Test success, failure, and missing-configuration paths. In the pull request, record the exact bot command, provider, and observed result.
+The repository uses an offline `node:test` suite through `pnpm test`; no coverage threshold is configured. For every change, run the focused tests, the full offline suite, syntax checks on touched files, and `git diff --check`. Real provider and QQ checks remain explicit, separately authorized gates. When they are run, record the exact bot command, provider, and observed result.
 
 ## Commit & Pull Request Guidelines
 
