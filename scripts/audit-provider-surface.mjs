@@ -1,49 +1,174 @@
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { lstat, readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import {
+  providerSurfaceIds,
+  providerSurfaceManifest
+} from '../dist/runtime/provider-surface-manifest.js'
 
 const execFileAsync = promisify(execFile)
-const definitions = [
-  ['openaiCompatible', /openai|chat\/completions|openAiBaseUrl/i],
-  ['chatgptWeb', /api3|accessToken|refreshToken/i],
-  ['bing', /bing|sydney|copilot/i],
-  ['claude', /claude/i],
-  ['gemini', /gemini|google-generative/i],
-  ['qwen', /qwen|通义/i],
-  ['chatglm', /chatglm|glm4/i],
-  ['xinghuo', /xinghuo|星火/i],
-  ['azureOpenai', /azureUrl|azureDeploymentName|@azure\/openai/i]
-]
+export const MAX_PROVIDER_SURFACE_FILE_BYTES = 524288
+export const MAX_PROVIDER_SURFACE_TOTAL_BYTES = 8388608
 
-export async function scanProviderSurface (rootUrl) {
-  const cwd = fileURLToPath(rootUrl)
+const lexicalExtensions = ['*.js', '*.ts', '*.json', '*.mjs', '*.patch']
+const configSurfacePaths = new Set(['utils/config.js', 'config/config.example.json'])
+const uiSurfacePaths = new Set(['guoba.support.js', 'resources/view/setting_view.json'])
+const dependencySurfacePaths = new Set(['package.json'])
+
+function isExcludedPath (path) {
+  return providerSurfaceManifest.preservedExclusions.directories.some(directory =>
+    path.startsWith(directory)
+  ) ||
+    providerSurfaceManifest.preservedExclusions.files.includes(path) ||
+    providerSurfaceManifest.preservedExclusions.paths.includes(path)
+}
+
+function createDefinitions () {
+  return providerSurfaceIds.map(id => ({
+    id,
+    exactSources: new Set(providerSurfaceManifest.sources[id]),
+    markers: providerSurfaceManifest.lexicalMarkers[id].map(marker => marker.toLowerCase()),
+    commands: providerSurfaceManifest.commands[id].map(marker => marker.toLowerCase()),
+    configFields: providerSurfaceManifest.configFields[id].map(marker => marker.toLowerCase()),
+    uiFields: providerSurfaceManifest.uiFields[id].map(marker => marker.toLowerCase()),
+    dependencies: providerSurfaceManifest.dependencies[id].map(marker => marker.toLowerCase()),
+    hits: []
+  }))
+}
+
+async function getCandidatePaths (cwd) {
   const { stdout } = await execFileAsync(
     'git',
-    ['ls-files', '-z', '*.js', '*.ts', '*.json', '*.md', '*.patch'],
+    ['ls-files', '-z', '--', ...lexicalExtensions],
     { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 }
   )
-  const paths = stdout.split('\0').filter(path =>
-    path &&
-    !path.startsWith('server/static/') &&
-    !path.startsWith('docs/') &&
-    !path.startsWith('test/') &&
-    path !== 'AGENTS.md' &&
-    path !== 'NOTICE.md'
+  const trackedPaths = stdout.split('\0').filter(Boolean)
+  const trackedPathSet = new Set(trackedPaths)
+  const exactSources = providerSurfaceIds.flatMap(id => providerSurfaceManifest.sources[id])
+
+  return [...new Set([
+    ...exactSources.filter(path => trackedPathSet.has(path)),
+    ...trackedPaths
+  ])]
+    .filter(path => !isExcludedPath(path))
+}
+
+function addHit (definition, path, line) {
+  if (definition.hits.some(hit => hit.path === path && hit.line === line)) return
+  definition.hits.push({ path, line })
+}
+
+function includesIdentifier (line, identifier) {
+  let index = line.indexOf(identifier)
+  while (index !== -1) {
+    const before = line[index - 1]
+    const after = line[index + identifier.length]
+    const isIdentifierCharacter = character => character && /[a-z0-9_$]/i.test(character)
+    if (!isIdentifierCharacter(before) && !isIdentifierCharacter(after)) return true
+    index = line.indexOf(identifier, index + identifier.length)
+  }
+  return false
+}
+
+function matchesScopedManifestEntry (definition, path, line) {
+  if ((path.startsWith('apps/') || path === 'resources/help.json') &&
+      definition.commands.some(marker => line.includes(marker))) {
+    return true
+  }
+  if (configSurfacePaths.has(path) &&
+      definition.configFields.some(marker => includesIdentifier(line, marker))) {
+    return true
+  }
+  if (uiSurfacePaths.has(path) &&
+      definition.uiFields.some(marker => includesIdentifier(line, marker))) {
+    return true
+  }
+  return dependencySurfacePaths.has(path) &&
+    definition.dependencies.some(marker => line.includes(marker))
+}
+
+function getBoundedLimit (value, ceiling) {
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, ceiling)
+    : ceiling
+}
+
+export async function scanProviderSurface (rootUrl, options = {}) {
+  const cwd = fileURLToPath(rootUrl)
+  const maxFileBytes = getBoundedLimit(
+    options.maxFileBytes,
+    MAX_PROVIDER_SURFACE_FILE_BYTES
   )
-  const result = definitions.map(([id]) => ({ id, hits: [] }))
+  const maxTotalBytes = getBoundedLimit(
+    options.maxTotalBytes,
+    MAX_PROVIDER_SURFACE_TOTAL_BYTES
+  )
+  const paths = await getCandidatePaths(cwd)
+  const definitions = createDefinitions()
+  const skipped = []
+  let bytesRead = 0
+
   for (const path of paths) {
-    const lines = (await readFile(resolve(cwd, path), 'utf8')).split('\n')
+    const absolutePath = resolve(cwd, path)
+    let fileStat
+    try {
+      fileStat = await lstat(absolutePath)
+    } catch {
+      skipped.push({ path, reason: 'unreadable', bytes: 0 })
+      continue
+    }
+    if (!fileStat.isFile()) {
+      skipped.push({ path, reason: 'not-regular-file', bytes: fileStat.size })
+      continue
+    }
+    if (fileStat.size > maxFileBytes) {
+      skipped.push({ path, reason: 'file-too-large', bytes: fileStat.size })
+      continue
+    }
+    if (bytesRead + fileStat.size > maxTotalBytes) {
+      skipped.push({ path, reason: 'total-budget-exceeded', bytes: fileStat.size })
+      continue
+    }
+
+    let content
+    try {
+      content = await readFile(absolutePath, 'utf8')
+    } catch {
+      skipped.push({ path, reason: 'unreadable', bytes: fileStat.size })
+      continue
+    }
+    bytesRead += fileStat.size
+
+    for (const definition of definitions) {
+      if (definition.exactSources.has(path)) addHit(definition, path, 1)
+    }
+
+    const lines = content.split('\n')
     lines.forEach((line, index) => {
-      definitions.forEach(([id, pattern], definitionIndex) => {
-        if (pattern.test(line)) result[definitionIndex].hits.push({ path, line: index + 1 })
+      const normalizedLine = line.toLowerCase()
+      definitions.forEach(definition => {
+        if (definition.markers.some(marker => normalizedLine.includes(marker)) ||
+            matchesScopedManifestEntry(definition, path, normalizedLine)) {
+          addHit(definition, path, index + 1)
+        }
       })
     })
   }
-  return result
+
+  return {
+    hits: definitions.map(({ id, hits }) => ({ id, hits })),
+    skipped,
+    bytesRead
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  console.log(JSON.stringify(await scanProviderSurface(new URL('../', import.meta.url)), null, 2))
+  const result = await scanProviderSurface(new URL('../', import.meta.url))
+  console.log(JSON.stringify({
+    categories: result.hits.map(({ id, hits }) => ({ id, hits: hits.length })),
+    skipped: result.skipped,
+    bytesRead: result.bytesRead
+  }, null, 2))
 }
