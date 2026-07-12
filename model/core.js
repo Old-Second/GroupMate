@@ -58,7 +58,7 @@ import Keyv from 'keyv'
 import crypto from 'crypto'
 import {GithubAPITool} from '../utils/tools/GithubTool.js'
 import { resolveLegacyConversationScope } from './legacy/conversation-scope.js'
-import { isLegacyToolExecutable } from './legacy/tool-visibility.js'
+import { executeLegacyToolCall } from './legacy/tool-execution.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -147,22 +147,6 @@ function finalizeSmartTrace (msg, trace) {
     msg.thinking_text = trace.join('\n\n')
   }
   return msg
-}
-
-function resolveToolCall (fullFuncMap, name) {
-  const normalizedName = name?.trim()
-  const aliases = {
-    mute: 'jinyan',
-    ban: 'jinyan',
-    jinyanTool: 'jinyan',
-    kick: 'kickOut',
-    kickout: 'kickOut'
-  }
-  const resolvedName = aliases[normalizedName] || normalizedName
-  return {
-    name: resolvedName,
-    tool: fullFuncMap[resolvedName]
-  }
 }
 
 function isSuccessfulToolResult (result) {
@@ -619,7 +603,6 @@ class Core {
               arguments: args
             } = msg.functionCall
             args = JSON.parse(args)
-            const resolvedTool = resolveToolCall(fullFuncMap, name)
             // 感觉换成targetGroupIdOrUserQQNumber这种表意比较清楚的变量名，效果会好一丢丢
             if (!args.groupId) {
               args.groupId = (e.group_id || e.sender.user_id) + ''
@@ -627,24 +610,27 @@ class Core {
             if (Number.isNaN(parseInt(args.groupId))) {
               args.groupId = (e.group_id || e.sender.user_id) + ''
             }
-            let functionResult
-            if (!resolvedTool.tool?.exec) {
-              functionResult = `tool ${name} is unavailable. Available tool names: ${Object.keys(fullFuncMap).join(', ')}`
-            } else if (!isLegacyToolExecutable({ toolName: resolvedTool.name, executableTools: funcMap })) {
-              functionResult = `tool ${resolvedTool.name} is unavailable in this chat scene or for the current requester permission`
-            } else {
-              functionResult = await resolvedTool.tool.exec.bind(this)(Object.assign({
+            const {
+              toolName,
+              result: functionResult
+            } = await executeLegacyToolCall({
+              requestedName: name,
+              fullFuncMap,
+              executableTools: funcMap,
+              toolArgs: Object.assign({
                 isAdmin,
                 sender
-              }, args), e)
-            }
+              }, args),
+              event: e,
+              receiver: this
+            })
             logger.mark(`function ${name} execution result: ${functionResult}`)
-            appendToolTrace(smartTrace, resolvedTool.name || name, args, functionResult)
+            appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
-            option.name = resolvedTool.name || name
-            option.toolCallId = msg.toolCalls?.[0]?.id || (resolvedTool.name || name).trim()
-            logger.mark(`[chatgpt-plugin] tool result feedback: name=${resolvedTool.name || name}, toolCallId=${option.toolCallId}`)
-            const finalizeAfterTool = shouldFinalizeAfterTool(resolvedTool.name || name, functionResult)
+            option.name = toolName
+            option.toolCallId = msg.toolCalls?.[0]?.id || toolName.trim()
+            logger.mark(`[chatgpt-plugin] tool result feedback: name=${toolName}, toolCallId=${option.toolCallId}`)
+            const finalizeAfterTool = shouldFinalizeAfterTool(toolName, functionResult)
             if (finalizeAfterTool) {
               disableFunctionCalling(option.completionParams)
             }
@@ -868,7 +854,6 @@ class Core {
               arguments: args
             } = msg.functionCall
             args = JSON.parse(args)
-            const resolvedTool = resolveToolCall(fullFuncMap, name)
             // 感觉换成targetGroupIdOrUserQQNumber这种表意比较清楚的变量名，效果会好一丢丢
             if (!args.groupId) {
               args.groupId = (e.group_id || e.sender.user_id) + ''
@@ -876,24 +861,27 @@ class Core {
             if (Number.isNaN(parseInt(args.groupId))) {
               args.groupId = (e.group_id || e.sender.user_id) + ''
             }
-            let functionResult
-            if (!resolvedTool.tool?.exec) {
-              functionResult = `tool ${name} is unavailable. Available tool names: ${Object.keys(fullFuncMap).join(', ')}`
-            } else if (!isLegacyToolExecutable({ toolName: resolvedTool.name, executableTools: funcMap })) {
-              functionResult = `tool ${resolvedTool.name} is unavailable in this chat scene or for the current requester permission`
-            } else {
-              functionResult = await resolvedTool.tool.exec.bind(this)(Object.assign({
+            const {
+              toolName,
+              result: functionResult
+            } = await executeLegacyToolCall({
+              requestedName: name,
+              fullFuncMap,
+              executableTools: funcMap,
+              toolArgs: Object.assign({
                 isAdmin,
                 sender
-              }, args), e)
-            }
+              }, args),
+              event: e,
+              receiver: this
+            })
             logger.mark(`function ${name} execution result: ${functionResult}`)
-            appendToolTrace(smartTrace, resolvedTool.name || name, args, functionResult)
+            appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
-            option.name = resolvedTool.name || name
-            option.toolCallId = msg.toolCalls?.[0]?.id || (resolvedTool.name || name).trim()
-            logger.mark(`[chatgpt-plugin] tool result feedback: name=${resolvedTool.name || name}, toolCallId=${option.toolCallId}`)
-            const finalizeAfterTool = shouldFinalizeAfterTool(resolvedTool.name || name, functionResult)
+            option.name = toolName
+            option.toolCallId = msg.toolCalls?.[0]?.id || toolName.trim()
+            logger.mark(`[chatgpt-plugin] tool result feedback: name=${toolName}, toolCallId=${option.toolCallId}`)
+            const finalizeAfterTool = shouldFinalizeAfterTool(toolName, functionResult)
             if (finalizeAfterTool) {
               disableFunctionCalling(option.completionParams)
             }
