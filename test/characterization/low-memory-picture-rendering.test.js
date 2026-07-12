@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
+import { buildGuobaSchemas } from '../../dist/runtime/guoba-schema.js'
 
 test('chat picture mode delegates one-shot rendering to the TypeScript coordinator', async () => {
   const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
@@ -50,11 +51,29 @@ test('local Chromium rendering always closes its page and optionally its browser
 test('low-memory browser cleanup is present in defaults, example config, and Guoba', async () => {
   const defaultConfig = await readFile(new URL('../../utils/config.js', import.meta.url), 'utf8')
   const exampleConfig = JSON.parse(await readFile(new URL('../../config/config.example.json', import.meta.url), 'utf8'))
-  const guoba = await readFile(new URL('../../guoba.support.js', import.meta.url), 'utf8')
+  const guoba = buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  }).find(item => item.field === 'closeBrowserAfterRender')
 
   assert.match(defaultConfig, /closeBrowserAfterRender:\s*true/)
   assert.equal(exampleConfig.closeBrowserAfterRender, true)
-  assert.match(guoba, /field:\s*'closeBrowserAfterRender'/)
-  assert.match(guoba, /关闭 Chromium/)
-  assert.match(guoba, /共享浏览器/)
+  assert.equal(guoba.field, 'closeBrowserAfterRender')
+  assert.match(guoba.label, /Chromium/)
+  assert.match(guoba.bottomHelpMessage, /共享浏览器/)
+})
+
+test('the optional legacy toolbox is disabled by default for low-memory hosts', async () => {
+  const defaultConfig = await readFile(new URL('../../utils/config.js', import.meta.url), 'utf8')
+  const exampleConfig = JSON.parse(await readFile(new URL('../../config/config.example.json', import.meta.url), 'utf8'))
+  const guoba = buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  }).find(item => item.field === 'enableToolbox')
+
+  assert.match(defaultConfig, /enableToolbox:\s*false/)
+  assert.equal(exampleConfig.enableToolbox, false)
+  assert.match(guoba.bottomHelpMessage, /增加.*内存占用/)
 })

@@ -6,6 +6,7 @@ import {
   selectImportableConfig,
   selectPersistedConfig
 } from '../../src/runtime/config-persistence.js'
+import { buildGuobaSchemas } from '../../src/runtime/guoba-schema.js'
 
 const root = process.cwd()
 
@@ -98,6 +99,116 @@ const preservedFields = [
   'toolVideoMaxMB'
 ] as const
 
+const requiredGuobaFields = [
+  'toggleMode',
+  'assistantLabel',
+  'enablePrivateChat',
+  'enableRobotAt',
+  'debug',
+  'proxy',
+  'defaultTimeoutMs',
+  'enableToolbox',
+  'closeBrowserAfterRender',
+  'apiKey',
+  'openAiBaseUrl',
+  'openAiForceUseReverse',
+  'model',
+  'apiStream',
+  'apiMaxToken',
+  'apiThinkingMode',
+  'apiReasoningEffort',
+  'promptPrefixOverride',
+  'temperature',
+  'forwardReasoning',
+  'smartMode',
+  'enableGroupContext',
+  'groupContextTip',
+  'groupContextLength',
+  'groupMerge',
+  'conversationPreserveTime',
+  'enableToolPrivateSend',
+  'enableToolCrossGroupSend',
+  'enableToolVideoDownload',
+  'toolVideoMaxMB',
+  'amapKey',
+  'azSerpKey',
+  'tavilyApiKey',
+  'braveSearchApiKey',
+  'serpSource',
+  'imageSearchSource',
+  'extraUrl',
+  'githubAPIKey',
+  'blockWords',
+  'promptBlockWords',
+  'whitelist',
+  'blacklist',
+  'imgOcr',
+  'quoteReply',
+  'defaultUsePicture',
+  'autoUsePicture',
+  'autoUsePictureThreshold',
+  'showQRCode',
+  'headless',
+  'chromePath',
+  'chromeTimeoutMS',
+  'chatViewWidth',
+  'toneStyle',
+  'serverPort',
+  'serverHost',
+  'viewHost',
+  'cloudRender',
+  'cloudDPR',
+  'chatViewBotName',
+  'groupAdminPage',
+  'live2d',
+  'live2dModel',
+  'live2dOption_scale',
+  'live2dOption_positionX',
+  'live2dOption_positionY',
+  'live2dOption_rotation',
+  'live2dOption_alpha',
+  'defaultUseTTS',
+  'alsoSendText',
+  'ttsMode',
+  'defaultTTSRole',
+  'ttsSpace',
+  'huggingFaceReverseProxy',
+  'voicevoxSpace',
+  'voicevoxTTSSpeaker',
+  'azureTTSKey',
+  'azureTTSRegion',
+  'azureTTSSpeaker',
+  'azureTTSEmotion',
+  'enhanceAzureTTSEmotion',
+  'ttsRegex',
+  'ttsAutoFallbackThreshold',
+  'autoJapanese',
+  'cloudTranscode',
+  'cloudMode',
+  'noiseScale',
+  'noiseScaleW',
+  'lengthScale',
+  'initiativeChatGroups',
+  'helloPrompt',
+  'helloInterval',
+  'helloProbability',
+  'emojiBaseURL',
+  'enableBYM',
+  'bymRate',
+  'bymDisableGroup',
+  'bymThinkingMode',
+  'bymReasoningEffort',
+  'bymPreset',
+  'bymFuckPrompt',
+  'bymFuckRecall',
+  'bymFuckRecallTime',
+  'bymFuckList',
+  'bymFuckBlacklist',
+  'sunoSessToken',
+  'sunoClientToken',
+  'enableChatSuno'
+] as const
+
 async function readSource (file: string): Promise<string> {
   return await readFile(path.join(root, file), 'utf8')
 }
@@ -118,16 +229,50 @@ test('default and example configuration expose only the supported provider', asy
 })
 
 test('Guoba and legacy settings view expose supported API, TTS and tool fields only', async () => {
-  const guoba = await readSource('guoba.support.js')
+  const guobaFields = new Set(buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  }).flatMap(schema => schema.field ? [schema.field] : []))
   const legacyView = await readSource('resources/view/setting_view.json')
 
   for (const field of removedFields) {
-    assert.doesNotMatch(guoba, new RegExp(`field: '${field}'`))
+    assert.equal(guobaFields.has(field), false, `${field} must be removed from Guoba`)
     assert.doesNotMatch(legacyView, new RegExp(`"data"\\s*:\\s*"${field}"`))
   }
   for (const field of preservedFields) {
-    assert.match(guoba, new RegExp(`field: '${field}'`), `${field} must remain in Guoba`)
+    assert.equal(guobaFields.has(field), true, `${field} must remain in Guoba`)
     assert.match(legacyView, new RegExp(`"data"\\s*:\\s*"${field}"`), `${field} must remain in the legacy view`)
+  }
+})
+
+test('Guoba exposes every supported user-facing configuration with an explanation', async () => {
+  const configSource = await readSource('utils/config.js')
+  const configExample = JSON.parse(await readSource('config/config.example.json')) as Record<string, unknown>
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [],
+    voicevoxRoleOptions: [],
+    azureRoleOptions: []
+  })
+  const fields = new Map(schemas.flatMap(schema =>
+    schema.field ? [[schema.field, schema] as const] : []
+  ))
+  const fieldCount = schemas.filter(schema => schema.field).length
+
+  assert.equal(fields.size, fieldCount, 'Guoba field names must be unique')
+
+  for (const field of requiredGuobaFields) {
+    assert.equal(fields.has(field), true, `${field} must be configurable in Guoba`)
+    assert.match(configSource, new RegExp(`^  ${field}:`, 'm'), `${field} must have a runtime default`)
+    assert.equal(Object.hasOwn(configExample, field), true, `${field} must have a safe example value`)
+  }
+
+  for (const [field, schema] of fields) {
+    assert.equal(
+      typeof schema.bottomHelpMessage === 'string' && schema.bottomHelpMessage.trim().length > 0,
+      true,
+      `${field} must explain its behavior in Guoba`
+    )
   }
 })
 
