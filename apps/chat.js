@@ -648,7 +648,7 @@ export class chatgpt extends plugin {
       }
     }
     if (Config.debug) {
-      logger.debug(createChatRequestLog({ mode: use, stream: Config.apiStream, prompt }))
+      logger.info(createChatRequestLog({ mode: use, stream: Config.apiStream, prompt }))
     }
     const conversationScope = getConversationScope(e)
     let previousConversation
@@ -779,7 +779,7 @@ export class chatgpt extends plugin {
           previousConversation.messages.push(chatMessage.message)
         }
         if (Config.debug) {
-          logger.debug(createChatResponseLog({ mode: use, response: chatMessage }))
+          logger.info(createChatResponseLog({ mode: use, response: chatMessage }))
         }
         if (!chatMessage.error) {
           // 没错误的时候再更新，不然易出错就对话没了

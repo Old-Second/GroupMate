@@ -584,7 +584,7 @@ class Core {
         try {
           this.qwenApi = new QwenApi(opts)
           msg = await this.qwenApi.sendMessage(prompt, option)
-          if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+          if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
           let toolCallCount = 0
           const smartTrace = []
           appendReasoningTrace(smartTrace, msg, '模型思考 1')
@@ -595,7 +595,7 @@ class Core {
               option.name = msg.functionCall.name
               disableFunctionCalling(option.completionParams)
               msg = await this.qwenApi.sendMessage('tool call limit reached. Please answer the user now based on the previous tool results. Do not call more tools.', option, 'tool')
-              if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+              if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
               appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 2}`)
               break
             }
@@ -630,7 +630,7 @@ class Core {
               event: e,
               receiver: this
             })
-            if (Config.debug) logger.debug(createToolExecutionLog({ name, result: functionResult }))
+            if (Config.debug) logger.info(createToolExecutionLog({ name, result: functionResult }))
             appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
             option.name = toolName
@@ -646,7 +646,7 @@ class Core {
               option,
               'tool'
             )
-            if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+            if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
             appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 1}`)
             if (finalizeAfterTool) {
               break
@@ -829,7 +829,7 @@ class Core {
         let msg
         try {
           msg = await this.chatGPTApi.sendMessage(prompt, option)
-          if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+          if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
           let toolCallCount = 0
           const smartTrace = []
           appendReasoningTrace(smartTrace, msg, '模型思考 1')
@@ -841,7 +841,7 @@ class Core {
               option.toolCallId = msg.toolCalls?.[0]?.id
               disableFunctionCalling(option.completionParams)
               msg = await this.chatGPTApi.sendMessage('tool call limit reached. Please answer the user now based on the previous tool results. Do not call more tools.', option, 'tool')
-              if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+              if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
               appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 2}`)
               break
             }
@@ -876,7 +876,7 @@ class Core {
               event: e,
               receiver: this
             })
-            if (Config.debug) logger.debug(createToolExecutionLog({ name, result: functionResult }))
+            if (Config.debug) logger.info(createToolExecutionLog({ name, result: functionResult }))
             appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
             option.name = toolName
@@ -892,7 +892,7 @@ class Core {
               option,
               'tool'
             )
-            if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
+            if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
             appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 1}`)
             if (finalizeAfterTool) {
               break

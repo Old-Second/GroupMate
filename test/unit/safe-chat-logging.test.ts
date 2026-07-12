@@ -117,3 +117,14 @@ test('active chat sources do not pass raw conversation values to loggers', () =>
 
   assert.deepEqual(offenders, [])
 })
+
+test('safe chat summaries use a visible log level behind the debug switch', () => {
+  const chatSource = readFileSync(path.join(projectRoot, 'apps', 'chat.js'), 'utf8')
+  const coreSource = readFileSync(path.join(projectRoot, 'model', 'core.js'), 'utf8')
+
+  assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatRequestLog/)
+  assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatResponseLog/)
+  assert.match(coreSource, /if \(Config\.debug\) logger\.info\(createChatResponseLog/)
+  assert.match(coreSource, /if \(Config\.debug\) logger\.info\(createToolExecutionLog/)
+  assert.doesNotMatch(`${chatSource}\n${coreSource}`, /logger\.debug\(create(?:Chat|Tool)/)
+})
