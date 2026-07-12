@@ -16,7 +16,15 @@ Do not rebuild or hand-edit files in `server/static/` unless the corresponding m
 
 ## Coding Style & Naming Conventions
 
-Follow the existing JavaScript style: two-space indentation, single quotes, no semicolons, and a space before function parentheses (`async sendMessage ()`). Use ESM `import`/`export`. Name classes and client/tool files in PascalCase (`BaseClient.js`, `WeatherTool.js`), functions and variables in camelCase, and command-handler files in lowercase or snake_case. Keep provider-specific behavior in its adapter rather than adding branches to shared utilities.
+While touching legacy JavaScript, preserve its existing style: two-space indentation, single quotes, no semicolons, and a space before function parentheses (`async sendMessage ()`). New and refactored code must use TypeScript with ESM `import`/`export` and project-wide compiler and lint settings. Name classes and client/tool files in PascalCase (`BaseClient.ts`, `WeatherTool.ts`), functions and variables in camelCase, and command-handler files in lowercase or snake_case. Keep provider-specific behavior in its adapter rather than adding branches to shared utilities.
+
+## TypeScript Migration Policy
+
+- TypeScript is the required language for all new or refactored source code wherever the host runtime and toolchain can reasonably support it. This includes the agent kernel, application handlers, adapters, tools, shared utilities, tests, and project-owned build or migration scripts.
+- Migrate legacy JavaScript incrementally as each module is refactored; do not perform blind extension-only renames. Preserve observable behavior with characterization tests and keep the plugin compatible with the Yunzai host and its supported Node.js runtime.
+- Establish a single TypeScript build/runtime path before switching entry points. TypeScript must become the source of truth; do not maintain independently editable `.ts` and `.js` copies of the same module.
+- JavaScript may remain only when an external host interface, configuration format, generated output, vendored dependency, or unavailable build path genuinely requires it. Document such exceptions close to the file or in the relevant refactoring record.
+- Do not hand-edit compiled JavaScript. Commit generated JavaScript only when deployment cannot consume TypeScript or build it safely on the memory-constrained remote host; otherwise keep build artifacts out of version control.
 
 ## Testing Guidelines
 
@@ -54,6 +62,6 @@ Never commit API keys, tokens, cookies, chat history, or generated data. Real co
 - Preserve the current `v2` branch as the historical baseline. On the new project branch, retain the entire legacy project state as one aggregated snapshot commit before adding refactoring commits.
 - The aggregated legacy root is `3a71182c` and preserves the runtime-relevant customization baseline from `caf7c4c`; obsolete generated, duplicate, and non-runtime files are intentionally excluded. The `groupmate` and `v2` histories intentionally have no common parent; never merge an upstream branch into `groupmate` without an explicit patch-level review.
 - Commit messages must keep a conventional type prefix such as `feat:` or `docs:`, but the descriptive text after the prefix must be written in Chinese.
-- The canonical refactoring phases are maintained in `docs/refactor/roadmap.md`; do not commit internal research, spec, or one-off execution-plan artifacts.
+- Keep phase roadmaps, research, specs, implementation plans, review reports, acceptance checklists, and raw baseline evidence as local-only working material. Do not commit them. Promote only stable user, deployment, architecture, API, or contributor documentation into project history.
 - Use `https://github.com/yaowan233/nonebot-plugin-ai-groupmate` as a product and architecture reference for group cognition, proactive reply decisions, long-term memory, learned group culture and memes, tool extension, execution budgets, caching, and tests.
 - The reference project is inspiration and comparison material, not a dependency or a codebase to transplant. Keep the selected self-built kernel and OpenAI-compatible-only provider scope; do not introduce LangChain. Check licensing and preserve required attribution before reusing any implementation detail.
