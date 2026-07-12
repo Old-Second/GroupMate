@@ -59,6 +59,11 @@ import crypto from 'crypto'
 import {GithubAPITool} from '../utils/tools/GithubTool.js'
 import { resolveLegacyConversationScope } from './legacy/conversation-scope.js'
 import { executeLegacyToolCall } from './legacy/tool-execution.js'
+import {
+  createChatErrorLog,
+  createChatResponseLog,
+  createToolExecutionLog
+} from '../dist/runtime/safe-chat-logging.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -579,7 +584,7 @@ class Core {
         try {
           this.qwenApi = new QwenApi(opts)
           msg = await this.qwenApi.sendMessage(prompt, option)
-          logger.info(msg)
+          if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
           let toolCallCount = 0
           const smartTrace = []
           appendReasoningTrace(smartTrace, msg, '模型思考 1')
@@ -590,7 +595,7 @@ class Core {
               option.name = msg.functionCall.name
               disableFunctionCalling(option.completionParams)
               msg = await this.qwenApi.sendMessage('tool call limit reached. Please answer the user now based on the previous tool results. Do not call more tools.', option, 'tool')
-              logger.info(msg)
+              if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
               appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 2}`)
               break
             }
@@ -625,12 +630,11 @@ class Core {
               event: e,
               receiver: this
             })
-            logger.mark(`function ${name} execution result: ${functionResult}`)
+            if (Config.debug) logger.debug(createToolExecutionLog({ name, result: functionResult }))
             appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
             option.name = toolName
             option.toolCallId = msg.toolCalls?.[0]?.id || toolName.trim()
-            logger.mark(`[chatgpt-plugin] tool result feedback: name=${toolName}, toolCallId=${option.toolCallId}`)
             const finalizeAfterTool = shouldFinalizeAfterTool(toolName, functionResult)
             if (finalizeAfterTool) {
               disableFunctionCalling(option.completionParams)
@@ -642,7 +646,7 @@ class Core {
               option,
               'tool'
             )
-            logger.info(msg)
+            if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
             appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 1}`)
             if (finalizeAfterTool) {
               break
@@ -650,7 +654,7 @@ class Core {
           }
           finalizeSmartTrace(msg, smartTrace)
         } catch (err) {
-          logger.error(err)
+          logger.error(createChatErrorLog({ mode: use, error: err }))
           throw new Error(err)
         }
         return msg
@@ -660,7 +664,7 @@ class Core {
           this.qwenApi = new QwenApi(opts)
           msg = await this.qwenApi.sendMessage(prompt, option)
         } catch (err) {
-          logger.error(err)
+          logger.error(createChatErrorLog({ mode: use, error: err }))
           throw new Error(err)
         }
         return msg
@@ -767,7 +771,6 @@ class Core {
       if (Config.enableChatSuno) {
         system += 'If I ask you to generate music or write songs, you need to reply with information suitable for Suno to generate music. Please use keywords such as Verse, Chorus, Bridge, Outro, and End to segment the lyrics, such as [Verse 1], The returned song information needs to be wrapped in JSON format and sent to me in Markdown format. The message structure is ` ` JSON {"option": "Suno", "tags": "style", "title": "title of The Song", "lyrics": "lyrics"} `.'
       }
-      logger.debug(system)
       let opts = {
         apiBaseUrl: Config.openAiBaseUrl,
         apiKey: Config.apiKey,
@@ -797,11 +800,7 @@ class Core {
         timeoutMs: 600000,
         completionParams,
         stream: Config.apiStream,
-        onProgress: (data) => {
-          if (Config.debug) {
-            logger.info(data?.text || data.functionCall || data)
-          }
-        }
+        onProgress: () => {}
         // systemMessage: promptPrefix
       }
       option.systemMessage = system
@@ -830,7 +829,7 @@ class Core {
         let msg
         try {
           msg = await this.chatGPTApi.sendMessage(prompt, option)
-          logger.info(msg)
+          if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
           let toolCallCount = 0
           const smartTrace = []
           appendReasoningTrace(smartTrace, msg, '模型思考 1')
@@ -842,7 +841,7 @@ class Core {
               option.toolCallId = msg.toolCalls?.[0]?.id
               disableFunctionCalling(option.completionParams)
               msg = await this.chatGPTApi.sendMessage('tool call limit reached. Please answer the user now based on the previous tool results. Do not call more tools.', option, 'tool')
-              logger.info(msg)
+              if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
               appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 2}`)
               break
             }
@@ -877,12 +876,11 @@ class Core {
               event: e,
               receiver: this
             })
-            logger.mark(`function ${name} execution result: ${functionResult}`)
+            if (Config.debug) logger.debug(createToolExecutionLog({ name, result: functionResult }))
             appendToolTrace(smartTrace, toolName, args, functionResult)
             option.parentMessageId = msg.id
             option.name = toolName
             option.toolCallId = msg.toolCalls?.[0]?.id || toolName.trim()
-            logger.mark(`[chatgpt-plugin] tool result feedback: name=${toolName}, toolCallId=${option.toolCallId}`)
             const finalizeAfterTool = shouldFinalizeAfterTool(toolName, functionResult)
             if (finalizeAfterTool) {
               disableFunctionCalling(option.completionParams)
@@ -894,7 +892,7 @@ class Core {
               option,
               'tool'
             )
-            logger.info(msg)
+            if (Config.debug) logger.debug(createChatResponseLog({ mode: use, response: msg }))
             appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 1}`)
             if (finalizeAfterTool) {
               break
@@ -903,13 +901,13 @@ class Core {
           finalizeSmartTrace(msg, smartTrace)
         } catch (err) {
           if (err.message?.indexOf('context_length_exceeded') > 0) {
-            logger.warn(err)
+            logger.warn(createChatErrorLog({ mode: use, error: err }))
             await redis.del(`CHATGPT:CONVERSATIONS:${getConversationScope(e)}`)
             await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
             await e.reply('字数超限啦，将为您自动结束本次对话。')
             return null
           } else {
-            logger.error(err)
+            logger.error(createChatErrorLog({ mode: use, error: err }))
             throw new Error(err)
           }
         }
@@ -920,13 +918,13 @@ class Core {
           msg = await this.chatGPTApi.sendMessage(prompt, option)
         } catch (err) {
           if (err.message?.indexOf('context_length_exceeded') > 0) {
-            logger.warn(err)
+            logger.warn(createChatErrorLog({ mode: use, error: err }))
             await redis.del(`CHATGPT:CONVERSATIONS:${getConversationScope(e)}`)
             await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
             await e.reply('字数超限啦，将为您自动结束本次对话。')
             return null
           } else {
-            logger.error(err)
+            logger.error(createChatErrorLog({ mode: use, error: err }))
             throw new Error(err)
           }
         }

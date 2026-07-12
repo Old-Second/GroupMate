@@ -39,6 +39,11 @@ import {
   selectLegacyPresentationMode
 } from '../model/legacy/reply-presenter.js'
 import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
+import {
+  createChatErrorLog,
+  createChatRequestLog,
+  createChatResponseLog
+} from '../dist/runtime/safe-chat-logging.js'
 
 let version = Config.version
 let proxy = getProxy()
@@ -527,7 +532,7 @@ export class chatgpt extends plugin {
           }
         }
       } catch (err) {
-        logger.warn(err)
+        logger.warn(createChatErrorLog({ error: err }))
       }
     } else {
       let ats = e.message.filter(m => m.type === 'at')
@@ -642,7 +647,9 @@ export class chatgpt extends plugin {
           break
       }
     }
-    logger.info(`chatgpt prompt: ${prompt}`)
+    if (Config.debug) {
+      logger.debug(createChatRequestLog({ mode: use, stream: Config.apiStream, prompt }))
+    }
     const conversationScope = getConversationScope(e)
     let previousConversation
     let conversation = {}
@@ -658,9 +665,6 @@ export class chatgpt extends plugin {
         conversation = {
           conversationId,
           parentMessageId: lastMessageId
-        }
-        if (Config.debug) {
-          logger.mark({ previousConversation })
         }
       } else {
         let ctime = new Date()
@@ -727,9 +731,6 @@ export class chatgpt extends plugin {
         conversation: {}
       })
       previousConversation = JSON.parse(previousConversation)
-      if (Config.debug) {
-        logger.info({ previousConversation })
-      }
       conversation = {
         messages: previousConversation.messages,
         conversationId: previousConversation.conversation?.conversationId,
@@ -744,9 +745,6 @@ export class chatgpt extends plugin {
       has: (arg1) => false
     }
     try {
-      if (Config.debug) {
-        logger.mark({ conversation })
-      }
       let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, use, e)
       if (chatMessage?.noMsg) {
         return false
@@ -781,7 +779,7 @@ export class chatgpt extends plugin {
           previousConversation.messages.push(chatMessage.message)
         }
         if (Config.debug) {
-          logger.info(chatMessage)
+          logger.debug(createChatResponseLog({ mode: use, response: chatMessage }))
         }
         if (!chatMessage.error) {
           // 没错误的时候再更新，不然易出错就对话没了
@@ -989,7 +987,7 @@ export class chatgpt extends plugin {
           await this.renderImage(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls)
         } catch (err) {
           logger.warn('error happened while uploading content to the cache server. QR Code will not be showed in this picture.')
-          logger.error(err)
+          logger.error(createChatErrorLog({ mode: use, error: err }))
           await this.renderImage(e, use, response, prompt)
         }
         if (Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
@@ -1034,8 +1032,6 @@ export class chatgpt extends plugin {
           if (Config.forwardReasoning) {
             let thinkingForward = await common.makeForwardMsg(e, buildLegacyThinkingForwardMessages(thinking, thinkingSegments), '思考过程')
             this.reply(thinkingForward)
-          } else {
-            logger.mark('思考过程', thinking)
           }
         }
 
@@ -1044,7 +1040,7 @@ export class chatgpt extends plugin {
         }
       }
     } catch (err) {
-      logger.error(err)
+      logger.error(createChatErrorLog({ mode: use, error: err }))
       if (use === 'api3') {
         // 异常了也要腾地方（todo 大概率后面的也会异常，要不要一口气全杀了）
         await redis.lPop('CHATGPT:CHAT_QUEUE', 0)
