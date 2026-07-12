@@ -39,6 +39,7 @@ import {
   selectLegacyPresentationMode
 } from '../model/legacy/reply-presenter.js'
 import { pluginDirectoryName } from '../dist/runtime/plugin-context.js'
+import { presentPictureReply } from '../dist/runtime/picture-reply.js'
 import {
   createChatErrorLog,
   createChatRequestLog,
@@ -918,6 +919,39 @@ export class chatgpt extends plugin {
         responseLength: response.length,
         autoPictureThreshold: Config.autoUsePictureThreshold
       })
+      const sendTextReply = async () => {
+        let responseText = await convertFaces(response, Config.enableRobotAt, e)
+        if (handler.has('chatgpt.markdown.convert')) {
+          responseText = await handler.call('chatgpt.markdown.convert', this.e, {
+            content: responseText,
+            use,
+            prompt
+          })
+        }
+        if (quotemessage.length > 0) {
+          await this.reply(await makeForwardMsg(this.e, buildLegacyQuoteForwardMessages(quotemessage)))
+        }
+        if (chatMessage?.conversation && Config.enableSuggestedResponses && !chatMessage.suggestedResponses && Config.apiKey) {
+          try {
+            chatMessage.suggestedResponses = await generateSuggestedResponse(chatMessage.conversation)
+          } catch (err) {
+            logger.debug('生成建议回复失败', err)
+          }
+        }
+        await this.reply(responseText, e.isGroup, {
+          btnData: {
+            use,
+            suggested: chatMessage.suggestedResponses
+          }
+        })
+        if (thinking && Config.forwardReasoning) {
+          const thinkingForward = await common.makeForwardMsg(e, buildLegacyThinkingForwardMessages(thinking, thinkingSegments), '思考过程')
+          await this.reply(thinkingForward)
+        }
+        if (Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
+          await this.reply(`建议的回复：\n${chatMessage.suggestedResponses}`)
+        }
+      }
       if (presentationMode === 'tts') {
         // 缓存数据
         this.cacheContent(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls)
@@ -983,14 +1017,12 @@ export class chatgpt extends plugin {
           await this.reply('合成语音发生错误~')
         }
       } else if (presentationMode === 'picture') {
-        try {
-          await this.renderImage(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls)
-        } catch (err) {
-          logger.warn('error happened while uploading content to the cache server. QR Code will not be showed in this picture.')
-          logger.error(createChatErrorLog({ mode: use, error: err }))
-          await this.renderImage(e, use, response, prompt)
-        }
-        if (Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
+        const pictureReplyResult = await presentPictureReply({
+          renderPicture: async () => await this.renderImage(e, use, response, prompt, quotemessage, mood, chatMessage.suggestedResponses, imgUrls),
+          sendTextFallback: sendTextReply,
+          reportFailure: (error) => logger.error(createChatErrorLog({ mode: 'picture', error }))
+        })
+        if (pictureReplyResult === 'picture' && Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
           this.reply(`建议的回复：\n${chatMessage.suggestedResponses}`)
         }
       } else {
@@ -1003,41 +1035,7 @@ export class chatgpt extends plugin {
           this.reply('今日对话已达上限')
           return false
         }
-        let responseText = await convertFaces(response, Config.enableRobotAt, e)
-        if (handler.has('chatgpt.markdown.convert')) {
-          responseText = await handler.call('chatgpt.markdown.convert', this.e, {
-            content: responseText,
-            use,
-            prompt
-          })
-        }
-        // await this.reply(responseText, e.isGroup)
-        if (quotemessage.length > 0) {
-          this.reply(await makeForwardMsg(this.e, buildLegacyQuoteForwardMessages(quotemessage)))
-        }
-        if (chatMessage?.conversation && Config.enableSuggestedResponses && !chatMessage.suggestedResponses && Config.apiKey) {
-          try {
-            chatMessage.suggestedResponses = await generateSuggestedResponse(chatMessage.conversation)
-          } catch (err) {
-            logger.debug('生成建议回复失败', err)
-          }
-        }
-        this.reply(responseText, e.isGroup, {
-          btnData: {
-            use,
-            suggested: chatMessage.suggestedResponses
-          }
-        })
-        if (thinking) {
-          if (Config.forwardReasoning) {
-            let thinkingForward = await common.makeForwardMsg(e, buildLegacyThinkingForwardMessages(thinking, thinkingSegments), '思考过程')
-            this.reply(thinkingForward)
-          }
-        }
-
-        if (Config.enableSuggestedResponses && chatMessage.suggestedResponses) {
-          this.reply(`建议的回复：\n${chatMessage.suggestedResponses}`)
-        }
+        await sendTextReply()
       }
     } catch (err) {
       logger.error(createChatErrorLog({ mode: use, error: err }))
@@ -1146,21 +1144,22 @@ export class chatgpt extends plugin {
   }
 
   async renderImage (e, use, content, prompt, quote = [], mood = '', suggest = '', imgUrls = []) {
-    let cacheData = await this.cacheContent(e, use, content, prompt, quote, mood, suggest, imgUrls)
-    // const template = use !== 'bing' ? 'content/ChatGPT/index' : 'content/Bing/index'
-    if (cacheData.error || cacheData.status != 200) {
-      await this.reply(`出现错误：${cacheData.error || 'server error ' + cacheData.status}`, true)
-    } else {
-      await this.reply(await renderUrl(e, (Config.viewHost ? `${Config.viewHost}/` : `http://127.0.0.1:${Config.serverPort || 3321}/`) + `page/${cacheData.file}?qr=${Config.showQRCode ? 'true' : 'false'}`, {
-        retType: Config.quoteReply ? 'base64' : '',
-        Viewport: {
-          width: parseInt(Config.chatViewWidth),
-          height: parseInt(parseInt(Config.chatViewWidth) * 0.56)
-        },
-        func: (parseFloat(Config.live2d) && !Config.viewHost) ? 'window.Live2d == true' : '',
-        deviceScaleFactor: parseFloat(Config.cloudDPR)
-      }), e.isGroup && Config.quoteReply)
-    }
+    const cacheData = await this.cacheContent(e, use, content, prompt, quote, mood, suggest, imgUrls)
+    if (!cacheData || cacheData.error || cacheData.status != 200) return false
+
+    const image = await renderUrl(e, (Config.viewHost ? `${Config.viewHost}/` : `http://127.0.0.1:${Config.serverPort || 3321}/`) + `page/${cacheData.file}?qr=${Config.showQRCode ? 'true' : 'false'}`, {
+      retType: 'base64',
+      Viewport: {
+        width: parseInt(Config.chatViewWidth),
+        height: parseInt(parseInt(Config.chatViewWidth) * 0.56)
+      },
+      func: (parseFloat(Config.live2d) && !Config.viewHost) ? 'window.Live2d == true' : '',
+      deviceScaleFactor: parseFloat(Config.cloudDPR)
+    })
+    if (!image) return false
+
+    await this.reply(image, e.isGroup && Config.quoteReply)
+    return true
   }
 
   async newxhBotConversation (e) {

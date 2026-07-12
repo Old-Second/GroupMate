@@ -68,6 +68,7 @@
   "sydneyApologyIgnored": true,
   "enforceMaster": false,
   "serverPort": 3321,
+  "closeBrowserAfterRender": true,
   "serverHost": "",
   "viewHost": "",
   "chatViewWidth": 1280,

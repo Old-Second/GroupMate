@@ -77,6 +77,12 @@ export function supportGuoba () {
           component: 'Switch'
         },
         {
+          field: 'closeBrowserAfterRender',
+          label: '图片渲染后关闭 Chromium',
+          bottomHelpMessage: '降低 Chromium 常驻内存，但每次图片回复需要重新启动浏览器、响应更慢。修改后无需重启。',
+          component: 'Switch'
+        },
+        {
           field: 'enableToolPrivateSend',
           label: '允许智能模式私聊',
           bottomHelpMessage: '是否允许智能模式下发起临时对话骚扰其他群友。默认开启，如果怕Bot乱骚扰其他人可以关闭。主人不受影响。',

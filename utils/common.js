@@ -13,6 +13,7 @@ import AzureTTS, { supportConfigurations as azureRoleList } from './tts/microsof
 import { translate } from './translate.js'
 import uploadRecord from './uploadRecord.js'
 import Version from './version.js'
+import { createChatErrorLog } from '../dist/runtime/safe-chat-logging.js'
 import fetch, { FormData, fileFromSync } from 'node-fetch'
 import https from 'https'
 let pdfjsLib
@@ -349,26 +350,31 @@ export async function renderUrl (e, url, renderCfg = {}) {
     }
   }
 
-  await _puppeteer.browserInit()
-  const page = await _puppeteer.browser.newPage()
+  let page
   let base64
   try {
-    await page.goto(url, { timeout: 120000 , waitUntil: 'networkidle0' })
+    await _puppeteer.browserInit()
+    page = await _puppeteer.browser.newPage()
     await page.setViewport(renderCfg.Viewport || {
       width: 1280,
       height: 720
     })
-    let buff = await page.screenshot({ fullPage: true });
-    let buffer = Buffer.from(buff).toString('base64');
-    base64 = segment.image(`base64://${buffer}`);
-    await page.close().catch((err) => logger.error(err))
+    await page.goto(url, { timeout: 120000, waitUntil: 'networkidle0' })
+    const buff = await page.screenshot({ fullPage: true })
+    const imageBase64 = Buffer.from(buff).toString('base64')
+    base64 = segment.image(`base64://${imageBase64}`)
   } catch (error) {
-    logger.error(`${url}图片生成失败:${error}`)
-    /** 关闭浏览器 */
-    if (_puppeteer.browser) {
-      await _puppeteer.browser.close().catch((err) => logger.error(err))
+    logger.error(createChatErrorLog({ mode: 'picture', error }))
+  } finally {
+    await page?.close().catch(error => {
+      logger.warn(createChatErrorLog({ mode: 'picture_cleanup', error }))
+    })
+    if (Config.closeBrowserAfterRender && _puppeteer.browser) {
+      await _puppeteer.browser.close().catch(error => {
+        logger.warn(createChatErrorLog({ mode: 'picture_cleanup', error }))
+      })
+      _puppeteer.browser = false
     }
-    _puppeteer.browser = false
   }
 
   if (renderCfg.retType === 'base64') {

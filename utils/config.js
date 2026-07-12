@@ -186,6 +186,7 @@ const defaultConfig = {
   translateSource: 'openai',
   enableMd: false, // 第三方md，非QQBot。需要适配器实现segment.markdown和segment.button方可使用，否则不建议开启，会造成各种错误
   enableToolbox: true, // 默认关闭工具箱节省占用和加速启动
+  closeBrowserAfterRender: true,
   enableBYM: false,
   // 触发对话的概率，百分比。比如5%就写5
   bymRate: 5,
