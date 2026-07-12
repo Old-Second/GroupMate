@@ -16,10 +16,12 @@ const providerIds = [
 
 test('provider manifest defines every baseline category with exact source entries', () => {
   assert.deepEqual(Object.keys(providerSurfaceManifest.sources), providerIds)
-  for (const providerId of providerIds) {
-    assert.ok(
-      providerSurfaceManifest.sources[providerId].length > 0,
-      `${providerId} must define at least one exact source`
+  assert.ok(providerSurfaceManifest.sources.openaiCompatible.length > 0)
+  for (const providerId of providerIds.slice(1)) {
+    assert.deepEqual(
+      providerSurfaceManifest.sources[providerId],
+      [],
+      `${providerId} must have no retained exact source`
     )
   }
 })

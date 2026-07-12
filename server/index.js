@@ -190,30 +190,7 @@ export async function createServer () {
       const filepath = path.join(dir, filename)
       const regexUrl = /\b((?:https?|ftp|file):\/\/[-a-zA-Z0-9+&@#\/%?=~_|!:,.;]*[-a-zA-Z0-9+&@#\/%=~_|])/g
       const ip = await getPublicIP()
-      let botName = ''
-      switch (body.model) {
-        case 'bing':
-          botName = 'Bing'
-          break
-        case 'api':
-          botName = 'ChatGPT'
-          break
-        case 'api3':
-          botName = 'ChatGPT'
-          break
-        case 'browser':
-          botName = 'ChatGPT'
-          break
-        case 'chatglm':
-          botName = 'ChatGLM'
-          break
-        case 'claude':
-          botName = 'Claude'
-          break
-        default:
-          botName = body.model
-          break
-      }
+      const botName = Config.assistantLabel || 'GroupMate'
       try {
         fs.mkdirSync(dir, { recursive: true })
         const data = {

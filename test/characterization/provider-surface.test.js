@@ -30,6 +30,16 @@ test('provider inventory reports every category throughout removal', async () =>
   )))
 })
 
+test('removed provider categories reach exact zero', async () => {
+  const result = await scanProviderSurface(new URL('../../', import.meta.url))
+  const byId = Object.fromEntries(result.hits.map(item => [item.id, item.hits]))
+
+  for (const id of ['chatgptWeb', 'bing', 'claude', 'gemini', 'qwen', 'chatglm', 'xinghuo', 'azureOpenai']) {
+    assert.deepEqual(byId[id], [], `${id} must have no remaining surface`)
+  }
+  assert.ok(byId.openaiCompatible.length > 0)
+})
+
 test('provider inventory skips oversized tracked files before the read budget is consumed', async (t) => {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'groupmate-provider-surface-'))
   t.after(() => rm(fixtureRoot, { recursive: true, force: true }))

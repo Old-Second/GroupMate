@@ -4,18 +4,10 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  '@google/generative-ai@0.1.1':
-    hash: 8081d958bb4b17364595dd366b2996fb1468f43be7f1585bda8169791c4bac6e
-    path: patches/@google__generative-ai@0.1.1.patch
-
 importers:
 
   .:
     dependencies:
-      '@azure/openai':
-        specifier: ^1.0.0-beta.1
-        version: 1.0.0-beta.5
       '@fastify/cookie':
         specifier: ^8.3.0
         version: 8.3.0
@@ -28,21 +20,12 @@ importers:
       '@fastify/websocket':
         specifier: ^8.2.0
         version: 8.2.0
-      '@google/generative-ai':
-        specifier: ^0.1.1
-        version: 0.1.1(patch_hash=8081d958bb4b17364595dd366b2996fb1468f43be7f1585bda8169791c4bac6e)
-      asn1.js:
-        specifier: ^5.0.0
-        version: 5.4.1
       diff:
         specifier: ^5.1.0
         version: 5.1.0
       emoji-strip:
         specifier: ^1.0.1
         version: 1.0.1
-      eventsource:
-        specifier: ^2.0.2
-        version: 2.0.2
       eventsource-parser:
         specifier: ^1.0.0
         version: 1.0.0
@@ -73,9 +56,6 @@ importers:
       node-fetch:
         specifier: ^3.3.1
         version: 3.3.1
-      openai:
-        specifier: ^3.2.1
-        version: 3.3.0
       p-timeout:
         specifier: ^6.1.2
         version: 6.1.2
@@ -111,9 +91,6 @@ importers:
       '@node-rs/jieba':
         specifier: ^1.6.2
         version: 1.7.0
-      cycletls:
-        specifier: ^1.0.21
-        version: 1.0.21
       jimp:
         specifier: ^0.22.7
         version: 0.22.8
@@ -137,42 +114,6 @@ importers:
         version: 0.18.5
 
 packages:
-
-  '@azure-rest/core-client@1.1.4':
-    resolution: {integrity: sha512-RUIQOA8T0WcbNlddr8hjl2MuC5GVRqmMwPXqBVsgvdKesLy+eg3y/6nf3qe2fvcJMI1gF6VtgU5U4hRaR4w4ag==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/abort-controller@1.1.0':
-    resolution: {integrity: sha512-TrRLIoSQVzfAJX9H1JeFjzAoDGcoK1IYX1UImfceTZpsyYfWr09Ss1aHW1y5TrrR3iq6RZLBwJ3E24uwPhwahw==}
-    engines: {node: '>=12.0.0'}
-
-  '@azure/core-auth@1.5.0':
-    resolution: {integrity: sha512-udzoBuYG1VBoHVohDTrvKjyzel34zt77Bhp7dQntVGGD0ehVq48owENbBG8fIgkHRNUBQH5k1r0hpoMu5L8+kw==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/core-lro@2.5.4':
-    resolution: {integrity: sha512-3GJiMVH7/10bulzOKGrrLeG/uCBH/9VtxqaMcB9lIqAeamI/xYQSHJL/KcsLDuH+yTjYpro/u6D/MuRe4dN70Q==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/core-rest-pipeline@1.12.1':
-    resolution: {integrity: sha512-SsyWQ+T5MFQRX+M8H/66AlaI6HyCbQStGfFngx2fuiW+vKI2DkhtOvbYodPyf9fOe/ARLWWc3ohX54lQ5Kmaog==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/core-tracing@1.0.1':
-    resolution: {integrity: sha512-I5CGMoLtX+pI17ZdiFJZgxMJApsK6jjfm85hpgp3oazCdq5Wxgh4wMr7ge/TTWW1B5WBuvIOI1fMU/FrOAMKrw==}
-    engines: {node: '>=12.0.0'}
-
-  '@azure/core-util@1.4.0':
-    resolution: {integrity: sha512-eGAyJpm3skVQoLiRqm/xPa+SXi/NPDdSHMxbRAz2lSprd+Zs+qrpQGQQ2VQ3Nttu+nSZR4XoYQC71LbEI7jsig==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/logger@1.0.4':
-    resolution: {integrity: sha512-ustrPY8MryhloQj7OWGe+HrYx+aoiOxzbXTtgblbV3xwCqpzUK36phH3XNHQKj3EPonyFUuDTfR3qFhTEAuZEg==}
-    engines: {node: '>=14.0.0'}
-
-  '@azure/openai@1.0.0-beta.5':
-    resolution: {integrity: sha512-Qjb6eXun6OUGwbHMRYtmjojn8wZf5ATGQHFzxPc+/dWFeLdSj5ahs/yWRAgqff3oL6GmgQFhjCPhAnAbVv5Q3w==}
-    engines: {node: '>=14.0.0'}
 
   '@cspotcode/source-map-support@0.8.1':
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
@@ -208,10 +149,6 @@ packages:
 
   '@fastify/websocket@8.2.0':
     resolution: {integrity: sha512-B4tlHFBKCX7tenEG9aUcQEpksW2e0+dgRTaH/05+cro1Xsq1+kSj+9IB9Gep7a0KbHZGrat+zBsOas6lRs5dFQ==}
-
-  '@google/generative-ai@0.1.1':
-    resolution: {integrity: sha512-cbzKa8mT9YkTrT4XUuENIuvlqiJjwDgcD2Ks4L99Az9dWLgdXn8xnETEAZLOpqzoGx+1PuATZqlUnVRAeLbMgA==}
-    engines: {node: '>=18.0.0'}
 
   '@jimp/bmp@0.22.8':
     resolution: {integrity: sha512-JEMKgM1AEvvWfn9ZCHn62nK+QCE3Pb/ZhPdL3NF0ZgKNww6pqOmo6KqXzqY18JLB7c0epuTp4GPDPDhOh/ou1g==}
@@ -496,10 +433,6 @@ packages:
   '@tokenizer/token@0.3.0':
     resolution: {integrity: sha1-/pipP+eJJH6ZjHXnTpx8YyF6onY=}
 
-  '@tootallnate/once@2.0.0':
-    resolution: {integrity: sha1-9UShSNOrNYAcH2M6dEH9h8LkhL8=}
-    engines: {node: '>= 10'}
-
   '@tsconfig/node10@1.0.9':
     resolution: {integrity: sha512-jNsYVVxU8v5g43Erja32laIDHXeoNvFEpX33OK4d6hljo3jDhCBDhx5dhCCTMWUojscpAagGiRkBKxpdl9fxqA==}
 
@@ -514,9 +447,6 @@ packages:
 
   '@types/node@16.9.1':
     resolution: {integrity: sha512-QpLcX9ZSsq3YYUUnD3nFDY8H7wctAhQj/TFKL8Ya8v5fMm3CFXxo8zStsLAl780ltoYoo1WvKUVGBQK+1ifr7g==}
-
-  '@types/node@17.0.45':
-    resolution: {integrity: sha512-w+tIMs3rq2afQdsPJlODhoUEKzFP1ayaoyl1CcnwtIlsVe7K7bA1NGm4s3PraqTLlXnbIN84zuBlxBWo1u9BLw==}
 
   '@types/node@18.19.130':
     resolution: {integrity: sha512-GRaXQx6jGfL8sKfaIDD6OupbIHBr9jv7Jnaml9tB7l4v068PAOXqfcujMMo5PhbIs6ggR1XODELqahT2R8v0fg==}
@@ -597,9 +527,6 @@ packages:
   argparse@1.0.10:
     resolution: {integrity: sha1-vNZ5HqWuCXJeF+WtmIE0zUCz2RE=}
 
-  asn1.js@5.4.1:
-    resolution: {integrity: sha512-+I//4cYPccV8LdmBLiX8CYvf9Sp3vQsrqu2QNXRcrbiWvcx/UdlFiqUJJzxRQxgsZmvhXhn4cSKeSmoFjVdupA==}
-
   asn1@0.2.6:
     resolution: {integrity: sha1-DTp7tuZOAqkMAwOzHykoaOoJoI0=}
 
@@ -625,9 +552,6 @@ packages:
 
   aws4@1.12.0:
     resolution: {integrity: sha512-NmWvPnx0F1SfrQbYwOi7OeaNGokp9XhzNioJ/CSBs8Qa4vxug81mhJEAVZwxXuBmYB5KDRfMq/F3RR0BIU7sWg==}
-
-  axios@0.26.1:
-    resolution: {integrity: sha512-fPwcX4EvnSHuInCMItEhAGnaSEXRBjtzh9fOtsE6E1G6p7vl7edEeZe11QHf18+6+9gR5PbKV/sGKNaD8YaMeA==}
 
   b4a@1.6.4:
     resolution: {integrity: sha512-fpWrvyVHEKyeEvbKZTVOeZF3VSKKWtJxFIxX/jaVPf+cLbGUSitjb49pHLqPV2BUNNZ0LcoeEGfE/YCpyDYHIw==}
@@ -655,9 +579,6 @@ packages:
 
   bmp-js@0.1.0:
     resolution: {integrity: sha512-vHdS19CnY3hwiNdkaqk93DvjVLfbEcI8mys4UjuWrlX1haDmroo8o4xCzh4wD6DGV6HxRCyauwhHRqMTfERtjw==}
-
-  bn.js@4.12.0:
-    resolution: {integrity: sha1-d1s/J477uXGO7HNh9IP7Nvu/6og=}
 
   brace-expansion@1.1.11:
     resolution: {integrity: sha1-PH/L9SnYcibz0vUrlm/1Jx60Qd0=}
@@ -754,9 +675,6 @@ packages:
   create-require@1.1.1:
     resolution: {integrity: sha512-dcKFX3jn0MpIaXjisoRvexIJVEKzaq7z2rZKxf+MSr9TkdmHmsU4m2lcLojrj/FHl8mk5VxMmYA+ftRkP/3oKQ==}
 
-  cycletls@1.0.21:
-    resolution: {integrity: sha512-Ccox1s+3mhoc/SOlzAXH2EqyKPc3PlJ6WVvshgzBn99ihDSmp/GQJqPw7TKBLO5pJMZtrl9B7s8cMdrwOoORbQ==}
-
   dashdash@1.14.1:
     resolution: {integrity: sha1-hTz6D3y+L+1d4gMmuN1YEDX24vA=}
     engines: {node: '>=0.10'}
@@ -848,10 +766,6 @@ packages:
     resolution: {integrity: sha512-9jgfSCa3dmEme2ES3mPByGXfgZ87VbP97tng1G2nWwWx6bV2nYxm2AWCrbQjXToSe+yYlqaZNtxffR9IeQr95g==}
     engines: {node: '>=14.18'}
 
-  eventsource@2.0.2:
-    resolution: {integrity: sha512-IzUmBGPR3+oUG9dUeXynyNmf91/3zUSJg1lCktzKw47OXuhco54U3r9B7O4XX+Rb1Itm9OZ2b0RkTs10bICOxA==}
-    engines: {node: '>=12.0.0'}
-
   exif-parser@0.1.12:
     resolution: {integrity: sha512-c2bQfLNbMzLPmzQuOr8fy0csy84WmwnER81W88DzTp9CYNPJ6yzOj2EZAh9pywYpqHnshVLHQJ8WzldAyfY+Iw==}
 
@@ -914,15 +828,6 @@ packages:
   find-my-way@7.6.2:
     resolution: {integrity: sha512-0OjHn1b1nCX3eVbm9ByeEHiscPYiHLfhei1wOUU9qffQkk98wE0Lo8VrVYfSGMgnSnDh86DxedduAnBf4nwUEw==}
     engines: {node: '>=14'}
-
-  follow-redirects@1.15.2:
-    resolution: {integrity: sha512-VQLG33o04KaQ8uYi2tVNbdrWp1QWxNNea+nmIB4EVM28v0hmP17z7aG1+wAkNzVq4KeXTq3221ye5qTJP91JwA==}
-    engines: {node: '>=4.0'}
-    peerDependencies:
-      debug: '*'
-    peerDependenciesMeta:
-      debug:
-        optional: true
 
   forever-agent@0.6.1:
     resolution: {integrity: sha1-+8cfDEGt6zf5bFd60e1C2P2sypE=}
@@ -997,10 +902,6 @@ packages:
   http-errors@2.0.0:
     resolution: {integrity: sha512-FtwrG/euBzaEjYeRqOgly7G0qviiXoJWnvEH2Z1plBdXgbyjv34pHTSb9zoeHMyDy33+DWy5Wt9Wo+TURtOYSQ==}
     engines: {node: '>= 0.8'}
-
-  http-proxy-agent@5.0.0:
-    resolution: {integrity: sha1-USmAAgNSDUNPFCvHj/PBcIAPK0M=}
-    engines: {node: '>= 6'}
 
   http-signature@1.3.6:
     resolution: {integrity: sha1-y2+/34bRyXTzQ76U6H9/wShmLPk=}
@@ -1177,9 +1078,6 @@ packages:
   min-document@2.19.0:
     resolution: {integrity: sha1-e9KC4/WELtKVu3SM3Z8f+iyCRoU=}
 
-  minimalistic-assert@1.0.1:
-    resolution: {integrity: sha1-LhlN4ERibUoQ5/f7wAznPoPk1cc=}
-
   minimatch@3.1.2:
     resolution: {integrity: sha512-J7p63hRiAjw1NDEww1W7i37+ByIrOWO5XQQAzZ3VOcL0PNybwpfmV/N05zFAzwQ9USyEcX6t3UO+K5aqBQOIHw==}
 
@@ -1284,9 +1182,6 @@ packages:
 
   once@1.4.0:
     resolution: {integrity: sha1-WDsap3WWHUsROsF9nFC6753Xa9E=}
-
-  openai@3.3.0:
-    resolution: {integrity: sha512-uqxI/Au+aPRnsaQRe8CojU0eCR7I0mBiKjD3sNMzY6DaC1ZVrc85u98mtJW6voDug8fgGN+DIZmTDxTthxb7dQ==}
 
   option@0.2.4:
     resolution: {integrity: sha512-pkEqbDyl8ou5cpq+VsnQbe/WlEy5qS7xPzMS1U55OCG9KPvwFD46zDbxQIj3egJSFc3D+XhYOPUzz49zQAVy7A==}
@@ -1641,9 +1536,6 @@ packages:
   tslib@1.14.1:
     resolution: {integrity: sha512-Xni35NKzjgMrwevysHTCArtLDpPvye8zV/0E4EyYn43P7/7qvQwPh9BGkHewbMulVntbigmcT7rdX3BNo9wRJg==}
 
-  tslib@2.6.2:
-    resolution: {integrity: sha512-AEYxH93jGFPn/a2iVAwW87VuUIkR1FVUKB77NwMF7nBTDkDrrT/Hpt/IrCJ0QXhW27jTBDcf5ZY7w6RiqTMw2Q==}
-
   tunnel-agent@0.6.0:
     resolution: {integrity: sha1-J6XeoGs2sEoKmWZ3SykIaPD8QP0=}
 
@@ -1804,72 +1696,6 @@ packages:
 
 snapshots:
 
-  '@azure-rest/core-client@1.1.4':
-    dependencies:
-      '@azure/abort-controller': 1.1.0
-      '@azure/core-auth': 1.5.0
-      '@azure/core-rest-pipeline': 1.12.1
-      '@azure/core-tracing': 1.0.1
-      '@azure/core-util': 1.4.0
-      tslib: 2.6.2
-    transitivePeerDependencies:
-      - supports-color
-
-  '@azure/abort-controller@1.1.0':
-    dependencies:
-      tslib: 2.6.2
-
-  '@azure/core-auth@1.5.0':
-    dependencies:
-      '@azure/abort-controller': 1.1.0
-      '@azure/core-util': 1.4.0
-      tslib: 2.6.2
-
-  '@azure/core-lro@2.5.4':
-    dependencies:
-      '@azure/abort-controller': 1.1.0
-      '@azure/core-util': 1.4.0
-      '@azure/logger': 1.0.4
-      tslib: 2.6.2
-
-  '@azure/core-rest-pipeline@1.12.1':
-    dependencies:
-      '@azure/abort-controller': 1.1.0
-      '@azure/core-auth': 1.5.0
-      '@azure/core-tracing': 1.0.1
-      '@azure/core-util': 1.4.0
-      '@azure/logger': 1.0.4
-      form-data: 4.0.0
-      http-proxy-agent: 5.0.0
-      https-proxy-agent: 5.0.1
-      tslib: 2.6.2
-    transitivePeerDependencies:
-      - supports-color
-
-  '@azure/core-tracing@1.0.1':
-    dependencies:
-      tslib: 2.6.2
-
-  '@azure/core-util@1.4.0':
-    dependencies:
-      '@azure/abort-controller': 1.1.0
-      tslib: 2.6.2
-
-  '@azure/logger@1.0.4':
-    dependencies:
-      tslib: 2.6.2
-
-  '@azure/openai@1.0.0-beta.5':
-    dependencies:
-      '@azure-rest/core-client': 1.1.4
-      '@azure/core-auth': 1.5.0
-      '@azure/core-lro': 2.5.4
-      '@azure/core-rest-pipeline': 1.12.1
-      '@azure/logger': 1.0.4
-      tslib: 2.6.2
-    transitivePeerDependencies:
-      - supports-color
-
   '@cspotcode/source-map-support@0.8.1':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
@@ -1925,8 +1751,6 @@ snapshots:
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
-
-  '@google/generative-ai@0.1.1(patch_hash=8081d958bb4b17364595dd366b2996fb1468f43be7f1585bda8169791c4bac6e)': {}
 
   '@jimp/bmp@0.22.8(@jimp/custom@0.22.8)':
     dependencies:
@@ -2278,8 +2102,6 @@ snapshots:
   '@tokenizer/token@0.3.0':
     optional: true
 
-  '@tootallnate/once@2.0.0': {}
-
   '@tsconfig/node10@1.0.9': {}
 
   '@tsconfig/node12@1.0.11': {}
@@ -2289,9 +2111,6 @@ snapshots:
   '@tsconfig/node16@1.0.4': {}
 
   '@types/node@16.9.1':
-    optional: true
-
-  '@types/node@17.0.45':
     optional: true
 
   '@types/node@18.19.130':
@@ -2374,13 +2193,6 @@ snapshots:
       sprintf-js: 1.0.3
     optional: true
 
-  asn1.js@5.4.1:
-    dependencies:
-      bn.js: 4.12.0
-      inherits: 2.0.4
-      minimalistic-assert: 1.0.1
-      safer-buffer: 2.1.2
-
   asn1@0.2.6:
     dependencies:
       safer-buffer: 2.1.2
@@ -2411,12 +2223,6 @@ snapshots:
 
   aws4@1.12.0:
     optional: true
-
-  axios@0.26.1:
-    dependencies:
-      follow-redirects: 1.15.2
-    transitivePeerDependencies:
-      - debug
 
   b4a@1.6.4:
     optional: true
@@ -2451,8 +2257,6 @@ snapshots:
 
   bmp-js@0.1.0:
     optional: true
-
-  bn.js@4.12.0: {}
 
   brace-expansion@1.1.11:
     dependencies:
@@ -2563,15 +2367,6 @@ snapshots:
 
   create-require@1.1.1: {}
 
-  cycletls@1.0.21:
-    dependencies:
-      '@types/node': 17.0.45
-      ws: 7.5.9
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
-    optional: true
-
   dashdash@1.14.1:
     dependencies:
       assert-plus: 1.0.0
@@ -2648,8 +2443,6 @@ snapshots:
   events@3.3.0: {}
 
   eventsource-parser@1.0.0: {}
-
-  eventsource@2.0.2: {}
 
   exif-parser@0.1.12:
     optional: true
@@ -2736,8 +2529,6 @@ snapshots:
       fast-deep-equal: 3.1.3
       fast-querystring: 1.1.2
       safe-regex2: 2.0.0
-
-  follow-redirects@1.15.2: {}
 
   forever-agent@0.6.1:
     optional: true
@@ -2846,14 +2637,6 @@ snapshots:
       statuses: 2.0.1
       toidentifier: 1.0.1
 
-  http-proxy-agent@5.0.0:
-    dependencies:
-      '@tootallnate/once': 2.0.0
-      agent-base: 6.0.2
-      debug: 4.3.4
-    transitivePeerDependencies:
-      - supports-color
-
   http-signature@1.3.6:
     dependencies:
       assert-plus: 1.0.0
@@ -2874,6 +2657,7 @@ snapshots:
       debug: 4.3.4
     transitivePeerDependencies:
       - supports-color
+    optional: true
 
   https-proxy-agent@7.0.1:
     dependencies:
@@ -3091,8 +2875,6 @@ snapshots:
       dom-walk: 0.1.2
     optional: true
 
-  minimalistic-assert@1.0.1: {}
-
   minimatch@3.1.2:
     dependencies:
       brace-expansion: 1.1.11
@@ -3212,13 +2994,6 @@ snapshots:
   once@1.4.0:
     dependencies:
       wrappy: 1.0.2
-
-  openai@3.3.0:
-    dependencies:
-      axios: 0.26.1
-      form-data: 4.0.0
-    transitivePeerDependencies:
-      - debug
 
   option@0.2.4:
     optional: true
@@ -3455,7 +3230,8 @@ snapshots:
 
   safe-stable-stringify@2.4.3: {}
 
-  safer-buffer@2.1.2: {}
+  safer-buffer@2.1.2:
+    optional: true
 
   sax@1.2.4:
     optional: true
@@ -3683,8 +3459,6 @@ snapshots:
       yn: 3.1.1
 
   tslib@1.14.1: {}
-
-  tslib@2.6.2: {}
 
   tunnel-agent@0.6.0:
     dependencies:

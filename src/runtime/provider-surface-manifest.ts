@@ -40,44 +40,14 @@ export const providerSurfaceManifest = {
       'utils/translate.js',
       'model/core.js'
     ],
-    chatgptWeb: [
-      'utils/message.js',
-      'apps/chat.js',
-      'model/core.js'
-    ],
-    bing: [
-      'utils/SydneyAIClient.js',
-      'client/CopilotAIClient.js',
-      'utils/BingDraw.js',
-      'apps/draw.js'
-    ],
-    claude: [
-      'client/ClaudeAPIClient.js',
-      'utils/claude.ai/index.js'
-    ],
-    gemini: [
-      'client/CustomGoogleGeminiClient.js',
-      'client/GoogleGeminiClient.js',
-      'patches/@google__generative-ai@0.1.1.patch'
-    ],
-    qwen: [
-      'utils/alibaba/qwen-api.js',
-      'utils/alibaba/tokenizer.js',
-      'utils/alibaba/types.js'
-    ],
-    chatglm: [
-      'client/ChatGLM4Client.js',
-      'utils/chatglm.js'
-    ],
-    xinghuo: [
-      'utils/xinghuo/xinghuo.js',
-      'apps/chat.js',
-      'utils/translate.js'
-    ],
-    azureOpenai: [
-      'model/core.js',
-      'apps/chat.js'
-    ]
+    chatgptWeb: [],
+    bing: [],
+    claude: [],
+    gemini: [],
+    qwen: [],
+    chatglm: [],
+    xinghuo: [],
+    azureOpenai: []
   },
   commands: {
     openaiCompatible: ['#chat1', '#chatgpt切换API'],
@@ -101,7 +71,6 @@ export const providerSurfaceManifest = {
     ],
     chatgptWeb: [
       'OpenAiPlatformRefreshToken',
-      'api',
       'apiBaseUrl',
       'apiForceUseReverse',
       'useGPT4'
@@ -173,7 +142,7 @@ export const providerSurfaceManifest = {
   },
   uiFields: {
     openaiCompatible: ['apiKey', 'openAiBaseUrl', 'model'],
-    chatgptWeb: ['api', 'apiBaseUrl', 'OpenAiPlatformRefreshToken'],
+    chatgptWeb: ['apiBaseUrl', 'OpenAiPlatformRefreshToken'],
     bing: ['sydney', 'sydneyReverseProxy', 'bingAiToken'],
     claude: ['claudeApiKey', 'claudeAISessionKey'],
     gemini: ['geminiKey', 'geminiModel', 'geminiBaseUrl'],
@@ -183,7 +152,7 @@ export const providerSurfaceManifest = {
     azureOpenai: ['azureUrl', 'azureDeploymentName']
   },
   dependencies: {
-    openaiCompatible: ['eventsource', 'eventsource-parser'],
+    openaiCompatible: ['eventsource-parser'],
     chatgptWeb: [],
     bing: [],
     claude: ['cycletls'],
@@ -210,6 +179,9 @@ export const providerSurfaceManifest = {
     paths: [
       'src/runtime/provider-surface-manifest.ts',
       'dist/runtime/provider-surface-manifest.js',
+      'src/runtime/provider-mode-policy.ts',
+      'dist/runtime/provider-mode-policy.js',
+      'apps/provider.js',
       'utils/tts/microsoft-azure.js',
       'utils/tts.js',
       'utils/tools/SerpTool.js',
@@ -224,7 +196,6 @@ export const providerSurfaceManifest = {
       'enhanceAzureTTSEmotion'
     ],
     dependencies: [
-      'eventsource',
       'eventsource-parser',
       'microsoft-cognitiveservices-speech-sdk'
     ]
