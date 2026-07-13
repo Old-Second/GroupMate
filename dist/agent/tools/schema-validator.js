@@ -178,6 +178,21 @@ export function validateToolInput(schema, input) {
         throw new ToolInputError('max_input_bytes_exceeded');
     return cloneValue(schema, input, 1, '$');
 }
+export function validateToolInputRecord(schema, input) {
+    validateSchema(schema);
+    let serialized;
+    try {
+        serialized = JSON.stringify(input);
+    }
+    catch {
+        throw new ToolInputError('invalid_type');
+    }
+    if (typeof serialized !== 'string')
+        throw new ToolInputError('invalid_type');
+    if (Buffer.byteLength(serialized, 'utf8') > maxInputBytes)
+        throw new ToolInputError('max_input_bytes_exceeded');
+    return cloneValue(schema, input, 1, '$');
+}
 const effects = ['read_only', 'visible_output', 'side_effect'];
 const risks = ['low', 'medium', 'high'];
 const permissions = [
@@ -197,6 +212,9 @@ export function validateToolDefinition(definition) {
         throw new ToolInputError('invalid_definition');
     }
     validateSchema(definition.inputSchema);
+    if (!('type' in definition.inputSchema) || definition.inputSchema.type !== 'object') {
+        throw new ToolInputError('invalid_definition');
+    }
     if (!effects.includes(definition.effect) || !risks.includes(definition.risk) ||
         !permissions.includes(definition.permission) ||
         !['none', 'call', 'semantic'].includes(definition.idempotency) ||
@@ -210,7 +228,9 @@ export function validateToolDefinition(definition) {
         throw new ToolInputError('invalid_definition');
     }
     if ((definition.effect === 'read_only') !== definition.readOnly ||
-        (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly))) {
+        (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly || definition.risk !== 'high')) ||
+        (definition.readOnly && definition.idempotency !== 'none') ||
+        (!definition.readOnly && definition.idempotency !== 'call')) {
         throw new ToolInputError('invalid_definition');
     }
     return definition;

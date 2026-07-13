@@ -181,7 +181,21 @@ test('tool definition rejects open objects, unsupported keywords and contradicto
     ...base,
     inputSchema: { ...closedSchema, minProperties: 1 }
   } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({
+    ...base,
+    inputSchema: { type: 'string' }
+  } as never), ToolInputError)
   assert.throws(() => validateToolDefinition({ ...base, effect: 'side_effect', readOnly: true } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({
+    ...base, effect: 'side_effect', readOnly: false, idempotency: 'none'
+  } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({
+    ...base, idempotency: 'semantic'
+  } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({
+    ...base, effect: 'side_effect', readOnly: false, destructive: true,
+    idempotency: 'call', risk: 'low'
+  } as never), ToolInputError)
 })
 
 test('tool result parser accepts exactly four bounded branches', () => {

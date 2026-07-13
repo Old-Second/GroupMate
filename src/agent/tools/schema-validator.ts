@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolEffect, ToolPermissionKind, ToolRisk } from './tool-definition.js'
-import type { StrictToolSchema, ToolSchemaValue } from './tool-schema.js'
+import type { StrictToolSchema, ToolObjectSchema, ToolSchemaValue } from './tool-schema.js'
 
 const maxDepth = 8
 const maxProperties = 64
@@ -179,6 +179,22 @@ export function validateToolInput<Schema extends StrictToolSchema> (schema: Sche
   return cloneValue(schema, input, 1, '$') as ToolSchemaValue<Schema>
 }
 
+export function validateToolInputRecord (
+  schema: ToolObjectSchema,
+  input: unknown
+): Readonly<Record<string, unknown>> {
+  validateSchema(schema)
+  let serialized: string
+  try {
+    serialized = JSON.stringify(input)
+  } catch {
+    throw new ToolInputError('invalid_type')
+  }
+  if (typeof serialized !== 'string') throw new ToolInputError('invalid_type')
+  if (Buffer.byteLength(serialized, 'utf8') > maxInputBytes) throw new ToolInputError('max_input_bytes_exceeded')
+  return cloneValue(schema, input, 1, '$') as Readonly<Record<string, unknown>>
+}
+
 const effects: readonly ToolEffect[] = ['read_only', 'visible_output', 'side_effect']
 const risks: readonly ToolRisk[] = ['low', 'medium', 'high']
 const permissions: readonly ToolPermissionKind[] = [
@@ -198,6 +214,9 @@ export function validateToolDefinition<Input> (definition: ToolDefinition<Input>
     throw new ToolInputError('invalid_definition')
   }
   validateSchema(definition.inputSchema)
+  if (!('type' in definition.inputSchema) || definition.inputSchema.type !== 'object') {
+    throw new ToolInputError('invalid_definition')
+  }
   if (!effects.includes(definition.effect) || !risks.includes(definition.risk) ||
     !permissions.includes(definition.permission) ||
     !['none', 'call', 'semantic'].includes(definition.idempotency) ||
@@ -211,7 +230,9 @@ export function validateToolDefinition<Input> (definition: ToolDefinition<Input>
     throw new ToolInputError('invalid_definition')
   }
   if ((definition.effect === 'read_only') !== definition.readOnly ||
-    (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly))) {
+    (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly || definition.risk !== 'high')) ||
+    (definition.readOnly && definition.idempotency !== 'none') ||
+    (!definition.readOnly && definition.idempotency !== 'call')) {
     throw new ToolInputError('invalid_definition')
   }
   return definition

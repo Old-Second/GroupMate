@@ -44,6 +44,7 @@ export type ToolErrorCode =
   | 'tool_invalid_result'
   | 'tool_output_too_large'
   | 'tool_control_unavailable'
+  | 'tool_in_progress'
   | 'tool_outcome_unknown'
 
 const denyCodes: ReadonlySet<ToolDenyCode> = new Set([
@@ -74,6 +75,7 @@ const errorCodes: ReadonlySet<ToolErrorCode> = new Set([
   'tool_invalid_result',
   'tool_output_too_large',
   'tool_control_unavailable',
+  'tool_in_progress',
   'tool_outcome_unknown'
 ])
 
