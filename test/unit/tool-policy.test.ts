@@ -75,7 +75,6 @@ const tools = {
   search: tool('search'),
   picture: tool('sendPicture', { effect: 'visible_output', permission: 'current_channel' }),
   game: tool('queryGenshin', { effect: 'visible_output', permission: 'current_channel' }),
-  progress: tool('reportProgress', { effect: 'progress_output', risk: 'medium', permission: 'current_channel' }),
   send: tool('sendMessage', {
     effect: 'side_effect', risk: 'high', permission: 'cross_channel',
     crossChannelAccess: { private: 'master', group: 'master' }
@@ -280,29 +279,6 @@ test('read-only, visible and cross-channel policy rows are fail closed', () => {
     intent: intent('把这句话发送给用户 8')
   }).kind, 'deny')
   assert.equal(decide({ profile: 'safe', definition: tools.send, facts: masterFacts, target: groupTarget, intent: intent('把这句话发送到群 99') }).kind, 'approval_required')
-})
-
-test('current-channel progress bypasses action intent and profile approval only for the current target', () => {
-  const current = { kind: 'group', groupId: '9' } as const
-  for (const profile of ['compatible', 'safe', 'strict'] as const) {
-    assert.deepEqual(decide({
-      profile,
-      definition: tools.progress,
-      target: current,
-      intent: intent('执行一个多步骤任务')
-    }), { kind: 'allow', reasonCode: 'policy_allowed' })
-  }
-  assert.equal(decide({
-    definition: tools.progress,
-    target: { kind: 'group', groupId: '99' },
-    intent: intent('执行一个多步骤任务')
-  }).kind, 'deny')
-  assert.equal(decide({
-    definition: tools.progress,
-    facts: { ...baseFacts, targetExists: false },
-    target: current,
-    intent: intent('执行一个多步骤任务')
-  }).kind, 'deny')
 })
 
 test('cross-channel policy applies independent target audiences and real mention evidence', () => {

@@ -1,4 +1,4 @@
-import type { AuthorizedToolContext, ToolRuntimeFacts, ToolTarget } from '../agent/tools/tool-context.js'
+import type { ToolRuntimeFacts, ToolTarget } from '../agent/tools/tool-context.js'
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
@@ -63,7 +63,6 @@ export interface VisibleToolServices {
   readonly videoDownloadEnabled: boolean
   readonly videoMaxBytes: number
   readonly crossChannelAccess: CrossChannelAccess
-  readonly reportProgress: (text: string, context: AuthorizedToolContext) => Promise<ToolResult>
 }
 
 export function currentChannelTarget (facts: ToolRuntimeFacts): ToolTarget {

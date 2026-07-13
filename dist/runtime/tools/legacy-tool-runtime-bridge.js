@@ -11,7 +11,6 @@ import { RedisApprovalStore } from './redis-approval-store.js';
 import { RedisIdempotencyStore } from './redis-idempotency-store.js';
 import { resolveToolRuntimeFacts } from './runtime-facts.js';
 import { resolveCrossChannelAccess } from './cross-channel-policy.js';
-import { ProgressOutputController } from './progress-output.js';
 import { createManagementToolDefinitions, createQueryToolRuntime, createVisibleToolDefinitions } from './tool-runtime-factory.js';
 export class ToolRuntimeConfigurationError extends Error {
     code;
@@ -759,17 +758,9 @@ function visibleServices(options, event, policyFetch) {
     ].some(key => configText(options.config, key) !== '');
     const processImage = options.processImage ?? pictureProcessor(policyFetch, configText(options.config, 'extraUrl'));
     const crossChannelAccess = resolveCrossChannelAccess(options.config);
-    const qq = qqCapabilities(event, options.segment());
-    const progress = new ProgressOutputController({
-        maxMessages: 5,
-        maxCharacters: 200,
-        hash: sha256ApprovalValue,
-        send: async (text, target, signal) => qq.sendText(target, text, signal),
-        audit: async (auditEvent) => { options.logger?.info?.(Object.freeze({ ...auditEvent })); }
-    });
     return {
         policyFetch,
-        qq,
+        qq: qqCapabilities(event, options.segment()),
         generateImage: async (prompt, signal) => {
             return options.generateImage === undefined
                 ? generateWithApPlugin(event, prompt, signal)
@@ -787,57 +778,7 @@ function visibleServices(options, event, policyFetch) {
         ttsAvailable,
         videoDownloadEnabled: downloadVideo,
         videoMaxBytes: finiteInteger(options.config.toolVideoMaxMB, 8, 1, 8) * 1024 * 1024,
-        crossChannelAccess,
-        reportProgress: async (text, context) => {
-            const outcome = await progress.deliver({
-                text,
-                target: context.target,
-                runId: context.runId,
-                callId: context.callId,
-                snapshotId: context.snapshotId,
-                signal: context.signal
-            });
-            if (outcome.kind === 'sent') {
-                return Object.freeze({
-                    status: 'success',
-                    effect: 'background',
-                    content: Object.freeze([Object.freeze({
-                            type: 'text',
-                            text: '进度已发送，请继续执行任务。'
-                        })]),
-                    retryable: false
-                });
-            }
-            if (outcome.kind === 'duplicate') {
-                return Object.freeze({
-                    status: 'success',
-                    effect: 'none',
-                    content: Object.freeze([Object.freeze({
-                            type: 'text',
-                            text: '相同进度已发送，请继续执行任务。'
-                        })]),
-                    retryable: false
-                });
-            }
-            if (outcome.kind === 'suppressed') {
-                return Object.freeze({
-                    status: 'success',
-                    effect: 'none',
-                    content: Object.freeze([Object.freeze({
-                            type: 'text',
-                            text: '进度消息已达到本轮上限，请继续任务并在最终回复中总结。'
-                        })]),
-                    retryable: false
-                });
-            }
-            return Object.freeze({
-                status: 'denied',
-                effect: 'none',
-                reasonCode: 'invalid_arguments',
-                userMessage: '进度消息必须为 1 到 200 个字符。',
-                retryable: false
-            });
-        }
+        crossChannelAccess
     };
 }
 function safeAudit(logger) {

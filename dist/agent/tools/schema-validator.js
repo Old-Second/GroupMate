@@ -193,7 +193,7 @@ export function validateToolInputRecord(schema, input) {
         throw new ToolInputError('max_input_bytes_exceeded');
     return cloneValue(schema, input, 1, '$');
 }
-const effects = ['read_only', 'visible_output', 'progress_output', 'side_effect'];
+const effects = ['read_only', 'visible_output', 'side_effect'];
 const risks = ['low', 'medium', 'high'];
 const permissions = [
     'any_user', 'current_channel', 'cross_channel', 'self_member',

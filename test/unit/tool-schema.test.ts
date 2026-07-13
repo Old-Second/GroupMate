@@ -196,6 +196,9 @@ test('tool definition rejects open objects, unsupported keywords and contradicto
     ...base, effect: 'side_effect', readOnly: false, idempotency: 'semantic', openWorld: false
   }).idempotency, 'semantic')
   assert.throws(() => validateToolDefinition({
+    ...base, effect: 'progress_output', readOnly: false, idempotency: 'call'
+  } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({
     ...base, effect: 'side_effect', readOnly: false, destructive: true,
     idempotency: 'call', risk: 'low'
   } as never), ToolInputError)

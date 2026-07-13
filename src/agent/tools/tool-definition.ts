@@ -3,7 +3,7 @@ import type { ToolResult } from './tool-result.js'
 import type { StrictToolSchema } from './tool-schema.js'
 import type { CrossChannelAccess } from './cross-channel-access.js'
 
-export type ToolEffect = 'read_only' | 'visible_output' | 'progress_output' | 'side_effect'
+export type ToolEffect = 'read_only' | 'visible_output' | 'side_effect'
 export type ToolRisk = 'low' | 'medium' | 'high'
 export type ToolPermissionKind =
   | 'any_user'

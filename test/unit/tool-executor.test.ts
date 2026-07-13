@@ -409,62 +409,6 @@ test('a started side effect timeout is indeterminate and ignores late settlement
   assert.equal(fixture.audits.length, auditCount)
 })
 
-test('every progress outcome remains non-terminal and uncertain feedback forbids replay', async () => {
-  const denied = harness({
-    effect: 'progress_output',
-    decision: {
-      kind: 'deny', reasonCode: 'permission_denied',
-      userMessage: '当前身份不能执行该操作。'
-    }
-  })
-  const deniedOutcome = await denied.executor.execute(denied.request())
-  assert.equal(deniedOutcome.kind === 'completed' && deniedOutcome.finalize, false)
-
-  const suppressed = harness({
-    effect: 'progress_output',
-    handler: async () => ({
-      status: 'success', effect: 'none',
-      content: [{ type: 'text', text: '进度消息已达到本轮上限，请继续任务并在最终回复中总结。' }],
-      retryable: false
-    })
-  })
-  const suppressedOutcome = await suppressed.executor.execute(suppressed.request())
-  assert.equal(suppressedOutcome.kind === 'completed' && suppressedOutcome.finalize, false)
-
-  const uncertain = harness({
-    effect: 'progress_output',
-    handler: async () => { throw new Error('transport-secret') }
-  })
-  const uncertainOutcome = await uncertain.executor.execute(uncertain.request())
-  assert.deepEqual(uncertainOutcome.kind === 'completed' && uncertainOutcome.result, {
-    status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
-    userMessage: '进度消息发送结果无法确认，请勿重试该条并继续任务。', retryable: false
-  })
-  assert.equal(uncertainOutcome.kind === 'completed' && uncertainOutcome.finalize, false)
-})
-
-test('semantic progress duplicates return fixed continue feedback without replay', async () => {
-  for (const reservation of [
-    { kind: 'running' } as const,
-    {
-      kind: 'completed',
-      outcome: {
-        status: 'success', effect: 'background', completedAt: '2026-07-13T00:00:00.000Z'
-      }
-    } as const
-  ]) {
-    const fixture = harness({ effect: 'progress_output', reservation })
-    const outcome = await fixture.executor.execute(fixture.request())
-    assert.deepEqual(outcome.kind === 'completed' && outcome.result, {
-      status: 'success', effect: 'none',
-      content: [{ type: 'text', text: '相同进度已发送，请继续执行任务。' }],
-      retryable: false
-    })
-    assert.equal(outcome.kind === 'completed' && outcome.finalize, false)
-    assert.equal(fixture.handlerCalls(), 0)
-  }
-})
-
 test('read-only failures, invalid results and output overruns stay typed', async () => {
   const thrown = harness({
     effect: 'read_only',

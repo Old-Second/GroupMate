@@ -195,7 +195,7 @@ export function validateToolInputRecord (
   return cloneValue(schema, input, 1, '$') as Readonly<Record<string, unknown>>
 }
 
-const effects: readonly ToolEffect[] = ['read_only', 'visible_output', 'progress_output', 'side_effect']
+const effects: readonly ToolEffect[] = ['read_only', 'visible_output', 'side_effect']
 const risks: readonly ToolRisk[] = ['low', 'medium', 'high']
 const permissions: readonly ToolPermissionKind[] = [
   'any_user', 'current_channel', 'cross_channel', 'self_member',

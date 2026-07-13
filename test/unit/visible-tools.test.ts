@@ -78,11 +78,7 @@ function fixture (): {
     ttsAvailable: true,
     videoDownloadEnabled: true,
     videoMaxBytes: 1024,
-    crossChannelAccess: { private: 'everyone', group: 'everyone' },
-    reportProgress: async () => ({
-      status: 'success', effect: 'background',
-      content: [{ type: 'text', text: '进度已发送，请继续执行任务。' }], retryable: false
-    })
+    crossChannelAccess: { private: 'everyone', group: 'everyone' }
   }
   return { definitions: createVisibleToolDefinitions(services), calls }
 }
@@ -93,53 +89,22 @@ function byName (definitions: ReturnType<typeof createVisibleToolDefinitions>, n
   return definition
 }
 
-test('visible tool factory exposes eleven exact typed definitions', () => {
+test('visible tool factory exposes ten exact typed definitions without progress as a tool', () => {
   const { definitions } = fixture()
   assert.deepEqual(definitions.map(tool => tool.name), [
     'draw', 'processPicture', 'sendPicture', 'sendVideo', 'sendAvatar',
-    'sendMusic', 'sendAudioMessage', 'sendDice', 'sendRPS', 'sendMessage',
-    'reportProgress'
+    'sendMusic', 'sendAudioMessage', 'sendDice', 'sendRPS', 'sendMessage'
   ])
+  assert.equal(definitions.some(tool => tool.name === 'reportProgress'), false)
   for (const definition of definitions) {
     assert.equal(definition.readOnly, false)
-    assert.equal(
-      definition.idempotency,
-      ['sendMessage', 'reportProgress'].includes(definition.name) ? 'semantic' : 'call'
-    )
+    assert.equal(definition.idempotency, definition.name === 'sendMessage' ? 'semantic' : 'call')
   }
   assert.equal(byName(definitions, 'sendMessage').effect, 'side_effect')
   assert.equal(byName(definitions, 'sendMessage').permission, 'cross_channel')
   assert.deepEqual(byName(definitions, 'sendMessage').crossChannelAccess, {
     private: 'everyone', group: 'everyone'
   })
-  assert.equal(byName(definitions, 'reportProgress').effect, 'progress_output')
-  assert.equal(byName(definitions, 'reportProgress').permission, 'current_channel')
-})
-
-test('reportProgress accepts only text and delegates to the run-bound service', async () => {
-  const original = fixture()
-  let observed: { text: string; context: AuthorizedToolContext } | undefined
-  const definitions = createVisibleToolDefinitions(visibleOptions(original.calls, {
-    reportProgress: async (text, progressContext) => {
-      observed = { text, context: progressContext }
-      return {
-        status: 'success', effect: 'none',
-        content: [{ type: 'text', text: '进度消息已达到本轮上限，请继续任务并在最终回复中总结。' }],
-        retryable: false
-      }
-    }
-  }))
-  const definition = byName(definitions, 'reportProgress')
-  assert.deepEqual(definition.resolveTarget({ text: '阶段一完成' }, facts), {
-    kind: 'group', groupId: '9'
-  })
-  assert.throws(() => validateToolInputRecord(
-    definition.inputSchema as ToolObjectSchema,
-    { text: '阶段一完成', sender: { isAdmin: true } }
-  ))
-  const outcome = await definition.execute({ text: '阶段一完成' }, context)
-  assert.equal(outcome.status, 'success')
-  assert.deepEqual(observed, { text: '阶段一完成', context })
 })
 
 test('media tools bind to the current group or private channel target', () => {
@@ -309,23 +274,6 @@ test('successful background and visible effects stop further tool calls', () => 
     status: 'success', effect: 'background',
     content: [{ type: 'text', text: '已执行操作。' }], retryable: false
   }), true)
-  const progressResults = [
-    {
-      status: 'success', effect: 'background',
-      content: [{ type: 'text', text: '进度已发送，请继续执行任务。' }], retryable: false
-    },
-    {
-      status: 'denied', effect: 'none', reasonCode: 'invalid_arguments',
-      userMessage: '进度消息必须为 1 到 200 个字符。', retryable: false
-    },
-    {
-      status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
-      userMessage: '进度消息发送结果无法确认，请勿重试该条并继续任务。', retryable: false
-    }
-  ] as const
-  for (const progressResult of progressResults) {
-    assert.equal(shouldFinalizeToolExecution('progress_output', progressResult), false)
-  }
   assert.equal(shouldFinalizeToolExecution('visible_output', {
     status: 'success', effect: 'visible', content: [], retryable: false
   }), true)
@@ -433,10 +381,6 @@ function visibleOptions (
     drawingAvailable: true, pictureProcessingAvailable: true, ttsAvailable: true,
     videoDownloadEnabled: false, videoMaxBytes: 1024,
     crossChannelAccess: { private: 'everyone', group: 'everyone' },
-    reportProgress: async () => ({
-      status: 'success', effect: 'background',
-      content: [{ type: 'text', text: '进度已发送，请继续执行任务。' }], retryable: false
-    }),
     ...overrides
   }
 }
