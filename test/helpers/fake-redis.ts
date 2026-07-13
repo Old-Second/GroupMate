@@ -7,7 +7,7 @@ interface FakeRedisEntry {
 
 export class FakeRedis implements RedisSessionClient {
   readonly scanCalls: Array<{ cursor: number; MATCH: string; COUNT: number }> = []
-  readonly setCalls: Array<{ key: string; options?: { EX?: number } }> = []
+  readonly setCalls: Array<{ key: string; options?: { EX?: number; NX?: boolean; XX?: boolean } }> = []
   private readonly entries = new Map<string, FakeRedisEntry>()
   private readonly now: () => number
 
@@ -20,13 +20,23 @@ export class FakeRedis implements RedisSessionClient {
     return this.entries.get(key)?.value ?? null
   }
 
-  async set (key: string, value: string, options?: { EX?: number }): Promise<string> {
+  async set (key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }): Promise<string | null> {
+    this.purgeExpired(key)
     this.setCalls.push({ key, options })
+    if (options?.NX === true && this.entries.has(key)) return null
+    if (options?.XX === true && !this.entries.has(key)) return null
     this.entries.set(key, {
       value,
       ...(options?.EX === undefined ? {} : { expiresAtMs: this.now() + options.EX * 1000 })
     })
     return 'OK'
+  }
+
+  async getDel (key: string): Promise<string | null> {
+    this.purgeExpired(key)
+    const value = this.entries.get(key)?.value ?? null
+    this.entries.delete(key)
+    return value
   }
 
   async del (key: string | readonly string[]): Promise<number> {
