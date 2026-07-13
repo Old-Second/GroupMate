@@ -369,8 +369,11 @@ async function messageTarget(event, target) {
     throw new TypeError('message target is invalid');
 }
 function resourceValue(resource) {
-    if (resource.kind === 'buffer')
-        return resource.data;
+    if (resource.kind === 'buffer') {
+        return Buffer.isBuffer(resource.data)
+            ? resource.data
+            : Buffer.from(resource.data.buffer, resource.data.byteOffset, resource.data.byteLength);
+    }
     return resource.kind === 'remote_url' ? resource.url : resource.path;
 }
 function magicSegment(segment, type, value) {

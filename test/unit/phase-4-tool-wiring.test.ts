@@ -341,6 +341,50 @@ test('Phase 4 production bridge routes restored media capabilities through typed
   ])
 })
 
+test('Phase 4 production bridge converts fetched image bytes to a Node Buffer for Yunzai', async () => {
+  const policyFetch = new PolicyFetch({
+    networkPolicy: new NetworkPolicy({
+      resolve: async () => [{ address: '93.184.216.34', family: 4 }]
+    }),
+    transport: {
+      request: async () => ({
+        status: 200, statusText: 'OK', headers: { 'content-type': 'image/png' },
+        body: (async function * () { yield new Uint8Array([1, 2, 3]) })()
+      })
+    }
+  })
+  const imageInputs: unknown[] = []
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(), policyFetch,
+    getMasterIds: async () => ['1'], getBotId: () => '10000',
+    segment: () => ({
+      image: (file: unknown) => {
+        imageInputs.push(file)
+        return { type: 'image', file }
+      }
+    })
+  })
+  const event = {
+    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
+    bot: { pickFriend: () => ({ sendMsg: async () => {} }) }
+  }
+  const started = await bridge.begin({ event, prompt: '发送我的头像' })
+  const outcome = await bridge.execute({
+    snapshotId: started.snapshotId, requestedName: 'sendAvatar',
+    arguments: { userIds: ['7'] }, callId: 'call-avatar-buffer'
+  })
+
+  assert.equal(outcome.result?.status, 'success')
+  assert.equal(imageInputs.length, 1)
+  assert.equal(Buffer.isBuffer(imageInputs[0]), true)
+})
+
 test('Phase 4 production bridge creates QQ dice segments without an invalid fixed value', async () => {
   const diceArguments: unknown[][] = []
   const sent: unknown[] = []

@@ -520,8 +520,12 @@ async function messageTarget (event: YunzaiRecord, target: ToolTarget): Promise<
   throw new TypeError('message target is invalid')
 }
 
-function resourceValue (resource: ToolResource): Uint8Array | string {
-  if (resource.kind === 'buffer') return resource.data
+function resourceValue (resource: ToolResource): Buffer | string {
+  if (resource.kind === 'buffer') {
+    return Buffer.isBuffer(resource.data)
+      ? resource.data
+      : Buffer.from(resource.data.buffer, resource.data.byteOffset, resource.data.byteLength)
+  }
   return resource.kind === 'remote_url' ? resource.url : resource.path
 }
 
