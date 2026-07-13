@@ -196,8 +196,13 @@ function collectionHasIdentifier(collection, targetId, propertyNames) {
     }
     if (!Array.isArray(collection))
         return false;
-    return collection.some(item => item !== null && typeof item === 'object' &&
-        propertyNames.some(property => String(item[property] ?? '') === targetId));
+    return collection.some(item => {
+        if ((typeof item === 'string' || typeof item === 'number' || typeof item === 'bigint') &&
+            String(item) === targetId)
+            return true;
+        return item !== null && typeof item === 'object' &&
+            propertyNames.some(property => String(item[property] ?? '') === targetId);
+    });
 }
 async function groupFor(event, groupId) {
     if (String(event.group_id ?? '') === groupId && event.group !== undefined)

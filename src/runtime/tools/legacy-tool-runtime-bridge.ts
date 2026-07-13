@@ -368,8 +368,12 @@ function collectionHasIdentifier (
     return collection.has(targetId) || collection.has(hostIdentifier(targetId))
   }
   if (!Array.isArray(collection)) return false
-  return collection.some(item => item !== null && typeof item === 'object' &&
-    propertyNames.some(property => String((item as YunzaiRecord)[property] ?? '') === targetId))
+  return collection.some(item => {
+    if ((typeof item === 'string' || typeof item === 'number' || typeof item === 'bigint') &&
+      String(item) === targetId) return true
+    return item !== null && typeof item === 'object' &&
+      propertyNames.some(property => String((item as YunzaiRecord)[property] ?? '') === targetId)
+  })
 }
 
 async function groupFor (event: YunzaiRecord, groupId: string): Promise<YunzaiRecord> {

@@ -494,7 +494,8 @@ test('Phase 4 production bridge snapshots cross-channel switches for each run', 
   const event = {
     isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
     bot: {
-      getFriendList: async () => new Map([[8, { user_id: 8 }]]),
+      // TRSS-Yunzai OneBotv11 returns an array of primitive IDs here.
+      getFriendList: async () => [8],
       pickFriend: () => receiver
     }
   }
@@ -520,6 +521,38 @@ test('Phase 4 production bridge snapshots cross-channel switches for each run', 
     assert.equal(secondResult.result.reasonCode, 'cross_channel_disabled')
   }
   assert.deepEqual(sent, ['你好'])
+})
+
+test('Phase 4 production bridge recognizes TRSS primitive group ID lists', async () => {
+  const config: Record<string, unknown> = {
+    toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+    serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+    enableToolPrivateSend: false, enableToolCrossGroupSend: false,
+    enableToolVideoDownload: false, groupMerge: true
+  }
+  let sends = 0
+  const event = {
+    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
+    bot: {
+      // TRSS-Yunzai OneBotv11 returns an array of primitive IDs here.
+      getGroupList: async () => [9],
+      pickGroup: () => ({ sendMsg: async () => { sends += 1 } })
+    }
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config, redis: new FakeRedis(), getMasterIds: async () => ['7'], getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const run = await bridge.begin({ event, prompt: '发送给群 9：你好' })
+  const outcome = await bridge.execute({
+    snapshotId: run.snapshotId, requestedName: 'sendMessage',
+    arguments: { targetKind: 'group', targetId: '9', text: '你好' }, callId: 'call-group-disabled'
+  })
+  assert.equal(outcome.result?.status, 'denied')
+  if (outcome.result?.status === 'denied') {
+    assert.equal(outcome.result.reasonCode, 'cross_channel_disabled')
+  }
+  assert.equal(sends, 0)
 })
 
 test('Phase 4 Yunzai bridge derives group authority from runtime facts before management execution', async () => {
