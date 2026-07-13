@@ -166,6 +166,13 @@ function boundedIntentText(value) {
         return value;
     return bytes.subarray(0, 32 * 1024).toString('utf8').replace(/\uFFFD$/, '');
 }
+function legacyImageUrls(value) {
+    if (!Array.isArray(value))
+        return Object.freeze([]);
+    return Object.freeze(value
+        .filter((item) => typeof item === 'string' && item.length > 0 && item.length <= 4_096)
+        .slice(0, 8));
+}
 function eventRecord(event) {
     if (event === null || typeof event !== 'object')
         throw new TypeError('Yunzai event is invalid');
@@ -921,7 +928,7 @@ export function createYunzaiToolRuntimeBridge(options) {
             })
                 .map(definition => definition.name);
             const replyId = await replyMessageId(event);
-            const images = options.getImages === undefined ? [] : await options.getImages(event);
+            const images = legacyImageUrls(options.getImages === undefined ? undefined : await options.getImages(event));
             const intentText = boundedIntentText(typeof event.groupmateCurrentRequestText === 'string'
                 ? event.groupmateCurrentRequestText
                 : input.prompt);
@@ -938,7 +945,7 @@ export function createYunzaiToolRuntimeBridge(options) {
                     reply: replyId === null ? null : { messageId: replyId },
                     ...(event.message_id === undefined ? {} : { currentMessageId: event.message_id })
                 }),
-                promptAddition: images.length === 0 ? '' : `\nthe url of the picture(s) above: ${images.slice(0, 8).join(', ')}`,
+                promptAddition: images.length === 0 ? '' : `\nthe url of the picture(s) above: ${images.join(', ')}`,
                 systemAddition: replyId === null
                     ? '\nNever manage the current request message itself.\n'
                     : `\nthe current request is replying to messageId ${replyId}. Only manage that message when explicitly requested.\nNever manage the current request message itself.\n`

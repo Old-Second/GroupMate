@@ -226,6 +226,34 @@ test('Phase 4 Yunzai bridge exposes strict model schemas and executes through th
   assert.match(outcome.modelFeedback, /"userId":"7"/)
 })
 
+test('Phase 4 Yunzai bridge treats a missing legacy image result as no images', async () => {
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['1'],
+    getBotId: () => '10000',
+    getImages: async () => undefined,
+    segment: () => ({})
+  })
+  const event = {
+    isGroup: false,
+    user_id: 7,
+    sender: { user_id: 7, nickname: 'fixture' },
+    bot: { pickFriend: () => ({ sendMsg: async () => {} }) },
+    message: []
+  }
+
+  const started = await bridge.begin({ event, prompt: '纯文字消息' })
+
+  assert.equal(started.promptAddition, '')
+  assert.ok(started.modelFunctions.some(item => item.name === 'website'))
+})
+
 test('Phase 4 production bridge keeps drawing, image processing, and game panels reachable', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
     config: {
