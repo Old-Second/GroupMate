@@ -20,6 +20,17 @@ import { createWeatherTool } from '../../tools/WeatherTool.js'
 import { createWebsiteTool } from '../../tools/WebsiteTool.js'
 import type { GameQueryInput } from '../../tools/game-query-support.js'
 import { PolicyFetch } from './policy-fetch.js'
+import { createDrawTool } from '../../tools/DrawTool.js'
+import { createProcessPictureTool } from '../../tools/ProcessPictureTool.js'
+import { createSendAudioMessageTool } from '../../tools/SendAudioMessageTool.js'
+import { createSendAvatarTool } from '../../tools/SendAvatarTool.js'
+import { createSendDiceTool } from '../../tools/SendDiceTool.js'
+import { createSendMessageTool } from '../../tools/SendMessageTool.js'
+import { createSendMusicTool } from '../../tools/SendMusicTool.js'
+import { createSendPictureTool } from '../../tools/SendPictureTool.js'
+import { createSendRPSTool } from '../../tools/SendRPSTool.js'
+import { createSendVideoTool } from '../../tools/SendVideoTool.js'
+import type { VisibleToolServices } from '../../tools/visible-tool-support.js'
 
 export interface QueryToolRuntimeConfig {
   readonly searchSource: SearchBackend
@@ -48,6 +59,21 @@ export interface QueryToolRuntimeOptions {
 export interface QueryToolRuntime {
   readonly definitions: readonly ToolDefinition[]
   readonly registry: ToolRegistry
+}
+
+export function createVisibleToolDefinitions (services: VisibleToolServices): readonly ToolDefinition[] {
+  return Object.freeze([
+    createDrawTool(services),
+    createProcessPictureTool(services),
+    createSendPictureTool(services),
+    createSendVideoTool(services),
+    createSendAvatarTool(services),
+    createSendMusicTool(services),
+    createSendAudioMessageTool(services),
+    createSendDiceTool(services),
+    createSendRPSTool(services),
+    createSendMessageTool(services)
+  ])
 }
 
 export function createQueryToolRuntime (options: QueryToolRuntimeOptions): QueryToolRuntime {

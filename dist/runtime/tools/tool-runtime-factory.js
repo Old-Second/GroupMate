@@ -10,6 +10,30 @@ import { createSearchTool } from '../../tools/SearchTool.js';
 import { createSearchVideoTool } from '../../tools/SearchVideoTool.js';
 import { createWeatherTool } from '../../tools/WeatherTool.js';
 import { createWebsiteTool } from '../../tools/WebsiteTool.js';
+import { createDrawTool } from '../../tools/DrawTool.js';
+import { createProcessPictureTool } from '../../tools/ProcessPictureTool.js';
+import { createSendAudioMessageTool } from '../../tools/SendAudioMessageTool.js';
+import { createSendAvatarTool } from '../../tools/SendAvatarTool.js';
+import { createSendDiceTool } from '../../tools/SendDiceTool.js';
+import { createSendMessageTool } from '../../tools/SendMessageTool.js';
+import { createSendMusicTool } from '../../tools/SendMusicTool.js';
+import { createSendPictureTool } from '../../tools/SendPictureTool.js';
+import { createSendRPSTool } from '../../tools/SendRPSTool.js';
+import { createSendVideoTool } from '../../tools/SendVideoTool.js';
+export function createVisibleToolDefinitions(services) {
+    return Object.freeze([
+        createDrawTool(services),
+        createProcessPictureTool(services),
+        createSendPictureTool(services),
+        createSendVideoTool(services),
+        createSendAvatarTool(services),
+        createSendMusicTool(services),
+        createSendAudioMessageTool(services),
+        createSendDiceTool(services),
+        createSendRPSTool(services),
+        createSendMessageTool(services)
+    ]);
+}
 export function createQueryToolRuntime(options) {
     const common = { policyFetch: options.policyFetch };
     const definitions = Object.freeze([

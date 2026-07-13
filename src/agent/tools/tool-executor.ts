@@ -16,6 +16,7 @@ import { ToolInputError, validateToolInputRecord } from './schema-validator.js'
 import type { ToolObjectSchema } from './tool-schema.js'
 import {
   parseToolResult,
+  shouldFinalizeToolResult,
   type ToolErrorCode,
   type ToolResult
 } from './tool-result.js'
@@ -108,7 +109,7 @@ function completed (toolName: string, result: ToolResult): ToolExecutionOutcome 
     kind: 'completed',
     toolName,
     result,
-    finalize: result.status === 'success' && result.effect === 'visible'
+    finalize: shouldFinalizeToolResult(result)
   })
 }
 

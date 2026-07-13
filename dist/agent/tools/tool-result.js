@@ -161,3 +161,6 @@ export function toolResultForModel(result) {
         ? text
         : Buffer.from(text, 'utf8').subarray(0, maxToolOutputBytes).toString('utf8');
 }
+export function shouldFinalizeToolResult(result) {
+    return result.status === 'success' && result.effect === 'visible';
+}

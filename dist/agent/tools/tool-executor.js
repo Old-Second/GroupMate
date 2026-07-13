@@ -1,6 +1,6 @@
 import { ToolUnavailableError } from './tool-registry.js';
 import { ToolInputError, validateToolInputRecord } from './schema-validator.js';
-import { parseToolResult } from './tool-result.js';
+import { parseToolResult, shouldFinalizeToolResult } from './tool-result.js';
 const idempotencyTtlSeconds = 300;
 function failedResult(errorCode) {
     const messages = {
@@ -34,7 +34,7 @@ function completed(toolName, result) {
         kind: 'completed',
         toolName,
         result,
-        finalize: result.status === 'success' && result.effect === 'visible'
+        finalize: shouldFinalizeToolResult(result)
     });
 }
 function parseArguments(call) {
