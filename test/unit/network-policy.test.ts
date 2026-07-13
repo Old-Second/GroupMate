@@ -8,6 +8,7 @@ import {
   type NetworkRequestPolicy
 } from '../../src/agent/tools/network-policy.js'
 import {
+  createPinnedLookup,
   PolicyFetch,
   type PolicyTransport,
   type PolicyTransportRequest,
@@ -105,6 +106,27 @@ test('text response policy cannot raise the global one MiB ceiling', async () =>
   await assert.rejects(policy.authorize('https://example.test/', {
     kind: 'open_http', maxBytes: 1024 * 1024 + 1, allowedContentTypes: ['text/plain']
   }), TypeError)
+})
+
+test('pinned lookup honors the Node 22 all-address callback contract', async () => {
+  const lookup = createPinnedLookup('93.184.216.34', 4)
+  const resolve = async (all: boolean): Promise<{ address: string | { address: string, family: number }[], family?: number }> => {
+    return await new Promise((resolve, reject) => {
+      lookup('example.test', { all }, (error, address, family) => {
+        if (error !== null) {
+          reject(error)
+          return
+        }
+        resolve({ address, family })
+      })
+    })
+  }
+
+  assert.deepEqual(await resolve(false), { address: '93.184.216.34', family: 4 })
+  assert.deepEqual(await resolve(true), {
+    address: [{ address: '93.184.216.34', family: 4 }],
+    family: undefined
+  })
 })
 
 test('PolicyFetch pins the approved address and returns a bounded response', async () => {

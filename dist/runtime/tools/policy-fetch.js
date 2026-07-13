@@ -48,14 +48,21 @@ function withAbort(operation, signal) {
         operation.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
     });
 }
+export function createPinnedLookup(address, family) {
+    return (_hostname, options, callback) => {
+        if (options.all === true) {
+            callback(null, [{ address, family }]);
+            return;
+        }
+        callback(null, address, family);
+    };
+}
 export function createNodeFetchTransport() {
     return {
         async request(request) {
             const Agent = request.url.protocol === 'https:' ? https.Agent : http.Agent;
             const agent = new Agent({
-                lookup: ((_hostname, _options, callback) => {
-                    callback(null, request.pinnedAddress, request.family);
-                })
+                lookup: createPinnedLookup(request.pinnedAddress, request.family)
             });
             const result = await fetch(request.url, {
                 method: request.method,

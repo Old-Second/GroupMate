@@ -1,5 +1,6 @@
 import http from 'node:http'
 import https from 'node:https'
+import type { LookupFunction } from 'node:net'
 import fetch from 'node-fetch'
 import {
   NetworkPolicy,
@@ -107,14 +108,22 @@ function withAbort<T> (operation: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
+export function createPinnedLookup (address: string, family: 4 | 6): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all === true) {
+      callback(null, [{ address, family }])
+      return
+    }
+    callback(null, address, family)
+  }
+}
+
 export function createNodeFetchTransport (): PolicyTransport {
   return {
     async request (request): Promise<PolicyTransportResponse> {
       const Agent = request.url.protocol === 'https:' ? https.Agent : http.Agent
       const agent = new Agent({
-        lookup: ((_hostname: string, _options: unknown, callback: (error: Error | null, address: string, family: number) => void) => {
-          callback(null, request.pinnedAddress, request.family)
-        }) as never
+        lookup: createPinnedLookup(request.pinnedAddress, request.family)
       })
       const result = await fetch(request.url, {
         method: request.method,
