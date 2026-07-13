@@ -24,6 +24,7 @@ import {
   createYunzaiToolRuntimeBridge,
   toolResourceFromLegacySegment
 } from '../dist/runtime/tools/legacy-tool-runtime-bridge.js'
+import { shouldFinalizeToolResult } from '../dist/agent/tools/tool-result.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -217,7 +218,7 @@ class Core {
 
   this.chatGPTApi = new ChatGPTAPI(opts)
   let option = {
-    timeoutMs: 600000,
+    timeoutMs: Config.defaultTimeoutMs,
     completionParams,
     stream: Config.apiStream,
     onProgress: () => {}
@@ -270,6 +271,7 @@ class Core {
         const {
           toolName,
           modelFeedback: functionResult,
+          result: toolResult,
           finalize: finalizeAfterTool,
           approvalRequired
         } = await toolRuntimeBridge.execute({
@@ -284,6 +286,10 @@ class Core {
         option.parentMessageId = msg.id
         option.name = toolName
         option.toolCallId = callId
+        if (toolResult && shouldFinalizeToolResult(toolResult)) {
+          msg = { noMsg: true }
+          break
+        }
         if (finalizeAfterTool) {
           disableFunctionCalling(option.completionParams)
         }
@@ -310,7 +316,7 @@ class Core {
         return null
       } else {
         logger.error(createChatErrorLog({ mode: use, error: err }))
-        throw new Error(err)
+        throw err
       }
     } finally {
       toolRuntimeBridge.finish(toolRun.snapshotId, { retainForApproval: retainToolRun })
@@ -329,7 +335,7 @@ class Core {
         return null
       } else {
         logger.error(createChatErrorLog({ mode: use, error: err }))
-        throw new Error(err)
+        throw err
       }
     }
     return msg

@@ -590,3 +590,32 @@ test('Phase 4 production source has one compiled bridge and no legacy execution 
     }
   }
 })
+
+test('Phase 4 production core honors the configured provider timeout', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+
+  assert.match(core, /timeoutMs:\s*Config\.defaultTimeoutMs/)
+  assert.doesNotMatch(core, /timeoutMs:\s*600000/)
+})
+
+test('Phase 4 production core skips provider follow-up after visible tool output', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+
+  assert.match(core, /shouldFinalizeToolResult/)
+  assert.match(core, /result:\s*toolResult/)
+
+  const guard = core.indexOf('if (toolResult && shouldFinalizeToolResult(toolResult))')
+  assert.notEqual(guard, -1)
+  const providerFollowUp = core.indexOf('msg = await this.chatGPTApi.sendMessage(', guard)
+  assert.notEqual(providerFollowUp, -1)
+  const finalizedBranch = core.slice(guard, providerFollowUp)
+  assert.match(finalizedBranch, /msg = \{ noMsg: true \}/)
+  assert.match(finalizedBranch, /break/)
+})
+
+test('Phase 4 production core preserves provider error metadata for presentation', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+
+  assert.doesNotMatch(core, /throw new Error\(err\)/)
+  assert.equal(core.match(/throw err/g)?.length, 2)
+})
