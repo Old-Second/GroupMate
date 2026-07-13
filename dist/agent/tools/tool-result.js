@@ -15,6 +15,10 @@ const denyCodes = new Set([
     'approval_invalid',
     'tool_unavailable',
     'invalid_arguments',
+    'current_message_protected',
+    'self_unmute_denied',
+    'self_mute_duration_exceeded',
+    'role_hierarchy_denied',
     'unknown_policy_profile'
 ]);
 const errorCodes = new Set([
