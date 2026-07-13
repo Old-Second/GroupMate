@@ -619,3 +619,14 @@ test('Phase 4 production core preserves provider error metadata for presentation
   assert.doesNotMatch(core, /throw new Error\(err\)/)
   assert.equal(core.match(/throw err/g)?.length, 2)
 })
+
+test('Phase 4 production core retries one invalid contextual request without optional history', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+
+  assert.match(core, /dist\/runtime\/provider-request-recovery\.js/)
+  assert.match(core, /withInvalidFormatRecovery/)
+  assert.match(core, /kind === 'recovery'/)
+  assert.match(core, /delete option\.parentMessageId/)
+  assert.match(core, /conversationId: uuid\(\)/)
+  assert.match(core, /event: 'chat\.request\.recovery'/)
+})

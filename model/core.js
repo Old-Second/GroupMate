@@ -25,6 +25,7 @@ import {
   toolResourceFromLegacySegment
 } from '../dist/runtime/tools/legacy-tool-runtime-bridge.js'
 import { shouldFinalizeToolResult } from '../dist/agent/tools/tool-result.js'
+import { withInvalidFormatRecovery } from '../dist/runtime/provider-request-recovery.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -188,9 +189,12 @@ class Core {
     Current date: ${currentDate}`
   let maxModelTokens = getMaxModelTokens(completionParams.model)
   // let system = promptPrefix
+  let recoverySystem = promptPrefix
   let system = await handleSystem(e, promptPrefix, opt.settings)
   if (Config.enableChatSuno) {
-    system += 'If I ask you to generate music or write songs, you need to reply with information suitable for Suno to generate music. Please use keywords such as Verse, Chorus, Bridge, Outro, and End to segment the lyrics, such as [Verse 1], The returned song information needs to be wrapped in JSON format and sent to me in Markdown format. The message structure is ` ` JSON {"option": "Suno", "tags": "style", "title": "title of The Song", "lyrics": "lyrics"} `.'
+    const sunoSystem = 'If I ask you to generate music or write songs, you need to reply with information suitable for Suno to generate music. Please use keywords such as Verse, Chorus, Bridge, Outro, and End to segment the lyrics, such as [Verse 1], The returned song information needs to be wrapped in JSON format and sent to me in Markdown format. The message structure is ` ` JSON {"option": "Suno", "tags": "style", "title": "title of The Song", "lyrics": "lyrics"} `.'
+    system += sunoSystem
+    recoverySystem += sunoSystem
   }
   let opts = {
     apiBaseUrl: Config.openAiBaseUrl,
@@ -237,12 +241,39 @@ class Core {
       option.completionParams = {}
     }
     toolRun.promptAddition && (prompt += toolRun.promptAddition)
-    toolRun.systemAddition && (option.systemMessage += toolRun.systemAddition)
+    if (toolRun.systemAddition) {
+      option.systemMessage += toolRun.systemAddition
+      recoverySystem += toolRun.systemAddition
+    }
     option.completionParams.functions = toolRun.modelFunctions
     let msg
     let retainToolRun = false
     try {
-      msg = await this.chatGPTApi.sendMessage(prompt, option)
+      const droppedConversationHistory = Boolean(option.parentMessageId)
+      const droppedOptionalContext = option.systemMessage !== recoverySystem
+      msg = await withInvalidFormatRecovery({
+        canRecover: droppedConversationHistory || droppedOptionalContext,
+        onRecovery: () => logger.warn({
+          event: 'chat.request.recovery',
+          reasonCode: 'provider_invalid_format',
+          droppedConversationHistory,
+          droppedOptionalContext
+        }),
+        attempt: async kind => {
+          if (kind === 'recovery') {
+            option = {
+              ...option,
+              conversationId: uuid(),
+              systemMessage: recoverySystem
+            }
+            delete option.parentMessageId
+            delete option.messageId
+            delete option.name
+            delete option.toolCallId
+          }
+          return await this.chatGPTApi.sendMessage(prompt, option)
+        }
+      })
       if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
       let toolCallCount = 0
       const smartTrace = []
