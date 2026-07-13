@@ -303,6 +303,7 @@ test('policy denial never reserves or executes a side effect', async () => {
   })
   const outcome = await fixture.executor.execute(fixture.request())
   assert.equal(outcome.kind === 'completed' && outcome.result.status, 'denied')
+  assert.equal(outcome.kind === 'completed' && outcome.finalize, true)
   assert.equal(fixture.handlerCalls(), 0)
   assert.equal(fixture.calls.includes('idempotency.reserve'), false)
 })

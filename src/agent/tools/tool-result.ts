@@ -239,7 +239,7 @@ export function shouldFinalizeToolResult (result: ToolResult): boolean {
 }
 
 export function shouldFinalizeToolExecution (definitionEffect: ToolEffect, result: ToolResult): boolean {
-  return result.status === 'success' && (
-    result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background')
-  )
+  if (result.status === 'denied' || result.status === 'indeterminate') return true
+  if (result.status === 'failed') return !result.retryable
+  return result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background')
 }

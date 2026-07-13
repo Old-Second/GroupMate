@@ -262,6 +262,22 @@ test('successful background and visible effects stop further tool calls', () => 
   assert.equal(shouldFinalizeToolExecution('side_effect', {
     status: 'success', effect: 'none', content: [], retryable: false
   }), false)
+  assert.equal(shouldFinalizeToolExecution('side_effect', {
+    status: 'denied', effect: 'none', reasonCode: 'current_channel_uses_normal_reply',
+    userMessage: '当前会话请使用普通回复。', retryable: false
+  }), true)
+  assert.equal(shouldFinalizeToolExecution('read_only', {
+    status: 'failed', effect: 'none', errorCode: 'configuration_missing',
+    userMessage: '工具配置不完整。', retryable: false
+  }), true)
+  assert.equal(shouldFinalizeToolExecution('read_only', {
+    status: 'failed', effect: 'none', errorCode: 'upstream_unavailable',
+    userMessage: '工具暂时不可用。', retryable: true
+  }), false)
+  assert.equal(shouldFinalizeToolExecution('side_effect', {
+    status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
+    userMessage: '操作结果暂时无法确认。', retryable: false
+  }), true)
 })
 
 test('visible tool schemas reject model-supplied sender and admin authority', () => {

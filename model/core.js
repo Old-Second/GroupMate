@@ -327,7 +327,7 @@ class Core {
         // 不然普通用户可能会被openai限速
         await common.sleep(300)
         msg = await this.chatGPTApi.sendMessage(
-          finalizeAfterTool ? `${functionResult}\nThe action is complete. Reply to the user now and do not call more tools.` : functionResult,
+          finalizeAfterTool ? `${functionResult}\nThe tool result is final for this turn. Reply to the user now and do not call more tools.` : functionResult,
           option,
           'tool'
         )

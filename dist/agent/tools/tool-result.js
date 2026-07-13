@@ -165,5 +165,9 @@ export function shouldFinalizeToolResult(result) {
     return result.status === 'success' && result.effect === 'visible';
 }
 export function shouldFinalizeToolExecution(definitionEffect, result) {
-    return result.status === 'success' && (result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background'));
+    if (result.status === 'denied' || result.status === 'indeterminate')
+        return true;
+    if (result.status === 'failed')
+        return !result.retryable;
+    return result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background');
 }
