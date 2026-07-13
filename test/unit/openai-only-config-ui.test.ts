@@ -121,6 +121,8 @@ const requiredGuobaFields = [
   'temperature',
   'forwardReasoning',
   'smartMode',
+  'toolPolicyProfile',
+  'toolApprovalTtlSeconds',
   'enableGroupContext',
   'groupContextTip',
   'groupContextLength',
@@ -239,7 +241,8 @@ const expectedGuobaGroups = [
   {
     label: '工具与搜索',
     fields: [
-      'smartMode', 'enableToolPrivateSend', 'enableToolCrossGroupSend',
+      'smartMode', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
+      'enableToolPrivateSend', 'enableToolCrossGroupSend',
       'enableToolVideoDownload', 'toolVideoMaxMB', 'serpSource', 'tavilyApiKey',
       'azSerpKey', 'imageSearchSource', 'braveSearchApiKey', 'amapKey',
       'githubAPIKey', 'extraUrl'
@@ -460,4 +463,15 @@ test('old configuration imports ignore obsolete and unknown fields', () => {
   }, ['model', 'apiKey']), {
     model: 'fixture-model'
   })
+})
+
+test('tool video limit matches the memory-safe runtime hard limit', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const field = schemas.find(schema => schema.field === 'toolVideoMaxMB')
+  assert.equal(field?.componentProps?.max, 8)
+  const example = JSON.parse(await readSource('config/config.example.json')) as Record<string, unknown>
+  assert.equal(example.toolVideoMaxMB, 8)
+  assert.match(await readSource('utils/config.js'), /toolVideoMaxMB:\s*8/)
 })

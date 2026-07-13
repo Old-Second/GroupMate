@@ -162,10 +162,7 @@ export const providerSurfaceManifest = {
             'dist/runtime/provider-mode-policy.js',
             'apps/provider.js',
             'utils/tts/microsoft-azure.js',
-            'utils/tts.js',
-            'utils/tools/SerpTool.js',
-            'utils/tools/SerpIkechan8370Tool.js',
-            'utils/tools/SearchImageTool.js'
+            'utils/tts.js'
         ],
         identifiers: [
             'azureTTSKey',

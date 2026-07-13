@@ -101,6 +101,8 @@ const defaultConfig = {
   imageSearchSource: 'auto',
   extraUrl: 'https://cpe.ikechan8370.com',
   smartMode: false,
+  toolPolicyProfile: 'compatible',
+  toolApprovalTtlSeconds: 120,
   trssBotUin: '',
   sunoSessToken: '',
   sunoClientToken: '',
@@ -140,10 +142,10 @@ const defaultConfig = {
   // OpenAI兼容API思考强度：default/high/max
   apiReasoningEffort: 'default',
   apiMaxToken: 4096,
-  enableToolPrivateSend: true, // 是否允许智能模式下私聊骚扰其他群友。主人不受影响。
-  enableToolCrossGroupSend: false, // 是否允许智能模式下跨群/跨用户发送消息。主人不受影响。
+  enableToolPrivateSend: true, // 是否允许机器人主人通过工具向明确指定的QQ用户发起私聊。
+  enableToolCrossGroupSend: false, // 是否允许机器人主人通过工具向明确指定的其他群发送消息。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。
-  toolVideoMaxMB: 30,
+  toolVideoMaxMB: 8,
   githubAPI: 'https://api.github.com',
   githubAPIKey: '',
   version: 'v2.8.4'

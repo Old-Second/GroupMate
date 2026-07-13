@@ -91,7 +91,10 @@ function runtime (options: {
       ['7', { userId: '7', nickname: 'sender', role: 'member' }],
       ['8', { userId: '8', nickname: 'other', role: 'member' }]
     ]),
-    queryGame: async input => ({ game: input.game, userId: input.userId, uid: input.uid })
+    queryGame: async () => ({
+      kind: 'buffer', data: Buffer.from('game'), mimeType: 'image/png', byteLength: 4
+    }),
+    sendGameImage: async () => {}
   })
 }
 
@@ -275,20 +278,28 @@ test('video and music query tools normalize successful fixture responses', async
 test('game query tools pass only normalized input and trusted current actor defaults', async () => {
   const fixture = policyFetchFixture(() => response({}))
   const calls: unknown[] = []
+  const sent: unknown[] = []
   const created = createQueryToolRuntime({
     ...runtimeOptions(fixture.policyFetch),
-    queryGame: async input => { calls.push(input); return { ok: true } }
+    queryGame: async input => {
+      calls.push(input)
+      return { kind: 'buffer', data: Buffer.from('game'), mimeType: 'image/png', byteLength: 4 }
+    },
+    sendGameImage: async (resource, target) => { sent.push({ resource, target }) }
   })
   const genshin = created.definitions.find(item => item.name === 'queryGenshin')
   const starRail = created.definitions.find(item => item.name === 'queryStarRail')
   assert.ok(genshin)
   assert.ok(starRail)
-  assert.equal((await genshin.execute({ userId: '', uid: '123', character: '胡桃' }, context)).status, 'success')
-  assert.equal((await starRail.execute({ userId: '8', uid: '', character: '' }, context)).status, 'success')
+  const gameContext = { ...context, target: { kind: 'group' as const, groupId: '9' } }
+  assert.equal((await genshin.execute({ userId: '', uid: '123', character: '胡桃' }, gameContext)).status, 'success')
+  assert.equal((await starRail.execute({ userId: '8', uid: '', character: '' }, gameContext)).status, 'success')
   assert.deepEqual(calls, [
     { game: 'genshin', userId: '7', uid: '123', character: '胡桃' },
     { game: 'star_rail', userId: '8', uid: '', character: '' }
   ])
+  assert.equal(sent.length, 2)
+  assert.deepEqual((sent[0] as { target: unknown }).target, { kind: 'group', groupId: '9' })
 })
 
 test('image caption reads a public image then calls only the configured fixed origin', async () => {
@@ -361,6 +372,9 @@ function runtimeOptions (policyFetch: PolicyFetch): Parameters<typeof createQuer
       extraUrl: 'https://caption.example.com'
     },
     currentGroupMembers: async () => new Map(),
-    queryGame: async () => ({})
+    queryGame: async () => ({
+      kind: 'buffer', data: Buffer.from('game'), mimeType: 'image/png', byteLength: 4
+    }),
+    sendGameImage: async () => {}
   }
 }

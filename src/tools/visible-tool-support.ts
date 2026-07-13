@@ -61,7 +61,9 @@ export interface VisibleToolServices {
   readonly ttsAvailable: boolean
   readonly videoDownloadEnabled: boolean
   readonly videoMaxBytes: number
-  readonly crossChannelSendEnabled: boolean
+  readonly canSendCrossChannel: (
+    target: Extract<ToolTarget, { readonly kind: 'group' | 'private' }>
+  ) => boolean
 }
 
 export function currentChannelTarget (facts: ToolRuntimeFacts): ToolTarget {

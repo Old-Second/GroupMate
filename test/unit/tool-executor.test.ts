@@ -58,6 +58,7 @@ interface HarnessOptions {
   idempotencyCompleteError?: Error
   idempotencyIndeterminateError?: Error
   pendingPutError?: Error
+  expectedApprovalTtlSeconds?: number
 }
 
 function harness (options: HarnessOptions = {}) {
@@ -111,7 +112,7 @@ function harness (options: HarnessOptions = {}) {
   const approvalStore: ApprovalStore = {
     create: async (_record: ApprovalRecord, ttlSeconds: number) => {
       calls.push('approval.create')
-      assert.equal(ttlSeconds, 120)
+      assert.equal(ttlSeconds, options.expectedApprovalTtlSeconds ?? 120)
       if (options.approvalCreateError !== undefined) throw options.approvalCreateError
     },
     get: async () => null,
@@ -268,6 +269,18 @@ test('approval stores pending arguments before the hashed control record', async
   assert.equal(fixture.pending.size, 1)
   assert.doesNotMatch(JSON.stringify([...fixture.pending.values()].map(call => ({ ...call, input: undefined }))), /approval-token-123456/)
   assert.equal(fixture.handlerCalls(), 0)
+})
+
+test('approval uses the TTL captured by the current run', async () => {
+  const fixture = harness({
+    decision: { kind: 'approval_required', reasonCode: 'approval_required', summaryCode: 'fixture_approval' },
+    expectedApprovalTtlSeconds: 30
+  })
+  const outcome = await fixture.executor.execute(fixture.request({ approvalTtlSeconds: 30 }))
+  assert.equal(outcome.kind, 'approval_required')
+  if (outcome.kind === 'approval_required') {
+    assert.equal(outcome.expiresAt, '2026-07-13T00:00:30.000Z')
+  }
 })
 
 test('approval storage failure removes pending input and fails closed', async () => {

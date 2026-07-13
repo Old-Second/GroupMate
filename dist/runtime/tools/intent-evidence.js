@@ -8,18 +8,20 @@ const actionRules = [
     ['unset_essence', /取消.{0,4}精华|移除.{0,4}精华/],
     ['set_essence', /设为.{0,4}精华|设置.{0,4}精华|加精/],
     ['recall', /撤回|\brecall\b|delete message/i],
-    ['image', /(?:发|发送|生成|画|处理|看看).{0,12}(?:图片|图像|照片|头像)/],
+    ['image', /(?:发|发送|生成|处理|看看).{0,12}(?:图|图片|图像|照片|头像)|画(?!蛇添足)|绘制/],
     ['video', /(?:发|发送|播放|找).{0,12}(?:视频|短片)/],
     ['audio', /语音|朗读|\baudio\b|\bvoice\b/i],
     ['music', /音乐|歌曲|唱一首|播放一首/],
     ['dice', /骰子|掷骰|摇骰/],
-    ['rps', /猜拳|石头剪刀布/]
+    ['rps', /猜拳|石头剪刀布/],
+    ['game', /原神|崩坏.{0,4}星穹铁道|星穹铁道|星铁|游戏.{0,4}(?:面板|资料)|角色面板/]
 ];
 const negatedActionRules = Object.freeze({
     send: /(?:不要|别|禁止|不许|无需).{0,6}(?:发送|转发|发给)|\b(?:do not|don't)\s+(?:send|forward)\b/i,
     mute: /(?:不要|别|禁止|不许).{0,6}(?:禁言|闭嘴)|\b(?:do not|don't)\s+(?:mute|ban)\b/i,
     kick: /(?:不要|别|禁止|不许).{0,6}(?:踢出|踢走|移出群)|\b(?:do not|don't)\s+kick\b/i,
-    recall: /(?:不要|别|禁止|不许).{0,6}撤回|\b(?:do not|don't)\s+(?:recall|delete)\b/i
+    recall: /(?:不要|别|禁止|不许).{0,6}撤回|\b(?:do not|don't)\s+(?:recall|delete)\b/i,
+    image: /(?:不要|别|禁止|不许).{0,6}(?:画|绘制|生成|发送).{0,8}(?:图|图片|图像|照片|头像)?/
 });
 function identifier(value, label) {
     const result = typeof value === 'number'

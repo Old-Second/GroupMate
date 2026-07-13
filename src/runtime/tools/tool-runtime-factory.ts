@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../../agent/tools/tool-definition.js'
+import type { ToolTarget } from '../../agent/tools/tool-context.js'
 import { ToolRegistry } from '../../agent/tools/tool-registry.js'
 import { createGithubTool } from '../../tools/GithubTool.js'
 import { createImageCaptionTool } from '../../tools/ImageCaptionTool.js'
@@ -30,7 +31,7 @@ import { createSendMusicTool } from '../../tools/SendMusicTool.js'
 import { createSendPictureTool } from '../../tools/SendPictureTool.js'
 import { createSendRPSTool } from '../../tools/SendRPSTool.js'
 import { createSendVideoTool } from '../../tools/SendVideoTool.js'
-import type { VisibleToolServices } from '../../tools/visible-tool-support.js'
+import type { ToolResource, VisibleToolServices } from '../../tools/visible-tool-support.js'
 import { createEditCardTool } from '../../tools/EditCardTool.js'
 import { createHandleMessageTool } from '../../tools/HandleMessageTool.js'
 import { createJinyanTool } from '../../tools/JinyanTool.js'
@@ -59,7 +60,12 @@ export interface QueryToolRuntimeOptions {
     groupId: string,
     signal: AbortSignal
   ) => Promise<ReadonlyMap<string, GroupMemberSummary>>
-  readonly queryGame: (input: GameQueryInput, signal: AbortSignal) => Promise<unknown>
+  readonly queryGame: (input: GameQueryInput, signal: AbortSignal) => Promise<ToolResource>
+  readonly sendGameImage: (
+    resource: ToolResource,
+    target: ToolTarget,
+    signal: AbortSignal
+  ) => Promise<void>
 }
 
 export interface QueryToolRuntime {
@@ -111,8 +117,8 @@ export function createQueryToolRuntime (options: QueryToolRuntimeOptions): Query
       ...common, apiBaseUrl: options.config.githubApiBaseUrl, apiKey: options.config.githubApiKey
     }),
     createQueryUserinfoTool({ currentGroupMembers: options.currentGroupMembers }),
-    createQueryGenshinTool({ queryGame: options.queryGame }),
-    createQueryStarRailTool({ queryGame: options.queryGame }),
+    createQueryGenshinTool({ queryGame: options.queryGame, sendImage: options.sendGameImage }),
+    createQueryStarRailTool({ queryGame: options.queryGame, sendImage: options.sendGameImage }),
     createSearchImageTool({
       ...common, backend: options.config.imageSearchSource,
       tavilyApiKey: options.config.tavilyApiKey,

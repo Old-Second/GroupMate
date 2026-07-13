@@ -51,8 +51,12 @@ test('core runtime contains only the OpenAI-compatible provider path', async () 
     assert.equal(source.includes(marker), false, `${marker} must be removed from model/core.js`)
   }
 
-  for (const marker of ['ChatGPTAPI', 'executeLegacyToolCall', 'shouldFinalizeAfterTool']) {
+  for (const marker of ['ChatGPTAPI', 'createYunzaiToolRuntimeBridge']) {
     assert.equal(source.includes(marker), true, `${marker} must remain in model/core.js`)
+  }
+
+  for (const marker of ['executeLegacyToolCall', 'shouldFinalizeAfterTool', 'utils/tools/']) {
+    assert.equal(source.includes(marker), false, `${marker} must be removed from model/core.js`)
   }
 })
 

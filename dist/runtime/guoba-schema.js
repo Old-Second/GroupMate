@@ -70,10 +70,18 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('bymFuckRecallTime', '反击回复撤回秒数', '反击回复成功发送后等待多少秒撤回。', 'InputNumber', { min: 1, max: 3600 }),
         divider('工具与搜索'),
         field('smartMode', '开启工具调用', '允许模型使用搜索、图片、语音和授权群管理工具，会增加请求次数；权限仍由运行时校验。', 'Switch'),
-        field('enableToolPrivateSend', '允许工具发起私聊', '允许非主人通过工具向其他群成员发起私聊；主人不受此开关限制。', 'Switch'),
-        field('enableToolCrossGroupSend', '允许工具跨会话发送', '允许非主人通过工具向非当前群或用户发送内容；默认关闭，主人不受限制。', 'Switch'),
+        field('toolPolicyProfile', '工具权限策略', '兼容模式仅执行运行时权限校验；安全模式会审批跨会话发送、踢人、消息管理和操作他人；严格模式会审批所有可见输出和副作用工具。', 'Select', {
+            options: [
+                { label: '兼容', value: 'compatible' },
+                { label: '安全', value: 'safe' },
+                { label: '严格', value: 'strict' }
+            ]
+        }),
+        field('toolApprovalTtlSeconds', '审批有效秒数', '工具审批口令的有效时间，范围 30 到 300 秒；过期后必须重新发起。', 'InputNumber', { min: 30, max: 300 }),
+        field('enableToolPrivateSend', '允许工具发起私聊', '允许机器人主人通过工具向明确指定的 QQ 用户发起私聊；关闭时即使主人也不能通过工具发送。', 'Switch'),
+        field('enableToolCrossGroupSend', '允许工具跨群发送', '允许机器人主人通过工具向明确指定的其他群发送消息；关闭时即使主人也不能跨群发送。', 'Switch'),
         field('enableToolVideoDownload', '允许下载并发送视频', '开启后视频工具可以下载并上传文件；关闭时只发送信息和链接。', 'Switch'),
-        field('toolVideoMaxMB', '视频下载上限 MB', '视频工具允许下载的单文件大小上限，避免耗尽磁盘和内存。', 'InputNumber', { min: 1, max: 200 }),
+        field('toolVideoMaxMB', '视频下载上限 MB', '视频工具允许下载的单文件大小上限；当前为保护低内存部署机，硬上限为 8 MB。', 'InputNumber', { min: 1, max: 8 }),
         field('serpSource', '网页搜索来源', 'Bing Web Search 已退役，推荐使用 Tavily；兼容公益源不保证可用性和长期维护。', 'Select', {
             options: [
                 { label: 'Tavily', value: 'tavily' },

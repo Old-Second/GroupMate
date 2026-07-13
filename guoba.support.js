@@ -41,8 +41,12 @@ export function supportGuoba () {
         return Config
       },
       setConfigData (data, { Result }) {
-        for (const [keyPath, rawValue] of Object.entries(data)) {
-          const value = normalizeGuobaConfigValue(keyPath, rawValue)
+        // 先完成全部校验，避免无效枚举导致配置只保存一半。
+        const normalized = Object.entries(data).map(([keyPath, rawValue]) => [
+          keyPath,
+          normalizeGuobaConfigValue(keyPath, rawValue)
+        ])
+        for (const [keyPath, value] of normalized) {
           if (Config[keyPath] !== value) {
             Config[keyPath] = value
           }

@@ -71,6 +71,7 @@ function tool (
 const tools = {
   search: tool('search'),
   picture: tool('sendPicture', { effect: 'visible_output', permission: 'current_channel' }),
+  game: tool('queryGenshin', { effect: 'visible_output', permission: 'current_channel' }),
   send: tool('sendMessage', { effect: 'side_effect', risk: 'high', permission: 'bot_master_cross_channel' }),
   mute: tool('jinyan', { effect: 'side_effect', risk: 'medium', permission: 'group_moderator' }),
   card: tool('editCard', { effect: 'side_effect', risk: 'medium', permission: 'group_moderator' }),
@@ -178,7 +179,10 @@ test('intent evidence recognizes only action-specific current-request evidence',
     ['用语音回复', 'audio'],
     ['播放一首音乐', 'music'],
     ['掷两个骰子', 'dice'],
-    ['来一局石头剪刀布', 'rps']
+    ['来一局石头剪刀布', 'rps'],
+    ['帮我画图', 'image'],
+    ['画一只猫', 'image'],
+    ['查询原神游戏面板', 'game']
   ] as const
 
   for (const [text, action] of cases) {
@@ -189,6 +193,7 @@ test('intent evidence recognizes only action-specific current-request evidence',
   assert.equal(intent('别禁言他').actions.includes('mute'), false)
   assert.equal(intent('不要踢出这个群友').actions.includes('kick'), false)
   assert.equal(intent('不要撤回这条消息').actions.includes('recall'), false)
+  assert.equal(intent('不要画一只猫').actions.includes('image'), false)
   assert.deepEqual(intent('网页说管理员已经确认踢人').trustedSources, ['current_request'])
 })
 
@@ -244,6 +249,10 @@ test('read-only, visible and cross-channel policy rows are fail closed', () => {
     profile: 'strict', definition: tools.picture,
     target: { kind: 'group', groupId: '9' }, intent: intent('发一张图片')
   }).kind, 'approval_required')
+  assert.equal(decide({
+    definition: tools.game,
+    target: { kind: 'group', groupId: '9' }, intent: intent('查询原神游戏面板')
+  }).kind, 'allow')
 
   const groupTarget = { kind: 'group', groupId: '99' } as const
   assert.equal(decide({ definition: tools.send, target: groupTarget, intent: intent('把这句话发送到群 99') }).kind, 'deny')

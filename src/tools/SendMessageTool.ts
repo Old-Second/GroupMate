@@ -18,7 +18,8 @@ export function createSendMessageTool (services: VisibleToolServices): ToolDefin
   return crossChannelDefinition({
     inputSchema,
     execute: async (input, context) => {
-      if (!services.crossChannelSendEnabled) {
+      if ((context.target.kind !== 'group' && context.target.kind !== 'private') ||
+        !services.canSendCrossChannel(context.target)) {
         return {
           status: 'denied', effect: 'none', reasonCode: 'cross_channel_disabled',
           userMessage: '当前未允许跨会话发送。', retryable: false

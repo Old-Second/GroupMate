@@ -18,6 +18,8 @@ const QQ_IDENTIFIER_FIELDS = new Set([
   'bymFuckBlacklist'
 ])
 
+const TOOL_POLICY_PROFILES = new Set(['compatible', 'safe', 'strict'])
+
 function splitList (value: unknown, separator: RegExp): string[] {
   const values = Array.isArray(value) ? value : String(value ?? '').split(separator)
   const seen = new Set<string>()
@@ -33,6 +35,19 @@ function splitList (value: unknown, separator: RegExp): string[] {
 }
 
 export function normalizeGuobaConfigValue (key: string, value: unknown): unknown {
+  if (key === 'toolPolicyProfile') {
+    if (typeof value !== 'string' || !TOOL_POLICY_PROFILES.has(value)) {
+      throw new TypeError('工具权限策略配置无效。')
+    }
+    return value
+  }
+
+  if (key === 'toolApprovalTtlSeconds') {
+    return typeof value === 'number' && Number.isFinite(value)
+      ? Math.min(Math.max(Math.trunc(value), 30), 300)
+      : 120
+  }
+
   if (CONTENT_LIST_FIELDS.has(key)) {
     return splitList(value, /[,，;；|]/)
   }

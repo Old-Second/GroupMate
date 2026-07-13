@@ -51,7 +51,9 @@ const mediaActions: Readonly<Record<string, IntentAction>> = Object.freeze({
   sendAudioMessage: 'audio',
   sendMusic: 'music',
   sendDice: 'dice',
-  sendRPS: 'rps'
+  sendRPS: 'rps',
+  queryGenshin: 'game',
+  queryStarRail: 'game'
 })
 
 function deny (reasonCode: ToolDenyCode): ToolPolicyDecision {

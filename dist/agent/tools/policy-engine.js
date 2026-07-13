@@ -25,7 +25,9 @@ const mediaActions = Object.freeze({
     sendAudioMessage: 'audio',
     sendMusic: 'music',
     sendDice: 'dice',
-    sendRPS: 'rps'
+    sendRPS: 'rps',
+    queryGenshin: 'game',
+    queryStarRail: 'game'
 });
 function deny(reasonCode) {
     return Object.freeze({ kind: 'deny', reasonCode, userMessage: denialMessages[reasonCode] });

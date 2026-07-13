@@ -479,10 +479,12 @@ export class chatgpt extends plugin {
         }
       }
     }
+    const currentRequestText = prompt
     const messageInput = await buildModelMessageInput({
       event: e,
-      currentPrompt: prompt
+      currentPrompt: currentRequestText
     })
+    e.groupmateCurrentRequestText = currentRequestText
     prompt = messageInput.prompt
     if (messageInput.hasReply) {
       e.groupmateMessageInputImages = messageInput.imageUrls

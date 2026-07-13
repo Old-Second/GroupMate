@@ -75,7 +75,7 @@ function fixture (): {
     ttsAvailable: true,
     videoDownloadEnabled: true,
     videoMaxBytes: 1024,
-    crossChannelSendEnabled: true
+    canSendCrossChannel: () => true
   }
   return { definitions: createVisibleToolDefinitions(services), calls }
 }
@@ -205,6 +205,32 @@ test('sendMessage cross-channel target is exact and capability runs once after a
   assert.deepEqual(calls, [{ kind: 'text', target: { kind: 'group', groupId: '88' }, value: 'hello' }])
 })
 
+test('sendMessage applies private and group configuration to the exact authorized target', async () => {
+  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const checked: ToolTarget[] = []
+  const definitions = createVisibleToolDefinitions(visibleOptions(calls, {
+    canSendCrossChannel: target => {
+      checked.push(target)
+      return target.kind === 'private'
+    }
+  }))
+  const definition = byName(definitions, 'sendMessage')
+  const privateTarget = { kind: 'private' as const, userId: '88' }
+  const privateResult = await definition.execute({
+    targetKind: 'private', targetId: '88', text: 'hello'
+  }, { ...context, target: privateTarget })
+  assert.equal(privateResult.status, 'success')
+
+  const groupTarget = { kind: 'group' as const, groupId: '99' }
+  const groupResult = await definition.execute({
+    targetKind: 'group', targetId: '99', text: 'hello'
+  }, { ...context, target: groupTarget })
+  assert.equal(groupResult.status, 'denied')
+  if (groupResult.status === 'denied') assert.equal(groupResult.reasonCode, 'cross_channel_disabled')
+  assert.deepEqual(checked, [privateTarget, groupTarget])
+  assert.deepEqual(calls, [{ kind: 'text', target: privateTarget, value: 'hello' }])
+})
+
 test('typed effect finalizes only successful visible results', () => {
   assert.equal(shouldFinalizeToolResult({
     status: 'success', effect: 'visible', content: [], retryable: false
@@ -295,7 +321,7 @@ function visibleOptions (
     synthesizeAudio: async () => ({ kind: 'buffer', data: Buffer.from('x'), mimeType: 'audio/silk', byteLength: 1 }),
     resolveVideo: async id => ({ id, shareText: id, videoUrl: 'https://cdn.example/x.mp4' }),
     drawingAvailable: true, pictureProcessingAvailable: true, ttsAvailable: true,
-    videoDownloadEnabled: false, videoMaxBytes: 1024, crossChannelSendEnabled: true,
+    videoDownloadEnabled: false, videoMaxBytes: 1024, canSendCrossChannel: () => true,
     ...overrides
   }
 }

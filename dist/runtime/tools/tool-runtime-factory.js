@@ -65,8 +65,8 @@ export function createQueryToolRuntime(options) {
             ...common, apiBaseUrl: options.config.githubApiBaseUrl, apiKey: options.config.githubApiKey
         }),
         createQueryUserinfoTool({ currentGroupMembers: options.currentGroupMembers }),
-        createQueryGenshinTool({ queryGame: options.queryGame }),
-        createQueryStarRailTool({ queryGame: options.queryGame }),
+        createQueryGenshinTool({ queryGame: options.queryGame, sendImage: options.sendGameImage }),
+        createQueryStarRailTool({ queryGame: options.queryGame, sendImage: options.sendGameImage }),
         createSearchImageTool({
             ...common, backend: options.config.imageSearchSource,
             tavilyApiKey: options.config.tavilyApiKey,

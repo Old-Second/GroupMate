@@ -32,3 +32,16 @@ test('leaves scalar Guoba values unchanged', () => {
   assert.equal(normalizeGuobaConfigValue('temperature', 0.8), 0.8)
   assert.equal(normalizeGuobaConfigValue('model', 'deepseek-chat'), 'deepseek-chat')
 })
+
+test('normalizes the tool policy profile and approval TTL fail closed', () => {
+  assert.equal(normalizeGuobaConfigValue('toolPolicyProfile', 'compatible'), 'compatible')
+  assert.equal(normalizeGuobaConfigValue('toolPolicyProfile', 'safe'), 'safe')
+  assert.equal(normalizeGuobaConfigValue('toolPolicyProfile', 'strict'), 'strict')
+  assert.throws(() => normalizeGuobaConfigValue('toolPolicyProfile', 'unknown'), /工具权限策略配置无效/)
+  assert.throws(() => normalizeGuobaConfigValue('toolPolicyProfile', 1), /工具权限策略配置无效/)
+
+  assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 12), 30)
+  assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 120.9), 120)
+  assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 999), 300)
+  assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 'bad'), 120)
+})

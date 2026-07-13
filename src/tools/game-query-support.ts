@@ -1,7 +1,10 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import type { ToolTarget } from '../agent/tools/tool-context.js'
+import { invalidArguments } from './query-tool-support.js'
 import {
-  boundedJson, invalidArguments, readOnlyDefinition, textResult, upstreamFailure
-} from './query-tool-support.js'
+  cancelledResult, executionFailure, validResource, visibleDefinition, visibleResult,
+  type ToolResource
+} from './visible-tool-support.js'
 
 export type GameKind = 'genshin' | 'star_rail'
 
@@ -13,7 +16,12 @@ export interface GameQueryInput {
 }
 
 export interface GameQueryToolOptions {
-  readonly queryGame: (input: GameQueryInput, signal: AbortSignal) => Promise<unknown>
+  readonly queryGame: (input: GameQueryInput, signal: AbortSignal) => Promise<ToolResource>
+  readonly sendImage: (
+    resource: ToolResource,
+    target: ToolTarget,
+    signal: AbortSignal
+  ) => Promise<void>
 }
 
 const inputSchema = {
@@ -30,8 +38,8 @@ export function createGameQueryTool (
   name: 'queryGenshin' | 'queryStarRail',
   description: string
 ): ToolDefinition {
-  return readOnlyDefinition({
-    name, description, inputSchema, network: 'none', timeoutMs: 20_000,
+  return visibleDefinition({
+    name, description, inputSchema, network: 'none',
     execute: async (input, context) => {
       const userId = String(input.userId ?? '').trim() || context.facts.actor.userId
       const uid = String(input.uid ?? '').trim()
@@ -40,10 +48,14 @@ export function createGameQueryTool (
         return invalidArguments('游戏查询参数无效。')
       }
       try {
-        const result = await options.queryGame({ game, userId, uid, character }, context.signal)
-        return textResult(boundedJson(result))
+        const resource = await options.queryGame({ game, userId, uid, character }, context.signal)
+        if (!validResource(resource)) return executionFailure('游戏面板返回了无效图片。')
+        await options.sendImage(resource, context.target, context.signal)
+        return visibleResult('游戏资料已发送。')
       } catch {
-        return upstreamFailure('游戏资料暂时不可用。')
+        return context.signal.aborted
+          ? cancelledResult()
+          : executionFailure('游戏资料暂时不可用。')
       }
     }
   })

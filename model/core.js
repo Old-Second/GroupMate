@@ -1,6 +1,7 @@
 import { Config, defaultOpenAIAPI } from '../utils/config.js'
 import {
   formatDate,
+  generateAudio,
   getImg,
   getMasterQQ, getMaxModelTokens,
   getUin,
@@ -8,49 +9,21 @@ import {
   isCN
 } from '../utils/common.js'
 import { getChatHistoryGroup } from '../utils/chat.js'
-import { APTool } from '../utils/tools/APTool.js'
 import { getMessageById, upsertMessage } from '../utils/history.js'
 import { v4 as uuid } from 'uuid'
-import { QueryStarRailTool } from '../utils/tools/QueryStarRailTool.js'
-import { WebsiteTool } from '../utils/tools/WebsiteTool.js'
-import { SendPictureTool } from '../utils/tools/SendPictureTool.js'
-import { SendVideoTool } from '../utils/tools/SendBilibiliTool.js'
-import { SearchVideoTool } from '../utils/tools/SearchBilibiliTool.js'
-import { SendAvatarTool } from '../utils/tools/SendAvatarTool.js'
-import { SerpImageTool } from '../utils/tools/SearchImageTool.js'
-import { SearchMusicTool } from '../utils/tools/SearchMusicTool.js'
-import { SendMusicTool } from '../utils/tools/SendMusicTool.js'
-import { SendAudioMessageTool } from '../utils/tools/SendAudioMessageTool.js'
-import { SendMessageToSpecificGroupOrUserTool } from '../utils/tools/SendMessageToSpecificGroupOrUserTool.js'
-import { QueryGenshinTool } from '../utils/tools/QueryGenshinTool.js'
-import { WeatherTool } from '../utils/tools/WeatherTool.js'
-import { QueryUserinfoTool } from '../utils/tools/QueryUserinfoTool.js'
-import { EditCardTool } from '../utils/tools/EditCardTool.js'
-import { JinyanTool } from '../utils/tools/JinyanTool.js'
-import { KickOutTool } from '../utils/tools/KickOutTool.js'
-import { SetTitleTool } from '../utils/tools/SetTitleTool.js'
-import { SerpIkechan8370Tool } from '../utils/tools/SerpIkechan8370Tool.js'
-import { SerpTool } from '../utils/tools/SerpTool.js'
-import { TavilySearchTool } from '../utils/tools/TavilySearchTool.js'
 import common from '../../../lib/common/common.js'
-import { SendDiceTool } from '../utils/tools/SendDiceTool.js'
-import { SendRPSTool } from '../utils/tools/SendRPSTool.js'
-// import { EliMovieTool } from '../utils/tools/EliMovieTool.js'
-// import { EliMusicTool } from '../utils/tools/EliMusicTool.js'
-import { HandleMessageMsgTool } from '../utils/tools/HandleMessageMsgTool.js'
-import { ProcessPictureTool } from '../utils/tools/ProcessPictureTool.js'
-import { ImageCaptionTool } from '../utils/tools/ImageCaptionTool.js'
 import { ChatGPTAPI } from '../utils/openai/chatgpt-api.js'
 import { newFetch } from '../utils/proxy.js'
-import {GithubAPITool} from '../utils/tools/GithubTool.js'
-import { executeLegacyToolCall } from './legacy/tool-execution.js'
 import {
   createChatErrorLog,
   createChatResponseLog,
   createToolExecutionLog
 } from '../dist/runtime/safe-chat-logging.js'
-import { shouldFinalizeAfterTool } from '../dist/runtime/tool-loop-policy.js'
 import { createLegacySessionBridge } from '../dist/runtime/legacy-session-bridge.js'
+import {
+  createYunzaiToolRuntimeBridge,
+  toolResourceFromLegacySegment
+} from '../dist/runtime/tools/legacy-tool-runtime-bridge.js'
 
 export const roleMap = {
   owner: 'group owner',
@@ -60,26 +33,24 @@ export const roleMap = {
 const defaultPropmtPrefix = ', a large language model trained by OpenAI. You answer as concisely as possible for each response (e.g. don’t be verbose). It is very important that you answer as concisely as possible, so please remember this. If you are generating a list, do not have too many items. Keep the number of items short.'
 const MAX_SMART_TOOL_CALLS = 8
 const MAX_TOOL_RESULT_TRACE_LENGTH = 4000
+const toolRuntimeBridge = createYunzaiToolRuntimeBridge({
+  config: Config,
+  redis,
+  getMasterIds: getMasterQQ,
+  getBotId: getUin,
+  getImages: getImg,
+  synthesizeAudio: async (event, text, _voice, signal) => {
+    if (signal.aborted) throw new DOMException('operation was aborted', 'AbortError')
+    const sendable = await generateAudio(event, text)
+    if (!sendable) throw new Error('audio generation failed')
+    return toolResourceFromLegacySegment(sendable)
+  },
+  segment: () => global.segment,
+  logger
+})
 async function clearCurrentConversation (e) {
   const bridge = createLegacySessionBridge({ redis, logger })
   await bridge.delete(e, Config.groupMerge)
-}
-
-async function getRequesterGroupRole (e, userId = e.sender?.user_id) {
-  if (!e.isGroup) {
-    return undefined
-  }
-  try {
-    const members = await e.group?.getMemberMap?.()
-    return members?.get(Number(userId))?.role || members?.get(String(userId))?.role || e.sender?.role
-  } catch (err) {
-    return e.sender?.role
-  }
-}
-
-async function isRequesterMaster (e, userId = e.sender?.user_id) {
-  const masters = await getMasterQQ()
-  return Array.isArray(masters) && masters.map(item => String(item)).includes(String(userId))
 }
 
 function disableFunctionCalling (completionParams = {}) {
@@ -260,22 +231,15 @@ class Core {
     option = Object.assign(option, conversation)
   }
   if (opt.enableSmart) {
-    let requesterRole = await getRequesterGroupRole(e)
-    let isAdmin = ['admin', 'owner'].includes(requesterRole)
-    let sender = e.sender.user_id
-    const {
-      funcMap,
-      fullFuncMap,
-      promptAddition,
-      systemAddition
-    } = await collectTools(e)
+    const toolRun = await toolRuntimeBridge.begin({ event: e, prompt })
     if (!option.completionParams) {
       option.completionParams = {}
     }
-    promptAddition && (prompt += promptAddition)
-    systemAddition && (option.systemMessage += systemAddition)
-    option.completionParams.functions = Object.keys(funcMap).map(k => funcMap[k].function)
+    toolRun.promptAddition && (prompt += toolRun.promptAddition)
+    toolRun.systemAddition && (option.systemMessage += toolRun.systemAddition)
+    option.completionParams.functions = toolRun.modelFunctions
     let msg
+    let retainToolRun = false
     try {
       msg = await this.chatGPTApi.sendMessage(prompt, option)
       if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
@@ -298,39 +262,28 @@ class Core {
         if (msg.text) {
           await e.reply(msg.text.replace('\n\n\n', '\n'))
         }
-        let {
+        const {
           name,
           arguments: args
         } = msg.functionCall
-        args = JSON.parse(args)
-        // 感觉换成targetGroupIdOrUserQQNumber这种表意比较清楚的变量名，效果会好一丢丢
-        if (!args.groupId) {
-          args.groupId = (e.group_id || e.sender.user_id) + ''
-        }
-        if (Number.isNaN(parseInt(args.groupId))) {
-          args.groupId = (e.group_id || e.sender.user_id) + ''
-        }
+        const callId = msg.toolCalls?.[0]?.id || `${toolRun.snapshotId}-${toolCallCount}`
         const {
           toolName,
-          result: functionResult
-        } = await executeLegacyToolCall({
+          modelFeedback: functionResult,
+          finalize: finalizeAfterTool,
+          approvalRequired
+        } = await toolRuntimeBridge.execute({
+          snapshotId: toolRun.snapshotId,
           requestedName: name,
-          fullFuncMap,
-          executableTools: funcMap,
-          toolArgs: args,
-          trustedContext: {
-            isAdmin,
-            sender
-          },
-          event: e,
-          receiver: this
+          arguments: args,
+          callId
         })
+        retainToolRun ||= approvalRequired
         if (Config.debug) logger.info(createToolExecutionLog({ name, result: functionResult }))
         appendToolTrace(smartTrace, toolName, args, functionResult)
         option.parentMessageId = msg.id
         option.name = toolName
-        option.toolCallId = msg.toolCalls?.[0]?.id || toolName.trim()
-        const finalizeAfterTool = shouldFinalizeAfterTool(toolName, functionResult)
+        option.toolCallId = callId
         if (finalizeAfterTool) {
           disableFunctionCalling(option.completionParams)
         }
@@ -359,6 +312,8 @@ class Core {
         logger.error(createChatErrorLog({ mode: use, error: err }))
         throw new Error(err)
       }
+    } finally {
+      toolRuntimeBridge.finish(toolRun.snapshotId, { retainForApproval: retainToolRun })
     }
     return msg
   } else {
@@ -379,154 +334,6 @@ class Core {
     }
     return msg
   }
-  }
-}
-
-/**
- * 收集tools
- * @param e
- * @return {Promise<{systemAddition, funcMap: {}, promptAddition: string, fullFuncMap: {}}>}
- */
-async function collectTools (e) {
-  let serpTool
-  switch (Config.serpSource) {
-    case 'tavily': {
-      serpTool = new TavilySearchTool()
-      break
-    }
-    case 'ikechan8370': {
-      serpTool = new SerpIkechan8370Tool()
-      break
-    }
-    case 'azure': {
-      if (!Config.azSerpKey) {
-        logger.warn('未配置bing搜索密钥，转为使用ikechan8370搜索源')
-        serpTool = new SerpIkechan8370Tool()
-      } else {
-        serpTool = new SerpTool()
-      }
-      break
-    }
-    default: {
-      serpTool = new SerpIkechan8370Tool()
-    }
-  }
-  let fullTools = [
-    new EditCardTool(),
-    // new QueryStarRailTool(),
-    new WebsiteTool(),
-    new JinyanTool(),
-    new KickOutTool(),
-    new WeatherTool(),
-    new SendPictureTool(),
-    new SendVideoTool(),
-    new ImageCaptionTool(),
-    new SearchVideoTool(),
-    new SendAvatarTool(),
-    new SerpImageTool(),
-    new SearchMusicTool(),
-    new SendMusicTool(),
-    new SerpIkechan8370Tool(),
-    new SerpTool(),
-    serpTool,
-    new SendAudioMessageTool(),
-    new SendRPSTool(),
-    // new ProcessPictureTool(),
-    new APTool(),
-    new HandleMessageMsgTool(),
-    new QueryUserinfoTool(),
-    // new EliMusicTool(),
-    // new EliMovieTool(),
-    new SendMessageToSpecificGroupOrUserTool(),
-    new SendDiceTool(),
-    new QueryGenshinTool(),
-    new SetTitleTool(),
-    new GithubAPITool()
-  ]
-  // todo 3.0再重构tool的插拔和管理
-  let /** @type{AbstractTool[]} **/ tools = [
-    new SendAvatarTool(),
-    new SendDiceTool(),
-    new SendMessageToSpecificGroupOrUserTool(),
-    // new EditCardTool(),
-    new QueryStarRailTool(),
-    new QueryGenshinTool(),
-    new SendMusicTool(),
-    new SearchMusicTool(),
-    new ProcessPictureTool(),
-    new WebsiteTool(),
-    // new JinyanTool(),
-    // new KickOutTool(),
-    new WeatherTool(),
-    new SendPictureTool(),
-    new SendAudioMessageTool(),
-    new SendRPSTool(),
-    new APTool(),
-    // new HandleMessageMsgTool(),
-    serpTool,
-    new QueryUserinfoTool(),
-    new GithubAPITool()
-  ]
-  let systemAddition = ''
-  if (e.isGroup) {
-    let botInfo = await e.bot?.pickMember?.(e.group_id, getUin(e)) || await e.bot?.getGroupMemberInfo?.(e.group_id, getUin(e))
-    if (botInfo?.role && botInfo.role !== 'member') {
-      const senderRole = await getRequesterGroupRole(e)
-      const senderIsMaster = await isRequesterMaster(e)
-      const canModerate = senderIsMaster || ['owner', 'admin'].includes(senderRole)
-      const canKick = senderIsMaster || senderRole === 'owner'
-      tools.push(new JinyanTool())
-      if (canModerate) {
-        tools.push(...[new EditCardTool(), new HandleMessageMsgTool()])
-        if (botInfo?.role === 'owner') {
-          tools.push(new SetTitleTool())
-        }
-      }
-      if (canKick) {
-        tools.push(new KickOutTool())
-      }
-      if (canModerate) {
-        // 用于撤回和加精的id
-        if (e.source?.seq) {
-          let source = (await e.group.getChatHistory(e.source?.seq, 1)).pop()
-          systemAddition += `\nthe current request is replying to messageId ${source.message_id}. Only use handleMsg for that replied message when the requester explicitly asks to manage it.\n`
-        }
-        systemAddition += '\nNever recall or manage the current request message itself.\n'
-      }
-    }
-  }
-  let promptAddition = ''
-  let img = await getImg(e)
-  if (img?.length > 0 && Config.extraUrl) {
-    tools.push(new ImageCaptionTool())
-    // tools.push(new ProcessPictureTool())
-    promptAddition += `\nthe url of the picture(s) above: ${img.join(', ')}`
-  } else {
-    tools.push(new SerpImageTool())
-    tools.push(...[new SearchVideoTool(),
-      new SendVideoTool()])
-  }
-  let funcMap = {}
-  let fullFuncMap = {}
-  tools.forEach(tool => {
-    funcMap[tool.name] = {
-      exec: tool.func,
-      function: tool.function(),
-      tool
-    }
-  })
-  fullTools.forEach(tool => {
-    fullFuncMap[tool.name] = {
-      exec: tool.func,
-      function: tool.function(),
-      tool
-    }
-  })
-  return {
-    funcMap,
-    fullFuncMap,
-    systemAddition,
-    promptAddition
   }
 }
 

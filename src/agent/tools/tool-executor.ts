@@ -38,6 +38,7 @@ export interface ToolExecutionRequest {
   readonly initialFacts: ToolRuntimeFacts
   readonly intent: IntentEvidence
   readonly refreshFacts: (target: ToolTarget, signal: AbortSignal) => Promise<ToolRuntimeFacts>
+  readonly approvalTtlSeconds?: number
   readonly approvalGrant?: {
     readonly tokenHash: string
     readonly callId: string
@@ -204,12 +205,16 @@ export class ToolExecutor {
     argumentHash: string,
     summaryCode: string
   ): Promise<ToolExecutionOutcome> {
+    const approvalTtlSeconds = request.approvalTtlSeconds ?? this.#approvalTtlSeconds
+    if (!Number.isInteger(approvalTtlSeconds) || approvalTtlSeconds < 30 || approvalTtlSeconds > 300) {
+      throw new TypeError('approval TTL is invalid')
+    }
     const token = this.#options.generateToken()
     const tokenHash = this.#options.hash(token)
     const pendingCallId = this.#options.generateId()
     const rawVersion = this.#options.generateId()
     const createdAt = this.#options.now()
-    const expiresAt = new Date(createdAt.getTime() + this.#approvalTtlSeconds * 1_000)
+    const expiresAt = new Date(createdAt.getTime() + approvalTtlSeconds * 1_000)
     const pending: PendingToolCall = Object.freeze({
       schemaVersion: 1,
       pendingCallId,
@@ -254,7 +259,7 @@ export class ToolExecutor {
       return completed(definition.name, failedResult('tool_control_unavailable'))
     }
     try {
-      await this.#options.approvalStore.create(record, this.#approvalTtlSeconds)
+      await this.#options.approvalStore.create(record, approvalTtlSeconds)
     } catch {
       this.#options.pendingCalls.delete(pendingCallId)
       return completed(definition.name, failedResult('tool_control_unavailable'))
