@@ -538,7 +538,7 @@ function qqCapabilities (event: YunzaiRecord, segment: YunzaiRecord): QqSendCapa
     sendAudio: async (target, resource, signal) => send(target, segment.record(resourceValue(resource)), signal),
     sendVideo: async (target, resource, signal) => send(target, segment.video(resourceValue(resource)), signal),
     sendMusic: async (target, music, signal) => send(target, segment.music(music.provider, music.id), signal),
-    sendDice: async (target, value, signal) => send(target, segment.dice(value), signal),
+    sendDice: async (target, _value, signal) => send(target, segment.dice(), signal),
     sendRps: async (target, value, signal) => send(target, segment.rps(value), signal)
   }
 }

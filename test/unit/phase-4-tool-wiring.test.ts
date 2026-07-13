@@ -341,6 +341,40 @@ test('Phase 4 production bridge routes restored media capabilities through typed
   ])
 })
 
+test('Phase 4 production bridge creates QQ dice segments without an invalid fixed value', async () => {
+  const diceArguments: unknown[][] = []
+  const sent: unknown[] = []
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    segment: () => ({
+      dice: (...values: unknown[]) => {
+        diceArguments.push(values)
+        return { type: 'dice' }
+      }
+    })
+  })
+  const event = {
+    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
+    bot: { pickFriend: () => ({ sendMsg: async (message: unknown) => { sent.push(message) } }) }
+  }
+  const started = await bridge.begin({ event, prompt: '请发送一枚骰子' })
+  const outcome = await bridge.execute({
+    snapshotId: started.snapshotId, requestedName: 'sendDice',
+    arguments: { count: 1 }, callId: 'call-dice'
+  })
+
+  assert.equal(outcome.result?.status, 'success')
+  assert.equal(outcome.result?.effect, 'visible')
+  assert.deepEqual(diceArguments, [[]])
+  assert.deepEqual(sent, [{ type: 'dice' }])
+})
+
 test('Phase 4 external plugin facade captures sends and blocks host mutations', async () => {
   let originalSends = 0
   let originalMutes = 0
