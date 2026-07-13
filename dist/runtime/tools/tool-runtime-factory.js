@@ -20,6 +20,11 @@ import { createSendMusicTool } from '../../tools/SendMusicTool.js';
 import { createSendPictureTool } from '../../tools/SendPictureTool.js';
 import { createSendRPSTool } from '../../tools/SendRPSTool.js';
 import { createSendVideoTool } from '../../tools/SendVideoTool.js';
+import { createEditCardTool } from '../../tools/EditCardTool.js';
+import { createHandleMessageTool } from '../../tools/HandleMessageTool.js';
+import { createJinyanTool } from '../../tools/JinyanTool.js';
+import { createKickOutTool } from '../../tools/KickOutTool.js';
+import { createSetTitleTool } from '../../tools/SetTitleTool.js';
 export function createVisibleToolDefinitions(services) {
     return Object.freeze([
         createDrawTool(services),
@@ -32,6 +37,15 @@ export function createVisibleToolDefinitions(services) {
         createSendDiceTool(services),
         createSendRPSTool(services),
         createSendMessageTool(services)
+    ]);
+}
+export function createManagementToolDefinitions(capabilities) {
+    return Object.freeze([
+        createEditCardTool(capabilities),
+        createJinyanTool(capabilities),
+        createKickOutTool(capabilities),
+        createSetTitleTool(capabilities),
+        createHandleMessageTool(capabilities)
     ]);
 }
 export function createQueryToolRuntime(options) {

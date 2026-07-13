@@ -31,6 +31,12 @@ import { createSendPictureTool } from '../../tools/SendPictureTool.js'
 import { createSendRPSTool } from '../../tools/SendRPSTool.js'
 import { createSendVideoTool } from '../../tools/SendVideoTool.js'
 import type { VisibleToolServices } from '../../tools/visible-tool-support.js'
+import { createEditCardTool } from '../../tools/EditCardTool.js'
+import { createHandleMessageTool } from '../../tools/HandleMessageTool.js'
+import { createJinyanTool } from '../../tools/JinyanTool.js'
+import { createKickOutTool } from '../../tools/KickOutTool.js'
+import { createSetTitleTool } from '../../tools/SetTitleTool.js'
+import type { QqManagementCapabilities } from '../../tools/management-tool-support.js'
 
 export interface QueryToolRuntimeConfig {
   readonly searchSource: SearchBackend
@@ -73,6 +79,18 @@ export function createVisibleToolDefinitions (services: VisibleToolServices): re
     createSendDiceTool(services),
     createSendRPSTool(services),
     createSendMessageTool(services)
+  ])
+}
+
+export function createManagementToolDefinitions (
+  capabilities: QqManagementCapabilities
+): readonly ToolDefinition[] {
+  return Object.freeze([
+    createEditCardTool(capabilities),
+    createJinyanTool(capabilities),
+    createKickOutTool(capabilities),
+    createSetTitleTool(capabilities),
+    createHandleMessageTool(capabilities)
   ])
 }
 
