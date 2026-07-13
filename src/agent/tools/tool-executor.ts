@@ -17,6 +17,7 @@ import type { ToolObjectSchema } from './tool-schema.js'
 import {
   parseToolResult,
   shouldFinalizeToolExecution,
+  type ToolDenyCode,
   type ToolErrorCode,
   type ToolResult
 } from './tool-result.js'
@@ -73,6 +74,7 @@ export interface ToolExecutorOptions {
   readonly hash: (value: string) => string
   readonly now: () => Date
   readonly approvalTtlSeconds?: number
+  readonly approvalMode?: 'enabled' | 'disabled'
 }
 
 function failedResult (errorCode: ToolErrorCode): ToolResult {
@@ -94,7 +96,7 @@ function failedResult (errorCode: ToolErrorCode): ToolResult {
   })
 }
 
-function deniedResult (reasonCode: 'tool_unavailable' | 'invalid_arguments' | 'permission_denied' | 'approval_invalid', message: string): ToolResult {
+function deniedResult (reasonCode: ToolDenyCode, message: string): ToolResult {
   return parseToolResult({ status: 'denied', effect: 'none', reasonCode, userMessage: message, retryable: false })
 }
 
@@ -354,6 +356,16 @@ export class ToolExecutor {
         status: 'denied', effect: 'none', reasonCode: decision.reasonCode,
         userMessage: decision.userMessage, retryable: false
       }))
+    }
+
+    if (decision.kind === 'approval_required' && this.#options.approvalMode === 'disabled') {
+      if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'approval_unavailable' })) {
+        return completed(definition, failedResult('tool_control_unavailable'))
+      }
+      return completed(definition, deniedResult(
+        'approval_unavailable',
+        '该操作需要人工确认，当前审批流程不可用，未执行操作。'
+      ))
     }
 
     const argumentHash = this.#options.hash(JSON.stringify(input))

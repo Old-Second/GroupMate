@@ -582,6 +582,58 @@ test('Phase 4 production bridge recognizes TRSS primitive group ID lists', async
   assert.equal(sends, 0)
 })
 
+test('Phase 4 production bridge retires legacy approval without control state or side effects', async () => {
+  let muteCalls = 0
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
+    [8, { user_id: 8, role: 'member', nickname: 'member' }],
+    [10000, { user_id: 10000, role: 'owner', nickname: 'bot' }]
+  ])
+  const group = {
+    getMemberMap: async () => members,
+    muteMember: async () => { muteCalls += 1 },
+    kickMember: async () => {}, setCard: async () => {}, setTitle: async () => {}, recallMsg: async () => {}
+  }
+  const event = {
+    isGroup: true, group_id: 9, user_id: 7, message_id: 'current-safe',
+    sender: { user_id: 7, role: 'owner', nickname: 'owner' },
+    group,
+    bot: {
+      pickGroup: () => group,
+      setEssenceMessage: async () => {}, removeEssenceMessage: async () => {}
+    },
+    message: []
+  }
+  const redis = new FakeRedis()
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis,
+    getMasterIds: async () => ['1'],
+    getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const started = await bridge.begin({ event, prompt: '请禁言 QQ:8 60 秒' })
+  const outcome = await bridge.execute({
+    snapshotId: started.snapshotId,
+    requestedName: 'jinyan',
+    arguments: { userId: '8', seconds: 60 },
+    callId: 'call-safe-retired-approval'
+  })
+
+  assert.deepEqual(outcome.result, {
+    status: 'denied', effect: 'none', reasonCode: 'approval_unavailable',
+    userMessage: '该操作需要人工确认，当前审批流程不可用，未执行操作。', retryable: false
+  })
+  assert.equal(outcome.approvalRequired, false)
+  assert.equal(muteCalls, 0)
+  assert.equal(redis.setCalls.some(call => call.key.startsWith('GROUPMATE:TOOL:APPROVAL:v1:')), false)
+})
+
 test('Phase 4 Yunzai bridge derives group authority from runtime facts before management execution', async () => {
   const muted: Array<{ userId: string | number; seconds: number }> = []
   const members = new Map<unknown, Record<string, unknown>>([

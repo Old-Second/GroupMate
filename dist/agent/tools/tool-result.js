@@ -13,6 +13,7 @@ const denyCodes = new Set([
     'bot_permission_denied',
     'cross_channel_disabled',
     'approval_invalid',
+    'approval_unavailable',
     'tool_unavailable',
     'invalid_arguments',
     'current_message_protected',

@@ -259,6 +259,12 @@ export class ToolExecutor {
                 userMessage: decision.userMessage, retryable: false
             }));
         }
+        if (decision.kind === 'approval_required' && this.#options.approvalMode === 'disabled') {
+            if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'approval_unavailable' })) {
+                return completed(definition, failedResult('tool_control_unavailable'));
+            }
+            return completed(definition, deniedResult('approval_unavailable', '该操作需要人工确认，当前审批流程不可用，未执行操作。'));
+        }
         const argumentHash = this.#options.hash(JSON.stringify(input));
         if (decision.kind === 'approval_required') {
             if (request.approvalGrant === undefined) {

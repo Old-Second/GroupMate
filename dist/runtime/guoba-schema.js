@@ -75,14 +75,14 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('bymFuckRecallTime', '反击回复撤回秒数', '反击回复成功发送后等待多少秒撤回。', 'InputNumber', { min: 1, max: 3600 }),
         divider('工具与搜索'),
         field('smartMode', '开启工具调用', '允许模型使用搜索、图片、语音和授权群管理工具，会增加请求次数；权限仍由运行时校验。', 'Switch'),
-        field('toolPolicyProfile', '工具权限策略', '兼容模式仅执行运行时权限校验；安全模式会审批跨会话发送、踢人、消息管理和操作他人；严格模式会审批所有可见输出和副作用工具。', 'Select', {
+        field('toolPolicyProfile', '工具权限策略', '兼容模式在通过运行时权限校验后执行；安全与严格模式中需要审批的操作会拒绝执行，不会生成旧口令；新的风险分级审批将在新运行引擎接入后启用。', 'Select', {
             options: [
                 { label: '兼容', value: 'compatible' },
                 { label: '安全', value: 'safe' },
                 { label: '严格', value: 'strict' }
             ]
         }),
-        field('toolApprovalTtlSeconds', '审批有效秒数', '工具审批口令的有效时间，范围 30 到 300 秒；过期后必须重新发起。', 'InputNumber', { min: 30, max: 300 }),
+        field('toolApprovalTtlSeconds', '审批有效秒数', '为新审批流程预留的有效时间，范围 30 到 300 秒；当前旧运行器不生成审批口令。', 'InputNumber', { min: 30, max: 300 }),
         field('toolPrivateSendPolicy', '工具发起私聊权限', '控制谁能通过工具向明确指定的 QQ 用户发起私聊；所有人允许仍要求当前请求给出精确目标和明确发送意图，修改对下一次运行生效。', 'Select', {
             options: crossChannelPolicyOptions
         }),

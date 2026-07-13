@@ -47,6 +47,7 @@ const schema = {
 } as const
 
 interface HarnessOptions {
+  approvalMode?: 'enabled' | 'disabled'
   effect?: ToolEffect
   idempotency?: 'call' | 'semantic'
   handler?: (input: Readonly<Record<string, unknown>>) => Promise<ToolResult>
@@ -191,8 +192,9 @@ function harness (options: HarnessOptions = {}) {
     generateId: () => `generated-${++generated}`,
     generateToken: () => 'approval-token-123456',
     hash: value => `hash:${value}`,
-    now: () => new Date('2026-07-13T00:00:00.000Z')
-  })
+    now: () => new Date('2026-07-13T00:00:00.000Z'),
+    approvalMode: options.approvalMode
+  } as ConstructorParameters<typeof ToolExecutor>[0])
   const request = (overrides: Partial<ToolExecutionRequest> = {}): ToolExecutionRequest => ({
     snapshot,
     call: {
@@ -306,6 +308,23 @@ test('policy denial never reserves or executes a side effect', async () => {
   assert.equal(outcome.kind === 'completed' && outcome.finalize, true)
   assert.equal(fixture.handlerCalls(), 0)
   assert.equal(fixture.calls.includes('idempotency.reserve'), false)
+})
+
+test('disabled approval mode denies without creating control state', async () => {
+  const fixture = harness({
+    decision: { kind: 'approval_required', reasonCode: 'approval_required', summaryCode: 'fixture_approval' },
+    approvalMode: 'disabled'
+  })
+  const outcome = await fixture.executor.execute(fixture.request())
+
+  assert.deepEqual(outcome.kind === 'completed' && outcome.result, {
+    status: 'denied', effect: 'none', reasonCode: 'approval_unavailable',
+    userMessage: '该操作需要人工确认，当前审批流程不可用，未执行操作。', retryable: false
+  })
+  assert.equal(fixture.pending.size, 0)
+  assert.equal(fixture.calls.includes('approval.create'), false)
+  assert.equal(fixture.calls.includes('idempotency.reserve'), false)
+  assert.equal(fixture.handlerCalls(), 0)
 })
 
 test('approval stores pending arguments before the hashed control record', async () => {

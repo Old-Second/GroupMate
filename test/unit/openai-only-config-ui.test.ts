@@ -357,6 +357,15 @@ test('Guoba exposes every supported user-facing configuration with an explanatio
   }
 })
 
+test('Guoba explains the retired legacy approval behavior', () => {
+  const fields = new Map(buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).flatMap(schema => schema.field ? [[schema.field, schema] as const] : []))
+
+  assert.match(fields.get('toolPolicyProfile')?.bottomHelpMessage ?? '', /需要审批的操作会拒绝执行/)
+  assert.match(fields.get('toolApprovalTtlSeconds')?.bottomHelpMessage ?? '', /新审批流程预留/)
+})
+
 test('cross-channel send permissions use independent fail-closed selects', async () => {
   const schemas = buildGuobaSchemas({
     vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []

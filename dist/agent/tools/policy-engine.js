@@ -8,6 +8,7 @@ const denialMessages = Object.freeze({
     bot_permission_denied: '机器人当前没有执行该操作的群权限。',
     cross_channel_disabled: '当前未允许跨会话发送。',
     approval_invalid: '该审批已失效，请重新发起。',
+    approval_unavailable: '该操作需要人工确认，当前审批流程不可用，未执行操作。',
     tool_unavailable: '该工具在当前场景不可用。',
     invalid_arguments: '工具参数无效。',
     current_message_protected: '不能管理当前请求消息。',

@@ -1016,6 +1016,7 @@ export function createYunzaiToolRuntimeBridge (
     const approvals = new RedisApprovalStore({ client: options.redis, botIdHash })
     const executor = new ToolExecutor({
       policy: new ToolPolicyEngine(),
+      approvalMode: 'disabled',
       approvalStore: approvalRouter,
       pendingCalls,
       idempotencyStore: new RedisIdempotencyStore({ client: options.redis, botIdHash }),
