@@ -69,7 +69,7 @@ test('management tool factory exposes five side-effect definitions without untru
   ])
   for (const definition of definitions) {
     assert.equal(definition.effect, 'side_effect')
-    assert.equal(definition.idempotency, 'call')
+    assert.equal(definition.idempotency, 'semantic')
     const schema = definition.inputSchema as ToolObjectSchema
     for (const field of ['sender', 'isAdmin', 'confirmByOwnerOrMaster']) {
       assert.equal(Object.hasOwn(schema.properties, field), false, `${definition.name}:${field}`)

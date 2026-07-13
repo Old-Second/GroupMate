@@ -334,6 +334,9 @@ class Core {
         if (Config.debug) logger.info(createChatResponseLog({ mode: use, response: msg }))
         appendReasoningTrace(smartTrace, msg, `模型思考 ${toolCallCount + 1}`)
         if (finalizeAfterTool) {
+          if (typeof msg?.text !== 'string' || !msg.text.trim()) {
+            msg = { ...(msg || {}), text: functionResult }
+          }
           break
         }
       }

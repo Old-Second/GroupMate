@@ -48,6 +48,7 @@ const schema = {
 
 interface HarnessOptions {
   effect?: ToolEffect
+  idempotency?: 'call' | 'semantic'
   handler?: (input: Readonly<Record<string, unknown>>) => Promise<ToolResult>
   decision?: ToolPolicyDecision
   reservation?: IdempotencyReservation
@@ -59,12 +60,14 @@ interface HarnessOptions {
   idempotencyIndeterminateError?: Error
   pendingPutError?: Error
   expectedApprovalTtlSeconds?: number
+  statefulIdempotency?: boolean
 }
 
 function harness (options: HarnessOptions = {}) {
   const calls: string[] = []
   const audits: ToolAuditEvent[] = []
   const pending = new Map<string, PendingToolCall>()
+  const idempotencyStates = new Map<string, IdempotencyReservation>()
   let handlerCalls = 0
   const effect = options.effect ?? 'side_effect'
   const target: ToolTarget = { kind: 'member', groupId: '9', userId: '8' }
@@ -78,7 +81,7 @@ function harness (options: HarnessOptions = {}) {
     risk: effect === 'read_only' ? 'low' : 'medium',
     readOnly: effect === 'read_only',
     destructive: false,
-    idempotency: effect === 'read_only' ? 'none' : 'call',
+    idempotency: effect === 'read_only' ? 'none' : (options.idempotency ?? 'call'),
     openWorld: false,
     timeoutMs: options.definitionTimeoutMs ?? 1_000,
     maxOutputBytes: options.maxOutputBytes ?? 4_096,
@@ -136,20 +139,31 @@ function harness (options: HarnessOptions = {}) {
     }
   }
   const idempotencyStore: IdempotencyStore = {
-    reserve: async (_record: IdempotencyRecord, ttlSeconds: number) => {
+    reserve: async (record: IdempotencyRecord, ttlSeconds: number) => {
       calls.push('idempotency.reserve')
       assert.equal(ttlSeconds, 300)
+      if (options.statefulIdempotency === true) {
+        const existing = idempotencyStates.get(record.key)
+        if (existing !== undefined) return existing
+        idempotencyStates.set(record.key, { kind: 'running' })
+      }
       return options.reservation ?? { kind: 'acquired' }
     },
-    complete: async (_key: string, _result: StoredToolOutcome, ttlSeconds: number) => {
+    complete: async (key: string, result: StoredToolOutcome, ttlSeconds: number) => {
       calls.push('idempotency.complete')
       assert.equal(ttlSeconds, 300)
       if (options.idempotencyCompleteError !== undefined) throw options.idempotencyCompleteError
+      if (options.statefulIdempotency === true) {
+        idempotencyStates.set(key, { kind: 'completed', outcome: result })
+      }
     },
-    markIndeterminate: async (_key: string, ttlSeconds: number) => {
+    markIndeterminate: async (key: string, ttlSeconds: number) => {
       calls.push('idempotency.indeterminate')
       assert.equal(ttlSeconds, 300)
       if (options.idempotencyIndeterminateError !== undefined) throw options.idempotencyIndeterminateError
+      if (options.statefulIdempotency === true) {
+        idempotencyStates.set(key, { kind: 'indeterminate' })
+      }
     }
   }
   const audit: ToolAuditSink = {
@@ -208,6 +222,7 @@ test('executor runs one validated tool call in the fixed order', async () => {
 
   assert.equal(outcome.kind, 'completed')
   assert.equal(outcome.kind === 'completed' && outcome.result.status, 'success')
+  assert.equal(outcome.kind === 'completed' && outcome.finalize, true)
   assert.deepEqual(fixture.calls, [
     'snapshot.resolve', 'schema.validate', 'target.resolve', 'facts.refresh',
     'policy.decide', 'idempotency.reserve', 'audit.started', 'handler.execute',
@@ -216,6 +231,42 @@ test('executor runs one validated tool call in the fixed order', async () => {
   assert.equal(fixture.handlerCalls(), 1)
   assert.deepEqual(fixture.audits.map(event => event.eventType), ['requested', 'started', 'completed'])
   assert.doesNotMatch(JSON.stringify(fixture.audits), /hello|10000|userId|groupId/)
+})
+
+test('semantic idempotency executes identical arguments once across different model call IDs', async () => {
+  const fixture = harness({ statefulIdempotency: true, idempotency: 'semantic' })
+  const first = await fixture.executor.execute(fixture.request())
+  const duplicate = await fixture.executor.execute(fixture.request({
+    call: {
+      runId: 'run-1', callId: 'call-2', snapshotId: 'snapshot-1',
+      requestedName: 'fixtureTool', arguments: { text: 'hello' }
+    }
+  }))
+
+  assert.equal(first.kind === 'completed' && first.result.status, 'success')
+  assert.equal(duplicate.kind === 'completed' && duplicate.result.status, 'success')
+  assert.equal(fixture.handlerCalls(), 1)
+
+  await fixture.executor.execute(fixture.request({
+    call: {
+      runId: 'run-1', callId: 'call-3', snapshotId: 'snapshot-1',
+      requestedName: 'fixtureTool', arguments: { text: 'different' }
+    }
+  }))
+  assert.equal(fixture.handlerCalls(), 2)
+})
+
+test('call idempotency keeps distinct model call IDs independent', async () => {
+  const fixture = harness({ statefulIdempotency: true, idempotency: 'call' })
+  await fixture.executor.execute(fixture.request())
+  await fixture.executor.execute(fixture.request({
+    call: {
+      runId: 'run-1', callId: 'call-2', snapshotId: 'snapshot-1',
+      requestedName: 'fixtureTool', arguments: { text: 'hello' }
+    }
+  }))
+
+  assert.equal(fixture.handlerCalls(), 2)
 })
 
 test('executor rejects unavailable and malformed calls without execution', async () => {

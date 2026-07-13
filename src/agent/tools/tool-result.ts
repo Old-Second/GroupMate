@@ -1,3 +1,5 @@
+import type { ToolEffect } from './tool-definition.js'
+
 const maxToolOutputBytes = 64 * 1024
 const maxMessageBytes = 16 * 1024
 const maxContentItems = 32
@@ -234,4 +236,10 @@ export function toolResultForModel (result: ToolResult): string {
 
 export function shouldFinalizeToolResult (result: ToolResult): boolean {
   return result.status === 'success' && result.effect === 'visible'
+}
+
+export function shouldFinalizeToolExecution (definitionEffect: ToolEffect, result: ToolResult): boolean {
+  return result.status === 'success' && (
+    result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background')
+  )
 }

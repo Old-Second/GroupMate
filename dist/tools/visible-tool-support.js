@@ -60,7 +60,7 @@ export function crossChannelDefinition(input) {
         description: '向明确指定的其他群或用户发送一条文本消息。',
         inputSchema: input.inputSchema,
         effect: 'side_effect', risk: 'high', readOnly: false, destructive: false,
-        idempotency: 'call', openWorld: false, timeoutMs: 10_000,
+        idempotency: 'semantic', openWorld: false, timeoutMs: 10_000,
         maxOutputBytes: 4 * 1024, network: 'none', permission: 'bot_master_cross_channel',
         resolveTarget: (toolInput) => toolInput.targetKind === 'group'
             ? Object.freeze({ kind: 'group', groupId: String(toolInput.targetId) })

@@ -16,7 +16,7 @@ import { ToolInputError, validateToolInputRecord } from './schema-validator.js'
 import type { ToolObjectSchema } from './tool-schema.js'
 import {
   parseToolResult,
-  shouldFinalizeToolResult,
+  shouldFinalizeToolExecution,
   type ToolErrorCode,
   type ToolResult
 } from './tool-result.js'
@@ -105,12 +105,13 @@ function indeterminateResult (): ToolResult {
   })
 }
 
-function completed (toolName: string, result: ToolResult): ToolExecutionOutcome {
+function completed (tool: string | ToolDefinition, result: ToolResult): ToolExecutionOutcome {
+  const toolName = typeof tool === 'string' ? tool : tool.name
   return Object.freeze({
     kind: 'completed',
     toolName,
     result,
-    finalize: shouldFinalizeToolResult(result)
+    finalize: typeof tool === 'string' ? false : shouldFinalizeToolExecution(tool.effect, result)
   })
 }
 
@@ -141,8 +142,15 @@ function channelKey (facts: ToolRuntimeFacts): string {
     : `group:${facts.channel.groupId}`
 }
 
-function idempotencyKey (definition: ToolDefinition, call: ToolCall, hash: (value: string) => string): string {
-  return hash(JSON.stringify({ version: 1, tool: definition.name, runId: call.runId, callId: call.callId }))
+function idempotencyKey (
+  definition: ToolDefinition,
+  call: ToolCall,
+  argumentHash: string,
+  hash: (value: string) => string
+): string {
+  return definition.idempotency === 'semantic'
+    ? hash(JSON.stringify({ version: 2, tool: definition.name, runId: call.runId, argumentHash }))
+    : hash(JSON.stringify({ version: 1, tool: definition.name, runId: call.runId, callId: call.callId }))
 }
 
 export class ToolExecutor {
@@ -256,13 +264,13 @@ export class ToolExecutor {
     try {
       this.#options.pendingCalls.put(pending)
     } catch {
-      return completed(definition.name, failedResult('tool_control_unavailable'))
+      return completed(definition, failedResult('tool_control_unavailable'))
     }
     try {
       await this.#options.approvalStore.create(record, approvalTtlSeconds)
     } catch {
       this.#options.pendingCalls.delete(pendingCallId)
-      return completed(definition.name, failedResult('tool_control_unavailable'))
+      return completed(definition, failedResult('tool_control_unavailable'))
     }
     await this.#tryAudit('approval_required', definition, request, { reasonCode: 'approval_required' })
     return Object.freeze({
@@ -274,16 +282,16 @@ export class ToolExecutor {
     })
   }
 
-  #duplicateOutcome (toolName: string, reservation: Exclude<Awaited<ReturnType<IdempotencyStore['reserve']>>, { kind: 'acquired' }>): ToolExecutionOutcome {
-    if (reservation.kind === 'running') return completed(toolName, failedResult('tool_in_progress'))
-    if (reservation.kind === 'indeterminate') return completed(toolName, indeterminateResult())
+  #duplicateOutcome (definition: ToolDefinition, reservation: Exclude<Awaited<ReturnType<IdempotencyStore['reserve']>>, { kind: 'acquired' }>): ToolExecutionOutcome {
+    if (reservation.kind === 'running') return completed(definition, failedResult('tool_in_progress'))
+    if (reservation.kind === 'indeterminate') return completed(definition, indeterminateResult())
     const stored = reservation.outcome
     if (stored.status === 'success') {
-      return completed(toolName, parseToolResult({
+      return completed(definition, parseToolResult({
         status: 'success', effect: stored.effect, content: [], retryable: false
       }))
     }
-    return completed(toolName, failedResult(stored.errorCode))
+    return completed(definition, failedResult(stored.errorCode))
   }
 
   async execute (request: ToolExecutionRequest): Promise<ToolExecutionOutcome> {
@@ -301,7 +309,7 @@ export class ToolExecutor {
     }
 
     if (!await this.#tryAudit('requested', definition, request)) {
-      return completed(definition.name, failedResult('tool_control_unavailable'))
+      return completed(definition, failedResult('tool_control_unavailable'))
     }
     let input: Readonly<Record<string, unknown>>
     let target: ToolTarget
@@ -312,17 +320,17 @@ export class ToolExecutor {
       target = definition.resolveTarget(input, request.initialFacts)
       refreshedFacts = await request.refreshFacts(target, request.signal ?? new AbortController().signal)
     } catch (error) {
-      if (isAborted(request.signal)) return completed(definition.name, failedResult('tool_cancelled'))
+      if (isAborted(request.signal)) return completed(definition, failedResult('tool_cancelled'))
       if (error instanceof ToolInputError || error instanceof SyntaxError) {
         if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'invalid_arguments' })) {
-          return completed(definition.name, failedResult('tool_control_unavailable'))
+          return completed(definition, failedResult('tool_control_unavailable'))
         }
-        return completed(definition.name, deniedResult('invalid_arguments', '工具参数无效。'))
+        return completed(definition, deniedResult('invalid_arguments', '工具参数无效。'))
       }
       if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'permission_denied' })) {
-        return completed(definition.name, failedResult('tool_control_unavailable'))
+        return completed(definition, failedResult('tool_control_unavailable'))
       }
-      return completed(definition.name, deniedResult('permission_denied', '当前身份不能执行该操作。'))
+      return completed(definition, deniedResult('permission_denied', '当前身份不能执行该操作。'))
     }
 
     let decision
@@ -340,9 +348,9 @@ export class ToolExecutor {
     }
     if (decision.kind === 'deny') {
       if (!await this.#tryAudit('denied', definition, request, { reasonCode: decision.reasonCode })) {
-        return completed(definition.name, failedResult('tool_control_unavailable'))
+        return completed(definition, failedResult('tool_control_unavailable'))
       }
-      return completed(definition.name, parseToolResult({
+      return completed(definition, parseToolResult({
         status: 'denied', effect: 'none', reasonCode: decision.reasonCode,
         userMessage: decision.userMessage, retryable: false
       }))
@@ -355,13 +363,13 @@ export class ToolExecutor {
       }
       if (request.approvalGrant.callId !== request.call.callId || request.approvalGrant.argumentHash !== argumentHash) {
         if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'approval_invalid' })) {
-          return completed(definition.name, failedResult('tool_control_unavailable'))
+          return completed(definition, failedResult('tool_control_unavailable'))
         }
-        return completed(definition.name, deniedResult('approval_invalid', '该审批已失效，请重新发起。'))
+        return completed(definition, deniedResult('approval_invalid', '该审批已失效，请重新发起。'))
       }
     }
 
-    const key = idempotencyKey(definition, request.call, this.#options.hash)
+    const key = idempotencyKey(definition, request.call, argumentHash, this.#options.hash)
     if (definition.idempotency !== 'none') {
       const record: IdempotencyRecord = Object.freeze({
         schemaVersion: 1,
@@ -376,9 +384,9 @@ export class ToolExecutor {
       try {
         reservation = await this.#options.idempotencyStore.reserve(record, idempotencyTtlSeconds)
       } catch {
-        return completed(definition.name, failedResult('tool_control_unavailable'))
+        return completed(definition, failedResult('tool_control_unavailable'))
       }
-      if (reservation.kind !== 'acquired') return this.#duplicateOutcome(definition.name, reservation)
+      if (reservation.kind !== 'acquired') return this.#duplicateOutcome(definition, reservation)
     }
 
     const startedAt = this.#options.now().getTime()
@@ -391,7 +399,7 @@ export class ToolExecutor {
           }, idempotencyTtlSeconds)
         } catch {}
       }
-      return completed(definition.name, failedResult('tool_control_unavailable'))
+      return completed(definition, failedResult('tool_control_unavailable'))
     }
 
     const controller = new AbortController()
@@ -438,7 +446,7 @@ export class ToolExecutor {
         outputBytes: Buffer.byteLength(JSON.stringify(result), 'utf8'),
         startedAt
       })
-      return completed(definition.name, result)
+      return completed(definition, result)
     } catch {
       if (definition.effect !== 'read_only') {
         if (definition.idempotency !== 'none') {
@@ -449,14 +457,14 @@ export class ToolExecutor {
         await this.#tryAudit('indeterminate', definition, request, {
           errorCode: 'tool_outcome_unknown', startedAt
         })
-        return completed(definition.name, indeterminateResult())
+        return completed(definition, indeterminateResult())
       }
       const code: ToolErrorCode = controller.signal.aborted
         ? (isAborted(request.signal) ? 'tool_cancelled' : 'tool_timeout')
         : 'tool_execution_failed'
       const result = failedResult(code)
       await this.#tryAudit('failed', definition, request, { errorCode: code, startedAt })
-      return completed(definition.name, result)
+      return completed(definition, result)
     } finally {
       clearTimeout(timer)
       request.signal?.removeEventListener('abort', externalAbort)

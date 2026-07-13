@@ -21,7 +21,7 @@ export function managementDefinition(input) {
         name: input.name, version: 1, aliases: Object.freeze([...(input.aliases ?? [])]),
         description: input.description, inputSchema: input.inputSchema,
         effect: 'side_effect', risk: 'high', readOnly: false,
-        destructive: input.destructive ?? false, idempotency: 'call', openWorld: false,
+        destructive: input.destructive ?? false, idempotency: 'semantic', openWorld: false,
         timeoutMs: 10_000, maxOutputBytes: 4 * 1024, network: 'none',
         permission: input.permission, resolveTarget: input.resolveTarget, execute: input.execute
     });

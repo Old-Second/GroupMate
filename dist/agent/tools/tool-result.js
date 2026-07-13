@@ -164,3 +164,6 @@ export function toolResultForModel(result) {
 export function shouldFinalizeToolResult(result) {
     return result.status === 'success' && result.effect === 'visible';
 }
+export function shouldFinalizeToolExecution(definitionEffect, result) {
+    return result.status === 'success' && (result.effect === 'visible' || (definitionEffect === 'side_effect' && result.effect === 'background'));
+}

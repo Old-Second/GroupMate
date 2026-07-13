@@ -335,6 +335,7 @@ test('Phase 4 production bridge routes restored media capabilities through typed
   assert.equal(game.result?.status, 'success')
   assert.equal(processed.result?.status, 'success')
   assert.equal(processed.result?.effect, 'background')
+  assert.equal(processed.finalize, false)
   assert.equal(sent.length, 2)
   assert.deepEqual(networkCalls.map(call => `${call.method} ${call.url.origin}${call.url.pathname}`), [
     'GET https://image.example/cat.png', 'POST https://extra.example/image2hed'
@@ -571,6 +572,7 @@ test('Phase 4 Yunzai bridge derives group authority from runtime facts before ma
   })
   assert.deepEqual(muted, [{ userId: 8, seconds: 60 }])
   assert.equal(outcome.result?.status, 'success')
+  assert.equal(outcome.finalize, true)
   assert.equal(outcome.modelFeedback, '已执行禁言。')
 })
 
@@ -655,6 +657,16 @@ test('Phase 4 production core skips provider follow-up after visible tool output
   const finalizedBranch = core.slice(guard, providerFollowUp)
   assert.match(finalizedBranch, /msg = \{ noMsg: true \}/)
   assert.match(finalizedBranch, /break/)
+})
+
+test('Phase 4 production core permits one final response after a background side effect', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+  const start = core.indexOf('if (finalizeAfterTool) {\n          disableFunctionCalling')
+  assert.notEqual(start, -1)
+  const section = core.slice(start, core.indexOf('finalizeSmartTrace', start))
+  assert.match(section, /The action is complete\. Reply to the user now and do not call more tools\./)
+  assert.match(section, /typeof msg\?\.text !== 'string' \|\| !msg\.text\.trim\(\)/)
+  assert.match(section, /text: functionResult[\s\S]*break\n        }/)
 })
 
 test('Phase 4 production core preserves provider error metadata for presentation', async () => {

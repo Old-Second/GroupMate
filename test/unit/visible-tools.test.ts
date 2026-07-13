@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { AuthorizedToolContext, ToolRuntimeFacts, ToolTarget } from '../../src/agent/tools/tool-context.js'
 import { ToolPolicyEngine } from '../../src/agent/tools/policy-engine.js'
-import { shouldFinalizeToolResult } from '../../src/agent/tools/tool-result.js'
+import {
+  shouldFinalizeToolExecution,
+  shouldFinalizeToolResult
+} from '../../src/agent/tools/tool-result.js'
 import { validateToolInputRecord } from '../../src/agent/tools/schema-validator.js'
 import type { ToolObjectSchema } from '../../src/agent/tools/tool-schema.js'
 import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
@@ -94,7 +97,7 @@ test('visible tool factory exposes ten exact typed definitions', () => {
   ])
   for (const definition of definitions) {
     assert.equal(definition.readOnly, false)
-    assert.equal(definition.idempotency, 'call')
+    assert.equal(definition.idempotency, definition.name === 'sendMessage' ? 'semantic' : 'call')
   }
   assert.equal(byName(definitions, 'sendMessage').effect, 'side_effect')
   assert.equal(byName(definitions, 'sendMessage').permission, 'bot_master_cross_channel')
@@ -241,6 +244,23 @@ test('typed effect finalizes only successful visible results', () => {
   assert.equal(shouldFinalizeToolResult({
     status: 'failed', effect: 'none', errorCode: 'tool_execution_failed',
     userMessage: '工具执行失败。', retryable: false
+  }), false)
+})
+
+test('successful background and visible effects stop further tool calls', () => {
+  assert.equal(shouldFinalizeToolExecution('side_effect', {
+    status: 'success', effect: 'background',
+    content: [{ type: 'text', text: '已执行操作。' }], retryable: false
+  }), true)
+  assert.equal(shouldFinalizeToolExecution('visible_output', {
+    status: 'success', effect: 'visible', content: [], retryable: false
+  }), true)
+  assert.equal(shouldFinalizeToolExecution('visible_output', {
+    status: 'success', effect: 'background',
+    content: [{ type: 'resource_ref', resourceType: 'image', resourceId: 'processed' }], retryable: false
+  }), false)
+  assert.equal(shouldFinalizeToolExecution('side_effect', {
+    status: 'success', effect: 'none', content: [], retryable: false
   }), false)
 })
 

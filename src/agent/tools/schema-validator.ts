@@ -232,7 +232,7 @@ export function validateToolDefinition<Input> (definition: ToolDefinition<Input>
   if ((definition.effect === 'read_only') !== definition.readOnly ||
     (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly || definition.risk !== 'high')) ||
     (definition.readOnly && definition.idempotency !== 'none') ||
-    (!definition.readOnly && definition.idempotency !== 'call')) {
+    (!definition.readOnly && definition.idempotency !== 'call' && definition.idempotency !== 'semantic')) {
     throw new ToolInputError('invalid_definition')
   }
   return definition
