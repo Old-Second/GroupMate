@@ -220,6 +220,13 @@ export class ToolPolicyEngine {
       return allowed()
     }
 
+    if (input.definition.effect === 'progress_output') {
+      return input.definition.permission === 'current_channel' &&
+        currentTarget(input.target, input.facts) && input.facts.targetExists
+        ? allowed()
+        : deny('target_invalid')
+    }
+
     const action = intendedAction(input.definition, input.input)
     if (input.definition.permission === 'current_channel') {
       if (!currentTarget(input.target, input.facts)) return deny('target_invalid')

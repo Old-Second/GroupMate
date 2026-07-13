@@ -18,6 +18,7 @@ import { RedisApprovalStore, type RedisToolControlClient } from './redis-approva
 import { RedisIdempotencyStore } from './redis-idempotency-store.js'
 import { resolveToolRuntimeFacts, type ToolRuntimeFactsSource } from './runtime-facts.js'
 import { resolveCrossChannelAccess } from './cross-channel-policy.js'
+import { ProgressOutputController } from './progress-output.js'
 import {
   createManagementToolDefinitions,
   createQueryToolRuntime,
@@ -932,9 +933,17 @@ function visibleServices (
   ].some(key => configText(options.config, key) !== '')
   const processImage = options.processImage ?? pictureProcessor(policyFetch, configText(options.config, 'extraUrl'))
   const crossChannelAccess = resolveCrossChannelAccess(options.config)
+  const qq = qqCapabilities(event, options.segment())
+  const progress = new ProgressOutputController({
+    maxMessages: 5,
+    maxCharacters: 200,
+    hash: sha256ApprovalValue,
+    send: async (text, target, signal) => qq.sendText(target, text, signal),
+    audit: async auditEvent => { options.logger?.info?.(Object.freeze({ ...auditEvent })) }
+  })
   return {
     policyFetch,
-    qq: qqCapabilities(event, options.segment()),
+    qq,
     generateImage: async (prompt, signal) => {
       return options.generateImage === undefined
         ? generateWithApPlugin(event, prompt, signal)
@@ -951,7 +960,57 @@ function visibleServices (
     ttsAvailable,
     videoDownloadEnabled: downloadVideo,
     videoMaxBytes: finiteInteger(options.config.toolVideoMaxMB, 8, 1, 8) * 1024 * 1024,
-    crossChannelAccess
+    crossChannelAccess,
+    reportProgress: async (text, context) => {
+      const outcome = await progress.deliver({
+        text,
+        target: context.target,
+        runId: context.runId,
+        callId: context.callId,
+        snapshotId: context.snapshotId,
+        signal: context.signal
+      })
+      if (outcome.kind === 'sent') {
+        return Object.freeze({
+          status: 'success' as const,
+          effect: 'background' as const,
+          content: Object.freeze([Object.freeze({
+            type: 'text' as const,
+            text: '进度已发送，请继续执行任务。'
+          })]),
+          retryable: false as const
+        })
+      }
+      if (outcome.kind === 'duplicate') {
+        return Object.freeze({
+          status: 'success' as const,
+          effect: 'none' as const,
+          content: Object.freeze([Object.freeze({
+            type: 'text' as const,
+            text: '相同进度已发送，请继续执行任务。'
+          })]),
+          retryable: false as const
+        })
+      }
+      if (outcome.kind === 'suppressed') {
+        return Object.freeze({
+          status: 'success' as const,
+          effect: 'none' as const,
+          content: Object.freeze([Object.freeze({
+            type: 'text' as const,
+            text: '进度消息已达到本轮上限，请继续任务并在最终回复中总结。'
+          })]),
+          retryable: false as const
+        })
+      }
+      return Object.freeze({
+        status: 'denied' as const,
+        effect: 'none' as const,
+        reasonCode: 'invalid_arguments' as const,
+        userMessage: '进度消息必须为 1 到 200 个字符。',
+        retryable: false as const
+      })
+    }
   }
 }
 

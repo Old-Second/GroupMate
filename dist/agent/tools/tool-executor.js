@@ -23,10 +23,13 @@ function failedResult(errorCode) {
 function deniedResult(reasonCode, message) {
     return parseToolResult({ status: 'denied', effect: 'none', reasonCode, userMessage: message, retryable: false });
 }
-function indeterminateResult() {
+function indeterminateResult(effect) {
     return parseToolResult({
         status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
-        userMessage: '操作结果暂时无法确认。', retryable: false
+        userMessage: effect === 'progress_output'
+            ? '进度消息发送结果无法确认，请勿重试该条并继续任务。'
+            : '操作结果暂时无法确认。',
+        retryable: false
     });
 }
 function completed(tool, result) {
@@ -184,10 +187,19 @@ export class ToolExecutor {
         });
     }
     #duplicateOutcome(definition, reservation) {
+        if (definition.effect === 'progress_output' &&
+            (reservation.kind === 'running' ||
+                (reservation.kind === 'completed' && reservation.outcome.status === 'success'))) {
+            return completed(definition, parseToolResult({
+                status: 'success', effect: 'none',
+                content: [{ type: 'text', text: '相同进度已发送，请继续执行任务。' }],
+                retryable: false
+            }));
+        }
         if (reservation.kind === 'running')
             return completed(definition, failedResult('tool_in_progress'));
         if (reservation.kind === 'indeterminate')
-            return completed(definition, indeterminateResult());
+            return completed(definition, indeterminateResult(definition.effect));
         const stored = reservation.outcome;
         if (stored.status === 'success') {
             return completed(definition, parseToolResult({
@@ -363,7 +375,7 @@ export class ToolExecutor {
                 await this.#tryAudit('indeterminate', definition, request, {
                     errorCode: 'tool_outcome_unknown', startedAt
                 });
-                return completed(definition, indeterminateResult());
+                return completed(definition, indeterminateResult(definition.effect));
             }
             const code = controller.signal.aborted
                 ? (isAborted(request.signal) ? 'tool_cancelled' : 'tool_timeout')

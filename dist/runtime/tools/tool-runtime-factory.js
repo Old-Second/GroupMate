@@ -20,6 +20,7 @@ import { createSendMusicTool } from '../../tools/SendMusicTool.js';
 import { createSendPictureTool } from '../../tools/SendPictureTool.js';
 import { createSendRPSTool } from '../../tools/SendRPSTool.js';
 import { createSendVideoTool } from '../../tools/SendVideoTool.js';
+import { createReportProgressTool } from '../../tools/ReportProgressTool.js';
 import { createEditCardTool } from '../../tools/EditCardTool.js';
 import { createHandleMessageTool } from '../../tools/HandleMessageTool.js';
 import { createJinyanTool } from '../../tools/JinyanTool.js';
@@ -36,7 +37,8 @@ export function createVisibleToolDefinitions(services) {
         createSendAudioMessageTool(services),
         createSendDiceTool(services),
         createSendRPSTool(services),
-        createSendMessageTool(services)
+        createSendMessageTool(services),
+        createReportProgressTool(services)
     ]);
 }
 export function createManagementToolDefinitions(capabilities) {

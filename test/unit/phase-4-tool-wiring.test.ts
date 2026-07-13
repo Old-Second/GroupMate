@@ -555,6 +555,96 @@ test('Phase 4 production bridge recognizes TRSS primitive group ID lists', async
   assert.equal(sends, 0)
 })
 
+test('Phase 4 production bridge reports at most five current-channel progress messages per run', async () => {
+  const sent: unknown[] = []
+  const logs: unknown[] = []
+  const receiver = { sendMsg: async (message: unknown) => { sent.push(message) } }
+  const event = {
+    isGroup: true, group_id: 9, user_id: 7, sender: { user_id: 7, role: 'member' },
+    group: receiver,
+    bot: { pickGroup: () => receiver },
+    message: []
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'strict', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    segment: () => ({}), logger: { info: value => { logs.push(value) } }
+  })
+  const run = await bridge.begin({ event, prompt: '执行一个多步骤任务' })
+  assert.equal(run.modelFunctions.some(item => item.name === 'reportProgress'), true)
+
+  for (let sequence = 1; sequence <= 5; sequence++) {
+    const outcome = await bridge.execute({
+      snapshotId: run.snapshotId,
+      requestedName: 'reportProgress',
+      arguments: { text: `阶段 ${sequence} 完成` },
+      callId: `progress-${sequence}`
+    })
+    assert.equal(outcome.modelFeedback, '进度已发送，请继续执行任务。')
+    assert.equal(outcome.finalize, false)
+    assert.equal(outcome.approvalRequired, false)
+  }
+  const suppressed = await bridge.execute({
+    snapshotId: run.snapshotId,
+    requestedName: 'reportProgress',
+    arguments: { text: '阶段 6 完成' },
+    callId: 'progress-6'
+  })
+  assert.equal(suppressed.modelFeedback, '进度消息已达到本轮上限，请继续任务并在最终回复中总结。')
+  assert.equal(suppressed.finalize, false)
+  assert.deepEqual(sent, [
+    '阶段 1 完成', '阶段 2 完成', '阶段 3 完成', '阶段 4 完成', '阶段 5 完成'
+  ])
+  const progressLogs = logs.filter(value => JSON.stringify(value).includes('groupmate.progress.output'))
+  assert.equal(progressLogs.length, 6)
+  assert.doesNotMatch(JSON.stringify(progressLogs), /阶段|group_id|user_id/)
+})
+
+test('Phase 4 progress send uncertainty stays non-terminal and cannot be retried', async () => {
+  let sends = 0
+  const receiver = {
+    sendMsg: async () => {
+      sends += 1
+      throw new Error('transport-secret')
+    }
+  }
+  const event = {
+    isGroup: true, group_id: 9, user_id: 7, sender: { user_id: 7, role: 'member' },
+    group: receiver, bot: { pickGroup: () => receiver }, message: []
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const run = await bridge.begin({ event, prompt: '执行一个多步骤任务' })
+  const first = await bridge.execute({
+    snapshotId: run.snapshotId, requestedName: 'reportProgress',
+    arguments: { text: '阶段完成' }, callId: 'uncertain-1'
+  })
+  assert.deepEqual(first.result, {
+    status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
+    userMessage: '进度消息发送结果无法确认，请勿重试该条并继续任务。', retryable: false
+  })
+  assert.equal(first.finalize, false)
+
+  const duplicate = await bridge.execute({
+    snapshotId: run.snapshotId, requestedName: 'reportProgress',
+    arguments: { text: ' 阶段完成 ' }, callId: 'uncertain-2'
+  })
+  assert.equal(duplicate.modelFeedback, '相同进度已发送，请继续执行任务。')
+  assert.equal(duplicate.finalize, false)
+  assert.equal(sends, 1)
+})
+
 test('Phase 4 Yunzai bridge derives group authority from runtime facts before management execution', async () => {
   const muted: Array<{ userId: string | number; seconds: number }> = []
   const members = new Map<unknown, Record<string, unknown>>([
@@ -701,6 +791,17 @@ test('Phase 4 production core permits one final response after a background side
   assert.doesNotMatch(section, /The action is complete/)
   assert.match(section, /typeof msg\?\.text !== 'string' \|\| !msg\.text\.trim\(\)/)
   assert.match(section, /text: functionResult[\s\S]*break\n        }/)
+})
+
+test('Phase 4 production core suppresses only reportProgress companion text', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+  const loop = core.indexOf('while (msg.functionCall)')
+  const extraction = core.indexOf('const {\n          name,\n          arguments: args\n        } = msg.functionCall', loop)
+  const companionGuard = core.indexOf("if (msg.text && name !== 'reportProgress')", loop)
+  assert.notEqual(extraction, -1)
+  assert.notEqual(companionGuard, -1)
+  assert.equal(extraction < companionGuard, true)
+  assert.match(core.slice(companionGuard, companionGuard + 180), /await e\.reply\(msg\.text\.replace/)
 })
 
 test('Phase 4 production core preserves provider error metadata for presentation', async () => {

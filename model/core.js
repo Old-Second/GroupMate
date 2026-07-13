@@ -291,13 +291,13 @@ class Core {
           break
         }
         toolCallCount++
-        if (msg.text) {
-          await e.reply(msg.text.replace('\n\n\n', '\n'))
-        }
         const {
           name,
           arguments: args
         } = msg.functionCall
+        if (msg.text && name !== 'reportProgress') {
+          await e.reply(msg.text.replace('\n\n\n', '\n'))
+        }
         const callId = msg.toolCalls?.[0]?.id || `${toolRun.snapshotId}-${toolCallCount}`
         const {
           toolName,
