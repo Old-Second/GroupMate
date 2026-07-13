@@ -118,6 +118,33 @@ test('Phase 4 tool wiring captures approval TTL per run instead of caching start
   assert.deepEqual(requests.map(request => request.approvalTtlSeconds), [120, 30])
 })
 
+test('Phase 4 tool wiring exposes approval as deterministic control output', async () => {
+  const approval = harness({
+    kind: 'approval_required',
+    toolName: 'fixture',
+    token: 'approval-token-123456',
+    expiresAt: '2026-07-14T00:00:00.000Z',
+    summaryCode: 'fixture_approval'
+  })
+  const run = await approval.bridge.begin({ event: {}, prompt: 'mute member' })
+  const outcome = await approval.bridge.execute({
+    snapshotId: run.snapshotId,
+    requestedName: 'fixture',
+    arguments: { text: 'one' },
+    callId: 'call-approval'
+  })
+  const presentation = (outcome as typeof outcome & {
+    readonly presentation?: Readonly<{ kind: 'approval'; text: string }>
+  }).presentation
+
+  assert.deepEqual(presentation, {
+    kind: 'approval',
+    text: '操作需要确认。请在 2026-07-14T00:00:00.000Z 前发送“#确认 approval-token-123456”，或发送“#拒绝 approval-token-123456”。'
+  })
+  assert.equal(outcome.approvalRequired, true)
+  assert.equal(outcome.finalize, true)
+})
+
 test('Phase 4 tool wiring captures profile and one immutable snapshot for the whole run', async () => {
   const success = result()
   const runtime = harness({ kind: 'completed', toolName: 'fixture', result: success, finalize: false })
@@ -690,6 +717,24 @@ test('Phase 4 production core skips provider follow-up after visible tool output
   const finalizedBranch = core.slice(guard, providerFollowUp)
   assert.match(finalizedBranch, /msg = \{ noMsg: true \}/)
   assert.match(finalizedBranch, /break/)
+})
+
+test('Phase 4 production core returns approval control output before provider follow-up', async () => {
+  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
+  const execute = core.indexOf('} = await toolRuntimeBridge.execute({')
+  const guard = core.indexOf("if (presentation?.kind === 'approval')", execute)
+  const toolTrace = core.indexOf('appendToolTrace(smartTrace, toolName, args, functionResult)', execute)
+  const providerFollowUp = core.indexOf('msg = await this.chatGPTApi.sendMessage(', execute)
+
+  assert.notEqual(execute, -1)
+  assert.notEqual(guard, -1)
+  assert.notEqual(toolTrace, -1)
+  assert.notEqual(providerFollowUp, -1)
+  assert.ok(guard < toolTrace)
+  assert.ok(guard < providerFollowUp)
+  assert.match(core.slice(guard, providerFollowUp), /retainToolRun = true/)
+  assert.match(core.slice(guard, providerFollowUp), /msg = \{ text: presentation\.text \}/)
+  assert.match(core.slice(guard, providerFollowUp), /break/)
 })
 
 test('Phase 4 production core permits one final response after a background side effect', async () => {

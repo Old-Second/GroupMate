@@ -69,12 +69,18 @@ export interface LegacyToolExecutionInput {
   readonly signal?: AbortSignal
 }
 
+export interface ToolControlPresentation {
+  readonly kind: 'approval'
+  readonly text: string
+}
+
 export interface LegacyToolExecutionResult {
   readonly toolName: string
   readonly modelFeedback: string
   readonly result: ToolResult | null
   readonly finalize: boolean
   readonly approvalRequired: boolean
+  readonly presentation?: ToolControlPresentation
 }
 
 export interface LegacyToolRuntimeBridge {
@@ -222,12 +228,14 @@ export function createLegacyToolRuntimeBridge (
         ...(input.signal === undefined ? {} : { signal: input.signal })
       })
       if (outcome.kind === 'approval_required') {
+        const feedback = approvalFeedback(outcome)
         return Object.freeze({
           toolName: outcome.toolName,
-          modelFeedback: approvalFeedback(outcome),
+          modelFeedback: feedback,
           result: null,
           finalize: true,
-          approvalRequired: true
+          approvalRequired: true,
+          presentation: Object.freeze({ kind: 'approval', text: feedback })
         })
       }
       return Object.freeze({

@@ -301,7 +301,8 @@ class Core {
           modelFeedback: functionResult,
           result: toolResult,
           finalize: finalizeAfterTool,
-          approvalRequired
+          approvalRequired,
+          presentation
         } = await toolRuntimeBridge.execute({
           snapshotId: toolRun.snapshotId,
           requestedName: name,
@@ -310,6 +311,11 @@ class Core {
         })
         retainToolRun ||= approvalRequired
         if (Config.debug) logger.info(createToolExecutionLog({ name, result: functionResult }))
+        if (presentation?.kind === 'approval') {
+          retainToolRun = true
+          msg = { text: presentation.text }
+          break
+        }
         appendToolTrace(smartTrace, toolName, args, functionResult)
         option.parentMessageId = msg.id
         option.name = toolName

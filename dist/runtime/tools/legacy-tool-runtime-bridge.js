@@ -115,12 +115,14 @@ export function createLegacyToolRuntimeBridge(options) {
                 ...(input.signal === undefined ? {} : { signal: input.signal })
             });
             if (outcome.kind === 'approval_required') {
+                const feedback = approvalFeedback(outcome);
                 return Object.freeze({
                     toolName: outcome.toolName,
-                    modelFeedback: approvalFeedback(outcome),
+                    modelFeedback: feedback,
                     result: null,
                     finalize: true,
-                    approvalRequired: true
+                    approvalRequired: true,
+                    presentation: Object.freeze({ kind: 'approval', text: feedback })
                 });
             }
             return Object.freeze({
