@@ -3,6 +3,7 @@ import type { ToolRuntimeFacts } from './tool-context.js'
 import type { ToolDefinition, ToolPermissionKind } from './tool-definition.js'
 import { ToolInputError, validateToolDefinition } from './schema-validator.js'
 import type { StrictToolSchema } from './tool-schema.js'
+import { actorMaySendCrossChannel } from './cross-channel-access.js'
 
 const snapshotIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const groupPermissions: ReadonlySet<ToolPermissionKind> = new Set([
@@ -97,6 +98,9 @@ function cloneDefinition (source: ToolDefinition): ToolDefinition {
     maxOutputBytes: source.maxOutputBytes,
     network: source.network,
     permission: source.permission,
+    ...(source.crossChannelAccess === undefined
+      ? {}
+      : { crossChannelAccess: Object.freeze({ ...source.crossChannelAccess }) }),
     resolveTarget: source.resolveTarget,
     execute: source.execute
   }
@@ -105,7 +109,13 @@ function cloneDefinition (source: ToolDefinition): ToolDefinition {
 
 function visibleInScene (definition: ToolDefinition, facts: ToolRuntimeFacts): boolean {
   if (groupPermissions.has(definition.permission) && facts.channel.kind !== 'group') return false
-  if (definition.permission === 'bot_master_cross_channel' && !facts.actor.isBotMaster) return false
+  if (definition.permission === 'cross_channel') {
+    const access = definition.crossChannelAccess
+    return access !== undefined && (
+      actorMaySendCrossChannel(access, 'private', facts.actor.isBotMaster) ||
+      actorMaySendCrossChannel(access, 'group', facts.actor.isBotMaster)
+    )
+  }
   return true
 }
 

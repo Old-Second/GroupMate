@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ToolRuntimeFacts, ToolTarget } from '../../src/agent/tools/tool-context.js'
+import type { CrossChannelAccess } from '../../src/agent/tools/cross-channel-access.js'
 import type {
   ToolDefinition,
   ToolEffect,
@@ -44,6 +45,7 @@ function tool (
     risk?: ToolRisk
     permission?: ToolPermissionKind
     destructive?: boolean
+    crossChannelAccess?: CrossChannelAccess
   } = {}
 ): ToolDefinition {
   const effect = options.effect ?? 'read_only'
@@ -63,6 +65,7 @@ function tool (
     maxOutputBytes: 4_096,
     network: 'none',
     permission: options.permission ?? 'any_user',
+    ...(options.crossChannelAccess === undefined ? {} : { crossChannelAccess: options.crossChannelAccess }),
     resolveTarget: () => ({ kind: 'none' }),
     execute: async () => ({ status: 'success', effect: 'none', content: [], retryable: false })
   }
@@ -72,7 +75,10 @@ const tools = {
   search: tool('search'),
   picture: tool('sendPicture', { effect: 'visible_output', permission: 'current_channel' }),
   game: tool('queryGenshin', { effect: 'visible_output', permission: 'current_channel' }),
-  send: tool('sendMessage', { effect: 'side_effect', risk: 'high', permission: 'bot_master_cross_channel' }),
+  send: tool('sendMessage', {
+    effect: 'side_effect', risk: 'high', permission: 'cross_channel',
+    crossChannelAccess: { private: 'master', group: 'master' }
+  }),
   mute: tool('jinyan', { effect: 'side_effect', risk: 'medium', permission: 'group_moderator' }),
   card: tool('editCard', { effect: 'side_effect', risk: 'medium', permission: 'group_moderator' }),
   kick: tool('kickOut', { effect: 'side_effect', risk: 'high', permission: 'group_owner_or_master', destructive: true }),
@@ -273,6 +279,48 @@ test('read-only, visible and cross-channel policy rows are fail closed', () => {
     intent: intent('把这句话发送给用户 8')
   }).kind, 'deny')
   assert.equal(decide({ profile: 'safe', definition: tools.send, facts: masterFacts, target: groupTarget, intent: intent('把这句话发送到群 99') }).kind, 'approval_required')
+})
+
+test('cross-channel policy applies independent target audiences and real mention evidence', () => {
+  const mixed = tool('sendMessage', {
+    effect: 'side_effect', risk: 'high', permission: 'cross_channel',
+    crossChannelAccess: { private: 'everyone', group: 'master' }
+  })
+  const privateTarget = { kind: 'private', userId: '8' } as const
+  const groupTarget = { kind: 'group', groupId: '99' } as const
+  assert.equal(decide({
+    definition: mixed,
+    target: privateTarget,
+    intent: intent('发送给这个群友', { mentions: ['8'] })
+  }).kind, 'allow')
+  assert.deepEqual(decide({
+    definition: mixed,
+    target: groupTarget,
+    intent: intent('发送到群 99')
+  }), {
+    kind: 'deny', reasonCode: 'permission_denied', userMessage: '当前身份不能执行该操作。'
+  })
+
+  const masterFacts = { ...baseFacts, actor: { ...baseFacts.actor, isBotMaster: true } }
+  assert.equal(decide({
+    definition: mixed, facts: masterFacts, target: groupTarget,
+    intent: intent('发送到群 99')
+  }).kind, 'allow')
+  assert.equal(decide({
+    profile: 'strict', definition: mixed, facts: masterFacts, target: groupTarget,
+    intent: intent('发送到群 99')
+  }).kind, 'approval_required')
+
+  const disabled = tool('sendMessage', {
+    effect: 'side_effect', risk: 'high', permission: 'cross_channel',
+    crossChannelAccess: { private: 'disabled', group: 'disabled' }
+  })
+  assert.deepEqual(decide({
+    definition: disabled, facts: masterFacts, target: groupTarget,
+    intent: intent('发送到群 99')
+  }), {
+    kind: 'deny', reasonCode: 'cross_channel_disabled', userMessage: '当前未允许跨会话发送。'
+  })
 })
 
 test('self mute and card exceptions remain bounded to the actor', () => {

@@ -195,10 +195,10 @@ export function validateToolInputRecord (
   return cloneValue(schema, input, 1, '$') as Readonly<Record<string, unknown>>
 }
 
-const effects: readonly ToolEffect[] = ['read_only', 'visible_output', 'side_effect']
+const effects: readonly ToolEffect[] = ['read_only', 'visible_output', 'progress_output', 'side_effect']
 const risks: readonly ToolRisk[] = ['low', 'medium', 'high']
 const permissions: readonly ToolPermissionKind[] = [
-  'any_user', 'current_channel', 'bot_master_cross_channel', 'self_member',
+  'any_user', 'current_channel', 'cross_channel', 'self_member',
   'group_moderator', 'group_owner_or_master', 'bot_group_owner'
 ]
 
@@ -233,6 +233,14 @@ export function validateToolDefinition<Input> (definition: ToolDefinition<Input>
     (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly || definition.risk !== 'high')) ||
     (definition.readOnly && definition.idempotency !== 'none') ||
     (!definition.readOnly && definition.idempotency !== 'call' && definition.idempotency !== 'semantic')) {
+    throw new ToolInputError('invalid_definition')
+  }
+  const access = definition.crossChannelAccess
+  const validCrossChannelAccess = isRecord(access) &&
+    Object.keys(access).sort().join(',') === 'group,private' &&
+    ['disabled', 'master', 'everyone'].includes(String(access.private)) &&
+    ['disabled', 'master', 'everyone'].includes(String(access.group))
+  if ((definition.permission === 'cross_channel') !== validCrossChannelAccess) {
     throw new ToolInputError('invalid_definition')
   }
   return definition

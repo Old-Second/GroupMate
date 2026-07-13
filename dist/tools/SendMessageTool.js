@@ -1,5 +1,6 @@
 import { invalidArguments } from './query-tool-support.js';
 import { cancelledResult, crossChannelDefinition, executionFailure, visibleResult } from './visible-tool-support.js';
+import { actorMaySendCrossChannel } from '../agent/tools/cross-channel-access.js';
 const inputSchema = {
     type: 'object', properties: {
         text: { type: 'string' },
@@ -11,13 +12,25 @@ const inputSchema = {
 export function createSendMessageTool(services) {
     return crossChannelDefinition({
         inputSchema,
+        crossChannelAccess: services.crossChannelAccess,
         execute: async (input, context) => {
-            if ((context.target.kind !== 'group' && context.target.kind !== 'private') ||
-                !services.canSendCrossChannel(context.target)) {
+            if (context.target.kind !== 'group' && context.target.kind !== 'private') {
                 return {
                     status: 'denied', effect: 'none', reasonCode: 'cross_channel_disabled',
                     userMessage: '当前未允许跨会话发送。', retryable: false
                 };
+            }
+            const audience = services.crossChannelAccess[context.target.kind];
+            if (!actorMaySendCrossChannel(services.crossChannelAccess, context.target.kind, context.facts.actor.isBotMaster)) {
+                return audience === 'master'
+                    ? {
+                        status: 'denied', effect: 'none', reasonCode: 'permission_denied',
+                        userMessage: '当前身份不能执行该操作。', retryable: false
+                    }
+                    : {
+                        status: 'denied', effect: 'none', reasonCode: 'cross_channel_disabled',
+                        userMessage: '当前未允许跨会话发送。', retryable: false
+                    };
             }
             const text = String(input.text ?? '').trim();
             const targetId = String(input.targetId ?? '').trim();

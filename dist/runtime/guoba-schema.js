@@ -20,6 +20,11 @@ const reasoningEffortOptions = [
     { label: 'high', value: 'high' },
     { label: 'max', value: 'max' }
 ];
+const crossChannelPolicyOptions = [
+    { label: '完全不允许', value: 'disabled' },
+    { label: '仅机器人主人允许', value: 'master' },
+    { label: '所有人允许', value: 'everyone' }
+];
 export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureRoleOptions }) {
     return [
         divider('基础与运行'),
@@ -78,8 +83,12 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
             ]
         }),
         field('toolApprovalTtlSeconds', '审批有效秒数', '工具审批口令的有效时间，范围 30 到 300 秒；过期后必须重新发起。', 'InputNumber', { min: 30, max: 300 }),
-        field('enableToolPrivateSend', '允许工具发起私聊', '允许机器人主人通过工具向明确指定的 QQ 用户发起私聊；关闭时即使主人也不能通过工具发送。', 'Switch'),
-        field('enableToolCrossGroupSend', '允许工具跨群发送', '允许机器人主人通过工具向明确指定的其他群发送消息；关闭时即使主人也不能跨群发送。', 'Switch'),
+        field('toolPrivateSendPolicy', '工具发起私聊权限', '控制谁能通过工具向明确指定的 QQ 用户发起私聊；所有人允许仍要求当前请求给出精确目标和明确发送意图，修改对下一次运行生效。', 'Select', {
+            options: crossChannelPolicyOptions
+        }),
+        field('toolCrossGroupSendPolicy', '工具跨群发送权限', '控制谁能通过工具向明确指定的其他群发送消息；所有人允许仍要求当前请求给出精确目标和明确发送意图，修改对下一次运行生效。', 'Select', {
+            options: crossChannelPolicyOptions
+        }),
         field('enableToolVideoDownload', '允许下载并发送视频', '开启后视频工具可以下载并上传文件；关闭时只发送信息和链接。', 'Switch'),
         field('toolVideoMaxMB', '视频下载上限 MB', '视频工具允许下载的单文件大小上限；当前为保护低内存部署机，硬上限为 8 MB。', 'InputNumber', { min: 1, max: 8 }),
         field('serpSource', '网页搜索来源', 'Bing Web Search 已退役，推荐使用 Tavily；兼容公益源不保证可用性和长期维护。', 'Select', {

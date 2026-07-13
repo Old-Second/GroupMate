@@ -134,14 +134,24 @@
     "title": "工具设置",
     "view": [
       {
-        "type": "check",
-        "label": "允许工具发起私聊",
-        "data": "enableToolPrivateSend"
+        "type": "select",
+        "label": "工具发起私聊权限",
+        "data": "toolPrivateSendPolicy",
+        "items": [
+          { "label": "完全不允许", "value": "disabled" },
+          { "label": "仅机器人主人允许", "value": "master" },
+          { "label": "所有人允许", "value": "everyone" }
+        ]
       },
       {
-        "type": "check",
-        "label": "允许工具跨群发送",
-        "data": "enableToolCrossGroupSend"
+        "type": "select",
+        "label": "工具跨群发送权限",
+        "data": "toolCrossGroupSendPolicy",
+        "items": [
+          { "label": "完全不允许", "value": "disabled" },
+          { "label": "仅机器人主人允许", "value": "master" },
+          { "label": "所有人允许", "value": "everyone" }
+        ]
       },
       {
         "type": "check",

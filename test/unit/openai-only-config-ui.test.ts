@@ -6,6 +6,7 @@ import {
   selectImportableConfig,
   selectPersistedConfig
 } from '../../src/runtime/config-persistence.js'
+import { normalizeGuobaConfigValue } from '../../src/runtime/guoba-config.js'
 import { buildGuobaSchemas } from '../../src/runtime/guoba-schema.js'
 
 const root = process.cwd()
@@ -76,7 +77,9 @@ const removedFields = [
   'bymMode',
   'translateSource',
   'enableDraw',
-  'drawCD'
+  'drawCD',
+  'enableToolPrivateSend',
+  'enableToolCrossGroupSend'
 ] as const
 
 const preservedFields = [
@@ -93,8 +96,8 @@ const preservedFields = [
   'voicevoxSpace',
   'voicevoxTTSSpeaker',
   'smartMode',
-  'enableToolPrivateSend',
-  'enableToolCrossGroupSend',
+  'toolPrivateSendPolicy',
+  'toolCrossGroupSendPolicy',
   'enableToolVideoDownload',
   'toolVideoMaxMB'
 ] as const
@@ -128,8 +131,8 @@ const requiredGuobaFields = [
   'groupContextLength',
   'groupMerge',
   'conversationPreserveTime',
-  'enableToolPrivateSend',
-  'enableToolCrossGroupSend',
+  'toolPrivateSendPolicy',
+  'toolCrossGroupSendPolicy',
   'enableToolVideoDownload',
   'toolVideoMaxMB',
   'amapKey',
@@ -242,7 +245,7 @@ const expectedGuobaGroups = [
     label: '工具与搜索',
     fields: [
       'smartMode', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
-      'enableToolPrivateSend', 'enableToolCrossGroupSend',
+      'toolPrivateSendPolicy', 'toolCrossGroupSendPolicy',
       'enableToolVideoDownload', 'toolVideoMaxMB', 'serpSource', 'tavilyApiKey',
       'azSerpKey', 'imageSearchSource', 'braveSearchApiKey', 'amapKey',
       'githubAPIKey', 'extraUrl'
@@ -352,6 +355,42 @@ test('Guoba exposes every supported user-facing configuration with an explanatio
       `${field} must explain its behavior in Guoba`
     )
   }
+})
+
+test('cross-channel send permissions use independent fail-closed selects', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const fields = new Map(schemas.flatMap(schema =>
+    schema.field ? [[schema.field, schema] as const] : []
+  ))
+  for (const field of ['toolPrivateSendPolicy', 'toolCrossGroupSendPolicy']) {
+    const schema = fields.get(field)
+    assert.equal(schema?.component, 'Select')
+    assert.deepEqual(
+      (schema?.componentProps?.options as Array<{ value: string }>).map(option => option.value),
+      ['disabled', 'master', 'everyone']
+    )
+    assert.match(schema?.bottomHelpMessage ?? '', /明确.*目标|精确.*目标/)
+  }
+  assert.equal(normalizeGuobaConfigValue('toolPrivateSendPolicy', 'master'), 'master')
+  assert.equal(normalizeGuobaConfigValue('toolCrossGroupSendPolicy', 'everyone'), 'everyone')
+  assert.throws(
+    () => normalizeGuobaConfigValue('toolPrivateSendPolicy', 'invalid'),
+    /工具跨会话发送权限配置无效/
+  )
+
+  const configSource = await readSource('utils/config.js')
+  assert.ok(
+    configSource.indexOf('migrateLegacyCrossChannelPolicies(config)') <
+      configSource.indexOf('Object.assign({}, defaultConfig, config)'),
+    'raw persisted configuration must migrate before defaults merge'
+  )
+  const managementSource = await readSource('apps/management.js')
+  const importStart = managementSource.indexOf('const chatdata = selectImportableConfig(')
+  const importEnd = managementSource.indexOf('for (let [keyPath, value]', importStart)
+  const importBlock = managementSource.slice(importStart, importEnd)
+  assert.match(importBlock, /migrateLegacyCrossChannelPolicies\(data\.chatConfig \|\| \{\}\)/)
 })
 
 test('Guoba external service fields provide actionable setup references', () => {

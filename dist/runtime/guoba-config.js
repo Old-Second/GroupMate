@@ -15,6 +15,7 @@ const QQ_IDENTIFIER_FIELDS = new Set([
     'bymFuckBlacklist'
 ]);
 const TOOL_POLICY_PROFILES = new Set(['compatible', 'safe', 'strict']);
+const CROSS_CHANNEL_POLICIES = new Set(['disabled', 'master', 'everyone']);
 function splitList(value, separator) {
     const values = Array.isArray(value) ? value : String(value ?? '').split(separator);
     const seen = new Set();
@@ -28,6 +29,12 @@ function splitList(value, separator) {
     }, []);
 }
 export function normalizeGuobaConfigValue(key, value) {
+    if (key === 'toolPrivateSendPolicy' || key === 'toolCrossGroupSendPolicy') {
+        if (typeof value !== 'string' || !CROSS_CHANNEL_POLICIES.has(value)) {
+            throw new TypeError('工具跨会话发送权限配置无效。');
+        }
+        return value;
+    }
     if (key === 'toolPolicyProfile') {
         if (typeof value !== 'string' || !TOOL_POLICY_PROFILES.has(value)) {
             throw new TypeError('工具权限策略配置无效。');

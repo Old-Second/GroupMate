@@ -88,8 +88,10 @@ function explicitTarget (target: ToolTarget, facts: ToolRuntimeFacts, intent: In
   if (target.kind === 'message') {
     return intent.replyMessageId === target.messageId || intent.explicitTargetIds.includes(target.messageId)
   }
-  const targetId = target.kind === 'group' ? target.groupId : target.userId
-  return intent.explicitTargetIds.includes(targetId)
+  if (target.kind === 'private') {
+    return intent.mentionUserIds.includes(target.userId) || intent.explicitTargetIds.includes(target.userId)
+  }
+  return intent.explicitTargetIds.includes(target.groupId)
 }
 
 function intendedAction (definition: ToolDefinition, input: Readonly<Record<string, unknown>>): IntentAction | null {
@@ -186,11 +188,15 @@ export class ToolPolicyEngine {
           ? allowed()
           : deny('target_invalid')
       }
-      if (input.definition.permission === 'bot_master_cross_channel') {
-        if (!input.facts.actor.isBotMaster) return deny('permission_denied')
-        if ((input.target.kind !== 'group' && input.target.kind !== 'private') ||
-          currentTarget(input.target, input.facts) || !input.facts.targetExists ||
-          !explicitTarget(input.target, input.facts, input.intent)) return deny('target_invalid')
+      if (input.definition.permission === 'cross_channel') {
+        if (input.target.kind !== 'group' && input.target.kind !== 'private') return deny('target_invalid')
+        if (currentTarget(input.target, input.facts)) return deny('target_invalid')
+        const audience = input.definition.crossChannelAccess?.[input.target.kind]
+        if (audience === undefined || audience === 'disabled' ||
+          (audience === 'master' && !input.facts.actor.isBotMaster) ||
+          !input.facts.targetExists || !explicitTarget(input.target, input.facts, input.intent)) {
+          return deny('target_invalid')
+        }
         return allowed()
       }
       if (input.facts.channel.kind !== 'group') return deny('target_invalid')
@@ -218,10 +224,13 @@ export class ToolPolicyEngine {
     if (input.definition.permission === 'current_channel') {
       if (!currentTarget(input.target, input.facts)) return deny('target_invalid')
       if (action === null || !input.intent.actions.includes(action)) return deny('explicit_intent_required')
-    } else if (input.definition.permission === 'bot_master_cross_channel') {
+    } else if (input.definition.permission === 'cross_channel') {
       if (input.target.kind !== 'group' && input.target.kind !== 'private') return deny('target_invalid')
       if (currentTarget(input.target, input.facts)) return deny('current_channel_uses_normal_reply')
-      if (!input.facts.actor.isBotMaster) return deny('permission_denied')
+      const audience = input.definition.crossChannelAccess?.[input.target.kind]
+      if (audience === undefined) return deny('permission_denied')
+      if (audience === 'disabled') return deny('cross_channel_disabled')
+      if (audience === 'master' && !input.facts.actor.isBotMaster) return deny('permission_denied')
       if (!input.facts.targetExists) return deny('target_not_found')
       if (!explicitTarget(input.target, input.facts, input.intent) || action === null || !input.intent.actions.includes(action)) {
         return deny('explicit_intent_required')

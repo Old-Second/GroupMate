@@ -17,6 +17,7 @@ import { PolicyFetch } from './policy-fetch.js'
 import { RedisApprovalStore, type RedisToolControlClient } from './redis-approval-store.js'
 import { RedisIdempotencyStore } from './redis-idempotency-store.js'
 import { resolveToolRuntimeFacts, type ToolRuntimeFactsSource } from './runtime-facts.js'
+import { resolveCrossChannelAccess } from './cross-channel-policy.js'
 import {
   createManagementToolDefinitions,
   createQueryToolRuntime,
@@ -930,8 +931,7 @@ function visibleServices (
     'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
   ].some(key => configText(options.config, key) !== '')
   const processImage = options.processImage ?? pictureProcessor(policyFetch, configText(options.config, 'extraUrl'))
-  const privateSendEnabled = configBoolean(options.config, 'enableToolPrivateSend')
-  const crossGroupSendEnabled = configBoolean(options.config, 'enableToolCrossGroupSend')
+  const crossChannelAccess = resolveCrossChannelAccess(options.config)
   return {
     policyFetch,
     qq: qqCapabilities(event, options.segment()),
@@ -951,9 +951,7 @@ function visibleServices (
     ttsAvailable,
     videoDownloadEnabled: downloadVideo,
     videoMaxBytes: finiteInteger(options.config.toolVideoMaxMB, 8, 1, 8) * 1024 * 1024,
-    canSendCrossChannel: target => target.kind === 'private'
-      ? privateSendEnabled
-      : crossGroupSendEnabled
+    crossChannelAccess
   }
 }
 

@@ -78,7 +78,7 @@ function fixture (): {
     ttsAvailable: true,
     videoDownloadEnabled: true,
     videoMaxBytes: 1024,
-    canSendCrossChannel: () => true
+    crossChannelAccess: { private: 'everyone', group: 'everyone' }
   }
   return { definitions: createVisibleToolDefinitions(services), calls }
 }
@@ -100,7 +100,10 @@ test('visible tool factory exposes ten exact typed definitions', () => {
     assert.equal(definition.idempotency, definition.name === 'sendMessage' ? 'semantic' : 'call')
   }
   assert.equal(byName(definitions, 'sendMessage').effect, 'side_effect')
-  assert.equal(byName(definitions, 'sendMessage').permission, 'bot_master_cross_channel')
+  assert.equal(byName(definitions, 'sendMessage').permission, 'cross_channel')
+  assert.deepEqual(byName(definitions, 'sendMessage').crossChannelAccess, {
+    private: 'everyone', group: 'everyone'
+  })
 })
 
 test('media tools bind to the current group or private channel target', () => {
@@ -210,12 +213,8 @@ test('sendMessage cross-channel target is exact and capability runs once after a
 
 test('sendMessage applies private and group configuration to the exact authorized target', async () => {
   const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
-  const checked: ToolTarget[] = []
   const definitions = createVisibleToolDefinitions(visibleOptions(calls, {
-    canSendCrossChannel: target => {
-      checked.push(target)
-      return target.kind === 'private'
-    }
+    crossChannelAccess: { private: 'everyone', group: 'disabled' }
   }))
   const definition = byName(definitions, 'sendMessage')
   const privateTarget = { kind: 'private' as const, userId: '88' }
@@ -230,8 +229,30 @@ test('sendMessage applies private and group configuration to the exact authorize
   }, { ...context, target: groupTarget })
   assert.equal(groupResult.status, 'denied')
   if (groupResult.status === 'denied') assert.equal(groupResult.reasonCode, 'cross_channel_disabled')
-  assert.deepEqual(checked, [privateTarget, groupTarget])
   assert.deepEqual(calls, [{ kind: 'text', target: privateTarget, value: 'hello' }])
+})
+
+test('sendMessage repeats master authorization at the capability boundary', async () => {
+  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const definitions = createVisibleToolDefinitions(visibleOptions(calls, {
+    crossChannelAccess: { private: 'master', group: 'master' }
+  }))
+  const definition = byName(definitions, 'sendMessage')
+  const target = { kind: 'private' as const, userId: '88' }
+  const denied = await definition.execute({
+    targetKind: 'private', targetId: '88', text: 'hello'
+  }, { ...context, target })
+  assert.equal(denied.status, 'denied')
+  if (denied.status === 'denied') assert.equal(denied.reasonCode, 'permission_denied')
+  const allowed = await definition.execute({
+    targetKind: 'private', targetId: '88', text: 'hello'
+  }, {
+    ...context,
+    facts: { ...context.facts, actor: { ...context.facts.actor, isBotMaster: true } },
+    target
+  })
+  assert.equal(allowed.status, 'success')
+  assert.deepEqual(calls, [{ kind: 'text', target, value: 'hello' }])
 })
 
 test('typed effect finalizes only successful visible results', () => {
@@ -357,7 +378,8 @@ function visibleOptions (
     synthesizeAudio: async () => ({ kind: 'buffer', data: Buffer.from('x'), mimeType: 'audio/silk', byteLength: 1 }),
     resolveVideo: async id => ({ id, shareText: id, videoUrl: 'https://cdn.example/x.mp4' }),
     drawingAvailable: true, pictureProcessingAvailable: true, ttsAvailable: true,
-    videoDownloadEnabled: false, videoMaxBytes: 1024, canSendCrossChannel: () => true,
+    videoDownloadEnabled: false, videoMaxBytes: 1024,
+    crossChannelAccess: { private: 'everyone', group: 'everyone' },
     ...overrides
   }
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ToolDefinition, ToolPermissionKind } from '../../src/agent/tools/tool-definition.js'
 import type { ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
+import type { CrossChannelAccess } from '../../src/agent/tools/cross-channel-access.js'
 import {
   ToolRegistry,
   ToolRegistryError,
@@ -30,6 +31,7 @@ function definition (
     aliases?: string[]
     permission?: ToolPermissionKind
     description?: string
+    crossChannelAccess?: CrossChannelAccess
   } = {}
 ): ToolDefinition {
   return {
@@ -48,6 +50,7 @@ function definition (
     maxOutputBytes: 4_096,
     network: 'none',
     permission: options.permission ?? 'any_user',
+    ...(options.crossChannelAccess === undefined ? {} : { crossChannelAccess: options.crossChannelAccess }),
     resolveTarget: () => ({ kind: 'none' }),
     execute: async () => ({ status: 'success', effect: 'none', content: [], retryable: false })
   }
@@ -73,6 +76,13 @@ test('registry rejects invalid definitions before snapshot creation', () => {
   assert.throws(() => new ToolRegistry([
     { ...definition('weather'), inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: true } } as never
   ]), ToolRegistryError)
+  assert.throws(() => new ToolRegistry([
+    definition('relay', { permission: 'cross_channel' })
+  ]), ToolRegistryError)
+  assert.throws(() => new ToolRegistry([{
+    ...definition('relay'),
+    crossChannelAccess: { private: 'everyone', group: 'disabled' }
+  } as never]), ToolRegistryError)
 })
 
 test('registered definitions and model schemas ignore later source mutation', () => {
@@ -151,7 +161,10 @@ test('snapshot filters tools by trusted scene facts', () => {
   const registry = new ToolRegistry([
     definition('search'),
     definition('mute', { permission: 'group_moderator' }),
-    definition('relay', { permission: 'bot_master_cross_channel' })
+    definition('relay', {
+      permission: 'cross_channel',
+      crossChannelAccess: { private: 'master', group: 'disabled' }
+    })
   ])
   const snapshot = registry.createSnapshot({
     id: 'private', facts: privateFacts, enabledTools: ['search', 'mute', 'relay']
@@ -164,6 +177,38 @@ test('snapshot filters tools by trusted scene facts', () => {
     enabledTools: ['search', 'mute', 'relay']
   })
   assert.deepEqual(masterSnapshot.toolNames, ['relay', 'search'])
+
+  const ordinaryRelay = new ToolRegistry([
+    definition('relay', {
+      permission: 'cross_channel',
+      crossChannelAccess: { private: 'everyone', group: 'master' }
+    })
+  ]).createSnapshot({ id: 'ordinary-relay', facts: privateFacts, enabledTools: ['relay'] })
+  assert.deepEqual(ordinaryRelay.toolNames, ['relay'])
+
+  const disabledRelay = new ToolRegistry([
+    definition('relay', {
+      permission: 'cross_channel',
+      crossChannelAccess: { private: 'disabled', group: 'disabled' }
+    })
+  ]).createSnapshot({
+    id: 'disabled-relay',
+    facts: { ...privateFacts, actor: { ...privateFacts.actor, isBotMaster: true } },
+    enabledTools: ['relay']
+  })
+  assert.deepEqual(disabledRelay.toolNames, [])
+})
+
+test('registry freezes cross-channel access metadata', () => {
+  const access = { private: 'everyone', group: 'master' } as const
+  const registry = new ToolRegistry([
+    definition('relay', { permission: 'cross_channel', crossChannelAccess: access })
+  ])
+  const snapshot = registry.createSnapshot({ id: 'access', facts: memberFacts, enabledTools: ['relay'] })
+  const registered = snapshot.resolve('relay').definition
+  assert.deepEqual(registered.crossChannelAccess, access)
+  assert.notEqual(registered.crossChannelAccess, access)
+  assert.equal(Object.isFrozen(registered.crossChannelAccess), true)
 })
 
 test('snapshot rejects invalid identity and unknown enabled names fail closed', () => {

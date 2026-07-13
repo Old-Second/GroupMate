@@ -3,6 +3,7 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import type { CrossChannelAccess } from '../agent/tools/cross-channel-access.js'
 
 export type ToolResource =
   | {
@@ -61,9 +62,7 @@ export interface VisibleToolServices {
   readonly ttsAvailable: boolean
   readonly videoDownloadEnabled: boolean
   readonly videoMaxBytes: number
-  readonly canSendCrossChannel: (
-    target: Extract<ToolTarget, { readonly kind: 'group' | 'private' }>
-  ) => boolean
+  readonly crossChannelAccess: CrossChannelAccess
 }
 
 export function currentChannelTarget (facts: ToolRuntimeFacts): ToolTarget {
@@ -138,6 +137,7 @@ export function visibleDefinition (input: {
 
 export function crossChannelDefinition (input: {
   readonly inputSchema: StrictToolSchema
+  readonly crossChannelAccess: CrossChannelAccess
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
   return Object.freeze({
@@ -146,7 +146,8 @@ export function crossChannelDefinition (input: {
     inputSchema: input.inputSchema,
     effect: 'side_effect', risk: 'high', readOnly: false, destructive: false,
     idempotency: 'semantic', openWorld: false, timeoutMs: 10_000,
-    maxOutputBytes: 4 * 1024, network: 'none', permission: 'bot_master_cross_channel',
+    maxOutputBytes: 4 * 1024, network: 'none', permission: 'cross_channel',
+    crossChannelAccess: Object.freeze({ ...input.crossChannelAccess }),
     resolveTarget: (toolInput: Readonly<Record<string, unknown>>) => toolInput.targetKind === 'group'
       ? Object.freeze({ kind: 'group' as const, groupId: String(toolInput.targetId) })
       : Object.freeze({ kind: 'private' as const, userId: String(toolInput.targetId) }),

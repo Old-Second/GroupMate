@@ -61,7 +61,8 @@ export function crossChannelDefinition(input) {
         inputSchema: input.inputSchema,
         effect: 'side_effect', risk: 'high', readOnly: false, destructive: false,
         idempotency: 'semantic', openWorld: false, timeoutMs: 10_000,
-        maxOutputBytes: 4 * 1024, network: 'none', permission: 'bot_master_cross_channel',
+        maxOutputBytes: 4 * 1024, network: 'none', permission: 'cross_channel',
+        crossChannelAccess: Object.freeze({ ...input.crossChannelAccess }),
         resolveTarget: (toolInput) => toolInput.targetKind === 'group'
             ? Object.freeze({ kind: 'group', groupId: String(toolInput.targetId) })
             : Object.freeze({ kind: 'private', userId: String(toolInput.targetId) }),

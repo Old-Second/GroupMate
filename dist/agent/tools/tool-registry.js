@@ -1,4 +1,5 @@
 import { ToolInputError, validateToolDefinition } from './schema-validator.js';
+import { actorMaySendCrossChannel } from './cross-channel-access.js';
 const snapshotIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const groupPermissions = new Set([
     'self_member', 'group_moderator', 'group_owner_or_master', 'bot_group_owner'
@@ -66,6 +67,9 @@ function cloneDefinition(source) {
         maxOutputBytes: source.maxOutputBytes,
         network: source.network,
         permission: source.permission,
+        ...(source.crossChannelAccess === undefined
+            ? {}
+            : { crossChannelAccess: Object.freeze({ ...source.crossChannelAccess }) }),
         resolveTarget: source.resolveTarget,
         execute: source.execute
     };
@@ -74,8 +78,11 @@ function cloneDefinition(source) {
 function visibleInScene(definition, facts) {
     if (groupPermissions.has(definition.permission) && facts.channel.kind !== 'group')
         return false;
-    if (definition.permission === 'bot_master_cross_channel' && !facts.actor.isBotMaster)
-        return false;
+    if (definition.permission === 'cross_channel') {
+        const access = definition.crossChannelAccess;
+        return access !== undefined && (actorMaySendCrossChannel(access, 'private', facts.actor.isBotMaster) ||
+            actorMaySendCrossChannel(access, 'group', facts.actor.isBotMaster));
+    }
     return true;
 }
 function modelDefinition(definition) {

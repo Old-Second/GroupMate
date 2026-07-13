@@ -482,7 +482,7 @@ test('Phase 4 external plugin facade captures sends and blocks host mutations', 
   assert.equal(facade.messages.length, 4)
 })
 
-test('Phase 4 production bridge snapshots cross-channel switches for each run', async () => {
+test('Phase 4 production bridge snapshots cross-channel policies for each run', async () => {
   const config: Record<string, unknown> = {
     toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
     serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
@@ -518,7 +518,7 @@ test('Phase 4 production bridge snapshots cross-channel switches for each run', 
   })
   assert.equal(secondResult.result?.status, 'denied')
   if (secondResult.result?.status === 'denied') {
-    assert.equal(secondResult.result.reasonCode, 'cross_channel_disabled')
+    assert.equal(secondResult.result.reasonCode, 'tool_unavailable')
   }
   assert.deepEqual(sent, ['你好'])
 })
@@ -527,7 +527,7 @@ test('Phase 4 production bridge recognizes TRSS primitive group ID lists', async
   const config: Record<string, unknown> = {
     toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
     serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-    enableToolPrivateSend: false, enableToolCrossGroupSend: false,
+    enableToolPrivateSend: true, enableToolCrossGroupSend: false,
     enableToolVideoDownload: false, groupMerge: true
   }
   let sends = 0

@@ -1,6 +1,7 @@
 import fs from 'fs'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 import { selectPersistedConfig } from '../dist/runtime/config-persistence.js'
+import { migrateLegacyCrossChannelPolicies } from '../dist/runtime/tools/cross-channel-policy.js'
 // Reverse proxy of https://api.openai.com
 export const defaultOpenAIReverseProxy = 'https://mondstadt.d201.eu.org/v1'
 // blocked in China Mainland
@@ -142,8 +143,8 @@ const defaultConfig = {
   // OpenAI兼容API思考强度：default/high/max
   apiReasoningEffort: 'default',
   apiMaxToken: 4096,
-  enableToolPrivateSend: true, // 是否允许机器人主人通过工具向明确指定的QQ用户发起私聊。
-  enableToolCrossGroupSend: false, // 是否允许机器人主人通过工具向明确指定的其他群发送消息。
+  toolPrivateSendPolicy: 'master', // 工具发起私聊：disabled/master/everyone。
+  toolCrossGroupSendPolicy: 'disabled', // 工具跨群发送：disabled/master/everyone。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。
   toolVideoMaxMB: 8,
   githubAPI: 'https://api.github.com',
@@ -195,6 +196,7 @@ if (fs.existsSync(configJsonPath)) {
     logger.error('[ChatGPT-Plugin]转换旧版配置文件失败，建议手动清理旧版index.js文件，并转为使用新版config.json格式', err)
   }
 }
+config = migrateLegacyCrossChannelPolicies(config)
 config = Object.assign({}, defaultConfig, config)
 config.version = defaultConfig.version
 // const latestTag = execSync(`git -C ${resolvePluginPath()} describe --tags --abbrev=0`).toString().trim()

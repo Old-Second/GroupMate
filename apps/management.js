@@ -23,6 +23,7 @@ import fetch from 'node-fetch'
 import { runServer, stopServer } from '../server/index.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 import { selectImportableConfig } from '../dist/runtime/config-persistence.js'
+import { migrateLegacyCrossChannelPolicies } from '../dist/runtime/tools/cross-channel-policy.js'
 import {
   providerModeMigrationEvent,
   resolveProviderMode,
@@ -898,7 +899,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
           const response = await fetch(fileUrl)
           const data = await response.json()
           const chatdata = selectImportableConfig(
-            data.chatConfig || {},
+            migrateLegacyCrossChannelPolicies(data.chatConfig || {}),
             supportedConfigKeys
           )
           for (let [keyPath, value] of Object.entries(chatdata)) {

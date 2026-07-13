@@ -10,6 +10,7 @@ import { PolicyFetch } from './policy-fetch.js';
 import { RedisApprovalStore } from './redis-approval-store.js';
 import { RedisIdempotencyStore } from './redis-idempotency-store.js';
 import { resolveToolRuntimeFacts } from './runtime-facts.js';
+import { resolveCrossChannelAccess } from './cross-channel-policy.js';
 import { createManagementToolDefinitions, createQueryToolRuntime, createVisibleToolDefinitions } from './tool-runtime-factory.js';
 export class ToolRuntimeConfigurationError extends Error {
     code;
@@ -756,8 +757,7 @@ function visibleServices(options, event, policyFetch) {
         'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
     ].some(key => configText(options.config, key) !== '');
     const processImage = options.processImage ?? pictureProcessor(policyFetch, configText(options.config, 'extraUrl'));
-    const privateSendEnabled = configBoolean(options.config, 'enableToolPrivateSend');
-    const crossGroupSendEnabled = configBoolean(options.config, 'enableToolCrossGroupSend');
+    const crossChannelAccess = resolveCrossChannelAccess(options.config);
     return {
         policyFetch,
         qq: qqCapabilities(event, options.segment()),
@@ -778,9 +778,7 @@ function visibleServices(options, event, policyFetch) {
         ttsAvailable,
         videoDownloadEnabled: downloadVideo,
         videoMaxBytes: finiteInteger(options.config.toolVideoMaxMB, 8, 1, 8) * 1024 * 1024,
-        canSendCrossChannel: target => target.kind === 'private'
-            ? privateSendEnabled
-            : crossGroupSendEnabled
+        crossChannelAccess
     };
 }
 function safeAudit(logger) {
