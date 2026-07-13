@@ -35,7 +35,7 @@ export interface QqSendCapabilities {
   sendAudio(target: ToolTarget, resource: ToolResource, signal: AbortSignal): Promise<void>
   sendVideo(target: ToolTarget, resource: ToolResource, signal: AbortSignal): Promise<void>
   sendMusic(target: ToolTarget, music: MusicShare, signal: AbortSignal): Promise<void>
-  sendDice(target: ToolTarget, value: number, signal: AbortSignal): Promise<void>
+  sendDice(target: ToolTarget, signal: AbortSignal): Promise<void>
   sendRps(target: ToolTarget, value: 1 | 2 | 3, signal: AbortSignal): Promise<void>
 }
 

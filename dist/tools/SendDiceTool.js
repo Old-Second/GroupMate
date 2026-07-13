@@ -12,7 +12,7 @@ export function createSendDiceTool(services) {
             let sent = 0;
             try {
                 for (let index = 0; index < count; index += 1) {
-                    await services.qq.sendDice(context.target, 0, context.signal);
+                    await services.qq.sendDice(context.target, context.signal);
                     sent += 1;
                 }
                 return visibleResult(`已投掷 ${count} 枚骰子。`);

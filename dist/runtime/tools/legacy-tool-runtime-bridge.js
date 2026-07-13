@@ -373,6 +373,13 @@ function resourceValue(resource) {
         return resource.data;
     return resource.kind === 'remote_url' ? resource.url : resource.path;
 }
+function magicSegment(segment, type, value) {
+    const factory = segment[type];
+    if (typeof factory === 'function') {
+        return Reflect.apply(factory, segment, value === undefined ? [] : [value]);
+    }
+    return { type, data: {} };
+}
 function qqCapabilities(event, segment) {
     const send = async (target, message, signal) => {
         throwIfAborted(signal);
@@ -386,8 +393,8 @@ function qqCapabilities(event, segment) {
         sendAudio: async (target, resource, signal) => send(target, segment.record(resourceValue(resource)), signal),
         sendVideo: async (target, resource, signal) => send(target, segment.video(resourceValue(resource)), signal),
         sendMusic: async (target, music, signal) => send(target, segment.music(music.provider, music.id), signal),
-        sendDice: async (target, _value, signal) => send(target, segment.dice(), signal),
-        sendRps: async (target, value, signal) => send(target, segment.rps(value), signal)
+        sendDice: async (target, signal) => send(target, magicSegment(segment, 'dice'), signal),
+        sendRps: async (target, value, signal) => send(target, magicSegment(segment, 'rps', value), signal)
     };
 }
 function legacyMediaResource(value, mimeType) {

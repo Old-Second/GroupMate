@@ -47,7 +47,7 @@ function fixture (): {
     sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }) },
     sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }) },
     sendMusic: async (target, value) => { calls.push({ kind: 'music', target, value }) },
-    sendDice: async (target, value) => { calls.push({ kind: 'dice', target, value }) },
+    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }) },
     sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }) }
   }
   const services: VisibleToolServices = {
@@ -307,7 +307,7 @@ function visibleOptions (
     sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }) },
     sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }) },
     sendMusic: async (target, value: MusicShare) => { calls.push({ kind: 'music', target, value }) },
-    sendDice: async (target, value) => { calls.push({ kind: 'dice', target, value }) },
+    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }) },
     sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }) }
   }
   return {

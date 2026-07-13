@@ -375,6 +375,41 @@ test('Phase 4 production bridge creates QQ dice segments without an invalid fixe
   assert.deepEqual(sent, [{ type: 'dice' }])
 })
 
+test('Phase 4 production bridge falls back to standard magic segments when factories are absent', async () => {
+  const sent: unknown[] = []
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const event = {
+    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
+    bot: { pickFriend: () => ({ sendMsg: async (message: unknown) => { sent.push(message) } }) }
+  }
+  const diceRun = await bridge.begin({ event, prompt: '请发送一枚骰子' })
+  const dice = await bridge.execute({
+    snapshotId: diceRun.snapshotId, requestedName: 'sendDice',
+    arguments: { count: 1 }, callId: 'call-fallback-dice'
+  })
+  const rpsRun = await bridge.begin({ event, prompt: '请发送一次猜拳' })
+  const rps = await bridge.execute({
+    snapshotId: rpsRun.snapshotId, requestedName: 'sendRPS',
+    arguments: { value: 2 }, callId: 'call-fallback-rps'
+  })
+
+  assert.equal(dice.result?.status, 'success')
+  assert.equal(rps.result?.status, 'success')
+  assert.deepEqual(sent, [
+    { type: 'dice', data: {} },
+    { type: 'rps', data: {} }
+  ])
+})
+
 test('Phase 4 external plugin facade captures sends and blocks host mutations', async () => {
   let originalSends = 0
   let originalMutes = 0
