@@ -9,16 +9,23 @@ async function readSource (file: string): Promise<string> {
   return await readFile(path.join(root, file), 'utf8')
 }
 
-test('BYM and translation use only the configured OpenAI-compatible API', async () => {
+test('BYM and auxiliary callers use only the configured OpenAI-compatible API', async () => {
   const bym = await readSource('apps/bym.js')
-  const translate = await readSource('utils/translate.js')
+  const auxiliary = await Promise.all([
+    readSource('utils/randomMessage.js'),
+    readSource('utils/translate.js'),
+    readSource('utils/chat.js')
+  ])
 
   assert.match(bym, /core\.sendMessage\(e\.msg, \{\}, 'api', e/)
   assert.match(bym, /system:\s*\{\s*api:\s*system\s*\}/s)
   assert.doesNotMatch(bym, /bymMode|\b(?:bing|claude2?|gemini|qwen|chatglm4?|xh):\s*system/)
 
-  assert.match(translate, /completionParams:\s*\{\s*model:\s*Config\.model\s*\}/s)
-  assert.doesNotMatch(translate, /translateSource|CustomGoogleGeminiClient|XinghuoClient|QwenApi|gpt-3\.5-turbo/)
+  for (const source of auxiliary) {
+    assert.match(source, /dist\/runtime\/completion-facade\.js/)
+    assert.doesNotMatch(source, /ChatGPTAPI|chat\/completions/)
+  }
+  assert.doesNotMatch(auxiliary.join('\n'), /translateSource|CustomGoogleGeminiClient|XinghuoClient|QwenApi|gpt-3\.5-turbo/)
 })
 
 test('prompt, history, buttons and entertainment expose no removed provider path', async () => {

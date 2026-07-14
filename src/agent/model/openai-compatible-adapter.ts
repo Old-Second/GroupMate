@@ -1,4 +1,4 @@
-import nodeFetch, { type RequestInit } from 'node-fetch'
+import type { RequestInit } from 'node-fetch'
 import { createParser } from 'eventsource-parser'
 import {
   jsonByteLength,
@@ -59,6 +59,7 @@ const RESERVED_REQUEST_EXTENSION_KEYS = new Set([
 const ALLOWED_TOOL_CONTROL_KEYS = new Set(['tools', 'tool_choice'])
 
 const defaultFetch: OpenAIFetch = async (url, init) => {
+  const { default: nodeFetch } = await import('node-fetch')
   return await nodeFetch(url, init as RequestInit) as unknown as OpenAIResponseLike
 }
 

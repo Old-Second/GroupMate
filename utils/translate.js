@@ -1,7 +1,7 @@
 import md5 from 'md5'
 import _ from 'lodash'
 import { Config } from './config.js'
-import { ChatGPTAPI } from './openai/chatgpt-api.js'
+import { createCompletionFacadeFromConfig } from '../dist/runtime/completion-facade.js'
 import { newFetch } from './proxy.js'
 
 // 代码参考：https://github.com/yeyang52/yenai-plugin/blob/b50b11338adfa5a4ef93912eefd2f1f704e8b990/model/api/funApi.js#L25
@@ -124,20 +124,14 @@ export async function translate (msg, to = 'auto', from = 'auto') {
       return result
     }
 
-    const api = new ChatGPTAPI({
-      apiBaseUrl: Config.openAiBaseUrl,
-      apiKey: Config.apiKey,
-      fetch: newFetch
-    })
-    const response = await api.sendMessage(msg, {
-      systemMessage: system,
-      completionParams: {
-        model: Config.model
-      }
-    })
-    return response.text
-  } catch (error) {
-    logger.error(error)
+    return await createCompletionFacadeFromConfig(Config, { fetch: newFetch }).completeText({
+      purpose: 'translation',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: msg }
+      ]
+    }, new AbortController().signal)
+  } catch {
     logger.info('基于LLM的翻译失败，转用老版翻译')
     return await translateOld(msg, to)
   }

@@ -1,4 +1,3 @@
-import nodeFetch from 'node-fetch';
 import { createParser } from 'eventsource-parser';
 import { jsonByteLength, parseJsonValue } from './json-value.js';
 import { ModelProviderError, modelProtocolError, modelRequestError } from './model-adapter.js';
@@ -17,6 +16,7 @@ const RESERVED_REQUEST_EXTENSION_KEYS = new Set([
 ]);
 const ALLOWED_TOOL_CONTROL_KEYS = new Set(['tools', 'tool_choice']);
 const defaultFetch = async (url, init) => {
+    const { default: nodeFetch } = await import('node-fetch');
     return await nodeFetch(url, init);
 };
 function safeErrorName(value) {
