@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
   boundedJson, boundedText, clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments,
   isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure
@@ -52,7 +53,8 @@ export function createSearchImageTool (options: SearchImageToolOptions): ToolDef
   const publicSearch = fixedOriginPolicy('https://serp.ikechan8370.com', ['/image/bing'])
   return readOnlyDefinition({
     name: 'searchImage', description: '搜索公开图片并返回候选图片地址。',
-    inputSchema, network: 'fixed_hosts',
+    inputSchema, network: 'fixed_hosts', retrySafe: options.backend !== 'tavily',
+    resourceKeys: input => readResourceKeys('searchImage', input),
     execute: async (input, context) => {
       const q = String(input.q ?? '').trim()
       const limit = clampInteger(input.limit, 1, 6, 2)

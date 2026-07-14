@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { configurationFailure, invalidArguments } from './query-tool-support.js'
 import {
   cancelledResult, executionFailure, validResource, visibleDefinition, visibleResult,
@@ -13,6 +14,7 @@ const inputSchema = {
 export function createSendAudioMessageTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
     name: 'sendAudioMessage', description: '将短文本转换为语音并发送到当前会话。', inputSchema,
+    resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       if (!services.ttsAvailable) return configurationFailure('语音服务尚未配置。')
       const text = String(input.text ?? '').trim()

@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, boundedText, clampInteger, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { keyword: { type: 'string' }, limit: { type: 'integer' } },
@@ -7,7 +8,8 @@ export function createSearchVideoTool(options) {
     const api = fixedOriginPolicy('https://api.bilibili.com', ['/x/web-interface/search/type']);
     return readOnlyDefinition({
         name: 'searchVideo', description: '按关键词搜索哔哩哔哩公开视频。',
-        inputSchema, network: 'fixed_hosts',
+        inputSchema, network: 'fixed_hosts', retrySafe: true,
+        resourceKeys: input => readResourceKeys('searchVideo', input),
         execute: async (input, context) => {
             const keyword = String(input.keyword ?? '').trim();
             const limit = clampInteger(input.limit, 1, 5, 5);

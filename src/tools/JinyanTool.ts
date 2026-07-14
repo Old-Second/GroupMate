@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { memberResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
   asMemberTarget, managementDefinition, managementSuccess, memberTarget,
@@ -14,7 +15,8 @@ export function createJinyanTool (capabilities: QqManagementCapabilities): ToolD
   return managementDefinition({
     name: 'jinyan', aliases: ['mute', 'ban', 'jinyanTool'],
     description: '禁言或解除禁言当前群内指定成员。',
-    inputSchema, permission: 'group_moderator', resolveTarget: memberTarget,
+    inputSchema, permission: 'group_moderator', resourceKeys: memberResourceKeys,
+    resolveTarget: memberTarget,
     execute: async (input, context) => {
       const target = asMemberTarget(context.target)
       const seconds = input.seconds

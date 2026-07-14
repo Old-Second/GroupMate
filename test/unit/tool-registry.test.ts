@@ -50,6 +50,9 @@ function definition (
     maxOutputBytes: 4_096,
     network: 'none',
     permission: options.permission ?? 'any_user',
+    executionClass: 'read_only',
+    retrySafe: true,
+    resourceKeys: () => Object.freeze([]),
     ...(options.crossChannelAccess === undefined ? {} : { crossChannelAccess: options.crossChannelAccess }),
     resolveTarget: () => ({ kind: 'none' }),
     execute: async () => ({ status: 'success', effect: 'none', content: [], retryable: false })
@@ -91,8 +94,10 @@ test('registered definitions and model schemas ignore later source mutation', ()
   const required = ['city']
   const source = {
     ...definition('weather', { aliases }),
-    inputSchema: { type: 'object' as const, properties, required, additionalProperties: false as const }
+    inputSchema: { type: 'object' as const, properties, required, additionalProperties: false as const },
+    resourceKeys: () => mutableResourceKeys
   }
+  const mutableResourceKeys = ['read:0123456789abcdef01234567']
   const registry = new ToolRegistry([source])
 
   aliases.push('mutated')
@@ -110,6 +115,10 @@ test('registered definitions and model schemas ignore later source mutation', ()
   assert.equal(Object.isFrozen(registered.definition), true)
   assert.equal(Object.isFrozen(registered.definition.inputSchema), true)
   assert.equal(Object.isFrozen(snapshot.modelTools), true)
+  const clonedResourceKeys = registered.definition.resourceKeys({}, memberFacts)
+  mutableResourceKeys.push('read:abcdef0123456789abcdef01')
+  assert.deepEqual(clonedResourceKeys, ['read:0123456789abcdef01234567'])
+  assert.equal(Object.isFrozen(clonedResourceKeys), true)
   assert.throws(() => snapshot.resolve('mutated'), ToolUnavailableError)
 })
 
@@ -148,6 +157,11 @@ test('snapshots sort deterministically across registration and enablement order'
 
   assert.deepEqual(first.toolNames, ['alpha', 'zeta'])
   assert.deepEqual(first.modelTools, second.modelTools)
+  assert.deepEqual(first.manifest, second.manifest)
+  assert.equal(first.fingerprint, second.fingerprint)
+  assert.match(first.fingerprint, /^[a-f0-9]{64}$/)
+  assert.equal(Object.isFrozen(first.manifest), true)
+  assert.ok(first.manifest.every(Object.isFrozen))
 })
 
 test('snapshot filters tools by trusted scene facts', () => {

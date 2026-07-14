@@ -1,3 +1,4 @@
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { configurationFailure, invalidArguments } from './query-tool-support.js';
 import { cancelledResult, executionFailure, validResource, visibleDefinition, visibleResult } from './visible-tool-support.js';
 const inputSchema = {
@@ -7,6 +8,7 @@ const inputSchema = {
 export function createDrawTool(services) {
     return visibleDefinition({
         name: 'draw', description: '根据描述生成图片并发送到当前会话。', inputSchema,
+        resourceKeys: currentChannelResourceKeys,
         execute: async (input, context) => {
             if (!services.drawingAvailable)
                 return configurationFailure('绘图服务尚未配置。');

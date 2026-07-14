@@ -1,3 +1,4 @@
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { cancelledResult, executionFailure, indeterminateResult, visibleDefinition, visibleResult } from './visible-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { count: { type: 'integer' } },
@@ -6,6 +7,7 @@ const inputSchema = {
 export function createSendDiceTool(services) {
     return visibleDefinition({
         name: 'sendDice', description: '在当前会话投掷一至五枚骰子。', inputSchema,
+        resourceKeys: currentChannelResourceKeys,
         execute: async (input, context) => {
             const count = typeof input.count === 'number' && Number.isFinite(input.count)
                 ? Math.min(Math.max(Math.trunc(input.count), 1), 5) : 1;

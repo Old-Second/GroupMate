@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, boundedText, clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { q: { type: 'string' }, limit: { type: 'integer' } },
@@ -38,7 +39,8 @@ export function createSearchImageTool(options) {
     const publicSearch = fixedOriginPolicy('https://serp.ikechan8370.com', ['/image/bing']);
     return readOnlyDefinition({
         name: 'searchImage', description: '搜索公开图片并返回候选图片地址。',
-        inputSchema, network: 'fixed_hosts',
+        inputSchema, network: 'fixed_hosts', retrySafe: options.backend !== 'tavily',
+        resourceKeys: input => readResourceKeys('searchImage', input),
         execute: async (input, context) => {
             const q = String(input.q ?? '').trim();
             const limit = clampInteger(input.limit, 1, 6, 2);

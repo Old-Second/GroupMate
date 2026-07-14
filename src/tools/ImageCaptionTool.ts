@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
   decodeText, fixedOriginPolicy, isToolResult, openImagePolicy, readOnlyDefinition,
   request, textResult, upstreamFailure
@@ -36,7 +37,8 @@ export function createImageCaptionTool (options: ImageCaptionToolOptions): ToolD
   )
   return readOnlyDefinition({
     name: 'imageCaption', description: '识别公开图片内容或回答有关图片的问题。',
-    inputSchema, network: 'open_http', timeoutMs: 20_000,
+    inputSchema, network: 'open_http', timeoutMs: 20_000, retrySafe: false,
+    resourceKeys: input => readResourceKeys('imageCaption', input),
     execute: async (input, context) => {
       if (api === null) {
         return {

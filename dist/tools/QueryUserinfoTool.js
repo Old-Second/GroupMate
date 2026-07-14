@@ -1,3 +1,4 @@
+import { memberResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, invalidArguments, readOnlyDefinition, targetNotFound, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { userId: { type: 'string' } },
@@ -15,7 +16,7 @@ function safeMember(member) {
 export function createQueryUserinfoTool(options) {
     return readOnlyDefinition({
         name: 'queryUserinfo', description: '查询当前会话中群成员的公开群资料。',
-        inputSchema, network: 'none',
+        inputSchema, network: 'none', retrySafe: true, resourceKeys: memberResourceKeys,
         execute: async (input, context) => {
             const userId = String(input.userId ?? '').trim() || context.facts.actor.userId;
             if (context.facts.channel.kind !== 'group') {

@@ -50,6 +50,8 @@ export function visibleDefinition(input) {
         idempotency: 'call', openWorld: input.network === 'open_http',
         timeoutMs: 30_000, maxOutputBytes: input.maxOutputBytes ?? 16 * 1024,
         network: input.network ?? 'none', permission: 'current_channel',
+        executionClass: 'visible_output', retrySafe: false,
+        resourceKeys: input.resourceKeys,
         resolveTarget: (_toolInput, facts) => currentChannelTarget(facts),
         execute: input.execute
     });
@@ -62,6 +64,8 @@ export function crossChannelDefinition(input) {
         effect: 'side_effect', risk: 'high', readOnly: false, destructive: false,
         idempotency: 'semantic', openWorld: false, timeoutMs: 10_000,
         maxOutputBytes: 4 * 1024, network: 'none', permission: 'cross_channel',
+        executionClass: 'side_effect', retrySafe: false,
+        resourceKeys: input.resourceKeys,
         crossChannelAccess: Object.freeze({ ...input.crossChannelAccess }),
         resolveTarget: (toolInput) => toolInput.targetKind === 'group'
             ? Object.freeze({ kind: 'group', groupId: String(toolInput.targetId) })

@@ -1,3 +1,4 @@
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { invalidArguments } from './query-tool-support.js';
 import { cancelledResult, executionFailure, visibleDefinition, visibleResult } from './visible-tool-support.js';
 const inputSchema = {
@@ -7,6 +8,7 @@ const inputSchema = {
 export function createSendMusicTool(services) {
     return visibleDefinition({
         name: 'sendMusic', description: '向当前会话分享已搜索到的网易云音乐。', inputSchema,
+        resourceKeys: currentChannelResourceKeys,
         execute: async (input, context) => {
             const id = String(input.id ?? '').trim();
             if (!/^\d{1,32}$/.test(id))

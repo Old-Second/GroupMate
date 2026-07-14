@@ -1,6 +1,7 @@
 import { invalidArguments } from './query-tool-support.js';
 import { cancelledResult, crossChannelDefinition, executionFailure, visibleResult } from './visible-tool-support.js';
 import { actorMaySendCrossChannel } from '../agent/tools/cross-channel-access.js';
+import { crossChannelResourceKeys } from '../agent/tools/resource-key.js';
 const inputSchema = {
     type: 'object', properties: {
         text: { type: 'string' },
@@ -13,6 +14,7 @@ export function createSendMessageTool(services) {
     return crossChannelDefinition({
         inputSchema,
         crossChannelAccess: services.crossChannelAccess,
+        resourceKeys: crossChannelResourceKeys,
         execute: async (input, context) => {
             if (context.target.kind !== 'group' && context.target.kind !== 'private') {
                 return {

@@ -65,6 +65,9 @@ function tool (
     maxOutputBytes: 4_096,
     network: 'none',
     permission: options.permission ?? 'any_user',
+    executionClass: effect,
+    retrySafe: effect === 'read_only',
+    resourceKeys: () => Object.freeze([]),
     ...(options.crossChannelAccess === undefined ? {} : { crossChannelAccess: options.crossChannelAccess }),
     resolveTarget: () => ({ kind: 'none' }),
     execute: async () => ({ status: 'success', effect: 'none', content: [], retryable: false })

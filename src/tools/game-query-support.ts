@@ -36,10 +36,11 @@ export function createGameQueryTool (
   options: GameQueryToolOptions,
   game: GameKind,
   name: 'queryGenshin' | 'queryStarRail',
-  description: string
+  description: string,
+  resourceKeys: ToolDefinition['resourceKeys']
 ): ToolDefinition {
   return visibleDefinition({
-    name, description, inputSchema, network: 'none',
+    name, description, inputSchema, network: 'none', resourceKeys,
     execute: async (input, context) => {
       const userId = String(input.userId ?? '').trim() || context.facts.actor.userId
       const uid = String(input.uid ?? '').trim()

@@ -194,6 +194,7 @@ export function validateToolInputRecord(schema, input) {
     return cloneValue(schema, input, 1, '$');
 }
 const effects = ['read_only', 'visible_output', 'side_effect'];
+const executionClasses = ['read_only', 'visible_output', 'side_effect'];
 const risks = ['low', 'medium', 'high'];
 const permissions = [
     'any_user', 'current_channel', 'cross_channel', 'self_member',
@@ -215,11 +216,13 @@ export function validateToolDefinition(definition) {
     if (!('type' in definition.inputSchema) || definition.inputSchema.type !== 'object') {
         throw new ToolInputError('invalid_definition');
     }
-    if (!effects.includes(definition.effect) || !risks.includes(definition.risk) ||
+    if (!effects.includes(definition.effect) || !executionClasses.includes(definition.executionClass) ||
+        !risks.includes(definition.risk) ||
         !permissions.includes(definition.permission) ||
         !['none', 'call', 'semantic'].includes(definition.idempotency) ||
         !['none', 'fixed_hosts', 'open_http'].includes(definition.network) ||
         typeof definition.readOnly !== 'boolean' || typeof definition.destructive !== 'boolean' ||
+        typeof definition.retrySafe !== 'boolean' || typeof definition.resourceKeys !== 'function' ||
         typeof definition.openWorld !== 'boolean' || typeof definition.resolveTarget !== 'function' ||
         typeof definition.execute !== 'function' || !Number.isInteger(definition.timeoutMs) ||
         definition.timeoutMs < 100 || definition.timeoutMs > 30_000 ||
@@ -227,7 +230,9 @@ export function validateToolDefinition(definition) {
         definition.maxOutputBytes > 64 * 1024) {
         throw new ToolInputError('invalid_definition');
     }
-    if ((definition.effect === 'read_only') !== definition.readOnly ||
+    if (definition.executionClass !== definition.effect ||
+        (definition.effect === 'read_only') !== definition.readOnly ||
+        (definition.retrySafe && definition.executionClass !== 'read_only') ||
         (definition.destructive && (definition.effect !== 'side_effect' || definition.readOnly || definition.risk !== 'high')) ||
         (definition.readOnly && definition.idempotency !== 'none') ||
         (!definition.readOnly && definition.idempotency !== 'call' && definition.idempotency !== 'semantic')) {

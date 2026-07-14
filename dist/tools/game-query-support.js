@@ -7,9 +7,9 @@ const inputSchema = {
     },
     required: ['userId', 'uid', 'character'], additionalProperties: false
 };
-export function createGameQueryTool(options, game, name, description) {
+export function createGameQueryTool(options, game, name, description, resourceKeys) {
     return visibleDefinition({
-        name, description, inputSchema, network: 'none',
+        name, description, inputSchema, network: 'none', resourceKeys,
         execute: async (input, context) => {
             const userId = String(input.userId ?? '').trim() || context.facts.actor.userId;
             const uid = String(input.uid ?? '').trim();

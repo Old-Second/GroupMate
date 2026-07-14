@@ -52,6 +52,8 @@ function definition (): ToolDefinition {
     effect: 'read_only', risk: 'low', readOnly: true, destructive: false,
     idempotency: 'none', openWorld: false, timeoutMs: 1_000, maxOutputBytes: 4_096,
     network: 'none', permission: 'any_user',
+    executionClass: 'read_only', retrySafe: true,
+    resourceKeys: () => Object.freeze([]),
     resolveTarget: () => Object.freeze({ kind: 'none' as const }),
     execute: async () => result()
   })

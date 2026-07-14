@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { memberResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
   asMemberTarget, managementDefinition, managementSuccess, memberTarget,
@@ -13,7 +14,8 @@ const inputSchema = {
 export function createKickOutTool (capabilities: QqManagementCapabilities): ToolDefinition {
   return managementDefinition({
     name: 'kickOut', aliases: ['kick', 'kickout'], description: '将当前群内指定普通成员移出群。',
-    inputSchema, permission: 'group_owner_or_master', destructive: true, resolveTarget: memberTarget,
+    inputSchema, permission: 'group_owner_or_master', destructive: true,
+    resourceKeys: memberResourceKeys, resolveTarget: memberTarget,
     execute: async (_input, context) => {
       const target = asMemberTarget(context.target)
       if (target === null || target.userId === '') return invalidArguments('移出群成员参数无效。')

@@ -88,6 +88,9 @@ function harness (options: HarnessOptions = {}) {
     maxOutputBytes: options.maxOutputBytes ?? 4_096,
     network: 'none',
     permission: 'any_user',
+    executionClass: effect,
+    retrySafe: effect === 'read_only',
+    resourceKeys: () => Object.freeze([]),
     resolveTarget: input => {
       assert.equal(Object.isFrozen(input), true)
       calls.push('schema.validate', 'target.resolve')
@@ -106,6 +109,8 @@ function harness (options: HarnessOptions = {}) {
     id: 'snapshot-1',
     modelTools: [],
     toolNames: ['fixtureTool'],
+    manifest: [],
+    fingerprint: '0'.repeat(64),
     resolve: () => registered,
     resolveCall: call => {
       calls.push('snapshot.resolve')

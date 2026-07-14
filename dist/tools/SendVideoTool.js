@@ -1,3 +1,4 @@
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { invalidArguments, isToolResult, request } from './query-tool-support.js';
 import { cancelledResult, executionFailure, resourceFromBytes, visibleDefinition, visibleResult } from './visible-tool-support.js';
 const inputSchema = {
@@ -8,6 +9,7 @@ export function createSendVideoTool(services) {
     return visibleDefinition({
         name: 'sendVideo', description: '向当前会话分享已搜索到的视频。',
         inputSchema, network: services.videoDownloadEnabled ? 'open_http' : 'none',
+        resourceKeys: currentChannelResourceKeys,
         execute: async (input, context) => {
             const id = String(input.id ?? '').trim();
             if (!/^[A-Za-z0-9]{2,32}$/.test(id))

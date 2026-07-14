@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, boundedText, clampInteger, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult } from './query-tool-support.js';
 const searchTypes = ['repositories', 'issues', 'users', 'code', 'custom'];
 const inputSchema = {
@@ -55,7 +56,8 @@ export function createGithubTool(options) {
     const api = fixedOriginPolicy(options.apiBaseUrl, ['/search', '/repos', '/users', '/orgs']);
     return readOnlyDefinition({
         name: 'github', description: '查询 GitHub 仓库、议题、用户和公开 API 资源。',
-        inputSchema, network: 'fixed_hosts',
+        inputSchema, network: 'fixed_hosts', retrySafe: true,
+        resourceKeys: input => readResourceKeys('github', input),
         execute: async (input, context) => {
             const type = String(input.type);
             const q = String(input.q ?? '').trim();

@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, boundedText, clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult } from './query-tool-support.js';
 const inputSchema = {
     type: 'object',
@@ -39,6 +40,8 @@ export function createSearchTool(options) {
         description: '搜索互联网公开信息；需要最新资料或不了解问题时使用。',
         inputSchema,
         network: 'fixed_hosts',
+        retrySafe: options.backend !== 'tavily',
+        resourceKeys: input => readResourceKeys('search', input),
         execute: async (input, context) => {
             const q = String(input.q ?? '').trim();
             const num = clampInteger(input.num, 1, 8, 5);

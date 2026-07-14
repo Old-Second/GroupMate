@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { configurationFailure, invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
   backgroundResourceResult, cancelledResult, executionFailure, resourceFromBytes,
@@ -16,7 +17,7 @@ const inputSchema = {
 export function createProcessPictureTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
     name: 'processPicture', description: '处理图片并返回可供后续发送的图片资源。',
-    inputSchema, network: 'open_http',
+    inputSchema, network: 'open_http', resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       if (!services.pictureProcessingAvailable) return configurationFailure('图片处理服务尚未配置。')
       const userId = String(input.userId ?? '').trim()

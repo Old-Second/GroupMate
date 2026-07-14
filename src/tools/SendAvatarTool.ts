@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
   cancelledResult, executionFailure, indeterminateResult, resourceFromBytes, visibleDefinition, visibleResult,
@@ -13,7 +14,7 @@ const inputSchema = {
 export function createSendAvatarTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
     name: 'sendAvatar', description: '向当前会话发送一至四个用户头像。',
-    inputSchema, network: 'open_http',
+    inputSchema, network: 'open_http', resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       const userIds = Array.isArray(input.userIds)
         ? input.userIds.map(String).filter(value => /^\d{1,20}$/.test(value)).slice(0, 4) : []

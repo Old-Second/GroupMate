@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
   decodeText, isToolResult, openWebPolicy, readOnlyDefinition, request,
   textResult, upstreamFailure
@@ -28,7 +29,8 @@ function cleanHtml (html: string): string {
 export function createWebsiteTool (options: WebsiteToolOptions): ToolDefinition {
   return readOnlyDefinition({
     name: 'website', description: '读取公开网页或文本 API 的正文内容。',
-    inputSchema, network: 'open_http', timeoutMs: 20_000,
+    inputSchema, network: 'open_http', timeoutMs: 20_000, retrySafe: true,
+    resourceKeys: input => readResourceKeys('website', input),
     execute: async (input, context) => {
       const response = await request(options.policyFetch, {
         url: String(input.url ?? ''), policy: openWebPolicy, timeoutMs: 20_000,

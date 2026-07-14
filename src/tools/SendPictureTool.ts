@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
   cancelledResult, executionFailure, indeterminateResult, resourceFromBytes, visibleDefinition, visibleResult,
@@ -13,7 +14,7 @@ const inputSchema = {
 export function createSendPictureTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
     name: 'sendPicture', description: '向当前会话发送一至四张公网图片。',
-    inputSchema, network: 'open_http',
+    inputSchema, network: 'open_http', resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       const urls = Array.isArray(input.urls)
         ? input.urls.map(String).map(value => value.trim()).filter(Boolean).slice(0, 4) : []

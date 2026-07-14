@@ -4,6 +4,10 @@ import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
 import type { CrossChannelAccess } from '../agent/tools/cross-channel-access.js'
+import {
+  crossChannelResourceKeys,
+  currentChannelResourceKeys
+} from '../agent/tools/resource-key.js'
 
 export type ToolResource =
   | {
@@ -121,6 +125,7 @@ export function visibleDefinition (input: {
   readonly inputSchema: StrictToolSchema
   readonly network?: 'none' | 'fixed_hosts' | 'open_http'
   readonly maxOutputBytes?: number
+  readonly resourceKeys: typeof currentChannelResourceKeys
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
   return Object.freeze({
@@ -130,6 +135,8 @@ export function visibleDefinition (input: {
     idempotency: 'call', openWorld: input.network === 'open_http',
     timeoutMs: 30_000, maxOutputBytes: input.maxOutputBytes ?? 16 * 1024,
     network: input.network ?? 'none', permission: 'current_channel',
+    executionClass: 'visible_output', retrySafe: false,
+    resourceKeys: input.resourceKeys,
     resolveTarget: (_toolInput: Readonly<Record<string, unknown>>, facts: ToolRuntimeFacts) => currentChannelTarget(facts),
     execute: input.execute
   })
@@ -138,6 +145,7 @@ export function visibleDefinition (input: {
 export function crossChannelDefinition (input: {
   readonly inputSchema: StrictToolSchema
   readonly crossChannelAccess: CrossChannelAccess
+  readonly resourceKeys: typeof crossChannelResourceKeys
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
   return Object.freeze({
@@ -147,6 +155,8 @@ export function crossChannelDefinition (input: {
     effect: 'side_effect', risk: 'high', readOnly: false, destructive: false,
     idempotency: 'semantic', openWorld: false, timeoutMs: 10_000,
     maxOutputBytes: 4 * 1024, network: 'none', permission: 'cross_channel',
+    executionClass: 'side_effect', retrySafe: false,
+    resourceKeys: input.resourceKeys,
     crossChannelAccess: Object.freeze({ ...input.crossChannelAccess }),
     resolveTarget: (toolInput: Readonly<Record<string, unknown>>) => toolInput.targetKind === 'group'
       ? Object.freeze({ kind: 'group' as const, groupId: String(toolInput.targetId) })

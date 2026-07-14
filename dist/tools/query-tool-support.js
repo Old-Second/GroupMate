@@ -140,6 +140,9 @@ export function readOnlyDefinition(input) {
         maxOutputBytes: input.maxOutputBytes ?? 16 * 1024,
         network: input.network,
         permission: 'any_user',
+        executionClass: 'read_only',
+        retrySafe: input.retrySafe,
+        resourceKeys: input.resourceKeys,
         resolveTarget: () => Object.freeze({ kind: 'none' }),
         execute: input.execute
     });

@@ -168,6 +168,9 @@ test('tool definition rejects open objects, unsupported keywords and contradicto
     maxOutputBytes: 4_096,
     network: 'fixed_hosts',
     permission: 'any_user',
+    executionClass: 'read_only',
+    retrySafe: true,
+    resourceKeys: () => Object.freeze([]),
     resolveTarget: () => ({ kind: 'none' }),
     execute
   } satisfies ToolDefinition
@@ -186,6 +189,8 @@ test('tool definition rejects open objects, unsupported keywords and contradicto
     inputSchema: { type: 'string' }
   } as never), ToolInputError)
   assert.throws(() => validateToolDefinition({ ...base, effect: 'side_effect', readOnly: true } as never), ToolInputError)
+  assert.throws(() => validateToolDefinition({ ...base, executionClass: 'side_effect' }), ToolInputError)
+  assert.throws(() => validateToolDefinition({ ...base, resourceKeys: null } as never), ToolInputError)
   assert.throws(() => validateToolDefinition({
     ...base, effect: 'side_effect', readOnly: false, idempotency: 'none'
   } as never), ToolInputError)
@@ -193,8 +198,13 @@ test('tool definition rejects open objects, unsupported keywords and contradicto
     ...base, idempotency: 'semantic'
   } as never), ToolInputError)
   assert.equal(validateToolDefinition({
-    ...base, effect: 'side_effect', readOnly: false, idempotency: 'semantic', openWorld: false
+    ...base, effect: 'side_effect', executionClass: 'side_effect', readOnly: false,
+    retrySafe: false, idempotency: 'semantic', openWorld: false
   }).idempotency, 'semantic')
+  assert.throws(() => validateToolDefinition({
+    ...base, effect: 'side_effect', executionClass: 'side_effect', readOnly: false,
+    retrySafe: true, idempotency: 'semantic', openWorld: false
+  }), ToolInputError)
   assert.throws(() => validateToolDefinition({
     ...base, effect: 'progress_output', readOnly: false, idempotency: 'call'
   } as never), ToolInputError)

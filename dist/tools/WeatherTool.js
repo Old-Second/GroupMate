@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { boundedJson, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { city: { type: 'string' } },
@@ -7,7 +8,8 @@ export function createWeatherTool(options) {
     const api = fixedOriginPolicy(options.apiBaseUrl, ['/v3/config/district', '/v3/weather/weatherInfo']);
     return readOnlyDefinition({
         name: 'weather', description: '查询指定区县的实时天气。',
-        inputSchema, network: 'fixed_hosts',
+        inputSchema, network: 'fixed_hosts', retrySafe: true,
+        resourceKeys: input => readResourceKeys('weather', input),
         execute: async (input, context) => {
             if (options.apiKey === '')
                 return configurationFailure('天气服务尚未配置。');

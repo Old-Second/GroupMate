@@ -99,6 +99,8 @@ test('visible tool factory exposes ten exact typed definitions without progress 
   for (const definition of definitions) {
     assert.equal(definition.readOnly, false)
     assert.equal(definition.idempotency, definition.name === 'sendMessage' ? 'semantic' : 'call')
+    assert.equal(definition.executionClass, definition.name === 'sendMessage' ? 'side_effect' : 'visible_output')
+    assert.equal(definition.retrySafe, false)
   }
   assert.equal(byName(definitions, 'sendMessage').effect, 'side_effect')
   assert.equal(byName(definitions, 'sendMessage').permission, 'cross_channel')

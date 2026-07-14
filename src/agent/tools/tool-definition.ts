@@ -4,6 +4,7 @@ import type { StrictToolSchema } from './tool-schema.js'
 import type { CrossChannelAccess } from './cross-channel-access.js'
 
 export type ToolEffect = 'read_only' | 'visible_output' | 'side_effect'
+export type ToolExecutionClass = 'read_only' | 'visible_output' | 'side_effect'
 export type ToolRisk = 'low' | 'medium' | 'high'
 export type ToolPermissionKind =
   | 'any_user'
@@ -14,7 +15,14 @@ export type ToolPermissionKind =
   | 'group_owner_or_master'
   | 'bot_group_owner'
 
-export interface ToolDefinition<Input = Readonly<Record<string, unknown>>> {
+export interface ToolSchedulingMetadata<Input = Readonly<Record<string, unknown>>> {
+  readonly executionClass: ToolExecutionClass
+  readonly retrySafe: boolean
+  resourceKeys(input: Input, facts: ToolRuntimeFacts): readonly string[]
+}
+
+export interface ToolDefinition<Input = Readonly<Record<string, unknown>>>
+  extends ToolSchedulingMetadata<Input> {
   readonly name: string
   readonly version: 1
   readonly aliases: readonly string[]

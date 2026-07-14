@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
   boundedJson, boundedText, clampInteger, fixedOriginPolicy, invalidArguments, isToolResult,
   parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure
@@ -16,7 +17,8 @@ export function createSearchMusicTool (options: SearchMusicToolOptions): ToolDef
   const api = fixedOriginPolicy('https://music.163.com', ['/api/search/get/web'])
   return readOnlyDefinition({
     name: 'searchMusic', description: '按歌曲名或歌手搜索网易云音乐公开曲目。',
-    inputSchema, network: 'fixed_hosts',
+    inputSchema, network: 'fixed_hosts', retrySafe: true,
+    resourceKeys: input => readResourceKeys('searchMusic', input),
     execute: async (input, context) => {
       const keyword = String(input.keyword ?? '').trim()
       const limit = clampInteger(input.limit, 1, 6, 6)

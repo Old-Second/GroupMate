@@ -1,3 +1,4 @@
+import { readResourceKeys } from '../agent/tools/resource-key.js';
 import { decodeText, isToolResult, openWebPolicy, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { url: { type: 'string' } },
@@ -18,7 +19,8 @@ function cleanHtml(html) {
 export function createWebsiteTool(options) {
     return readOnlyDefinition({
         name: 'website', description: '读取公开网页或文本 API 的正文内容。',
-        inputSchema, network: 'open_http', timeoutMs: 20_000,
+        inputSchema, network: 'open_http', timeoutMs: 20_000, retrySafe: true,
+        resourceKeys: input => readResourceKeys('website', input),
         execute: async (input, context) => {
             const response = await request(options.policyFetch, {
                 url: String(input.url ?? ''), policy: openWebPolicy, timeoutMs: 20_000,

@@ -2,6 +2,7 @@ import type { ToolRuntimeFacts, ToolTarget } from '../agent/tools/tool-context.j
 import type { ToolDefinition, ToolPermissionKind } from '../agent/tools/tool-definition.js'
 import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
+import type { memberResourceKeys, messageResourceKeys } from '../agent/tools/resource-key.js'
 
 export type MemberTarget = Extract<ToolTarget, { readonly kind: 'member' }>
 export type MessageTarget = Extract<ToolTarget, { readonly kind: 'message' }>
@@ -50,6 +51,7 @@ export function managementDefinition (input: {
   readonly inputSchema: StrictToolSchema
   readonly permission: ToolPermissionKind
   readonly destructive?: boolean
+  readonly resourceKeys: typeof memberResourceKeys | typeof messageResourceKeys
   readonly resolveTarget: ToolDefinition['resolveTarget']
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
@@ -59,7 +61,9 @@ export function managementDefinition (input: {
     effect: 'side_effect', risk: 'high', readOnly: false,
     destructive: input.destructive ?? false, idempotency: 'semantic', openWorld: false,
     timeoutMs: 10_000, maxOutputBytes: 4 * 1024, network: 'none',
-    permission: input.permission, resolveTarget: input.resolveTarget, execute: input.execute
+    permission: input.permission, executionClass: 'side_effect', retrySafe: false,
+    resourceKeys: input.resourceKeys,
+    resolveTarget: input.resolveTarget, execute: input.execute
   })
 }
 

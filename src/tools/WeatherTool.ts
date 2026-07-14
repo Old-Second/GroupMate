@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
+import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
   boundedJson, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult,
   parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure
@@ -20,7 +21,8 @@ export function createWeatherTool (options: WeatherToolOptions): ToolDefinition 
   const api = fixedOriginPolicy(options.apiBaseUrl, ['/v3/config/district', '/v3/weather/weatherInfo'])
   return readOnlyDefinition({
     name: 'weather', description: '查询指定区县的实时天气。',
-    inputSchema, network: 'fixed_hosts',
+    inputSchema, network: 'fixed_hosts', retrySafe: true,
+    resourceKeys: input => readResourceKeys('weather', input),
     execute: async (input, context) => {
       if (options.apiKey === '') return configurationFailure('天气服务尚未配置。')
       const city = String(input.city ?? '').trim()

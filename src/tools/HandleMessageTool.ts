@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { messageResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
   asMessageTarget, managementDefinition, managementSuccess, messageTarget,
@@ -16,7 +17,8 @@ const inputSchema = {
 export function createHandleMessageTool (capabilities: QqManagementCapabilities): ToolDefinition {
   return managementDefinition({
     name: 'handleMsg', description: '撤回当前群内指定消息，或设置、取消精华。',
-    inputSchema, permission: 'group_moderator', destructive: true, resolveTarget: messageTarget,
+    inputSchema, permission: 'group_moderator', destructive: true,
+    resourceKeys: messageResourceKeys, resolveTarget: messageTarget,
     execute: async (input, context) => {
       const target = asMessageTarget(context.target)
       if (target === null || target.messageId === '') return invalidArguments('消息管理参数无效。')

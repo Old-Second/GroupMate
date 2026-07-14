@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
+import { memberResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
   asMemberTarget, managementDefinition, managementSuccess, memberTarget,
@@ -13,7 +14,8 @@ const inputSchema = {
 export function createSetTitleTool (capabilities: QqManagementCapabilities): ToolDefinition {
   return managementDefinition({
     name: 'setTitle', description: '设置当前群内指定成员的专属头衔。',
-    inputSchema, permission: 'bot_group_owner', resolveTarget: memberTarget,
+    inputSchema, permission: 'bot_group_owner', resourceKeys: memberResourceKeys,
+    resolveTarget: memberTarget,
     execute: async (input, context) => {
       const target = asMemberTarget(context.target)
       const title = String(input.title ?? '').trim()

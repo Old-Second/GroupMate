@@ -1,3 +1,4 @@
+import { memberResourceKeys } from '../agent/tools/resource-key.js';
 import { invalidArguments } from './query-tool-support.js';
 import { asMemberTarget, managementDefinition, managementSuccess, memberTarget } from './management-tool-support.js';
 const inputSchema = {
@@ -7,7 +8,8 @@ const inputSchema = {
 export function createSetTitleTool(capabilities) {
     return managementDefinition({
         name: 'setTitle', description: '设置当前群内指定成员的专属头衔。',
-        inputSchema, permission: 'bot_group_owner', resolveTarget: memberTarget,
+        inputSchema, permission: 'bot_group_owner', resourceKeys: memberResourceKeys,
+        resolveTarget: memberTarget,
         execute: async (input, context) => {
             const target = asMemberTarget(context.target);
             const title = String(input.title ?? '').trim();

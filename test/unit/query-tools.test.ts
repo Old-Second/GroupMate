@@ -110,6 +110,24 @@ test('query tool runtime exposes eleven unique canonical definitions', () => {
   assert.equal(created.definitions.filter(tool => tool.name === 'search').length, 1)
   assert.equal(created.definitions.find(tool => tool.name === 'website')?.network, 'open_http')
   assert.equal(created.definitions.find(tool => tool.name === 'website')?.readOnly, true)
+  for (const definition of created.definitions) {
+    assert.equal(definition.executionClass, definition.effect)
+    assert.equal(definition.retrySafe, !['queryGenshin', 'queryStarRail', 'imageCaption'].includes(definition.name))
+  }
+})
+
+test('POST-backed search definitions are never marked retry safe', () => {
+  const { policyFetch } = policyFetchFixture(() => response({ data: [] }))
+  for (const definition of [
+    runtime({ policyFetch, searchSource: 'tavily', tavilyApiKey: 'key' })
+      .definitions.find(tool => tool.name === 'search'),
+    runtime({ policyFetch, imageSearchSource: 'tavily', tavilyApiKey: 'key' })
+      .definitions.find(tool => tool.name === 'searchImage')
+  ]) {
+    assert.ok(definition)
+    assert.equal(definition.executionClass, 'read_only')
+    assert.equal(definition.retrySafe, false)
+  }
 })
 
 test('search tool selects one configured backend and never leaks its key', async () => {

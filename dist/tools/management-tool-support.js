@@ -23,7 +23,9 @@ export function managementDefinition(input) {
         effect: 'side_effect', risk: 'high', readOnly: false,
         destructive: input.destructive ?? false, idempotency: 'semantic', openWorld: false,
         timeoutMs: 10_000, maxOutputBytes: 4 * 1024, network: 'none',
-        permission: input.permission, resolveTarget: input.resolveTarget, execute: input.execute
+        permission: input.permission, executionClass: 'side_effect', retrySafe: false,
+        resourceKeys: input.resourceKeys,
+        resolveTarget: input.resolveTarget, execute: input.execute
     });
 }
 export function asMemberTarget(target) {

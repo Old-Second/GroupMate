@@ -2,6 +2,7 @@ import { NetworkPolicyError, type NetworkRequestPolicy } from '../agent/tools/ne
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
+import type { ToolRuntimeFacts } from '../agent/tools/tool-context.js'
 import { PolicyFetch, type PolicyResponse } from '../runtime/tools/policy-fetch.js'
 
 export const jsonContentTypes = ['application/json'] as const
@@ -155,6 +156,11 @@ export function readOnlyDefinition (input: {
   readonly network: 'none' | 'fixed_hosts' | 'open_http'
   readonly timeoutMs?: number
   readonly maxOutputBytes?: number
+  readonly retrySafe: boolean
+  readonly resourceKeys: (
+    input: Readonly<Record<string, unknown>>,
+    facts: ToolRuntimeFacts
+  ) => readonly string[]
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
   return Object.freeze({
@@ -173,6 +179,9 @@ export function readOnlyDefinition (input: {
     maxOutputBytes: input.maxOutputBytes ?? 16 * 1024,
     network: input.network,
     permission: 'any_user',
+    executionClass: 'read_only',
+    retrySafe: input.retrySafe,
+    resourceKeys: input.resourceKeys,
     resolveTarget: () => Object.freeze({ kind: 'none' as const }),
     execute: input.execute
   })
