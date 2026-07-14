@@ -222,6 +222,44 @@ export function cancelToolExecutionLedger (
   }))
 }
 
+export function toolLedgerHasUnresolvedNonRead (
+  ledger: ToolExecutionLedger
+): boolean {
+  return ledger.calls.some(call => (
+    !isTerminalToolLedgerStatus(call.status) &&
+    (call.capability === null || call.capability.executionClass !== 'read_only')
+  ))
+}
+
+export function resetToolExecutionLedgerForRecovery (
+  ledger: ToolExecutionLedger
+): ToolExecutionLedger {
+  if (toolLedgerHasUnresolvedNonRead(ledger)) {
+    throw new TypeError('non-read tool execution cannot be replayed')
+  }
+  return freezeLedger(ledger.step, ledger.calls.map(call => ({
+    ...call,
+    status: 'planned',
+    capability: null,
+    result: null
+  })))
+}
+
+export function failRecoveredToolExecutionLedger (
+  ledger: ToolExecutionLedger
+): ToolExecutionLedger {
+  return freezeLedger(ledger.step, ledger.calls.map(call => {
+    if (isTerminalToolLedgerStatus(call.status)) return call
+    const nonRead = call.capability === null ||
+      call.capability.executionClass !== 'read_only'
+    return {
+      ...call,
+      status: nonRead ? 'indeterminate' as const : 'cancelled' as const,
+      result: nonRead ? indeterminateResult() : cancelledResult()
+    }
+  }))
+}
+
 export function toolLedgerIsTerminal (ledger: ToolExecutionLedger): boolean {
   return ledger.calls.every(call => isTerminalToolLedgerStatus(call.status))
 }

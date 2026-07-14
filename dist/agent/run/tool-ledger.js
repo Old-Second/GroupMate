@@ -146,6 +146,34 @@ export function cancelToolExecutionLedger(ledger, startedCallIds = new Set()) {
         };
     }));
 }
+export function toolLedgerHasUnresolvedNonRead(ledger) {
+    return ledger.calls.some(call => (!isTerminalToolLedgerStatus(call.status) &&
+        (call.capability === null || call.capability.executionClass !== 'read_only')));
+}
+export function resetToolExecutionLedgerForRecovery(ledger) {
+    if (toolLedgerHasUnresolvedNonRead(ledger)) {
+        throw new TypeError('non-read tool execution cannot be replayed');
+    }
+    return freezeLedger(ledger.step, ledger.calls.map(call => ({
+        ...call,
+        status: 'planned',
+        capability: null,
+        result: null
+    })));
+}
+export function failRecoveredToolExecutionLedger(ledger) {
+    return freezeLedger(ledger.step, ledger.calls.map(call => {
+        if (isTerminalToolLedgerStatus(call.status))
+            return call;
+        const nonRead = call.capability === null ||
+            call.capability.executionClass !== 'read_only';
+        return {
+            ...call,
+            status: nonRead ? 'indeterminate' : 'cancelled',
+            result: nonRead ? indeterminateResult() : cancelledResult()
+        };
+    }));
+}
 export function toolLedgerIsTerminal(ledger) {
     return ledger.calls.every(call => isTerminalToolLedgerStatus(call.status));
 }

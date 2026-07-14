@@ -3,11 +3,11 @@ import { AgentError, serializeAgentError } from '../contracts/error.js';
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js';
 import { completedPreparedCall } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
-import { createInitialRunCheckpoint, nextRunCheckpoint } from './run-checkpoint.js';
+import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { createRunEvent } from './run-events.js';
 import { isTerminalRunStatus } from './run-state.js';
 import { RunStoreConflictError } from './run-store.js';
-import { applyToolPreflight, cancelToolExecutionLedger, completeToolExecutionLedger, createToolExecutionLedger, failToolExecutionLedger, toolLedgerHasIndeterminate, toolLedgerHasVisibleOutput, toolLedgerModelMessages } from './tool-ledger.js';
+import { applyToolPreflight, cancelToolExecutionLedger, completeToolExecutionLedger, createToolExecutionLedger, failRecoveredToolExecutionLedger, failToolExecutionLedger, resetToolExecutionLedgerForRecovery, toolLedgerHasIndeterminate, toolLedgerHasUnresolvedNonRead, toolLedgerHasVisibleOutput, toolLedgerModelMessages } from './tool-ledger.js';
 class ModelAttemptFailure extends Error {
     agentError;
     counters;
@@ -205,6 +205,7 @@ export class RunEngine {
             profileVersion: this.#profile.version,
             runId: input.runId,
             sessionId: input.sessionId,
+            sessionAddress: input.sessionAddress,
             model,
             toolSnapshot: Object.freeze({
                 id: input.runtime.snapshot.id,
@@ -245,20 +246,28 @@ export class RunEngine {
             if (timer !== undefined)
                 clearTimeout(timer);
             const latest = await this.#store.load(input.runId).catch(() => null);
-            if (latest !== null && isTerminalRunStatus(latest.status)) {
-                this.#runtimeBindings.delete(input.runId);
-                this.#startedToolCalls.delete(input.runId);
-                if (this.#controllers.get(input.runId) === controller) {
-                    this.#controllers.delete(input.runId);
-                }
+            if (latest === null || isTerminalRunStatus(latest.status)) {
+                this.#cleanupRun(input.runId, controller);
             }
         }
     }
     async resume(runId, runtime, options = {}) {
         if (runtime !== undefined)
             this.#runtimeBindings.set(runId, runtime);
-        const checkpoint = await this.#store.load(runId);
+        let checkpoint;
+        try {
+            checkpoint = await this.#store.load(runId);
+        }
+        catch (error) {
+            this.#runtimeBindings.delete(runId);
+            return Object.freeze({
+                kind: 'failed',
+                runId,
+                error: serializeAgentError(asAgentError(error))
+            });
+        }
         if (checkpoint === null) {
+            this.#runtimeBindings.delete(runId);
             return Object.freeze({
                 kind: 'failed',
                 runId,
@@ -278,12 +287,29 @@ export class RunEngine {
         const detach = this.#linkExternalSignal(options.signal, controller);
         const timer = this.#deadlineTimer(checkpoint, controller);
         try {
-            return await this.#drive(checkpoint, controller);
+            let resumable = checkpoint;
+            try {
+                this.#assertRecoveredCompatibility(resumable);
+                if (resumable.status === 'executing_tools') {
+                    resumable = await this.#recoverExecutingTools(resumable);
+                    if (isTerminalRunStatus(resumable.status))
+                        return terminalResult(resumable);
+                }
+            }
+            catch (error) {
+                const failed = await this.#fail(resumable, asAgentError(error));
+                return terminalResult(failed);
+            }
+            return await this.#drive(resumable, controller);
         }
         finally {
             detach();
             if (timer !== undefined)
                 clearTimeout(timer);
+            const latest = await this.#store.load(runId).catch(() => null);
+            if (latest === null || isTerminalRunStatus(latest.status)) {
+                this.#cleanupRun(runId, controller);
+            }
         }
     }
     async cancel(runId, reason = 'user_cancelled') {
@@ -322,6 +348,88 @@ export class RunEngine {
             runId,
             error: serializeAgentError(checkpointConflict())
         });
+    }
+    #assertRecoveredCompatibility(checkpoint) {
+        if (checkpoint.profileId !== this.#profile.id ||
+            checkpoint.profileVersion !== this.#profile.version) {
+            throw new AgentError({
+                code: 'checkpoint_invalid',
+                stage: 'run.profile',
+                retryable: false,
+                userMessage: '任务模型兼容配置已变化，请重新发起。'
+            });
+        }
+        const runtime = this.#runtime(checkpoint.runId);
+        this.#assertSnapshot(checkpoint, runtime.snapshot);
+    }
+    async #recoverExecutingTools(checkpoint) {
+        const ledger = checkpoint.toolLedgers.at(-1);
+        if (ledger === undefined || ledger.step !== checkpoint.step ||
+            checkpoint.preparedBatch === null) {
+            throw new AgentError({
+                code: 'checkpoint_invalid',
+                stage: 'run.recovery',
+                retryable: false,
+                userMessage: '任务工具状态不完整，请重新发起。'
+            });
+        }
+        if (toolLedgerHasUnresolvedNonRead(ledger)) {
+            const failedLedger = failRecoveredToolExecutionLedger(ledger);
+            return await this.#fail(checkpoint, toolOutcomeUnknown(), ledger.calls
+                .filter(call => call.status !== 'succeeded' && call.status !== 'failed' &&
+                call.status !== 'denied' && call.status !== 'rejected' &&
+                call.status !== 'expired' && call.status !== 'cancelled' &&
+                call.status !== 'indeterminate')
+                .map(call => ({
+                type: 'tool.failed',
+                payload: {
+                    callId: call.callId,
+                    toolName: call.toolName,
+                    reason: 'recovery_outcome_unknown'
+                }
+            })), {
+                toolLedgers: this.#replaceLastLedger(checkpoint, failedLedger),
+                preparedBatch: null
+            });
+        }
+        const remainingToolCalls = checkpoint.budgetCounters.toolCalls - ledger.calls.length;
+        if (remainingToolCalls < 0) {
+            throw new AgentError({
+                code: 'checkpoint_invalid',
+                stage: 'run.recovery',
+                retryable: false,
+                userMessage: '任务工具预算状态不完整，请重新发起。'
+            });
+        }
+        const resetLedger = resetToolExecutionLedgerForRecovery(ledger);
+        const occurredAt = this.#timestamp();
+        const event = createRunEvent({
+            eventId: this.#generateId(),
+            runId: checkpoint.runId,
+            sessionId: checkpoint.sessionId,
+            sequence: checkpoint.nextEventSequence,
+            occurredAt,
+            type: 'run.resumed',
+            payload: { reason: 'read_only_recovery' }
+        });
+        const next = recoverExecutingRunCheckpoint(checkpoint, {
+            toolLedgers: this.#replaceLastLedger(checkpoint, resetLedger),
+            preparedBatch: null,
+            budgetCounters: Object.freeze({
+                ...checkpoint.budgetCounters,
+                toolCalls: remainingToolCalls
+            })
+        }, [event], occurredAt);
+        try {
+            const stored = await this.#store.compareAndSet(checkpoint, next);
+            this.#notifyNewEvents(checkpoint, stored);
+            return stored;
+        }
+        catch (error) {
+            if (error instanceof RunStoreConflictError)
+                throw checkpointConflict(error);
+            throw error;
+        }
     }
     async #drive(initial, controller) {
         let checkpoint = initial;
@@ -1071,6 +1179,13 @@ export class RunEngine {
     }
     #signalCancellationReason(signal) {
         return boundedCancellationReason(typeof signal.reason === 'string' ? signal.reason : 'user_cancelled');
+    }
+    #cleanupRun(runId, controller) {
+        this.#runtimeBindings.delete(runId);
+        this.#startedToolCalls.delete(runId);
+        if (this.#controllers.get(runId) === controller) {
+            this.#controllers.delete(runId);
+        }
     }
     #notifyNewEvents(previous, next) {
         for (const event of next.events.slice(previous.events.length))

@@ -1,0 +1,421 @@
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { test } from 'node:test'
+import { AgentError } from '../../src/agent/contracts/error.js'
+import type { SessionAddress } from '../../src/agent/contracts/identity.js'
+import { ModelProviderError, type ModelAdapter, type ModelRequest, type ModelTurn } from '../../src/agent/model/model-adapter.js'
+import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
+import { RunAdmission } from '../../src/agent/run/run-admission.js'
+import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import { createInitialRunCheckpoint, nextRunCheckpoint, type RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
+import { RunEngine, type RunRuntimeBinding } from '../../src/agent/run/run-engine.js'
+import { createRunEvent } from '../../src/agent/run/run-events.js'
+import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
+import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
+import { applyToolPreflight, createToolExecutionLedger } from '../../src/agent/run/tool-ledger.js'
+import type { ToolCall } from '../../src/agent/tools/tool-call.js'
+import type { ToolExecutionContext, ToolPreparationContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
+import type { SerializablePreparedCapability } from '../../src/agent/tools/prepared-capability.js'
+import type { ToolSnapshot } from '../../src/agent/tools/tool-registry.js'
+import type { ToolResult } from '../../src/agent/tools/tool-result.js'
+import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
+import { FakeRedis } from '../helpers/fake-redis.js'
+
+const timestamp = '2026-07-14T00:00:00.000Z'
+const deadlineAt = '2026-07-14T00:04:00.000Z'
+const address: SessionAddress = Object.freeze({
+  botId: 'bot-private-value',
+  scope: Object.freeze({ kind: 'group', groupId: 'group-private-value' })
+})
+const facts: ToolRuntimeFacts = Object.freeze({
+  botId: 'bot-private-value',
+  actor: Object.freeze({ userId: 'actor-private-value', role: 'owner', isBotMaster: true }),
+  channel: Object.freeze({ kind: 'group', botId: 'bot-private-value', groupId: 'group-private-value' }),
+  scope: address.scope,
+  botGroupRole: 'owner', actorGroupRole: 'owner', targetRole: 'member',
+  targetIsBotMaster: false, targetExists: true
+})
+const preparation: ToolPreparationContext = Object.freeze({
+  runId: 'run-1', profile: 'compatible', facts,
+  intent: Object.freeze({
+    trustedSources: Object.freeze(['current_request'] as const), actions: Object.freeze([]),
+    explicitTargetIds: Object.freeze([]), mentionUserIds: Object.freeze([]),
+    currentMessageId: 'message-current', replyMessageId: null
+  }),
+  now: timestamp
+})
+const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
+const emptyManifestFingerprint = createHash('sha256').update('[]').digest('hex')
+
+function runEvent (runId: string, sequence: number, type: 'run.created' | 'run.started' | 'model.started' | 'model.completed' | 'tool.batch_planned' | 'tool.requested' | 'tool.started'): ReturnType<typeof createRunEvent> {
+  return createRunEvent({
+    eventId: `event-${sequence}`, runId, sessionId: 'session-1', sequence,
+    occurredAt: timestamp, type, payload: Object.freeze({})
+  })
+}
+
+function snapshot (fingerprint = emptyManifestFingerprint): ToolSnapshot {
+  const capability = Object.freeze({
+    definition: Object.freeze({
+      name: 'fixture', version: 1 as const, aliases: Object.freeze([]), description: 'fixture',
+      inputSchema: Object.freeze({ type: 'object' as const, properties: Object.freeze({}), required: Object.freeze([]), additionalProperties: false as const }),
+      effect: 'read_only' as const, risk: 'low' as const, readOnly: true, destructive: false,
+      idempotency: 'none' as const, openWorld: false, timeoutMs: 1_000,
+      maxOutputBytes: 4_096, network: 'none' as const, permission: 'any_user' as const,
+      executionClass: 'read_only' as const, retrySafe: true,
+      resourceKeys: () => Object.freeze(['fixture:000000000000000000000000']),
+      resolveTarget: () => Object.freeze({ kind: 'none' as const }),
+      execute: async () => success('fixture')
+    }),
+    canonicalName: 'fixture'
+  })
+  return Object.freeze({
+    id: 'snapshot-1', fingerprint, manifest: Object.freeze([]),
+    toolNames: Object.freeze(['fixture']), modelTools: Object.freeze([]),
+    resolve: () => capability,
+    resolveCall: () => capability
+  })
+}
+
+function success (text: string): ToolResult {
+  return Object.freeze({
+    status: 'success', effect: 'none',
+    content: Object.freeze([{ type: 'text' as const, text }]), retryable: false
+  })
+}
+
+function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
+  return createInitialRunCheckpoint({
+    profileId: 'standard', profileVersion: 1, runId,
+    sessionId: 'session-1', sessionAddress: address,
+    model: Object.freeze({
+      model: 'fixture-model', streaming: false, maxOutputTokens: 256,
+      reasoning: Object.freeze({ enabled: false })
+    }),
+    toolSnapshot: Object.freeze({
+      id: toolSnapshot.id, fingerprint: toolSnapshot.fingerprint,
+      manifest: toolSnapshot.manifest
+    }),
+    budgetLimits: budget.limits, budgetCounters: budget.initialCounters,
+    deadlineAt, createdAt: timestamp, event: runEvent(runId, 0, 'run.created')
+  })
+}
+
+function callingModelPath (source: RunCheckpoint): readonly RunCheckpoint[] {
+  const prepared = nextRunCheckpoint(source, 'preparing', {
+    messages: Object.freeze([{ role: 'user' as const, content: '继续任务' }]),
+    estimatedInputTokens: 8
+  }, [runEvent(source.runId, 1, 'run.started')], timestamp)
+  const counters = budget.reserveModelTurn(prepared.budgetCounters, {
+    kind: 'normal', estimatedInputTokens: 8, maxOutputTokens: 256
+  })
+  const calling = nextRunCheckpoint(prepared, 'calling_model', {
+    budgetCounters: counters,
+    modelTurn: Object.freeze({ kind: 'normal', maxOutputTokens: 256 })
+  }, [runEvent(source.runId, 2, 'model.started')], timestamp)
+  return Object.freeze([source, prepared, calling])
+}
+
+function executingPath (
+  source: RunCheckpoint,
+  executionClass: SerializablePreparedCapability['executionClass']
+): readonly RunCheckpoint[] {
+  const callingPath = callingModelPath(source)
+  const calling = callingPath.at(-1)
+  if (calling === undefined) throw new TypeError('calling checkpoint is missing')
+  const call = Object.freeze({
+    index: 0, callId: 'call-1', name: 'fixture', argumentsText: '{}',
+    arguments: Object.freeze({})
+  })
+  const ledger = createToolExecutionLedger(0, [call])
+  const assistant = Object.freeze({
+    role: 'assistant' as const, content: null,
+    toolCalls: Object.freeze([{ callId: 'call-1', name: 'fixture', arguments: Object.freeze({}) }])
+  })
+  const evaluating = nextRunCheckpoint(calling, 'evaluating_tools', {
+    messages: Object.freeze([...calling.messages, assistant]),
+    modelTurn: null,
+    toolLedgers: Object.freeze([ledger])
+  }, [
+    runEvent(source.runId, 3, 'model.completed'),
+    runEvent(source.runId, 4, 'tool.batch_planned')
+  ], timestamp)
+  const capability: SerializablePreparedCapability = Object.freeze({
+    schemaVersion: 1, callId: 'call-1', toolName: 'fixture', toolVersion: 1,
+    snapshotId: source.toolSnapshot.id, canonicalArguments: Object.freeze({}),
+    argumentHash: 'hash-call-1', target: Object.freeze({ kind: 'none' }),
+    resourceKeys: Object.freeze(['fixture:000000000000000000000000']),
+    executionClass, retrySafe: executionClass === 'read_only'
+  })
+  const batch = Object.freeze({
+    schemaVersion: 1 as const,
+    calls: Object.freeze([{ kind: 'ready' as const, capability }])
+  })
+  const counters = budget.reserveToolBatch(evaluating.budgetCounters, 1)
+  const executing = nextRunCheckpoint(evaluating, 'executing_tools', {
+    budgetCounters: counters,
+    toolLedgers: Object.freeze([applyToolPreflight(ledger, batch)]),
+    preparedBatch: batch
+  }, [
+    runEvent(source.runId, 5, 'tool.requested'),
+    runEvent(source.runId, 6, 'tool.started')
+  ], timestamp)
+  return Object.freeze([...callingPath, evaluating, executing])
+}
+
+class ScriptedAdapter implements ModelAdapter {
+  calls = 0
+  constructor (readonly turn: ModelTurn) {}
+  async complete (_request: ModelRequest, _signal: AbortSignal): Promise<ModelTurn> {
+    this.calls += 1
+    return this.turn
+  }
+}
+
+class CountingRuntime implements ToolRuntime {
+  preparations = 0
+  executions = 0
+  async prepare (call: ToolCall, _context: ToolPreparationContext, _snapshot: ToolSnapshot) {
+    this.preparations += 1
+    const capability: SerializablePreparedCapability = Object.freeze({
+      schemaVersion: 1, callId: call.callId, toolName: 'fixture', toolVersion: 1,
+      snapshotId: call.snapshotId, canonicalArguments: Object.freeze({}),
+      argumentHash: 'hash-call-1', target: Object.freeze({ kind: 'none' }),
+      resourceKeys: Object.freeze(['fixture:000000000000000000000000']),
+      executionClass: 'read_only', retrySafe: true
+    })
+    return Object.freeze({ kind: 'ready' as const, capability })
+  }
+
+  async executePrepared (): Promise<ToolResult> {
+    this.executions += 1
+    return success('recovered')
+  }
+}
+
+function runtimeBinding (toolSnapshot: ToolSnapshot): RunRuntimeBinding {
+  return Object.freeze({
+    snapshot: toolSnapshot,
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '继续任务' }]),
+      estimatedInputTokens: 8
+    }),
+    prepareToolContext: async () => preparation,
+    contextFor: async () => Object.freeze({ ...preparation }) as ToolExecutionContext
+  })
+}
+
+function textTurn (text: string): ModelTurn {
+  return Object.freeze({ text, toolCalls: Object.freeze([]), finishReason: 'stop' })
+}
+
+async function persistPath (store: RedisRunStore, path: readonly RunCheckpoint[]): Promise<void> {
+  await store.create(path[0])
+  for (let index = 1; index < path.length; index += 1) {
+    await store.compareAndSet(path[index - 1], path[index])
+  }
+}
+
+test('RunEngine resumes a complete calling-model checkpoint exactly once', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const source = initial()
+  const path = callingModelPath(source)
+  await persistPath(store, path)
+  const adapter = new ScriptedAdapter(textTurn('恢复完成'))
+  const toolRuntime = new CountingRuntime()
+  const engine = new RunEngine({
+    adapter, profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: toolRuntime }), store, budget,
+    now: () => new Date(timestamp), generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(adapter.calls, 1)
+  assert.equal(await store.load(source.runId), null)
+  assert.equal((await store.loadTombstone(source.runId))?.status, 'completed')
+})
+
+test('RunEngine fails closed when the recovered Profile or ToolSnapshot changed', async () => {
+  for (const changedRuntime of [
+    runtimeBinding(snapshot('b'.repeat(64))),
+    runtimeBinding(Object.freeze({ ...snapshot(), id: 'snapshot-changed' }))
+  ]) {
+    const redis = new FakeRedis(() => Date.parse(timestamp))
+    const store = new RedisRunStore({ client: redis })
+    const source = initial()
+    await store.create(source)
+    const adapter = new ScriptedAdapter(textTurn('不应调用'))
+    const engine = new RunEngine({
+      adapter, profile: standardOpenAIProfile,
+      scheduler: new ToolScheduler({ runtime: new CountingRuntime() }),
+      store, budget, now: () => new Date(timestamp), generateId: () => 'generated-id'
+    })
+
+    const result = await engine.resume(source.runId, changedRuntime)
+
+    assert.equal(result.kind, 'failed')
+    assert.equal(result.kind === 'failed' && result.error.code, 'checkpoint_invalid')
+    assert.equal(adapter.calls, 0)
+  }
+})
+
+test('RunEngine never replays a recovered non-read capability without a terminal checkpoint', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const source = initial()
+  const path = executingPath(source, 'side_effect')
+  await persistPath(store, path)
+  const toolRuntime = new CountingRuntime()
+  const engine = new RunEngine({
+    adapter: new ScriptedAdapter(textTurn('不应调用')),
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: toolRuntime }),
+    store, budget, now: () => new Date(timestamp), generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'tool_outcome_unknown')
+  assert.equal(toolRuntime.preparations, 0)
+  assert.equal(toolRuntime.executions, 0)
+  assert.equal((await store.loadTombstone(source.runId))?.errorCode, 'tool_outcome_unknown')
+})
+
+test('RunEngine re-prepares a recovered read-only batch before executing it', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const source = initial()
+  const path = executingPath(source, 'read_only')
+  await persistPath(store, path)
+  const toolRuntime = new CountingRuntime()
+  const adapter = new ScriptedAdapter(textTurn('只读恢复完成'))
+  const engine = new RunEngine({
+    adapter, profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: toolRuntime }), store, budget,
+    now: () => new Date(timestamp), generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(toolRuntime.preparations, 1)
+  assert.equal(toolRuntime.executions, 1)
+  assert.equal(adapter.calls, 1)
+})
+
+test('RunAdmission enforces global two, per-session one and a FIFO queue of three', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  let generated = 0
+  const admission = new RunAdmission({
+    client: redis, generateId: () => `lease-${++generated}`, leaseTtlSeconds: 300
+  })
+  const other = (id: string): SessionAddress => Object.freeze({
+    botId: 'bot-private-value', scope: Object.freeze({ kind: 'private', userId: id })
+  })
+  const first = await admission.acquire(other('session-a'))
+  const second = await admission.acquire(other('session-b'))
+  const queuedOne = admission.acquire(other('session-c'))
+  const queuedTwo = admission.acquire(other('session-d'))
+  const queuedThree = admission.acquire(other('session-e'))
+
+  await assert.rejects(admission.acquire(other('session-f')), error => (
+    error instanceof AgentError && error.code === 'run_budget_exceeded'
+  ))
+  assert.equal(admission.activeCount, 2)
+  assert.equal(admission.queuedCount, 3)
+
+  await first.release()
+  const third = await queuedOne
+  assert.equal(third.leaseId, 'lease-3')
+  await second.release()
+  const fourth = await queuedTwo
+  await third.release()
+  const fifth = await queuedThree
+  await Promise.all([fourth.release(), fifth.release()])
+  assert.equal(admission.activeCount, 0)
+  assert.equal(admission.queuedCount, 0)
+})
+
+test('RunAdmission serializes one session, removes an aborted waiter and hashes Redis keys', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  let generated = 0
+  const admission = new RunAdmission({
+    client: redis, generateId: () => `lease-${++generated}`, leaseTtlSeconds: 300
+  })
+  const first = await admission.acquire(address)
+  const controller = new AbortController()
+  const aborted = admission.acquire(address, controller.signal)
+  controller.abort()
+  await assert.rejects(aborted, error => (
+    error instanceof AgentError && error.code === 'cancelled'
+  ))
+  assert.equal(admission.queuedCount, 0)
+
+  const waiting = admission.acquire(address)
+  await first.release()
+  const second = await waiting
+  const keys = (await redis.scan(0, { MATCH: 'GROUPMATE:RUN:v1:admission:*', COUNT: 100 })).keys
+  assert.equal(keys.some(key => key.includes(address.botId)), false)
+  assert.equal(keys.some(key => key.includes('group-private-value')), false)
+  assert.equal(await redis.ttl(keys[0] ?? ''), 300)
+  await second.release()
+})
+
+test('RunAdmission rebuilds a lease only from a valid non-terminal checkpoint', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const staleAdmission = new RunAdmission({
+    client: redis,
+    generateId: () => 'lease-from-previous-process'
+  })
+  const staleLease = await staleAdmission.acquire(address)
+  const admission = new RunAdmission({ client: redis, generateId: () => 'lease-recovered' })
+  const source = initial('run-recovered')
+  const lease = await admission.recover(source)
+  assert.equal(lease.leaseId, 'lease-recovered')
+  assert.equal(redis.evalCalls.some(call => call.operation === 'admission_recover'), true)
+  await lease.release()
+  await staleLease.release()
+
+  await assert.rejects(admission.recover({
+    ...source,
+    status: 'completed'
+  } as RunCheckpoint), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+})
+
+test('RunEngine keeps a final retryable provider error typed after restart', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const source = initial()
+  const path = callingModelPath(source)
+  await persistPath(store, path)
+  const failure = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  class FailingAdapter implements ModelAdapter {
+    calls = 0
+    async complete (): Promise<ModelTurn> {
+      this.calls += 1
+      throw failure
+    }
+  }
+  const adapter = new FailingAdapter()
+  const engine = new RunEngine({
+    adapter, profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: new CountingRuntime() }),
+    store, budget, now: () => new Date(timestamp), generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'provider_unavailable')
+  assert.equal(adapter.calls, 2)
+  assert.equal((await store.loadTombstone(source.runId))?.providerRetries, 1)
+})

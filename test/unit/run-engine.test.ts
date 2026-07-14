@@ -263,6 +263,7 @@ function harness (
   const input: StartRunInput = Object.freeze({
     runId: 'run-1',
     sessionId: 'session-1',
+    sessionAddress: Object.freeze({ botId: facts.botId, scope: facts.scope }),
     deadlineAt,
     model: Object.freeze({
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
