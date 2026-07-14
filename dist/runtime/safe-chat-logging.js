@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readChatErrorMetadata } from './chat-error-presentation.js';
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
@@ -71,5 +72,23 @@ export function createMessageInputLog(input) {
         replySegmentCount: getSafeCount(input.replySegmentCount),
         imageCount: Array.isArray(input.imageUrls) ? input.imageUrls.length : 0,
         promptCharacters: getStringLength(input.prompt)
+    };
+}
+export function createAgentRunLog(input) {
+    const runId = typeof input.runId === 'string' ? input.runId : 'unknown';
+    return {
+        event: 'agent.run',
+        runRef: createHash('sha256').update(runId).digest('hex').slice(0, 16),
+        fromStatus: getSafeToken(input.fromStatus),
+        toStatus: getSafeToken(input.toStatus),
+        modelTurns: getSafeCount(input.modelTurns),
+        toolCalls: getSafeCount(input.toolCalls),
+        usedActiveRuntimeMs: getSafeCount(input.usedActiveRuntimeMs),
+        providerAttempts: getSafeCount(input.providerAttempts),
+        recoveryAttempts: getSafeCount(input.recoveryAttempts),
+        correctionAttempts: getSafeCount(input.correctionAttempts),
+        errorCode: getSafeToken(input.errorCode),
+        storeKeyCount: getSafeCount(input.storeKeyCount),
+        estimatedBytes: getSafeCount(input.estimatedBytes)
     };
 }

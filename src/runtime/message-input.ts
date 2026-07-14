@@ -1,4 +1,5 @@
 import { normalizeMessageContent } from './message-content.js'
+import type { QuotedMessageSnapshot } from '../agent/contracts/content.js'
 
 const MAX_FIELD_CHARACTERS = 500
 
@@ -30,6 +31,9 @@ export interface MessageEventLike {
 export interface ModelMessageInput {
   prompt: string
   imageUrls: string[]
+  currentMessageId: string | null
+  quotedMessageId: string | null
+  quotedMessage?: QuotedMessageSnapshot
   hasReply: boolean
   replyResolved: boolean
   currentSegmentCount: number
@@ -126,6 +130,7 @@ async function resolveReplyReference (
 
 async function findReplyMessage (event: MessageEventLike): Promise<{
   hasReply: boolean
+  source?: UnknownRecord
   reply?: UnknownRecord
 }> {
   let source = isRecord(event.source) ? event.source : findReplySegment(event.message)
@@ -149,6 +154,7 @@ async function findReplyMessage (event: MessageEventLike): Promise<{
   if (!source) return { hasReply: false }
   return {
     hasReply: true,
+    source,
     reply: await resolveReplyReference(event, source)
   }
 }
@@ -164,11 +170,14 @@ export async function buildModelMessageInput ({
   const current = normalizeMessageContent(event.message, { textOverride: currentPrompt })
   const replyResult = await findReplyMessage(event)
   const { hasReply } = replyResult
+  const currentMessageId = getBoundedScalar(event.message_id ?? event.seq) ?? null
 
   if (!hasReply) {
     return {
       prompt: currentPrompt,
       imageUrls: current.imageUrls,
+      currentMessageId,
+      quotedMessageId: null,
       hasReply: false,
       replyResolved: false,
       currentSegmentCount: current.segmentCount,
@@ -193,6 +202,31 @@ export async function buildModelMessageInput ({
         content: quoted.text || '[空消息]'
       }
     : { status: 'unavailable' }
+  const quotedMessageId = getBoundedScalar(
+    reply?.message_id ?? replyResult.source?.message_id ?? replyResult.source?.seq ??
+      replyResult.source?.id
+  ) ?? null
+  const projectedSender = projectSender(reply?.sender)
+  const quotedSnapshot: QuotedMessageSnapshot | undefined = reply !== undefined &&
+    quotedMessageId !== null
+    ? Object.freeze({
+        messageId: quotedMessageId,
+        sender: Object.freeze({
+          userId: projectedSender.userId ?? 'unknown',
+          ...((projectedSender.card ?? projectedSender.nickname) === undefined
+            ? {}
+            : { displayName: projectedSender.card ?? projectedSender.nickname })
+        }),
+        parts: Object.freeze([
+          Object.freeze({ type: 'text' as const, text: quoted.text || '[空消息]' }),
+          ...quoted.imageUrls.map(resourceId => Object.freeze({
+            type: 'resource_ref' as const,
+            resourceType: 'image' as const,
+            resourceId
+          }))
+        ])
+      })
+    : undefined
   const payload = {
     quotedMessage,
     currentRequest: {
@@ -204,6 +238,9 @@ export async function buildModelMessageInput ({
   return {
     prompt: `${prefix}\n${JSON.stringify(payload)}`,
     imageUrls: mergeImageUrls(current.imageUrls, quoted.imageUrls),
+    currentMessageId,
+    quotedMessageId,
+    ...(quotedSnapshot === undefined ? {} : { quotedMessage: quotedSnapshot }),
     hasReply: true,
     replyResolved,
     currentSegmentCount: current.segmentCount,

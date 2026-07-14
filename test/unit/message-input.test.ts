@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildModelMessageInput } from '../../src/runtime/message-input.js'
+import { adaptYunzaiRequest } from '../../src/runtime/yunzai-request-adapter.js'
 
 function parseInputPayload (prompt: string): Record<string, any> {
   const jsonStart = prompt.indexOf('{')
@@ -72,6 +73,8 @@ test('resolves one group reply with sender identity and merged images', async ()
   assert.equal(result.replyResolved, true)
   assert.equal(result.currentSegmentCount, 2)
   assert.equal(result.replySegmentCount, 3)
+  assert.equal(result.currentMessageId, null)
+  assert.equal(result.quotedMessageId, 'message-42')
   assert.deepEqual(result.imageUrls, [
     'https://fixture.invalid/shared.png',
     'https://fixture.invalid/quoted.png'
@@ -96,6 +99,96 @@ test('resolves one group reply with sender identity and merged images', async ()
   assert.deepEqual(payload.currentRequest, {
     content: 'current request\n[图片]'
   })
+})
+
+test('Yunzai request adapter freezes group addressing and quoted message references', async () => {
+  const event = {
+    isGroup: true,
+    group_id: 'group-1',
+    self_id: 'bot-1',
+    user_id: 'actor-1',
+    message_id: 'current-message-1',
+    sender: { user_id: 'actor-1', nickname: 'member', role: 'admin' },
+    message: [
+      { type: 'text', text: 'current request' },
+      { type: 'image', url: 'https://fixture.invalid/current.png' }
+    ],
+    source: { seq: 42, message_id: 'quoted-message-1' },
+    group: {
+      async getChatHistory () {
+        return [{
+          message_id: 'quoted-message-1',
+          sender: { user_id: 'actor-2', nickname: 'quoted member' },
+          message: [{ type: 'text', text: 'quoted content' }]
+        }]
+      }
+    }
+  }
+  const request = await adaptYunzaiRequest({
+    event,
+    currentPrompt: 'current request',
+    groupMerge: false,
+    requestId: 'request-1',
+    createdAt: '2026-07-14T01:00:00.000Z',
+    deadlineAt: '2026-07-14T01:04:00.000Z',
+    systemInstructions: ['system fixture'],
+    model: {
+      model: 'fixture-model', streaming: true, maxOutputTokens: 512,
+      reasoning: { enabled: true }
+    },
+    contextBudget: {
+      modelContextTokens: 8_192, reservedOutputTokens: 512,
+      reservedToolTokens: 1_024, safetyMarginTokens: 256,
+      maxItems: 64, maxBytes: 256 * 1_024
+    }
+  })
+
+  event.sender.nickname = 'mutated'
+  assert.deepEqual(request.sessionAddress, {
+    botId: 'bot-1',
+    scope: { kind: 'group_user', groupId: 'group-1', userId: 'actor-1' }
+  })
+  assert.deepEqual(request.channel, { kind: 'group', botId: 'bot-1', groupId: 'group-1' })
+  assert.deepEqual(request.actor, { userId: 'actor-1', displayName: 'member', role: 'admin' })
+  assert.deepEqual(request.references, {
+    currentMessageId: 'current-message-1', quotedMessageId: 'quoted-message-1'
+  })
+  assert.equal(request.message.replyTo?.messageId, 'quoted-message-1')
+  assert.equal(request.message.replyTo?.sender.userId, 'actor-2')
+  assert.equal(request.message.parts.some(part => (
+    part.type === 'resource_ref' && part.resourceId === 'https://fixture.invalid/current.png'
+  )), true)
+  assert.equal(Object.isFrozen(request), true)
+  assert.equal(Object.isFrozen(request.message.parts), true)
+})
+
+test('Yunzai request adapter preserves merged group scope without trusting missing identities', async () => {
+  const base = {
+    currentPrompt: 'hello', groupMerge: true, requestId: 'request-2',
+    createdAt: '2026-07-14T01:00:00.000Z', deadlineAt: '2026-07-14T01:04:00.000Z',
+    systemInstructions: ['system fixture'],
+    model: {
+      model: 'fixture-model', streaming: false, maxOutputTokens: 256,
+      reasoning: { enabled: false }
+    },
+    contextBudget: {
+      modelContextTokens: 4_096, reservedOutputTokens: 256,
+      reservedToolTokens: 512, safetyMarginTokens: 128,
+      maxItems: 32, maxBytes: 128 * 1_024
+    }
+  }
+  const merged = await adaptYunzaiRequest({
+    ...base,
+    event: {
+      isGroup: true, group_id: 'group-1', self_id: 'bot-1', user_id: 'actor-1',
+      sender: { user_id: 'actor-1', role: 'member' }, message: []
+    }
+  })
+  assert.deepEqual(merged.sessionAddress.scope, { kind: 'group', groupId: 'group-1' })
+  await assert.rejects(adaptYunzaiRequest({
+    ...base,
+    event: { isGroup: false, user_id: 'actor-1', message: [] }
+  }), /bot identity/i)
 })
 
 test('uses the private reader and source time for private replies', async () => {

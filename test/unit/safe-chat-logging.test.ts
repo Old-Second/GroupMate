@@ -16,7 +16,8 @@ test('safe chat log summaries expose bounded metadata without message content', 
     createChatResponseLog,
     createChatErrorLog,
     createToolExecutionLog,
-    createMessageInputLog
+    createMessageInputLog,
+    createAgentRunLog
   } = await import(pathToFileURL(runtimePath).href)
   assert.equal(typeof createToolExecutionLog, 'function')
   assert.equal(typeof createChatErrorLog, 'function')
@@ -60,6 +61,24 @@ test('safe chat log summaries expose bounded metadata without message content', 
     replySegmentCount: 3,
     error: new Error('private input error')
   })
+  const agentRun = createAgentRunLog({
+    runId: 'private-run-id-123456',
+    fromStatus: 'calling_model',
+    toStatus: 'executing_tools',
+    modelTurns: 2,
+    toolCalls: 3,
+    usedActiveRuntimeMs: 400,
+    providerAttempts: 2,
+    recoveryAttempts: 1,
+    correctionAttempts: 0,
+    errorCode: 'provider_rate_limited',
+    storeKeyCount: 2,
+    estimatedBytes: 4096,
+    endpoint: 'https://private.example',
+    model: 'private-model',
+    actorId: '123456',
+    content: secretPrompt
+  })
 
   assert.deepEqual(request, {
     event: 'chat.request',
@@ -97,8 +116,24 @@ test('safe chat log summaries expose bounded metadata without message content', 
     imageCount: 1,
     promptCharacters: secretPrompt.length
   })
+  assert.deepEqual(agentRun, {
+    event: 'agent.run',
+    runRef: agentRun.runRef,
+    fromStatus: 'calling_model',
+    toStatus: 'executing_tools',
+    modelTurns: 2,
+    toolCalls: 3,
+    usedActiveRuntimeMs: 400,
+    providerAttempts: 2,
+    recoveryAttempts: 1,
+    correctionAttempts: 0,
+    errorCode: 'provider_rate_limited',
+    storeKeyCount: 2,
+    estimatedBytes: 4096
+  })
+  assert.match(agentRun.runRef, /^[a-f0-9]{16}$/)
 
-  const serialized = JSON.stringify({ request, response, tool, error, messageInput })
+  const serialized = JSON.stringify({ request, response, tool, error, messageInput, agentRun })
   assert.doesNotMatch(serialized, /secret|private|123456|https:|conversation|arguments/)
 })
 

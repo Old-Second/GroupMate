@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readChatErrorMetadata } from './chat-error-presentation.js'
 
 type UnknownRecord = Record<string, unknown>
@@ -31,6 +32,21 @@ interface MessageInputLogInput {
   replyResolved?: unknown
   currentSegmentCount?: unknown
   replySegmentCount?: unknown
+}
+
+interface AgentRunLogInput {
+  runId?: unknown
+  fromStatus?: unknown
+  toStatus?: unknown
+  modelTurns?: unknown
+  toolCalls?: unknown
+  usedActiveRuntimeMs?: unknown
+  providerAttempts?: unknown
+  recoveryAttempts?: unknown
+  correctionAttempts?: unknown
+  errorCode?: unknown
+  storeKeyCount?: unknown
+  estimatedBytes?: unknown
 }
 
 function isRecord (value: unknown): value is UnknownRecord {
@@ -116,5 +132,24 @@ export function createMessageInputLog (input: MessageInputLogInput) {
     replySegmentCount: getSafeCount(input.replySegmentCount),
     imageCount: Array.isArray(input.imageUrls) ? input.imageUrls.length : 0,
     promptCharacters: getStringLength(input.prompt)
+  } as const
+}
+
+export function createAgentRunLog (input: AgentRunLogInput) {
+  const runId = typeof input.runId === 'string' ? input.runId : 'unknown'
+  return {
+    event: 'agent.run',
+    runRef: createHash('sha256').update(runId).digest('hex').slice(0, 16),
+    fromStatus: getSafeToken(input.fromStatus),
+    toStatus: getSafeToken(input.toStatus),
+    modelTurns: getSafeCount(input.modelTurns),
+    toolCalls: getSafeCount(input.toolCalls),
+    usedActiveRuntimeMs: getSafeCount(input.usedActiveRuntimeMs),
+    providerAttempts: getSafeCount(input.providerAttempts),
+    recoveryAttempts: getSafeCount(input.recoveryAttempts),
+    correctionAttempts: getSafeCount(input.correctionAttempts),
+    errorCode: getSafeToken(input.errorCode),
+    storeKeyCount: getSafeCount(input.storeKeyCount),
+    estimatedBytes: getSafeCount(input.estimatedBytes)
   } as const
 }

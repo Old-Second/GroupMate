@@ -1,5 +1,6 @@
 import type { AgentMessage } from '../contracts/content.js'
 import type { MemoryQuery } from '../contracts/memory.js'
+import type { ModelMessage } from '../model/model-adapter.js'
 
 export type ContextSource =
   | 'system_instruction'
@@ -15,6 +16,8 @@ export interface ContextItem {
   readonly source: ContextSource
   readonly message: AgentMessage
   readonly atomicGroupId?: string
+  readonly protocolSpanId?: string
+  readonly modelMessage?: ModelMessage
 }
 
 export interface ContextInput {
@@ -29,4 +32,5 @@ export interface ContextInput {
 
 export interface TokenEstimator {
   estimate(message: AgentMessage): number
+  estimateModelMessage?(message: ModelMessage): number
 }

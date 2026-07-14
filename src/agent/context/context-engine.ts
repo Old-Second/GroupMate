@@ -99,8 +99,10 @@ function byteLength (items: readonly ContextItem[]): number {
       id: item.id,
       source: item.source,
       atomicGroupId: item.atomicGroupId,
+      protocolSpanId: item.protocolSpanId,
       role: item.message.role,
-      parts: item.message.parts
+      parts: item.message.parts,
+      modelMessage: item.modelMessage
     }))
     return Buffer.byteLength(JSON.stringify(modelInput), 'utf8')
   } catch (error) {
@@ -117,7 +119,9 @@ function byteLength (items: readonly ContextItem[]): number {
 function buildGroups (items: readonly EstimatedItem[]): AtomicGroup[] {
   const grouped = new Map<string, EstimatedItem[]>()
   for (const estimated of items) {
-    const groupId = estimated.item.atomicGroupId ?? `item:${estimated.item.id}`
+    const groupId = estimated.item.protocolSpanId === undefined
+      ? estimated.item.atomicGroupId ?? `item:${estimated.item.id}`
+      : `protocol:${estimated.item.protocolSpanId}`
     const group = grouped.get(groupId)
     if (group === undefined) grouped.set(groupId, [estimated])
     else group.push(estimated)
@@ -201,7 +205,12 @@ export class ContextEngine {
     }
 
     const estimated: EstimatedItem[] = unique.map(value => {
-      const tokens = this.estimator.estimate(value.item.message)
+      const tokens = value.item.modelMessage === undefined
+        ? this.estimator.estimate(value.item.message)
+        : this.estimator.estimateModelMessage?.(value.item.modelMessage) ?? Math.max(
+          1,
+          Math.ceil(Buffer.byteLength(JSON.stringify(value.item.modelMessage), 'utf8') / 4)
+        )
       if (!Number.isSafeInteger(tokens) || tokens < 0) {
         throw new TypeError('token estimator must return a non-negative safe integer')
       }

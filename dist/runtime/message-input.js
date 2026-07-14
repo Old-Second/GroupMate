@@ -97,6 +97,7 @@ async function findReplyMessage(event) {
         return { hasReply: false };
     return {
         hasReply: true,
+        source,
         reply: await resolveReplyReference(event, source)
     };
 }
@@ -107,10 +108,13 @@ export async function buildModelMessageInput({ event, currentPrompt }) {
     const current = normalizeMessageContent(event.message, { textOverride: currentPrompt });
     const replyResult = await findReplyMessage(event);
     const { hasReply } = replyResult;
+    const currentMessageId = getBoundedScalar(event.message_id ?? event.seq) ?? null;
     if (!hasReply) {
         return {
             prompt: currentPrompt,
             imageUrls: current.imageUrls,
+            currentMessageId,
+            quotedMessageId: null,
             hasReply: false,
             replyResolved: false,
             currentSegmentCount: current.segmentCount,
@@ -134,6 +138,29 @@ export async function buildModelMessageInput({ event, currentPrompt }) {
             content: quoted.text || '[空消息]'
         }
         : { status: 'unavailable' };
+    const quotedMessageId = getBoundedScalar(reply?.message_id ?? replyResult.source?.message_id ?? replyResult.source?.seq ??
+        replyResult.source?.id) ?? null;
+    const projectedSender = projectSender(reply?.sender);
+    const quotedSnapshot = reply !== undefined &&
+        quotedMessageId !== null
+        ? Object.freeze({
+            messageId: quotedMessageId,
+            sender: Object.freeze({
+                userId: projectedSender.userId ?? 'unknown',
+                ...((projectedSender.card ?? projectedSender.nickname) === undefined
+                    ? {}
+                    : { displayName: projectedSender.card ?? projectedSender.nickname })
+            }),
+            parts: Object.freeze([
+                Object.freeze({ type: 'text', text: quoted.text || '[空消息]' }),
+                ...quoted.imageUrls.map(resourceId => Object.freeze({
+                    type: 'resource_ref',
+                    resourceType: 'image',
+                    resourceId
+                }))
+            ])
+        })
+        : undefined;
     const payload = {
         quotedMessage,
         currentRequest: {
@@ -144,6 +171,9 @@ export async function buildModelMessageInput({ event, currentPrompt }) {
     return {
         prompt: `${prefix}\n${JSON.stringify(payload)}`,
         imageUrls: mergeImageUrls(current.imageUrls, quoted.imageUrls),
+        currentMessageId,
+        quotedMessageId,
+        ...(quotedSnapshot === undefined ? {} : { quotedMessage: quotedSnapshot }),
         hasReply: true,
         replyResolved,
         currentSegmentCount: current.segmentCount,

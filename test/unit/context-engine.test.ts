@@ -71,6 +71,9 @@ const estimator: TokenEstimator = {
     return value.parts.reduce((total: number, part: AgentContentPart) => {
       return total + (part.type === 'text' ? part.text.length : 1)
     }, 0)
+  },
+  estimateModelMessage () {
+    return 2
   }
 }
 
@@ -122,6 +125,31 @@ test('complete atomic groups are included or omitted together', async () => {
 
   assert.deepEqual(snapshot.includedIds, ['system', 'current'])
   assert.deepEqual(snapshot.omitted.map(value => value.id), ['tool-call', 'tool-result'])
+})
+
+test('provider protocol span IDs are selected atomically without exposing reasoning views', async () => {
+  const engine = new ContextEngine({ estimator, memoryStore: new NoopMemoryStore() })
+  const protocolItems = ['assistant', 'tool-1', 'tool-2', 'tool-3'].map((id, index) => ({
+    ...item(`span-${id}`, 'tool_chain', '12'),
+    protocolSpanId: 'span-1',
+    modelMessage: index === 0
+      ? {
+          role: 'assistant' as const,
+          content: null,
+          toolCalls: [{ callId: 'call-1', name: 'fixture', arguments: { value: 'fixture' } }],
+          providerState: {
+            profileId: 'deepseek', profileVersion: 1,
+            payload: { reasoningContent: 'opaque protocol state' }
+          }
+        }
+      : { role: 'tool' as const, content: `result-${index}`, toolCallId: `call-${index}` }
+  }))
+
+  const omitted = await engine.prepare(input({ toolMessages: protocolItems }), budget(9))
+  const retained = await engine.prepare(input({ toolMessages: protocolItems }), budget(20))
+  assert.equal(omitted.items.filter(value => value.protocolSpanId === 'span-1').length, 0)
+  assert.equal(retained.items.filter(value => value.protocolSpanId === 'span-1').length, 4)
+  assert.doesNotMatch(JSON.stringify(retained.items), /reasoningView/)
 })
 
 test('stable IDs are de-duplicated before budget selection', async () => {
