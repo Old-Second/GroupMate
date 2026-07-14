@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 const runtimeModeFiles = [
-  'apps/chat.js',
   'apps/management.js',
   'apps/history.js'
 ]
@@ -12,7 +11,11 @@ async function readProjectFile (path) {
   return readFile(new URL(`../../${path}`, import.meta.url), 'utf8')
 }
 
-test('every persisted global provider mode read passes through the runtime policy', async () => {
+test('only legacy management surfaces retain guarded provider mode reads', async () => {
+  const chatSource = await readProjectFile('apps/chat.js')
+  assert.doesNotMatch(chatSource, /provider-mode-policy\.js/)
+  assert.doesNotMatch(chatSource, /redis\.(?:get|set)\(['`]CHATGPT:USE['`]/)
+
   for (const path of runtimeModeFiles) {
     const source = await readProjectFile(path)
     assert.match(
@@ -35,11 +38,12 @@ test('every persisted global provider mode read passes through the runtime polic
   }
 })
 
-test('user mode and imported mode values are resolved without persisting migrations', async () => {
+test('production chat ignores user provider mode while management avoids migration writes', async () => {
   const chatSource = await readProjectFile('apps/chat.js')
   const managementSource = await readProjectFile('apps/management.js')
 
-  assert.match(chatSource, /resolveProviderModeForRuntime\([^\n]*userData\.mode/)
+  assert.doesNotMatch(chatSource, /resolveProviderModeForRuntime|userData\.mode/)
+  assert.doesNotMatch(chatSource, /redis\.(?:get|set)\(['`]CHATGPT:USE['`]/)
   assert.match(managementSource, /resolveProviderMode\(redisConfig\.useMode\)/)
   assert.doesNotMatch(
     managementSource,

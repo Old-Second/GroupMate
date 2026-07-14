@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isApprovalActorEligible, parseApprovalReplyText } from '../agent/run/interruption.js';
 import { createApprovalRunIndex, deleteApprovalRunIndex, RUN_STORE_NAMESPACE } from '../agent/run/redis-run-store.js';
 import { canonicalSessionKey } from '../agent/session/conversation-scope.js';
+import { buildModelMessageInput } from './message-input.js';
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const INDEX_GRACE_SECONDS = 300;
 function boundedIdentifier(value, label) {
@@ -72,6 +73,57 @@ function sameAddress(left, right) {
         return false;
     }
 }
+function yunzaiIdentifier(value, label) {
+    if ((typeof value !== 'string' && typeof value !== 'number') ||
+        String(value).length === 0 || String(value).length > 128) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    return String(value);
+}
+function yunzaiActorRole(actorId, senderRole, masterIds) {
+    if (masterIds.some(value => String(value) === actorId))
+        return 'bot_master';
+    if (senderRole === 'owner')
+        return 'group_owner';
+    if (senderRole === 'admin')
+        return 'group_admin';
+    return 'member';
+}
+function yunzaiOccurredAt(now) {
+    return now().toISOString();
+}
+export async function projectYunzaiApprovalReply(event, options) {
+    const text = typeof event.msg === 'string' ? event.msg.normalize('NFC').trim() : '';
+    if (parseApprovalReplyText(text) === null)
+        return null;
+    const input = await buildModelMessageInput({ event, currentPrompt: text });
+    if (input.quotedMessageId === null)
+        return null;
+    const botId = yunzaiIdentifier(options.botId, 'approval bot ID');
+    const actorId = yunzaiIdentifier(event.sender?.user_id ?? event.user_id, 'approval actor ID');
+    const sessionAddress = event.isGroup === true
+        ? Object.freeze({
+            botId,
+            scope: Object.freeze({
+                kind: 'group',
+                groupId: yunzaiIdentifier(event.group_id, 'approval group ID')
+            })
+        })
+        : Object.freeze({
+            botId,
+            scope: Object.freeze({ kind: 'private', userId: actorId })
+        });
+    return Object.freeze({
+        text,
+        quotedMessageId: input.quotedMessageId,
+        sessionAddress,
+        actor: Object.freeze({
+            userId: actorId,
+            role: yunzaiActorRole(actorId, event.sender?.role, options.masterIds)
+        }),
+        occurredAt: yunzaiOccurredAt(options.now ?? (() => new Date()))
+    });
+}
 export class RedisApprovalReferenceIndex {
     #client;
     constructor(client) {
@@ -126,7 +178,7 @@ export class RunApprovalRouter {
             throw error;
         }
     }
-    async route(reply) {
+    async route(reply, onResult) {
         const kind = parseApprovalReplyText(reply.text);
         if (kind === null || reply.quotedMessageId === null)
             return false;
@@ -160,9 +212,10 @@ export class RunApprovalRouter {
         if (result === null)
             return false;
         await this.#index.delete(reference);
+        await onResult?.(result, reference);
         return true;
     }
-    async expire(address, messageId, occurredAt) {
+    async expire(address, messageId, occurredAt, onResult) {
         const reference = await this.#index.load(address, messageId);
         if (reference === null)
             return false;
@@ -182,6 +235,7 @@ export class RunApprovalRouter {
         if (result === null)
             return false;
         await this.#index.delete(reference);
+        await onResult?.(result, reference);
         return true;
     }
 }

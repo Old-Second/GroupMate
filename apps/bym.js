@@ -1,7 +1,29 @@
 import { Config } from '../utils/config.js'
 import { convertFaces } from '../utils/face.js'
 import { customSplitRegex, filterResponseChunk } from '../utils/text.js'
-import core from '../model/core.js'
+import { generateAudio, getImg, getMasterQQ, getUin } from '../utils/common.js'
+import { getChatHistoryGroup } from '../utils/chat.js'
+import { newFetch } from '../utils/proxy.js'
+import { getYunzaiAgentServiceBridge } from '../dist/runtime/agent-service-bridge.js'
+import { toolResourceFromLegacySegment } from '../dist/runtime/tools/yunzai-tool-runtime.js'
+
+const productionAgentServiceBridge = () => getYunzaiAgentServiceBridge({
+  config: Config,
+  redis,
+  fetch: newFetch,
+  getMasterIds: getMasterQQ,
+  getBotId: getUin,
+  getImages: getImg,
+  synthesizeAudio: async (event, text, _voice, signal) => {
+    if (signal.aborted) throw new DOMException('operation was aborted', 'AbortError')
+    const sendable = await generateAudio(event, text)
+    if (!sendable) throw new Error('audio generation failed')
+    return toolResourceFromLegacySegment(sendable)
+  },
+  loadGroupHistory: async (event, limit) => await getChatHistoryGroup(event, limit),
+  segment: () => global.segment,
+  logger
+})
 
 async function replyWithoutRecallingUserMessage (e, msg, quote, data = {}) {
   const recallMsg = Number(data?.recallMsg) || 0
@@ -39,6 +61,7 @@ export class bym extends plugin {
         }
       ]
     })
+    this.agentServiceBridge = productionAgentServiceBridge()
   }
 
   /** 复读 */
@@ -53,8 +76,6 @@ export class bym extends plugin {
     }
 
     let sender = e.sender.user_id
-    let card = e.sender.card || e.sender.nickname
-    let group = e.group_id
     let prop = Math.floor(Math.random() * 100)
     if (Config.assistantLabel && e.msg?.includes(Config.assistantLabel)) {
       prop = -1
@@ -75,28 +96,24 @@ export class bym extends plugin {
     }
     if (prop < Config.bymRate) {
       logger.info('random chat hit')
-      let system = `你的名字是“${Config.assistantLabel}”，你在一个qq群里，群号是${group},当前和你说话的人群名片是${card}, qq号是${sender}, 请你结合用户的发言和聊天记录作出回应，要求表现得随性一点，最好参与讨论，混入其中。不要过分插科打诨，不知道说什么可以复读群友的话。要求你做搜索、发图、发视频和音乐等操作时要使用工具。不可以直接发[图片]这样蒙混过关。要求优先使用中文进行对话。如果此时不需要自己说话，可以只回复<EMPTY>` +
+      let system = `你的名字是“${Config.assistantLabel}”，你是QQ群里的一名普通群友。请结合用户发言和聊天记录作出回应，表现得随性自然，最好参与讨论、融入其中。不要过分插科打诨，不知道说什么可以复读群友的话。要求你做搜索、发图、发视频和音乐等操作时使用工具，不可以直接发[图片]蒙混过关。优先使用中文；如果此时不需要自己说话，只回复<EMPTY>。` +
         candidate +
         `\n你的回复应该尽可能简练，像人类一样随意，不要附加任何奇怪的东西，如聊天记录的格式（比如${Config.assistantLabel}：），禁止重复聊天记录。`
 
-      let rsp = await core.sendMessage(e.msg, {}, 'api', e, {
-        enableSmart: Config.smartMode,
-        apiThinkingMode: Config.bymThinkingMode,
-        apiReasoningEffort: Config.bymReasoningEffort,
-        system: {
-          api: system
-        },
-        settings: {
-          replyPureTextCallback: msg => {
-            msg = filterResponseChunk(msg)
-            msg && e.reply(msg)
-          },
-          // 强制打开上下文，不然伪人笨死了
-          enableGroupContext: true
-        }
+      const rsp = await this.agentServiceBridge.handleEphemeral(e, e.msg, {
+        systemInstructions: [system],
+        enableGroupContext: true,
+        thinkingMode: Config.bymThinkingMode,
+        reasoningEffort: Config.bymReasoningEffort
       })
-      // let rsp = await client.sendMessage(e.msg, opt)
-      let text = rsp.text
+      if (rsp.kind !== 'completed' || rsp.text === null || rsp.visibleOutput) {
+        if (rsp.kind === 'failed') {
+          logger.warn(`主动群聊运行失败：${rsp.error.code}`)
+        }
+        return false
+      }
+      let text = rsp.text.trim()
+      if (text === '<EMPTY>') return false
       let texts = customSplitRegex(text, /(?<!\?)[。？\n](?!\?)/, 3)
       // let texts = text.split(/(?<!\?)[。？\n](?!\?)/, 3)
       for (let t of texts) {

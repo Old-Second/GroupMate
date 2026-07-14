@@ -236,6 +236,7 @@ function execution (): ToolExecutionContext {
 
 interface HarnessOptions {
   readonly profile?: typeof standardOpenAIProfile
+  readonly prepareContext?: StartRunInput['runtime']['prepareContext']
   readonly recoverContext?: StartRunInput['runtime']['recoverContext']
   readonly contextFor?: StartRunInput['runtime']['contextFor']
   readonly now?: () => Date
@@ -271,10 +272,10 @@ function harness (
     }),
     runtime: Object.freeze({
       snapshot: snapshot(),
-      prepareContext: async () => Object.freeze({
+      prepareContext: options.prepareContext ?? (async () => Object.freeze({
         messages: Object.freeze([{ role: 'user' as const, content: '完成任务' }]),
         estimatedInputTokens: 16
-      }),
+      })),
       prepareToolContext: async () => preparation(),
       contextFor: options.contextFor ?? (async () => execution()),
       ...(options.recoverContext === undefined ? {} : { recoverContext: options.recoverContext })
@@ -544,6 +545,23 @@ test('RunEngine cancels an expired deadline before any Provider call', async () 
   assert.deepEqual(result, {
     kind: 'cancelled', runId: 'run-1', reason: 'deadline_exceeded'
   })
+  assert.equal(fixture.adapter.requests.length, 0)
+})
+
+test('RunEngine aborts the run signal when a fatal preparation error wins', async () => {
+  let runSignal: AbortSignal | undefined
+  const fixture = harness([], {
+    prepareContext: async signal => {
+      runSignal = signal
+      throw new Error('fatal context fixture')
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(runSignal?.aborted, true)
+  assert.equal(runSignal?.reason, 'fatal_error')
   assert.equal(fixture.adapter.requests.length, 0)
 })
 

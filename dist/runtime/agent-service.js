@@ -23,6 +23,48 @@ function failedEnvelope(runId, error) {
         error: serializeAgentError(asAgentError(error))
     });
 }
+function cancellationReason(value, fallback = 'user_cancelled') {
+    if (typeof value !== 'string')
+        return fallback;
+    const normalized = value.trim();
+    return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalized)
+        ? normalized
+        : fallback;
+}
+function cancelledEnvelope(runId, reason = 'user_cancelled') {
+    return Object.freeze({
+        kind: 'cancelled',
+        runId,
+        reason: cancellationReason(reason)
+    });
+}
+function linkedAbortSignal(callerSignal, lifecycleSignal) {
+    const controller = new AbortController();
+    const sources = callerSignal === undefined
+        ? [lifecycleSignal]
+        : [callerSignal, lifecycleSignal];
+    const listeners = new Map();
+    for (const source of sources) {
+        const forward = () => {
+            controller.abort(cancellationReason(source.reason));
+        };
+        if (source.aborted) {
+            forward();
+            break;
+        }
+        listeners.set(source, forward);
+        source.addEventListener('abort', forward, { once: true });
+    }
+    return Object.freeze({
+        signal: controller.signal,
+        dispose: () => {
+            for (const [source, listener] of listeners) {
+                source.removeEventListener('abort', listener);
+            }
+            listeners.clear();
+        }
+    });
+}
 function contentPartText(part) {
     switch (part.type) {
         case 'text': return part.text;
@@ -52,6 +94,48 @@ function modelMessageFor(item) {
         retryable: false,
         userMessage: '会话历史格式不兼容，请重新开始对话。'
     });
+}
+function currentRunItemOrder(items) {
+    const runtimeFacts = items.filter(item => item.source === 'runtime_fact');
+    if (runtimeFacts.length === 0)
+        return items;
+    const ordered = items.filter(item => item.source !== 'runtime_fact');
+    const currentIndex = ordered.findIndex(item => item.source === 'current_request');
+    if (currentIndex < 0)
+        return Object.freeze([...ordered, ...runtimeFacts]);
+    return Object.freeze([
+        ...ordered.slice(0, currentIndex),
+        ...runtimeFacts,
+        ...ordered.slice(currentIndex)
+    ]);
+}
+function mergeableTextRole(message) {
+    if (message.role === 'tool')
+        return null;
+    if (message.role !== 'assistant')
+        return message.role;
+    return typeof message.content === 'string' && message.toolCalls === undefined &&
+        message.providerState === undefined
+        ? 'assistant'
+        : null;
+}
+function coalesceModelMessages(messages) {
+    const result = [];
+    for (const message of messages) {
+        const role = mergeableTextRole(message);
+        const previous = result.at(-1);
+        if (role !== null && previous !== undefined &&
+            mergeableTextRole(previous) === role) {
+            result[result.length - 1] = Object.freeze({
+                role,
+                content: `${previous.content ?? ''}\n\n${message.content ?? ''}`
+            });
+        }
+        else {
+            result.push(message);
+        }
+    }
+    return Object.freeze(result);
 }
 function systemItem(runId, instruction, index, createdAt) {
     const id = `system:${runId}:${index}`;
@@ -239,6 +323,9 @@ export class AgentService {
     #onObserverFailure;
     #engine;
     #pending = new Map();
+    #lifecycleController = new AbortController();
+    #shutdownReason = 'process_shutdown';
+    #shutdownPromise;
     #observerFailureReported = false;
     constructor(options) {
         this.#sessions = options.sessions;
@@ -275,24 +362,65 @@ export class AgentService {
         return await this.#start(request, true, options);
     }
     async resume(runId, options = {}) {
+        const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(runId);
-        if (pending === undefined) {
-            try {
-                pending = await this.#recoverPending(runId, options.signal);
-            }
-            catch (error) {
-                return failedEnvelope(runId, error);
-            }
-        }
-        if (pending === null)
-            return terminalEnvelope(await this.#engine.resume(runId, undefined, options));
         try {
-            const result = await this.#engine.resume(runId, pending.binding, options);
+            if (linked.signal.aborted) {
+                return await this.cancel(runId, linked.signal.reason);
+            }
+            if (pending === undefined) {
+                pending = await this.#recoverPending(runId, linked.signal);
+            }
+            if (pending === null) {
+                return terminalEnvelope(await this.#engine.resume(runId, undefined, {
+                    ...options,
+                    signal: linked.signal
+                }));
+            }
+            const result = await this.#engine.resume(runId, pending.binding, {
+                ...options,
+                signal: linked.signal
+            });
             return await this.#finish(pending, result);
         }
         catch (error) {
+            if (linked.signal.aborted) {
+                return await this.cancel(runId, linked.signal.reason);
+            }
+            if (pending === undefined || pending === null)
+                return failedEnvelope(runId, error);
             return await this.#abortPending(pending, failedEnvelope(runId, error));
         }
+        finally {
+            linked.dispose();
+        }
+    }
+    async cancel(runId, reason = 'user_cancelled') {
+        const pending = this.#pending.get(runId);
+        try {
+            const result = await this.#engine.cancel(runId, reason);
+            return pending === undefined
+                ? terminalEnvelope(result)
+                : await this.#finish(pending, result);
+        }
+        catch (error) {
+            if (pending !== undefined) {
+                this.#pending.delete(runId);
+                await this.#progressPresenter.drain(runId).catch(() => undefined);
+                this.#progressPresenter.detach(runId);
+                await pending.lease.release().catch(() => undefined);
+            }
+            return failedEnvelope(runId, error);
+        }
+    }
+    shutdown(reason = 'process_shutdown') {
+        if (this.#shutdownPromise !== undefined)
+            return this.#shutdownPromise;
+        this.#shutdownReason = cancellationReason(reason, 'process_shutdown');
+        this.#lifecycleController.abort(this.#shutdownReason);
+        const runIds = Object.freeze([...this.#pending.keys()]);
+        this.#shutdownPromise = Promise.all(runIds.map(async (runId) => await this.cancel(runId, this.#shutdownReason))).then(() => runIds.length);
+        return this.#shutdownPromise;
     }
     async pendingApproval(runId, approvalId) {
         return await this.#engine.pendingApproval(runId, approvalId);
@@ -301,31 +429,53 @@ export class AgentService {
         return await this.#engine.displayApproval(input);
     }
     async decideApproval(input, options = {}) {
+        const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(input.runId);
-        if (pending === undefined) {
-            try {
-                pending = await this.#recoverPending(input.runId, options.signal);
+        try {
+            if (linked.signal.aborted) {
+                return await this.cancel(input.runId, linked.signal.reason);
             }
-            catch {
+            if (pending === undefined) {
+                try {
+                    pending = await this.#recoverPending(input.runId, linked.signal);
+                }
+                catch {
+                    if (linked.signal.aborted) {
+                        return await this.cancel(input.runId, linked.signal.reason);
+                    }
+                    return null;
+                }
+            }
+            const result = await this.#engine.decideApproval(input, pending?.binding, { ...options, signal: linked.signal });
+            if (result === null)
                 return null;
-            }
+            return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result);
         }
-        const result = await this.#engine.decideApproval(input, pending?.binding, options);
-        if (result === null)
-            return null;
-        return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result);
+        finally {
+            linked.dispose();
+        }
     }
     async #start(request, ephemeral, options) {
         const runId = this.#generateId();
+        const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let lease;
         try {
-            lease = await this.#admission.acquire(request.sessionAddress, options.signal);
+            if (linked.signal.aborted) {
+                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason);
+            }
+            lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
+            if (linked.signal.aborted)
+                throw new Error('run start was cancelled');
             const timestamp = this.#now().toISOString();
             const session = ephemeral
                 ? null
-                : await this.#sessions.get(request.sessionAddress, { signal: options.signal }) ??
+                : await this.#sessions.get(request.sessionAddress, { signal: linked.signal }) ??
                     freshSession(request, this.#generateId(), timestamp);
+            if (linked.signal.aborted)
+                throw new Error('run start was cancelled');
             const runtime = await this.#createRuntime(request);
+            if (linked.signal.aborted)
+                throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
             const binding = this.#bindingFor(runId, request, session, runtime);
             const pending = Object.freeze({
@@ -345,7 +495,7 @@ export class AgentService {
                 deadlineAt: request.deadlineAt,
                 model: request.model,
                 runtime: binding
-            }, options);
+            }, { ...options, signal: linked.signal });
             return await this.#finish(pending, result);
         }
         catch (error) {
@@ -357,7 +507,13 @@ export class AgentService {
             }
             this.#pending.delete(runId);
             this.#progressPresenter.detach(runId);
+            if (linked.signal.aborted) {
+                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason);
+            }
             return failedEnvelope(runId, error);
+        }
+        finally {
+            linked.dispose();
         }
     }
     #bindingFor(runId, request, session, runtime) {
@@ -385,7 +541,7 @@ export class AgentService {
                 toolMessages: EMPTY_ITEMS
             }, request.contextBudget, signal);
             return Object.freeze({
-                messages: Object.freeze(snapshot.items.map(modelMessageFor)),
+                messages: coalesceModelMessages(currentRunItemOrder(snapshot.items).map(modelMessageFor)),
                 estimatedInputTokens: snapshot.estimatedInputTokens
             });
         };

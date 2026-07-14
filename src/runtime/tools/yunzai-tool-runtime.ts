@@ -1,11 +1,25 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { ApprovalStore } from '../../agent/tools/approval-store.js'
 import type { ToolAuditEvent, ToolAuditSink } from '../../agent/tools/audit.js'
-import type { ToolRuntimeFacts, ToolTarget } from '../../agent/tools/tool-context.js'
+import type {
+  ToolExecutionContext,
+  ToolPreparationContext,
+  ToolRuntimeFacts,
+  ToolTarget
+} from '../../agent/tools/tool-context.js'
+import type { ToolCall } from '../../agent/tools/tool-call.js'
 import { ToolExecutor } from '../../agent/tools/tool-executor.js'
-import { ToolPolicyEngine } from '../../agent/tools/policy-engine.js'
+import { ToolPolicyEngine, type ToolPolicyProfile } from '../../agent/tools/policy-engine.js'
+import type {
+  PreparedToolCall,
+  SerializablePreparedCapability
+} from '../../agent/tools/prepared-capability.js'
 import type { ToolSnapshot } from '../../agent/tools/tool-registry.js'
-import { ApprovalCommandService, sha256ApprovalValue } from './approval-command.js'
+import type { ToolResult } from '../../agent/tools/tool-result.js'
+import type { ToolRuntime } from '../../agent/tools/tool-runtime.js'
+import type { ApprovalActorReference } from '../../agent/run/interruption.js'
+import type { RunRuntimeBinding } from '../../agent/run/run-engine.js'
+import type { RunCheckpoint } from '../../agent/run/run-checkpoint.js'
 import { InMemoryPendingCallStore } from './in-memory-pending-call-store.js'
 import { extractIntentEvidence } from './intent-evidence.js'
 import {
@@ -13,6 +27,10 @@ import {
   createLegacyToolRuntimeBridge,
   type LegacyToolCapture,
   type LegacyToolExecutorPort,
+  type LegacyToolExecutionInput,
+  type LegacyToolExecutionResult,
+  type LegacyToolRunInput,
+  type LegacyToolRun,
   type LegacyToolRuntimeBridge
 } from './legacy-tool-runtime-bridge.js'
 import { PolicyFetch } from './policy-fetch.js'
@@ -72,8 +90,10 @@ export interface YunzaiToolRuntimeBridgeOptions {
 }
 
 interface ProductionRun {
+  readonly profile: ToolPolicyProfile
   readonly snapshot: ToolSnapshot
   readonly initialFacts: ToolRuntimeFacts
+  readonly intent: LegacyToolCapture['intent']
   readonly refreshFacts: LegacyToolCapture['refreshFacts']
 }
 
@@ -84,12 +104,28 @@ interface ProductionControl {
   readonly approvals: RedisApprovalStore
 }
 
-type GlobalToolRuntime = typeof globalThis & {
-  groupmateApprovalService?: ApprovalCommandService
+export interface YunzaiAgentToolRun {
+  readonly profile: ToolPolicyProfile
+  readonly snapshot: ToolSnapshot
+  readonly promptAddition: string
+  readonly systemAddition: string
+  readonly binding: Readonly<Pick<
+    RunRuntimeBinding,
+    'snapshot' | 'prepareToolContext' | 'contextFor' | 'approvalControlContext'
+  >>
+}
+
+export interface YunzaiToolRuntimeBridge extends LegacyToolRuntimeBridge {
+  readonly runtime: ToolRuntime
+  prepareAgentRun(input: LegacyToolRunInput): Promise<YunzaiAgentToolRun>
 }
 
 function runtimeId (): string {
   return randomUUID().replace(/-/g, '')
+}
+
+function sha256Value (value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
 }
 
 function identifier (value: unknown, label: string): string {
@@ -244,6 +280,35 @@ async function sourceFor (
       } catch { return { exists: false, role: 'none' } }
     }
   }
+}
+
+async function eligibleApprovers (
+  options: YunzaiToolRuntimeBridgeOptions,
+  event: YunzaiRecord
+): Promise<readonly ApprovalActorReference[]> {
+  const actors = new Map<string, ApprovalActorReference['role']>()
+  for (const value of await options.getMasterIds()) {
+    actors.set(identifier(value, 'master ID'), 'bot_master')
+  }
+  const actorId = identifier(event.sender?.user_id ?? event.user_id, 'actor ID')
+  const actorGroupRole = role(event.sender?.role)
+  if (actorGroupRole === 'owner') actors.set(actorId, 'group_owner')
+  if (actorGroupRole === 'admin' && !actors.has(actorId)) actors.set(actorId, 'group_admin')
+  if (event.isGroup === true) {
+    try {
+      const members = await memberMap(event, identifier(event.group_id, 'group ID'))
+      for (const [key, value] of members) {
+        if (actors.size >= 32) break
+        const userId = identifier(value.user_id ?? key, 'member ID')
+        const memberRole = role(value.role)
+        if (memberRole === 'owner') actors.set(userId, 'group_owner')
+        if (memberRole === 'admin' && !actors.has(userId)) actors.set(userId, 'group_admin')
+      }
+    } catch {}
+  }
+  return Object.freeze([...actors.entries()].slice(0, 32).map(([userId, actorRole]) => (
+    Object.freeze({ userId, role: actorRole })
+  )))
 }
 
 async function replyMessageId (event: YunzaiRecord): Promise<string | null> {
@@ -758,7 +823,7 @@ export function toolResourceFromLegacySegment (value: unknown): ToolResource {
 
 export function createYunzaiToolRuntimeBridge (
   options: YunzaiToolRuntimeBridgeOptions
-): LegacyToolRuntimeBridge {
+): YunzaiToolRuntimeBridge {
   const policyFetch = options.policyFetch ?? new PolicyFetch()
   const productionRuns = new Map<string, ProductionRun>()
   const controls = new Map<string, ProductionControl>()
@@ -793,7 +858,7 @@ export function createYunzaiToolRuntimeBridge (
   const ensureControl = (botId: string): ProductionControl => {
     const existing = controls.get(botId)
     if (existing !== undefined) return existing
-    const botIdHash = sha256ApprovalValue(botId)
+    const botIdHash = sha256Value(botId)
     const approvals = new RedisApprovalStore({ client: options.redis, botIdHash })
     const executor = new ToolExecutor({
       policy: new ToolPolicyEngine(),
@@ -804,7 +869,7 @@ export function createYunzaiToolRuntimeBridge (
       audit: safeAudit(options.logger),
       generateId: runtimeId,
       generateToken: () => randomBytes(18).toString('base64url'),
-      hash: sha256ApprovalValue,
+      hash: sha256Value,
       now: () => new Date(),
       approvalTtlSeconds: 120
     })
@@ -816,43 +881,32 @@ export function createYunzaiToolRuntimeBridge (
   const executorRouter: LegacyToolExecutorPort = {
     execute: async request => ensureControl(request.initialFacts.botId).executor.execute(request)
   }
-  const approvalService = new ApprovalCommandService({
-    approvals: approvalRouter,
-    pendingCalls,
-    executor: executorRouter as unknown as ToolExecutor,
-    hash: sha256ApprovalValue,
-    now: () => new Date(),
-    bindEvent: async rawEvent => {
-      const event = eventRecord(rawEvent)
-      const currentBotId = identifier(options.getBotId(event), 'bot ID')
-      const actorId = identifier(event.sender?.user_id ?? event.user_id, 'actor ID')
-      const masters = (await options.getMasterIds()).map(String)
-      const channel = event.isGroup === true
-        ? `group:${identifier(event.group_id, 'group ID')}`
-        : `private:${actorId}`
-      return Object.freeze({
-        botIdHash: sha256ApprovalValue(currentBotId),
-        actorIdHash: sha256ApprovalValue(actorId),
-        channelHash: sha256ApprovalValue(channel),
-        isBotMaster: masters.includes(actorId)
-      })
-    },
-    resolveRuntime: async (record, _pending, _event, signal) => {
-      throwIfAborted(signal)
-      const run = productionRuns.get(record.snapshotId)
-      if (run === undefined) throw new ToolRuntimeConfigurationError('runtime_not_found')
-      return run
-    }
+  const runtime: ToolRuntime = Object.freeze({
+    prepare: async (
+      call: ToolCall,
+      context: ToolPreparationContext,
+      snapshot: ToolSnapshot
+    ): Promise<PreparedToolCall> => await ensureControl(
+      context.facts.botId
+    ).executor.prepare(call, context, snapshot),
+    executePrepared: async (
+      capability: SerializablePreparedCapability,
+      context: ToolExecutionContext,
+      snapshot: ToolSnapshot,
+      signal: AbortSignal
+    ): Promise<ToolResult> => await ensureControl(
+      context.facts.botId
+    ).executor.executePrepared(capability, context, snapshot, signal)
   })
-  ;(globalThis as GlobalToolRuntime).groupmateApprovalService = approvalService
-
   const bridge = createLegacyToolRuntimeBridge({
     generateId: runtimeId,
     executor: executorRouter,
     onRunCaptured: run => {
       productionRuns.set(run.snapshot.id, Object.freeze({
+        profile: run.profile,
         snapshot: run.snapshot,
         initialFacts: run.initialFacts,
+        intent: run.intent,
         refreshFacts: run.refreshFacts
       }))
       while (productionRuns.size > 64) {
@@ -932,5 +986,60 @@ export function createYunzaiToolRuntimeBridge (
       }
     }
   })
-  return bridge
+  return Object.freeze({
+    runtime,
+    begin: async (input: LegacyToolRunInput): Promise<LegacyToolRun> => await bridge.begin(input),
+    execute: async (input: LegacyToolExecutionInput): Promise<LegacyToolExecutionResult> => (
+      await bridge.execute(input)
+    ),
+    finish: (
+      snapshotId: string,
+      finishOptions?: { readonly retainForApproval?: boolean }
+    ): void => bridge.finish(snapshotId, finishOptions),
+    async prepareAgentRun (input: LegacyToolRunInput): Promise<YunzaiAgentToolRun> {
+      const started = await bridge.begin(input)
+      try {
+        const run = productionRuns.get(started.snapshotId)
+        if (run === undefined) throw new ToolRuntimeConfigurationError('runtime_not_found')
+        const binding: YunzaiAgentToolRun['binding'] = Object.freeze({
+          snapshot: run.snapshot,
+          prepareToolContext: async (
+            checkpoint: RunCheckpoint,
+            signal: AbortSignal
+          ): Promise<ToolPreparationContext> => Object.freeze({
+            runId: checkpoint.runId,
+            profile: run.profile,
+            facts: await run.refreshFacts(Object.freeze({ kind: 'none' }), signal),
+            intent: run.intent,
+            now: new Date().toISOString()
+          }),
+          contextFor: async (
+            capability: SerializablePreparedCapability,
+            checkpoint: RunCheckpoint,
+            signal: AbortSignal
+          ): Promise<ToolExecutionContext> => Object.freeze({
+            runId: checkpoint.runId,
+            profile: run.profile,
+            facts: await run.refreshFacts(capability.target, signal),
+            intent: run.intent,
+            now: new Date().toISOString()
+          }),
+          approvalControlContext: async () => Object.freeze({
+            eligibleApprovers: await eligibleApprovers(options, eventRecord(input.event))
+          })
+        })
+        return Object.freeze({
+          profile: run.profile,
+          snapshot: run.snapshot,
+          promptAddition: started.promptAddition,
+          systemAddition: started.systemAddition,
+          binding
+        })
+      } finally {
+        // The native binding closes over the immutable run data. Keeping the
+        // legacy capture would retain the full QQ event until its TTL expires.
+        bridge.finish(started.snapshotId)
+      }
+    }
+  })
 }

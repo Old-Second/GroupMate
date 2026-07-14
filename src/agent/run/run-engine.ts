@@ -1630,6 +1630,7 @@ export class RunEngine {
     detailOverride?: Readonly<Record<string, string | number | boolean | null>>
   ): Promise<RunCheckpoint> {
     if (isTerminalRunStatus(checkpoint.status)) return checkpoint
+    this.#controllers.get(checkpoint.runId)?.abort('fatal_error')
     const serialized: SerializedAgentError = detailOverride === undefined
       ? serializeAgentError(error)
       : Object.freeze({
@@ -1975,8 +1976,12 @@ export class RunEngine {
     controller: AbortController
   ): () => void {
     if (signal === undefined) return () => undefined
-    const abort = (): void => controller.abort('user_cancelled')
-    if (signal.aborted) controller.abort('user_cancelled')
+    const abort = (): void => controller.abort(
+      boundedCancellationReason(
+        typeof signal.reason === 'string' ? signal.reason : 'user_cancelled'
+      )
+    )
+    if (signal.aborted) abort()
     else signal.addEventListener('abort', abort, { once: true })
     return () => signal.removeEventListener('abort', abort)
   }

@@ -1,7 +1,7 @@
-import type {
-  LegacySessionBridge,
-  LegacySessionEvent
-} from './legacy-session-bridge.js'
+import { AgentError } from '../agent/contracts/error.js'
+import type { SessionAddress } from '../agent/contracts/identity.js'
+import { resolveConversationScope } from '../agent/session/conversation-scope.js'
+import type { ConversationSessionPort } from './agent-service.js'
 
 export const originalValues = ['api', 'API'] as const
 
@@ -11,9 +11,23 @@ export interface ConversationCommandResult {
   readonly success: boolean
 }
 
+export interface ConversationCommandEvent {
+  readonly isGroup: boolean
+  readonly group_id?: string | number
+  readonly user_id?: string | number
+  readonly self_id?: string | number
+  readonly bot?: { readonly uin?: string | number }
+  readonly sender?: {
+    readonly user_id?: string | number
+    readonly nickname?: string
+    readonly card?: string
+  }
+  readonly message?: readonly Readonly<Record<string, unknown>>[]
+}
+
 interface ConversationCommandInput {
-  readonly bridge: LegacySessionBridge
-  readonly event: LegacySessionEvent
+  readonly bridge: ConversationSessionPort
+  readonly event: ConversationCommandEvent
 }
 
 interface ScopedConversationCommandInput extends ConversationCommandInput {
@@ -28,9 +42,45 @@ interface AtSegment extends Readonly<Record<string, unknown>> {
   readonly text?: string
 }
 
+function identifier (value: unknown, label: string): string {
+  const text = typeof value === 'string' || typeof value === 'number'
+    ? String(value)
+    : ''
+  if (text.length === 0 || text.length > 128) {
+    throw new AgentError({
+      code: 'invalid_session',
+      stage: 'conversation.command',
+      retryable: false,
+      userMessage: '无法识别当前会话。',
+      details: { missing: label }
+    })
+  }
+  return text
+}
+
+export function resolveConversationCommandAddress (
+  event: ConversationCommandEvent,
+  groupMerge: boolean,
+  targetUserId?: string | number
+): SessionAddress {
+  const botId = identifier(event.self_id ?? event.bot?.uin, 'botId')
+  const userId = identifier(
+    targetUserId ?? event.sender?.user_id ?? event.user_id,
+    'userId'
+  )
+  return Object.freeze({
+    botId,
+    scope: Object.freeze(resolveConversationScope({
+      isGroup: event.isGroup,
+      groupId: event.group_id,
+      userId,
+      groupMerge
+    }))
+  })
+}
+
 function atSegments (
-  bridge: LegacySessionBridge,
-  event: LegacySessionEvent,
+  event: ConversationCommandEvent,
   toggleMode: string
 ): AtSegment[] {
   const segments = (event.message ?? []).filter((segment): segment is AtSegment => {
@@ -38,7 +88,7 @@ function atSegments (
       (typeof segment.qq === 'string' || typeof segment.qq === 'number')
   })
   if (toggleMode !== 'at') return segments
-  const botId = bridge.resolveAddress(event, false).botId
+  const botId = resolveConversationCommandAddress(event, false).botId
   return segments.filter(segment => String(segment.qq) !== botId)
 }
 
@@ -49,8 +99,9 @@ function targetName (segment: AtSegment): string {
 export async function listConversations (
   input: ConversationCommandInput
 ): Promise<ConversationCommandResult> {
+  const address = resolveConversationCommandAddress(input.event, false)
   const summaries = []
-  for await (const value of input.bridge.list(input.event)) summaries.push(value)
+  for await (const value of input.bridge.list({ botId: address.botId })) summaries.push(value)
   if (summaries.length === 0) {
     return {
       message: '当前没有人正在与机器人对话',
@@ -68,9 +119,10 @@ export async function listConversations (
 export async function endConversation (
   input: ScopedConversationCommandInput
 ): Promise<ConversationCommandResult> {
-  const mentions = atSegments(input.bridge, input.event, input.toggleMode)
+  const mentions = atSegments(input.event, input.toggleMode)
   if (mentions.length === 0) {
-    const deleted = await input.bridge.delete(input.event, input.groupMerge)
+    const address = resolveConversationCommandAddress(input.event, input.groupMerge)
+    const deleted = await input.bridge.delete(address)
     return deleted
       ? {
           message: '已结束当前对话，请@我进行聊天以开启新的对话',
@@ -81,7 +133,12 @@ export async function endConversation (
   }
   const target = mentions[0]
   const name = targetName(target)
-  const deleted = await input.bridge.delete(input.event, input.groupMerge, target.qq)
+  const address = resolveConversationCommandAddress(
+    input.event,
+    input.groupMerge,
+    target.qq
+  )
+  const deleted = await input.bridge.delete(address)
   return deleted
     ? {
         message: `已结束${name}的对话，TA仍可以@我进行聊天以开启新的对话`,
@@ -94,7 +151,8 @@ export async function endConversation (
 export async function endAllConversations (
   input: ConversationCommandInput
 ): Promise<ConversationCommandResult> {
-  const deleted = await input.bridge.deleteAll(input.event)
+  const address = resolveConversationCommandAddress(input.event, false)
+  const deleted = await input.bridge.deleteAll({ botId: address.botId })
   return {
     message: `结束了${deleted}个用户的对话。`,
     quote: true,
@@ -105,7 +163,7 @@ export async function endAllConversations (
 export async function joinConversation (
   input: ScopedConversationCommandInput
 ): Promise<ConversationCommandResult> {
-  const mentions = atSegments(input.bridge, input.event, input.toggleMode)
+  const mentions = atSegments(input.event, input.toggleMode)
   if (mentions.length === 0) {
     return {
       message: '指令错误，使用本指令时请同时@某人',
@@ -115,13 +173,28 @@ export async function joinConversation (
   }
   const target = mentions[0]
   const name = targetName(target)
-  const joined = await input.bridge.fork({
-    event: input.event,
-    groupMerge: input.groupMerge,
-    sourceUserId: target.qq,
-    ttlSeconds: input.ttlSeconds
-  })
-  return joined
-    ? { message: `加入${name}的对话成功`, quote: false, success: true }
-    : { message: `${name}当前未开启对话，无法加入`, quote: true, success: false }
+  const source = resolveConversationCommandAddress(
+    input.event,
+    input.groupMerge,
+    target.qq
+  )
+  const destination = resolveConversationCommandAddress(input.event, input.groupMerge)
+  const userId = identifier(
+    input.event.sender?.user_id ?? input.event.user_id,
+    'userId'
+  )
+  try {
+    await input.bridge.fork(source, destination, {
+      userId,
+      ...(input.event.sender?.card === undefined && input.event.sender?.nickname === undefined
+        ? {}
+        : { displayName: input.event.sender.card ?? input.event.sender.nickname })
+    }, input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds })
+    return { message: `加入${name}的对话成功`, quote: false, success: true }
+  } catch (error) {
+    if (error instanceof AgentError && error.code === 'invalid_session') {
+      return { message: `${name}当前未开启对话，无法加入`, quote: true, success: false }
+    }
+    throw error
+  }
 }

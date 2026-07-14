@@ -1,7 +1,5 @@
 import plugin from '../../../lib/plugins/plugin.js'
-import { createApprovalCommandBridge } from '../dist/runtime/tools/approval-command.js'
-
-const handleApprovalCommand = createApprovalCommandBridge()
+import { routeYunzaiApprovalReply } from '../dist/runtime/agent-service-bridge.js'
 
 export class approval extends plugin {
   constructor () {
@@ -11,13 +9,12 @@ export class approval extends plugin {
       event: 'message',
       priority: 1143,
       rule: [
-        { reg: '^#确认\\s+[A-Za-z0-9_-]{16,64}$', fnc: 'confirmToolOperation' },
-        { reg: '^#拒绝\\s+[A-Za-z0-9_-]{16,64}$', fnc: 'confirmToolOperation' }
+        { reg: '^(确认|拒绝)$', fnc: 'confirmToolOperation' }
       ]
     })
   }
 
   async confirmToolOperation (event) {
-    return await handleApprovalCommand(event)
+    return await routeYunzaiApprovalReply(event)
   }
 }

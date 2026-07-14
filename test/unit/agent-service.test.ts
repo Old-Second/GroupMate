@@ -111,6 +111,12 @@ function result (text: string): ToolResult {
 }
 
 class ServiceToolRuntime implements ToolRuntime {
+  readonly #approvalRequired: boolean
+
+  constructor (approvalRequired = false) {
+    this.#approvalRequired = approvalRequired
+  }
+
   async prepare (call: ToolCall): Promise<PreparedToolCall> {
     const capability: SerializablePreparedCapability = Object.freeze({
       schemaVersion: 1,
@@ -124,7 +130,9 @@ class ServiceToolRuntime implements ToolRuntime {
       resourceKeys: Object.freeze([`${call.requestedName}:${call.callId}`]),
       executionClass: 'read_only', retrySafe: true
     })
-    return Object.freeze({ kind: 'ready', capability })
+    return this.#approvalRequired
+      ? Object.freeze({ kind: 'approval_required', capability, summaryCode: 'website_approval' })
+      : Object.freeze({ kind: 'ready', capability })
   }
 
   async executePrepared (prepared: SerializablePreparedCapability): Promise<ToolResult> {
@@ -281,6 +289,14 @@ test('AgentService owns context, progress, run execution and terminal session wr
   assert.equal(ephemeral.kind, 'completed')
   assert.equal((await sessions.get(request('lookup', 'unused').sessionAddress))?.turnCount, 1)
 
+  const callerAbort = new AbortController()
+  callerAbort.abort('untrusted cancellation detail')
+  const aborted = await service.handle(request('request-aborted', '不应进入模型'), {
+    signal: callerAbort.signal
+  })
+  assert.equal(aborted.kind, 'cancelled')
+  assert.equal(aborted.kind === 'cancelled' ? aborted.reason : null, 'user_cancelled')
+
   let bridgeCreations = 0
   const firstBridge = getAgentServiceBridge(() => {
     bridgeCreations += 1
@@ -360,4 +376,117 @@ test('AgentService serializes active runs for the same canonical session', async
     message.role === 'assistant' && message.content === '第 1 次完成。'
   )), true)
   assert.equal((await sessions.get(request('lookup', 'unused').sessionAddress))?.turnCount, 2)
+})
+
+test('AgentService cancellation releases a paused run before the next session turn', async () => {
+  const redis = new FakeRedis(() => Date.parse(createdAt))
+  const sessions = new RedisAgentSessionStore({
+    redis, now: () => new Date(createdAt), generateId: () => 'session-cancel'
+  })
+  const runStore = new InMemoryRunStore()
+  const turns: ModelTurn[] = [
+    Object.freeze({
+      text: '', finishReason: 'tool_calls',
+      toolCalls: Object.freeze([Object.freeze({
+        index: 0, callId: 'call-approval', name: 'website',
+        argumentsText: '{"value":"one"}', arguments: Object.freeze({ value: 'one' })
+      })])
+    }),
+    Object.freeze({
+      text: '取消后可继续。', finishReason: 'stop', toolCalls: Object.freeze([])
+    })
+  ]
+  const adapter: ModelAdapter = Object.freeze({
+    complete: async () => {
+      const turn = turns.shift()
+      if (turn === undefined) throw new Error('cancel adapter script exhausted')
+      return turn
+    }
+  })
+  const definitions = Object.freeze([toolDefinition('website')])
+  const snapshot = new ToolRegistry(definitions).createSnapshot({
+    id: 'snapshot-service-cancel', facts, enabledTools: ['website']
+  })
+  let generated = 0
+  const service = new AgentService({
+    sessions,
+    runStore,
+    admission: new RunAdmission({
+      client: redis, generateId: () => `cancel-lease-${++generated}`
+    }),
+    contextEngine: new ContextEngine({
+      estimator: {
+        estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
+        estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
+      },
+      memoryStore: new NoopMemoryStore()
+    }),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: observer => new RunEngine({
+      adapter,
+      profile: standardOpenAIProfile,
+      scheduler: new ToolScheduler({ runtime: new ServiceToolRuntime(true) }),
+      store: runStore,
+      budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
+      now: () => new Date(createdAt),
+      generateId: () => `cancel-engine-${++generated}`,
+      observer
+    }),
+    createRuntime: async () => Object.freeze({
+      binding: Object.freeze({
+        snapshot,
+        prepareToolContext: async (): Promise<ToolPreparationContext> => Object.freeze({
+          runId: 'cancel-run', profile: 'safe', facts, intent, now: createdAt
+        }),
+        contextFor: async (): Promise<ToolExecutionContext> => Object.freeze({
+          runId: 'cancel-run', profile: 'safe', facts, intent, now: createdAt
+        }),
+        approvalControlContext: async () => Object.freeze({
+          eligibleApprovers: Object.freeze([
+            Object.freeze({ userId: 'actor-1', role: 'bot_master' as const })
+          ])
+        })
+      })
+    }),
+    now: () => new Date(createdAt),
+    generateId: () => `cancel-service-${++generated}`
+  })
+
+  const paused = await service.handle(request('cancel-1', '执行需要审批的任务'))
+  assert.equal(paused.kind, 'paused')
+  const cancelled = await service.cancel(paused.runId, 'approval_delivery_failed')
+  assert.equal(cancelled.kind, 'cancelled')
+
+  const next = await service.handle(request('cancel-2', '继续下一轮'))
+  assert.equal(next.kind, 'completed')
+  assert.equal(next.kind === 'completed' ? next.text : null, '取消后可继续。')
+
+  turns.push(Object.freeze({
+    text: '', finishReason: 'tool_calls',
+    toolCalls: Object.freeze([Object.freeze({
+      index: 0, callId: 'call-shutdown-approval', name: 'website',
+      argumentsText: '{"value":"shutdown"}',
+      arguments: Object.freeze({ value: 'shutdown' })
+    })])
+  }))
+  const pendingShutdown = await service.handle(
+    request('cancel-3', '等待审批后关闭进程')
+  )
+  assert.equal(pendingShutdown.kind, 'paused')
+
+  const cancelledCount = await service.shutdown('process_shutdown')
+  assert.equal(cancelledCount, 1)
+  assert.equal(await service.shutdown('ignored_second_reason'), 1)
+  const shutdownCheckpoint = await runStore.load(pendingShutdown.runId)
+  assert.equal(shutdownCheckpoint?.status, 'cancelled')
+  assert.equal(shutdownCheckpoint?.cancellationReason, 'process_shutdown')
+
+  const afterShutdown = await service.handle(
+    request('cancel-4', '关闭后不应再启动新运行')
+  )
+  assert.equal(afterShutdown.kind, 'cancelled')
+  assert.equal(
+    afterShutdown.kind === 'cancelled' ? afterShutdown.reason : null,
+    'process_shutdown'
+  )
 })

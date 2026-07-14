@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { AgentError } from '../../src/agent/contracts/error.js'
+import type { AgentSessionState } from '../../src/agent/session/agent-session-state.js'
+import type { SessionRecord } from '../../src/agent/session/session-record.js'
 import type { SessionSummary } from '../../src/agent/session/session-record.js'
-import type { LegacySessionBridge } from '../../src/runtime/legacy-session-bridge.js'
+import type { ConversationSessionPort } from '../../src/runtime/agent-service.js'
 import {
   endAllConversations,
   endConversation,
@@ -18,16 +21,13 @@ const event = {
   message: [] as Array<Record<string, unknown>>
 }
 
-function fakeBridge (overrides: Partial<LegacySessionBridge> = {}): LegacySessionBridge {
+function fakeBridge (overrides: Partial<ConversationSessionPort> = {}): ConversationSessionPort {
   return {
-    resolveAddress: () => ({ botId: '10000', scope: { kind: 'private', userId: '7' } }),
-    loadOrCreate: async () => { throw new Error('not implemented') },
-    save: async () => {},
-    has: async () => false,
+    get: async () => null,
     delete: async () => false,
     list: async function * () {},
     deleteAll: async () => 0,
-    fork: async () => false,
+    fork: async () => { throw new Error('not implemented') },
     ...overrides
   }
 }
@@ -88,8 +88,8 @@ test('end current returns exact results for missing and active sessions', async 
 test('end mentioned filters the bot mention in at mode', async () => {
   const targets: Array<string | number | undefined> = []
   const bridge = fakeBridge({
-    delete: async (_event, _groupMerge, targetUserId) => {
-      targets.push(targetUserId)
+    delete: async address => {
+      targets.push(address.scope.kind === 'group_user' ? address.scope.userId : undefined)
       return true
     }
   })
@@ -111,7 +111,7 @@ test('end mentioned filters the bot mention in at mode', async () => {
     quote: true,
     success: true
   })
-  assert.deepEqual(targets, [9])
+  assert.deepEqual(targets, ['9'])
 })
 
 test('end all returns the exact deleted count', async () => {
@@ -142,7 +142,19 @@ test('join validates mentions and forks to an independent session', async () => 
     message: [{ type: 'at', qq: 9, text: '@target' }]
   }
   assert.deepEqual(await joinConversation({
-    bridge: fakeBridge({ fork: async () => true }),
+    bridge: fakeBridge({
+      fork: async (_source, target, startedBy) => ({
+        schemaVersion: 1,
+        sessionId: 'joined',
+        botId: target.botId,
+        scope: target.scope,
+        startedBy,
+        createdAt: '2026-07-13T00:00:00.000Z',
+        updatedAt: '2026-07-13T00:00:00.000Z',
+        turnCount: 0,
+        state: { schemaVersion: 1, messages: [] }
+      } satisfies SessionRecord<AgentSessionState>)
+    }),
     event: joinedEvent,
     groupMerge: false,
     toggleMode: 'at'
@@ -150,5 +162,23 @@ test('join validates mentions and forks to an independent session', async () => 
     message: '加入target的对话成功',
     quote: false,
     success: true
+  })
+
+  assert.deepEqual(await joinConversation({
+    bridge: fakeBridge({
+      fork: async () => {
+        throw new AgentError({
+          code: 'invalid_session', stage: 'test', retryable: false,
+          userMessage: 'missing'
+        })
+      }
+    }),
+    event: joinedEvent,
+    groupMerge: false,
+    toggleMode: 'at'
+  }), {
+    message: 'target当前未开启对话，无法加入',
+    quote: true,
+    success: false
   })
 })

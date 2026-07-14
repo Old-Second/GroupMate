@@ -2,14 +2,21 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
-test('legacy chat delegates reply input construction to the TypeScript adapter', async () => {
+test('production chat delegates reply input construction through AgentService', async () => {
   const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
-
-  assert.match(
-    source,
-    /import\s*\{\s*buildModelMessageInput\s*\}\s*from '\.\.\/dist\/runtime\/message-input\.js'/
+  const bridge = await readFile(
+    new URL('../../src/runtime/agent-service-bridge.ts', import.meta.url),
+    'utf8'
   )
-  assert.match(source, /\bcreateMessageInputLog\b/)
+  const adapter = await readFile(
+    new URL('../../src/runtime/yunzai-request-adapter.ts', import.meta.url),
+    'utf8'
+  )
+
+  assert.match(source, /getYunzaiAgentServiceBridge/)
+  assert.doesNotMatch(source, /buildModelMessageInput|createMessageInputLog/)
+  assert.match(bridge, /await adaptYunzaiRequest\(\{/)
+  assert.match(adapter, /await buildModelMessageInput\(\{/)
 
   const methodStart = source.indexOf('  async abstractChat (e, prompt, use, forcePictureMode = false) {')
   const methodEnd = source.indexOf('\n  async cacheContent ', methodStart)
@@ -17,25 +24,18 @@ test('legacy chat delegates reply input construction to the TypeScript adapter',
   assert.notEqual(methodEnd, -1)
   const method = source.slice(methodStart, methodEnd)
 
-  assert.equal(method.match(/await buildModelMessageInput\(\{/g)?.length ?? 0, 1)
-  assert.match(method, /const currentRequestText = prompt/)
-  assert.match(method, /await buildModelMessageInput\(\{\s*event: e,\s*currentPrompt: currentRequestText\s*\}\)/)
-  assert.match(method, /e\.groupmateCurrentRequestText = currentRequestText/)
-  assert.match(method, /prompt = messageInput\.prompt/)
-  assert.match(method, /e\.groupmateMessageInputImages = messageInput\.imageUrls/)
-  assert.match(method, /logger\.info\(createMessageInputLog\(messageInput\)\)/)
+  assert.equal(method.match(/this\.agentServiceBridge\.handle\(e, prompt,/g)?.length ?? 0, 1)
+  assert.match(method, /e\.groupmateCurrentRequestText = prompt/)
 
   const authorizationIndex = method.indexOf('if (!chatPermission) {')
-  const trustedTextIndex = method.indexOf('const currentRequestText = prompt')
-  const inputIndex = method.indexOf('await buildModelMessageInput({')
-  const trustedEventIndex = method.indexOf('e.groupmateCurrentRequestText = currentRequestText')
+  const trustedEventIndex = method.indexOf('e.groupmateCurrentRequestText = prompt')
   const imageIndex = method.indexOf('await getImg(e)')
   const blockWordIndex = method.indexOf('Config.promptBlockWords.find')
-  assert.ok(authorizationIndex >= 0 && authorizationIndex < trustedTextIndex)
-  assert.ok(trustedTextIndex < inputIndex)
-  assert.ok(inputIndex < trustedEventIndex)
+  const handleIndex = method.indexOf('this.agentServiceBridge.handle(e, prompt,')
+  assert.ok(authorizationIndex >= 0 && authorizationIndex < trustedEventIndex)
   assert.ok(trustedEventIndex < imageIndex)
   assert.ok(imageIndex < blockWordIndex)
+  assert.ok(blockWordIndex < handleIndex)
 })
 
 test('legacy image lookup reuses images resolved with the reply input', async () => {

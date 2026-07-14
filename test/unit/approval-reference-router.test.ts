@@ -6,6 +6,7 @@ import type { ApprovalInterruption } from '../../src/agent/run/interruption.js'
 import {
   RedisApprovalReferenceIndex,
   RunApprovalRouter,
+  projectYunzaiApprovalReply,
   redisApprovalReferenceKey,
   type ApprovalDecisionInput,
   type ApprovalDisplayInput,
@@ -143,6 +144,31 @@ test('reference approval requires an exact quote before deciding', async () => {
   assert.equal(control.decisions.length, 0)
   assert.equal(await router.route(reply()), true)
   assert.equal(control.decisions[0]?.kind, 'approved')
+})
+
+test('Yunzai approval projection requires an exact quoted decision', async () => {
+  const receivedAt = '2026-07-14T00:00:10.987Z'
+  const event = {
+    msg: '确认', time: Math.floor(Date.parse(now) / 1_000),
+    isGroup: true, group_id: 'group-1', user_id: 'actor-1',
+    sender: { user_id: 'actor-1', role: 'owner' },
+    source: { message_id: 'approval-message-1' },
+    message: [{ type: 'text', text: '确认' }]
+  }
+  const projected = await projectYunzaiApprovalReply(event, {
+    botId: 'bot-1', masterIds: [], now: () => new Date(receivedAt)
+  })
+
+  assert.equal(projected?.quotedMessageId, 'approval-message-1')
+  assert.equal(projected?.actor.role, 'group_owner')
+  assert.deepEqual(projected?.sessionAddress, groupAddress)
+  assert.equal(projected?.occurredAt, receivedAt)
+  assert.equal(await projectYunzaiApprovalReply({ ...event, msg: '确认一下' }, {
+    botId: 'bot-1', masterIds: []
+  }), null)
+  assert.equal(await projectYunzaiApprovalReply({ ...event, source: undefined }, {
+    botId: 'bot-1', masterIds: []
+  }), null)
 })
 
 test('reference approval rejects wrong bot, session and actor projections', async () => {

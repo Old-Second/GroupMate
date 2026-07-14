@@ -266,6 +266,7 @@ test('approval bridge replies only for exact commands', async () => {
 
 test('thin approval app contains no store, policy or token implementation', async () => {
   const source = await readFile('apps/approval.js', 'utf8')
-  assert.match(source, /createApprovalCommandBridge/)
-  assert.doesNotMatch(source, /redis|ApprovalStore|PendingCallStore|ToolPolicy|createHash|tokenHash|consume\(/)
+  assert.match(source, /routeYunzaiApprovalReply/)
+  assert.match(source, /\^\(确认\|拒绝\)\$/)
+  assert.doesNotMatch(source, /#确认|#拒绝|redis|ApprovalStore|PendingCallStore|ToolPolicy|createHash|tokenHash|consume\(/)
 })

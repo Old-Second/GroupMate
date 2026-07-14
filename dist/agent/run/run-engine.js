@@ -1320,6 +1320,7 @@ export class RunEngine {
     async #fail(checkpoint, error, prefixEvents = [], changes = {}, detailOverride) {
         if (isTerminalRunStatus(checkpoint.status))
             return checkpoint;
+        this.#controllers.get(checkpoint.runId)?.abort('fatal_error');
         const serialized = detailOverride === undefined
             ? serializeAgentError(error)
             : Object.freeze({
@@ -1595,9 +1596,9 @@ export class RunEngine {
     #linkExternalSignal(signal, controller) {
         if (signal === undefined)
             return () => undefined;
-        const abort = () => controller.abort('user_cancelled');
+        const abort = () => controller.abort(boundedCancellationReason(typeof signal.reason === 'string' ? signal.reason : 'user_cancelled'));
         if (signal.aborted)
-            controller.abort('user_cancelled');
+            abort();
         else
             signal.addEventListener('abort', abort, { once: true });
         return () => signal.removeEventListener('abort', abort);

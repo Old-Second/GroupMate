@@ -17,8 +17,10 @@ test('BYM and auxiliary callers use only the configured OpenAI-compatible API', 
     readSource('utils/chat.js')
   ])
 
-  assert.match(bym, /core\.sendMessage\(e\.msg, \{\}, 'api', e/)
-  assert.match(bym, /system:\s*\{\s*api:\s*system\s*\}/s)
+  assert.match(bym, /dist\/runtime\/agent-service-bridge\.js/)
+  assert.match(bym, /handleEphemeral\(e, e\.msg,/)
+  assert.match(bym, /systemInstructions:\s*\[system\]/)
+  assert.doesNotMatch(bym, /model\/core\.js|core\.sendMessage/)
   assert.doesNotMatch(bym, /bymMode|\b(?:bing|claude2?|gemini|qwen|chatglm4?|xh):\s*system/)
 
   for (const source of auxiliary) {

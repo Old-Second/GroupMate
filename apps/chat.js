@@ -11,6 +11,7 @@ import {
   getDefaultReplySetting,
   getImageOcrText,
   getImg,
+  getMasterQQ,
   getUin,
   getUserData,
   getUserReplySetting,
@@ -24,8 +25,7 @@ import fetch from 'node-fetch'
 import { convertSpeaker, speakers } from '../utils/tts.js'
 import { convertFaces } from '../utils/face.js'
 import { getProxy } from '../utils/proxy.js'
-import { generateSuggestedResponse } from '../utils/chat.js'
-import Core from '../model/core.js'
+import { generateSuggestedResponse, getChatHistoryGroup } from '../utils/chat.js'
 import { collectProcessors } from '../utils/postprocessors/BasicProcessor.js'
 import {
   buildLegacyQuoteForwardMessages,
@@ -33,7 +33,6 @@ import {
   presentLegacyReply,
   selectLegacyPresentationMode
 } from '../model/legacy/reply-presenter.js'
-import { buildModelMessageInput } from '../dist/runtime/message-input.js'
 import { presentPictureReply } from '../dist/runtime/picture-reply.js'
 import {
   shouldFallbackVitsToText,
@@ -42,12 +41,11 @@ import {
 import {
   createChatErrorLog,
   createChatRequestLog,
-  createChatResponseLog,
-  createMessageInputLog
+  createChatResponseLog
 } from '../dist/runtime/safe-chat-logging.js'
 import { getChatErrorPresentation } from '../dist/runtime/chat-error-presentation.js'
-import { resolveProviderModeForRuntime } from '../dist/runtime/provider-mode-policy.js'
-import { createLegacySessionBridge } from '../dist/runtime/legacy-session-bridge.js'
+import { getYunzaiAgentServiceBridge } from '../dist/runtime/agent-service-bridge.js'
+import { toolResourceFromLegacySegment } from '../dist/runtime/tools/yunzai-tool-runtime.js'
 import {
   endAllConversations as endAllConversationSessions,
   endConversation,
@@ -80,6 +78,24 @@ const newFetch = (url, options = {}) => {
 
   return fetch(url, mergedOptions)
 }
+
+const productionAgentServiceBridge = () => getYunzaiAgentServiceBridge({
+  config: Config,
+  redis,
+  fetch: newFetch,
+  getMasterIds: getMasterQQ,
+  getBotId: getUin,
+  getImages: getImg,
+  synthesizeAudio: async (event, text, _voice, signal) => {
+    if (signal.aborted) throw new DOMException('operation was aborted', 'AbortError')
+    const sendable = await generateAudio(event, text)
+    if (!sendable) throw new Error('audio generation failed')
+    return toolResourceFromLegacySegment(sendable)
+  },
+  loadGroupHistory: async (event, limit) => await getChatHistoryGroup(event, limit),
+  segment: () => global.segment,
+  logger
+})
 
 export class chatgpt extends plugin {
   constructor (e) {
@@ -167,7 +183,7 @@ export class chatgpt extends plugin {
       logger,
       schedule: setTimeout
     })
-    this.sessionBridge = createLegacySessionBridge({ redis, logger })
+    this.agentServiceBridge = productionAgentServiceBridge()
   }
 
   /**
@@ -176,7 +192,7 @@ export class chatgpt extends plugin {
    * @returns {Promise<void>}
    */
   async getConversations (e) {
-    const result = await listConversations({ bridge: this.sessionBridge, event: e })
+    const result = await listConversations({ bridge: this.agentServiceBridge.conversations, event: e })
     await this.reply(result.message, result.quote)
   }
 
@@ -188,7 +204,7 @@ export class chatgpt extends plugin {
   async destroyConversations (e) {
     await redis.del(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
     const result = await endConversation({
-      bridge: this.sessionBridge,
+      bridge: this.agentServiceBridge.conversations,
       event: e,
       groupMerge: Config.groupMerge,
       toggleMode: Config.toggleMode
@@ -198,7 +214,7 @@ export class chatgpt extends plugin {
 
   async endAllConversations (e) {
     const result = await endAllConversationSessions({
-      bridge: this.sessionBridge,
+      bridge: this.agentServiceBridge.conversations,
       event: e
     })
     await this.reply(result.message, result.quote)
@@ -427,12 +443,9 @@ export class chatgpt extends plugin {
       logger.info('chatgpt闭嘴中，不予理会')
       return false
     }
-    // 获取用户配置
-    const userData = await getUserData(e.user_id)
-    const use = resolveProviderModeForRuntime((userData.mode === 'default' ? null : userData.mode) || await redis.get('CHATGPT:USE'), logger)
     // 自动化插件本月已发送xx条消息更新太快，由于延迟和缓存问题导致不同客户端不一样，at文本和获取的card不一致。因此单独处理一下
     prompt = prompt.replace(/^｜本月已发送\d+条消息/, '')
-    await this.abstractChat(e, prompt, use, forcePictureMode)
+    await this.abstractChat(e, prompt, 'api', forcePictureMode)
   }
 
   async abstractChat (e, prompt, use, forcePictureMode = false) {
@@ -479,19 +492,7 @@ export class chatgpt extends plugin {
         }
       }
     }
-    const currentRequestText = prompt
-    const messageInput = await buildModelMessageInput({
-      event: e,
-      currentPrompt: currentRequestText
-    })
-    e.groupmateCurrentRequestText = currentRequestText
-    prompt = messageInput.prompt
-    if (messageInput.hasReply) {
-      e.groupmateMessageInputImages = messageInput.imageUrls
-    }
-    if (Config.debug) {
-      logger.info(createMessageInputLog(messageInput))
-    }
+    e.groupmateCurrentRequestText = prompt
     let userSetting = await getUserReplySetting(this.e)
     let useTTS = !!userSetting.useTTS
     const isImg = await getImg(e)
@@ -535,55 +536,50 @@ export class chatgpt extends plugin {
     if (Config.debug) {
       logger.info(createChatRequestLog({ mode: use, stream: Config.apiStream, prompt }))
     }
-    let previousConversation = await this.sessionBridge.loadOrCreate({
-      event: e,
-      groupMerge: Config.groupMerge,
-      initialMessages: [{
-        role: 'system',
-        content: 'You are an AI assistant that helps people find information.'
-      }]
-    })
-    const conversation = {
-      messages: previousConversation.messages,
-      conversationId: previousConversation.conversation?.conversationId,
-      parentMessageId: previousConversation.parentMessageId
-    }
     let handler = this.e.runtime?.handler || {
       has: (arg1) => false
     }
     try {
-      let chatMessage = await Core.sendMessage.bind(this)(prompt, conversation, use, e)
-      if (chatMessage?.noMsg) {
+      const userData = await getUserData(e.user_id)
+      const currentDate = formatDate2(new Date())
+      const systemInstruction = `You are ${Config.assistantLabel}. ${userData.cast?.api || Config.promptPrefixOverride} Current date: ${currentDate}.`
+      const agentReply = await this.agentServiceBridge.handle(e, prompt, {
+        systemInstructions: [systemInstruction],
+        enableGroupContext: Config.enableGroupContext,
+        thinkingMode: Config.apiThinkingMode,
+        reasoningEffort: Config.apiReasoningEffort,
+        progress: async text => await this.reply(text, e.isGroup, { recallMsg: 0 }),
+        sessionTtlSeconds: Config.conversationPreserveTime > 0
+          ? Config.conversationPreserveTime
+          : undefined
+      })
+      if (agentReply.kind === 'paused') {
         return false
       }
-      if (!chatMessage) {
+      if (agentReply.kind === 'failed') {
+        logger.error(createChatErrorLog({
+          mode: use,
+          error: agentReply.error,
+          category: agentReply.error.code
+        }))
+        await this.reply(agentReply.error.userMessage, true, { recallMsg: 0 })
         return false
       }
-      previousConversation.conversation = {
-        conversationId: chatMessage.conversationId
+      if (agentReply.kind === 'cancelled') {
+        await this.reply('任务已取消。', true, { recallMsg: 0 })
+        return false
       }
-      if (chatMessage.id) {
-        previousConversation.parentMessageId = chatMessage.id
-      } else if (chatMessage.message) {
-        if (previousConversation.messages.length > 10) {
-          previousConversation.messages.shift()
+      if (agentReply.text === null && agentReply.visibleOutput) return false
+      if (agentReply.text === null) return false
+      let chatMessage = {
+        text: agentReply.text,
+        conversation: {
+          prompt,
+          response: agentReply.text
         }
-        previousConversation.messages.push(chatMessage.message)
       }
       if (Config.debug) {
         logger.info(createChatResponseLog({ mode: use, response: chatMessage }))
-      }
-      if (!chatMessage.error) {
-        previousConversation.num += 1
-        previousConversation.utime = new Date().toISOString()
-        await this.sessionBridge.save({
-          event: e,
-          groupMerge: Config.groupMerge,
-          snapshot: previousConversation,
-          ttlSeconds: Config.conversationPreserveTime > 0
-            ? Config.conversationPreserveTime
-            : undefined
-        })
       }
       let response = chatMessage?.text?.replace('\n\n\n', '\n')
       let postProcessors = await collectProcessors('post')
@@ -612,8 +608,7 @@ export class chatgpt extends plugin {
       }
       let mood = 'blandness'
       if (!response) {
-        await this.reply('没有任何回复', true)
-        return
+        return false
       }
       let emotion, emotionDegree
       if (Config.ttsMode === 'azure' && await AzureTTS.getEmotionPrompt(e)) {
@@ -827,10 +822,7 @@ export class chatgpt extends plugin {
         error: err,
         category: presentation.code
       }))
-      if (presentation.resetConversation) {
-        await this.destroyConversations(err)
-      }
-      await this.reply(presentation.message, true)
+      await this.reply(presentation.message, true, { recallMsg: 0 })
     }
   }
 
@@ -909,7 +901,7 @@ export class chatgpt extends plugin {
 
   async joinConversation (e) {
     const result = await joinConversationSession({
-      bridge: this.sessionBridge,
+      bridge: this.agentServiceBridge.conversations,
       event: e,
       groupMerge: Config.groupMerge,
       toggleMode: Config.toggleMode,

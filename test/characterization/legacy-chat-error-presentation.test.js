@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
-test('legacy chat delegates user-visible errors to the safe presentation policy', async () => {
+test('production chat presents fixed errors without recalling or deleting the session', async () => {
   const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
   const chatgpt1Index = source.indexOf('\n  async chatgpt1 (e)')
   const catchIndex = source.lastIndexOf('    } catch (err) {', chatgpt1Index)
@@ -17,11 +17,11 @@ test('legacy chat delegates user-visible errors to the safe presentation policy'
   )
   assert.match(errorBranch, /const presentation = getChatErrorPresentation\(err\)/)
   assert.match(errorBranch, /category: presentation\.code/)
-  assert.match(errorBranch, /if \(presentation\.resetConversation\)/)
-  assert.match(errorBranch, /await this\.destroyConversations\(err\)/)
-  assert.match(errorBranch, /await this\.reply\(presentation\.message, true\)/)
+  assert.doesNotMatch(errorBranch, /presentation\.resetConversation/)
+  assert.doesNotMatch(errorBranch, /destroyConversations/)
+  assert.match(errorBranch, /await this\.reply\(presentation\.message, true, \{ recallMsg: 0 \}\)/)
   assert.doesNotMatch(
     errorBranch,
-    /err\?\.message|err\?\.data|JSON\.stringify\(err\)|renderImage|recallMsg/
+    /err\?\.message|err\?\.data|JSON\.stringify\(err\)|renderImage/
   )
 })

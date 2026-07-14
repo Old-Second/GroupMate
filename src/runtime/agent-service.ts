@@ -127,6 +127,56 @@ function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
   })
 }
 
+function cancellationReason (value: unknown, fallback = 'user_cancelled'): string {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim()
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalized)
+    ? normalized
+    : fallback
+}
+
+function cancelledEnvelope (
+  runId: string,
+  reason: unknown = 'user_cancelled'
+): ChatReplyEnvelope {
+  return Object.freeze({
+    kind: 'cancelled',
+    runId,
+    reason: cancellationReason(reason)
+  })
+}
+
+function linkedAbortSignal (
+  callerSignal: AbortSignal | undefined,
+  lifecycleSignal: AbortSignal
+): Readonly<{ signal: AbortSignal; dispose(): void }> {
+  const controller = new AbortController()
+  const sources = callerSignal === undefined
+    ? [lifecycleSignal]
+    : [callerSignal, lifecycleSignal]
+  const listeners = new Map<AbortSignal, () => void>()
+  for (const source of sources) {
+    const forward = (): void => {
+      controller.abort(cancellationReason(source.reason))
+    }
+    if (source.aborted) {
+      forward()
+      break
+    }
+    listeners.set(source, forward)
+    source.addEventListener('abort', forward, { once: true })
+  }
+  return Object.freeze({
+    signal: controller.signal,
+    dispose: (): void => {
+      for (const [source, listener] of listeners) {
+        source.removeEventListener('abort', listener)
+      }
+      listeners.clear()
+    }
+  })
+}
+
 function contentPartText (part: AgentContentPart): string {
   switch (part.type) {
     case 'text': return part.text
@@ -154,6 +204,50 @@ function modelMessageFor (item: ContextItem): ModelMessage {
     retryable: false,
     userMessage: '会话历史格式不兼容，请重新开始对话。'
   })
+}
+
+function currentRunItemOrder (items: readonly ContextItem[]): readonly ContextItem[] {
+  const runtimeFacts = items.filter(item => item.source === 'runtime_fact')
+  if (runtimeFacts.length === 0) return items
+  const ordered = items.filter(item => item.source !== 'runtime_fact')
+  const currentIndex = ordered.findIndex(item => item.source === 'current_request')
+  if (currentIndex < 0) return Object.freeze([...ordered, ...runtimeFacts])
+  return Object.freeze([
+    ...ordered.slice(0, currentIndex),
+    ...runtimeFacts,
+    ...ordered.slice(currentIndex)
+  ])
+}
+
+function mergeableTextRole (
+  message: ModelMessage
+): 'system' | 'developer' | 'user' | 'assistant' | null {
+  if (message.role === 'tool') return null
+  if (message.role !== 'assistant') return message.role
+  return typeof message.content === 'string' && message.toolCalls === undefined &&
+    message.providerState === undefined
+    ? 'assistant'
+    : null
+}
+
+function coalesceModelMessages (
+  messages: readonly ModelMessage[]
+): readonly ModelMessage[] {
+  const result: ModelMessage[] = []
+  for (const message of messages) {
+    const role = mergeableTextRole(message)
+    const previous = result.at(-1)
+    if (role !== null && previous !== undefined &&
+      mergeableTextRole(previous) === role) {
+      result[result.length - 1] = Object.freeze({
+        role,
+        content: `${previous.content ?? ''}\n\n${message.content ?? ''}`
+      }) as ModelMessage
+    } else {
+      result.push(message)
+    }
+  }
+  return Object.freeze(result)
 }
 
 function systemItem (
@@ -377,6 +471,9 @@ export class AgentService {
   readonly #onObserverFailure?: AgentServiceOptions['onObserverFailure']
   readonly #engine: RunEngine
   readonly #pending = new Map<string, PendingRun>()
+  readonly #lifecycleController = new AbortController()
+  #shutdownReason = 'process_shutdown'
+  #shutdownPromise: Promise<number> | undefined
   #observerFailureReported = false
 
   constructor (options: AgentServiceOptions) {
@@ -438,21 +535,67 @@ export class AgentService {
     runId: string,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope> {
+    const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | null | undefined = this.#pending.get(runId)
-    if (pending === undefined) {
-      try {
-        pending = await this.#recoverPending(runId, options.signal)
-      } catch (error) {
-        return failedEnvelope(runId, error)
-      }
-    }
-    if (pending === null) return terminalEnvelope(await this.#engine.resume(runId, undefined, options))
     try {
-      const result = await this.#engine.resume(runId, pending.binding, options)
+      if (linked.signal.aborted) {
+        return await this.cancel(runId, linked.signal.reason)
+      }
+      if (pending === undefined) {
+        pending = await this.#recoverPending(runId, linked.signal)
+      }
+      if (pending === null) {
+        return terminalEnvelope(await this.#engine.resume(runId, undefined, {
+          ...options,
+          signal: linked.signal
+        }))
+      }
+      const result = await this.#engine.resume(runId, pending.binding, {
+        ...options,
+        signal: linked.signal
+      })
       return await this.#finish(pending, result)
     } catch (error) {
+      if (linked.signal.aborted) {
+        return await this.cancel(runId, linked.signal.reason)
+      }
+      if (pending === undefined || pending === null) return failedEnvelope(runId, error)
       return await this.#abortPending(pending, failedEnvelope(runId, error))
+    } finally {
+      linked.dispose()
     }
+  }
+
+  async cancel (
+    runId: string,
+    reason = 'user_cancelled'
+  ): Promise<ChatReplyEnvelope> {
+    const pending = this.#pending.get(runId)
+    try {
+      const result = await this.#engine.cancel(runId, reason)
+      return pending === undefined
+        ? terminalEnvelope(result)
+        : await this.#finish(pending, result)
+    } catch (error) {
+      if (pending !== undefined) {
+        this.#pending.delete(runId)
+        await this.#progressPresenter.drain(runId).catch(() => undefined)
+        this.#progressPresenter.detach(runId)
+        await pending.lease.release().catch(() => undefined)
+      }
+      return failedEnvelope(runId, error)
+    }
+  }
+
+  shutdown (reason = 'process_shutdown'): Promise<number> {
+    if (this.#shutdownPromise !== undefined) return this.#shutdownPromise
+    this.#shutdownReason = cancellationReason(reason, 'process_shutdown')
+    this.#lifecycleController.abort(this.#shutdownReason)
+    const runIds = Object.freeze([...this.#pending.keys()])
+    this.#shutdownPromise = Promise.all(
+      runIds.map(async runId => await this.cancel(runId, this.#shutdownReason))
+    ).then(() => runIds.length)
+    return this.#shutdownPromise
   }
 
   async pendingApproval (
@@ -472,21 +615,32 @@ export class AgentService {
     input: RunApprovalDecisionCommand,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope | null> {
+    const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | null | undefined = this.#pending.get(input.runId)
-    if (pending === undefined) {
-      try {
-        pending = await this.#recoverPending(input.runId, options.signal)
-      } catch {
-        return null
+    try {
+      if (linked.signal.aborted) {
+        return await this.cancel(input.runId, linked.signal.reason)
       }
+      if (pending === undefined) {
+        try {
+          pending = await this.#recoverPending(input.runId, linked.signal)
+        } catch {
+          if (linked.signal.aborted) {
+            return await this.cancel(input.runId, linked.signal.reason)
+          }
+          return null
+        }
+      }
+      const result = await this.#engine.decideApproval(
+        input,
+        pending?.binding,
+        { ...options, signal: linked.signal }
+      )
+      if (result === null) return null
+      return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result)
+    } finally {
+      linked.dispose()
     }
-    const result = await this.#engine.decideApproval(
-      input,
-      pending?.binding,
-      options
-    )
-    if (result === null) return null
-    return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result)
   }
 
   async #start (
@@ -495,15 +649,22 @@ export class AgentService {
     options: RunControlOptions
   ): Promise<ChatReplyEnvelope> {
     const runId = this.#generateId()
+    const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let lease: RunLease | undefined
     try {
-      lease = await this.#admission.acquire(request.sessionAddress, options.signal)
+      if (linked.signal.aborted) {
+        return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason)
+      }
+      lease = await this.#admission.acquire(request.sessionAddress, linked.signal)
+      if (linked.signal.aborted) throw new Error('run start was cancelled')
       const timestamp = this.#now().toISOString()
       const session = ephemeral
         ? null
-        : await this.#sessions.get(request.sessionAddress, { signal: options.signal }) ??
+        : await this.#sessions.get(request.sessionAddress, { signal: linked.signal }) ??
           freshSession(request, this.#generateId(), timestamp)
+      if (linked.signal.aborted) throw new Error('run start was cancelled')
       const runtime = await this.#createRuntime(request)
+      if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       const binding = this.#bindingFor(runId, request, session, runtime)
       const pending: PendingRun = Object.freeze({
@@ -523,7 +684,7 @@ export class AgentService {
         deadlineAt: request.deadlineAt,
         model: request.model,
         runtime: binding
-      }, options)
+      }, { ...options, signal: linked.signal })
       return await this.#finish(pending, result)
     } catch (error) {
       if (this.#pending.has(runId)) {
@@ -534,7 +695,12 @@ export class AgentService {
       }
       this.#pending.delete(runId)
       this.#progressPresenter.detach(runId)
+      if (linked.signal.aborted) {
+        return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason)
+      }
       return failedEnvelope(runId, error)
+    } finally {
+      linked.dispose()
     }
   }
 
@@ -576,7 +742,9 @@ export class AgentService {
         toolMessages: EMPTY_ITEMS
       }, request.contextBudget, signal)
       return Object.freeze({
-        messages: Object.freeze(snapshot.items.map(modelMessageFor)),
+        messages: coalesceModelMessages(
+          currentRunItemOrder(snapshot.items).map(modelMessageFor)
+        ),
         estimatedInputTokens: snapshot.estimatedInputTokens
       })
     }

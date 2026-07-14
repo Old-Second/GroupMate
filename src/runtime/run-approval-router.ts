@@ -16,6 +16,10 @@ import {
   type RedisRunClient
 } from '../agent/run/redis-run-store.js'
 import { canonicalSessionKey } from '../agent/session/conversation-scope.js'
+import {
+  buildModelMessageInput,
+  type MessageEventLike
+} from './message-input.js'
 
 export interface ApprovalReference {
   readonly schemaVersion: 1
@@ -70,6 +74,30 @@ export interface RunApprovalRouterOptions {
   readonly index: ApprovalReferenceIndex
   readonly runtimeFor?: (runId: string) => Promise<RunRuntimeBinding | undefined>
 }
+
+export interface YunzaiApprovalReplyEvent extends MessageEventLike {
+  readonly msg?: unknown
+  readonly time?: unknown
+  readonly isGroup?: unknown
+  readonly group_id?: unknown
+  readonly user_id?: unknown
+  readonly self_id?: unknown
+  readonly sender?: {
+    readonly user_id?: unknown
+    readonly role?: unknown
+  }
+}
+
+export interface ProjectYunzaiApprovalReplyOptions {
+  readonly botId: string | number
+  readonly masterIds: readonly (string | number)[]
+  readonly now?: () => Date
+}
+
+export type ApprovalRouteResultHandler = (
+  result: RunAdvanceResult,
+  reference: ApprovalReference
+) => void | Promise<void>
 
 interface PersistedApprovalReference {
   readonly schemaVersion: 1
@@ -162,6 +190,66 @@ function sameAddress (left: SessionAddress, right: SessionAddress): boolean {
   }
 }
 
+function yunzaiIdentifier (value: unknown, label: string): string {
+  if ((typeof value !== 'string' && typeof value !== 'number') ||
+    String(value).length === 0 || String(value).length > 128) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  return String(value)
+}
+
+function yunzaiActorRole (
+  actorId: string,
+  senderRole: unknown,
+  masterIds: readonly (string | number)[]
+): ApprovalActorReference['role'] {
+  if (masterIds.some(value => String(value) === actorId)) return 'bot_master'
+  if (senderRole === 'owner') return 'group_owner'
+  if (senderRole === 'admin') return 'group_admin'
+  return 'member'
+}
+
+function yunzaiOccurredAt (now: () => Date): string {
+  return now().toISOString()
+}
+
+export async function projectYunzaiApprovalReply (
+  event: YunzaiApprovalReplyEvent,
+  options: ProjectYunzaiApprovalReplyOptions
+): Promise<ApprovalReplyProjection | null> {
+  const text = typeof event.msg === 'string' ? event.msg.normalize('NFC').trim() : ''
+  if (parseApprovalReplyText(text) === null) return null
+  const input = await buildModelMessageInput({ event, currentPrompt: text })
+  if (input.quotedMessageId === null) return null
+  const botId = yunzaiIdentifier(options.botId, 'approval bot ID')
+  const actorId = yunzaiIdentifier(
+    event.sender?.user_id ?? event.user_id,
+    'approval actor ID'
+  )
+  const sessionAddress: SessionAddress = event.isGroup === true
+    ? Object.freeze({
+        botId,
+        scope: Object.freeze({
+          kind: 'group' as const,
+          groupId: yunzaiIdentifier(event.group_id, 'approval group ID')
+        })
+      })
+    : Object.freeze({
+        botId,
+        scope: Object.freeze({ kind: 'private' as const, userId: actorId })
+      })
+  return Object.freeze({
+    text,
+    quotedMessageId: input.quotedMessageId,
+    sessionAddress,
+    actor: Object.freeze({
+      userId: actorId,
+      role: yunzaiActorRole(actorId, event.sender?.role, options.masterIds)
+    }),
+    occurredAt: yunzaiOccurredAt(options.now ?? (() => new Date()))
+  })
+}
+
 export class RedisApprovalReferenceIndex implements ApprovalReferenceIndex {
   readonly #client: RedisRunClient
 
@@ -233,7 +321,10 @@ export class RunApprovalRouter {
     }
   }
 
-  async route (reply: ApprovalReplyProjection): Promise<boolean> {
+  async route (
+    reply: ApprovalReplyProjection,
+    onResult?: ApprovalRouteResultHandler
+  ): Promise<boolean> {
     const kind = parseApprovalReplyText(reply.text)
     if (kind === null || reply.quotedMessageId === null) return false
     let occurredAt: string
@@ -261,13 +352,15 @@ export class RunApprovalRouter {
     }, runtime)
     if (result === null) return false
     await this.#index.delete(reference)
+    await onResult?.(result, reference)
     return true
   }
 
   async expire (
     address: SessionAddress,
     messageId: string,
-    occurredAt: string
+    occurredAt: string,
+    onResult?: ApprovalRouteResultHandler
   ): Promise<boolean> {
     const reference = await this.#index.load(address, messageId)
     if (reference === null) return false
@@ -285,6 +378,7 @@ export class RunApprovalRouter {
     }, runtime)
     if (result === null) return false
     await this.#index.delete(reference)
+    await onResult?.(result, reference)
     return true
   }
 }

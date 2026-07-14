@@ -257,6 +257,54 @@ test('Phase 4 Yunzai bridge exposes strict model schemas and executes through th
   assert.match(outcome.modelFeedback, /"userId":"7"/)
 })
 
+test('Phase 5 Yunzai bridge exposes a native run binding without entering the legacy loop', async () => {
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 90,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['1'],
+    getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const event = {
+    isGroup: true, group_id: 9, user_id: 7, self_id: 10000,
+    sender: { user_id: 7, nickname: 'fixture', role: 'owner' },
+    group: { gml: new Map([[7, { user_id: 7, role: 'owner' }]]) },
+    bot: { pickGroup: () => ({ sendMsg: async () => {} }) },
+    message: []
+  }
+
+  const run = await bridge.prepareAgentRun({ event, prompt: '读取网页' })
+  const checkpoint = { runId: 'run-native' } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const context = await run.binding.prepareToolContext(
+    checkpoint,
+    new AbortController().signal
+  )
+
+  assert.equal(run.profile, 'safe')
+  assert.equal(run.binding.snapshot.id, run.snapshot.id)
+  assert.ok(run.snapshot.modelTools.some(tool => tool.function.name === 'website'))
+  assert.equal(context.runId, 'run-native')
+  assert.equal(context.profile, 'safe')
+  assert.equal(typeof bridge.runtime.prepare, 'function')
+  await assert.rejects(
+    bridge.execute({
+      snapshotId: run.snapshot.id,
+      requestedName: 'website',
+      arguments: { url: 'https://fixture.invalid/' },
+      callId: 'legacy-after-native'
+    }),
+    (error: unknown) => error instanceof ToolRuntimeConfigurationError &&
+      error.code === 'runtime_not_found'
+  )
+})
+
 test('Phase 4 Yunzai bridge treats a missing legacy image result as no images', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
     config: {
