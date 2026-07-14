@@ -24,6 +24,7 @@ const defaultConfig = {
   showQRCode: true,
   apiKey: '',
   openAiBaseUrl: defaultOpenAIReverseProxy,
+  openAiCompatibilityProfile: 'standard',
   openAiForceUseReverse: false,
   apiStream: false,
   model: '',

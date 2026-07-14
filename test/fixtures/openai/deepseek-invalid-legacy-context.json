@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "deepseek-fixture does not support successive user or assistant messages (messages[2] and messages[3] in your input). You should interleave the user/assistant messages in the message sequence.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_request_error"
+  }
+}

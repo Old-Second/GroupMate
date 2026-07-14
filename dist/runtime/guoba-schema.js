@@ -43,6 +43,12 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         divider('模型与会话'),
         field('apiKey', 'API Key', 'OpenAI-compatible Chat Completions 服务的访问密钥，只会保存到本机真实配置。', 'InputPassword'),
         field('openAiBaseUrl', 'API Base URL', '填写兼容 Chat Completions 的 /v1 地址，例如 https://api.example.com/v1。'),
+        field('openAiCompatibilityProfile', 'API 兼容配置', '显式选择标准 OpenAI-compatible 或 DeepSeek 方言；不会根据 API 地址或模型名自动猜测。使用 DeepSeek 官方 API 时请选择 DeepSeek。', 'Select', {
+            options: [
+                { label: '标准 OpenAI-compatible', value: 'standard' },
+                { label: 'DeepSeek', value: 'deepseek' }
+            ]
+        }),
         field('model', '模型', '填写服务端实际支持的模型 ID，例如 deepseek-chat；留空时使用适配器默认值。'),
         field('promptPrefixOverride', '系统设定', '普通对话使用的系统设定，用于定义身份、语气和回答边界。', 'InputTextArea'),
         field('temperature', '生成温度', '控制普通回复的随机性；服务端不支持时可能忽略该参数。', 'InputNumber', { min: 0, max: 2, step: 0.1 }),

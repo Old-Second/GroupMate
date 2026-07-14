@@ -20,6 +20,7 @@ const QQ_IDENTIFIER_FIELDS = new Set([
 
 const TOOL_POLICY_PROFILES = new Set(['compatible', 'safe', 'strict'])
 const CROSS_CHANNEL_POLICIES = new Set(['disabled', 'master', 'everyone'])
+const OPENAI_COMPATIBILITY_PROFILES = new Set(['standard', 'deepseek'])
 
 function splitList (value: unknown, separator: RegExp): string[] {
   const values = Array.isArray(value) ? value : String(value ?? '').split(separator)
@@ -36,6 +37,13 @@ function splitList (value: unknown, separator: RegExp): string[] {
 }
 
 export function normalizeGuobaConfigValue (key: string, value: unknown): unknown {
+  if (key === 'openAiCompatibilityProfile') {
+    if (typeof value !== 'string' || !OPENAI_COMPATIBILITY_PROFILES.has(value)) {
+      throw new TypeError('OpenAI API 兼容配置无效。')
+    }
+    return value
+  }
+
   if (key === 'toolPrivateSendPolicy' || key === 'toolCrossGroupSendPolicy') {
     if (typeof value !== 'string' || !CROSS_CHANNEL_POLICIES.has(value)) {
       throw new TypeError('工具跨会话发送权限配置无效。')

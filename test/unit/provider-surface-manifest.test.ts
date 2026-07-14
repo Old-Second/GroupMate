@@ -24,6 +24,18 @@ test('provider manifest defines every baseline category with exact source entrie
       `${providerId} must have no retained exact source`
     )
   }
+  assert.ok(providerSurfaceManifest.sources.openaiCompatible.includes(
+    'src/agent/model/deepseek-compatibility-profile.ts'
+  ))
+  assert.ok(providerSurfaceManifest.sources.openaiCompatible.includes(
+    'dist/agent/model/deepseek-compatibility-profile.js'
+  ))
+  assert.ok(providerSurfaceManifest.configFields.openaiCompatible.includes(
+    'openAiCompatibilityProfile'
+  ))
+  assert.ok(providerSurfaceManifest.uiFields.openaiCompatible.includes(
+    'openAiCompatibilityProfile'
+  ))
 })
 
 test('provider manifest separates Azure TTS from Azure OpenAI', () => {

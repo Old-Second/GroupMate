@@ -21,6 +21,7 @@
   "showQRCode": true,
   "apiKey": "",
   "openAiBaseUrl": "https://mondstadt.d201.eu.org/v1",
+  "openAiCompatibilityProfile": "standard",
   "openAiForceUseReverse": false,
   "model": "",
   "temperature": 0.8,

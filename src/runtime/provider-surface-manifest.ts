@@ -33,6 +33,18 @@ interface ProviderSurfaceManifest {
 export const providerSurfaceManifest = {
   sources: {
     openaiCompatible: [
+      'src/agent/model/openai-compatible-adapter.ts',
+      'dist/agent/model/openai-compatible-adapter.js',
+      'src/agent/model/openai-compatible-profile.ts',
+      'dist/agent/model/openai-compatible-profile.js',
+      'src/agent/model/openai-wire.ts',
+      'dist/agent/model/openai-wire.js',
+      'src/agent/model/standard-openai-profile.ts',
+      'dist/agent/model/standard-openai-profile.js',
+      'src/agent/model/deepseek-compatibility-profile.ts',
+      'dist/agent/model/deepseek-compatibility-profile.js',
+      'src/runtime/model-runtime-config.ts',
+      'dist/runtime/model-runtime-config.js',
       'utils/openai/chatgpt-api.js',
       'utils/openai/fetch-sse.js',
       'utils/chat.js',
@@ -64,6 +76,7 @@ export const providerSurfaceManifest = {
     openaiCompatible: [
       'apiKey',
       'openAiBaseUrl',
+      'openAiCompatibilityProfile',
       'model',
       'apiStream',
       'apiThinkingMode',
@@ -141,7 +154,7 @@ export const providerSurfaceManifest = {
     azureOpenai: ['azureUrl', 'azureDeploymentName']
   },
   uiFields: {
-    openaiCompatible: ['apiKey', 'openAiBaseUrl', 'model'],
+    openaiCompatible: ['apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model'],
     chatgptWeb: ['apiBaseUrl', 'OpenAiPlatformRefreshToken'],
     bing: ['sydney', 'sydneyReverseProxy', 'bingAiToken'],
     claude: ['claudeApiKey', 'claudeAISessionKey'],
@@ -163,7 +176,13 @@ export const providerSurfaceManifest = {
     azureOpenai: ['@azure/openai']
   },
   lexicalMarkers: {
-    openaiCompatible: ['ChatGPTAPI', 'chat/completions', 'openAiBaseUrl'],
+    openaiCompatible: [
+      'ChatGPTAPI',
+      'chat/completions',
+      'openAiBaseUrl',
+      'openAiCompatibilityProfile',
+      'deepSeekCompatibilityProfile'
+    ],
     chatgptWeb: ['OfficialChatGPTClient', 'api3', 'defaultChatGPTAPI', 'OpenAiPlatformRefreshToken'],
     bing: ['SydneyAIClient', 'BingAIClient', 'CopilotAIClient', 'sydneyReverseProxy', 'bingAiToken', '#bing'],
     claude: ['ClaudeAPIClient', 'ClaudeAIClient', 'claudeApiKey', 'claudeAISessionKey', '#claude'],

@@ -33,6 +33,19 @@ test('leaves scalar Guoba values unchanged', () => {
   assert.equal(normalizeGuobaConfigValue('model', 'deepseek-chat'), 'deepseek-chat')
 })
 
+test('normalizes the OpenAI compatibility profile explicitly and fail closed', () => {
+  assert.equal(normalizeGuobaConfigValue('openAiCompatibilityProfile', 'standard'), 'standard')
+  assert.equal(normalizeGuobaConfigValue('openAiCompatibilityProfile', 'deepseek'), 'deepseek')
+  assert.throws(
+    () => normalizeGuobaConfigValue('openAiCompatibilityProfile', 'auto'),
+    /兼容配置无效/
+  )
+  assert.throws(
+    () => normalizeGuobaConfigValue('openAiCompatibilityProfile', 1),
+    /兼容配置无效/
+  )
+})
+
 test('normalizes the tool policy profile and approval TTL fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('toolPolicyProfile', 'compatible'), 'compatible')
   assert.equal(normalizeGuobaConfigValue('toolPolicyProfile', 'safe'), 'safe')

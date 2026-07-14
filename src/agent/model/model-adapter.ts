@@ -10,7 +10,7 @@ export type ModelToolMode = 'auto' | 'required' | 'disabled'
 
 export interface ModelReasoningOptions {
   readonly enabled: boolean
-  readonly effort?: 'low' | 'medium' | 'high'
+  readonly effort?: 'low' | 'medium' | 'high' | 'max'
 }
 
 export interface ModelToolDefinition {

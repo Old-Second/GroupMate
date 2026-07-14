@@ -114,6 +114,7 @@ const requiredGuobaFields = [
   'closeBrowserAfterRender',
   'apiKey',
   'openAiBaseUrl',
+  'openAiCompatibilityProfile',
   'openAiForceUseReverse',
   'model',
   'apiStream',
@@ -225,7 +226,8 @@ const expectedGuobaGroups = [
   {
     label: '模型与会话',
     fields: [
-      'apiKey', 'openAiBaseUrl', 'model', 'promptPrefixOverride', 'temperature',
+      'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model',
+      'promptPrefixOverride', 'temperature',
       'apiStream', 'apiMaxToken', 'apiThinkingMode', 'apiReasoningEffort',
       'forwardReasoning', 'openAiForceUseReverse', 'enableGroupContext',
       'groupContextLength', 'groupContextTip', 'groupMerge',
@@ -307,6 +309,8 @@ test('default and example configuration expose only the supported provider', asy
     assert.match(source, new RegExp(`^  ${field}:`, 'm'))
   }
   assert.doesNotMatch(source, /getGeminiKey|pureSydneyInstruction|defaultChatGPTAPI|officialChatGPTAPI/)
+  assert.match(source, /^  openAiCompatibilityProfile: 'standard',/m)
+  assert.equal(example.openAiCompatibilityProfile, 'standard')
 })
 
 test('Guoba and legacy settings view expose supported API, TTS and tool fields only', async () => {
@@ -364,6 +368,19 @@ test('Guoba explains the retired legacy approval behavior', () => {
 
   assert.match(fields.get('toolPolicyProfile')?.bottomHelpMessage ?? '', /需要审批的操作会拒绝执行/)
   assert.match(fields.get('toolApprovalTtlSeconds')?.bottomHelpMessage ?? '', /新审批流程预留/)
+})
+
+test('Guoba exposes only explicit standard and DeepSeek compatibility profiles', () => {
+  const field = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).find(schema => schema.field === 'openAiCompatibilityProfile')
+
+  assert.equal(field?.component, 'Select')
+  assert.deepEqual(
+    (field?.componentProps?.options as Array<{ value: string }>).map(option => option.value),
+    ['standard', 'deepseek']
+  )
+  assert.match(field?.bottomHelpMessage ?? '', /不会.*自动猜测/)
 })
 
 test('cross-channel send permissions use independent fail-closed selects', async () => {
@@ -485,11 +502,13 @@ test('saving one supported field retains unknown legacy configuration keys', () 
   const defaults = {
     model: '',
     apiKey: '',
+    openAiCompatibilityProfile: 'standard',
     nested: { enabled: false }
   }
   const loaded = {
     ...defaults,
     model: 'fixture-model',
+    openAiCompatibilityProfile: 'deepseek',
     legacyProviderToken: 'fixture-legacy-token',
     unknownObject: { keep: true }
   }
@@ -497,9 +516,16 @@ test('saving one supported field retains unknown legacy configuration keys', () 
 
   assert.deepEqual(selectPersistedConfig(loaded, defaults), {
     model: 'fixture-model',
+    openAiCompatibilityProfile: 'deepseek',
     nested: { enabled: true },
     legacyProviderToken: 'fixture-legacy-token',
     unknownObject: { keep: true }
+  })
+  assert.deepEqual(selectPersistedConfig({
+    ...defaults,
+    legacyProviderToken: 'fixture-legacy-token'
+  }, defaults), {
+    legacyProviderToken: 'fixture-legacy-token'
   })
 })
 
