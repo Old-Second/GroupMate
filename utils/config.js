@@ -114,6 +114,7 @@ const defaultConfig = {
   enableToolbox: false, // 默认关闭工具箱节省占用和加速启动
   closeBrowserAfterRender: true,
   enableBYM: false,
+  bymRecognizeLeadingAlias: true,
   // 触发对话的概率，百分比。比如5%就写5
   bymRate: 5,
   bymDisableGroup: [],

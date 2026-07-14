@@ -18,7 +18,7 @@ test('BYM and auxiliary callers use only the configured OpenAI-compatible API', 
   ])
 
   assert.match(bym, /dist\/runtime\/agent-service-bridge\.js/)
-  assert.match(bym, /handleEphemeral\(e, e\.msg,/)
+  assert.match(bym, /handleEphemeral\(e,\s*trigger\.prompt,/)
   assert.match(bym, /systemInstructions:\s*\[system\]/)
   assert.doesNotMatch(bym, /model\/core\.js|core\.sendMessage/)
   assert.doesNotMatch(bym, /bymMode|\b(?:bing|claude2?|gemini|qwen|chatglm4?|xh):\s*system/)

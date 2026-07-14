@@ -200,6 +200,7 @@ const requiredGuobaFields = [
   'helloProbability',
   'emojiBaseURL',
   'enableBYM',
+  'bymRecognizeLeadingAlias',
   'bymRate',
   'bymDisableGroup',
   'bymThinkingMode',
@@ -238,7 +239,7 @@ const expectedGuobaGroups = [
     label: '群聊参与',
     fields: [
       'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt',
-      'enableBYM', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
+      'enableBYM', 'bymRecognizeLeadingAlias', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
       'bymReasoningEffort', 'bymPreset', 'bymFuckList', 'bymFuckBlacklist',
       'bymFuckPrompt', 'bymFuckRecall', 'bymFuckRecallTime'
     ]
@@ -381,6 +382,22 @@ test('Guoba exposes only explicit standard and DeepSeek compatibility profiles',
     ['standard', 'deepseek']
   )
   assert.match(field?.bottomHelpMessage ?? '', /不会.*自动猜测/)
+})
+
+test('Guoba configures leading name recognition as an enabled-by-default switch', async () => {
+  const fields = new Map(buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).flatMap(schema => schema.field ? [[schema.field, schema] as const] : []))
+  const source = await readSource('utils/config.js')
+  const example = JSON.parse(
+    await readSource('config/config.example.json')
+  ) as Record<string, unknown>
+  const schema = fields.get('bymRecognizeLeadingAlias')
+
+  assert.equal(schema?.component, 'Switch')
+  assert.match(schema?.bottomHelpMessage ?? '', /句首.*称呼|别名.*明确点名/)
+  assert.match(source, /^  bymRecognizeLeadingAlias: true,/m)
+  assert.equal(example.bymRecognizeLeadingAlias, true)
 })
 
 test('cross-channel send permissions use independent fail-closed selects', async () => {

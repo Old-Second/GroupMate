@@ -105,6 +105,12 @@ export function buildGuobaSchemas ({
     field('helloInterval', '主动聊天间隔小时', '定时任务在 7:00 到 23:00 之间使用的小时步长；修改后需重启以重建任务。', 'InputNumber', { min: 1, max: 24 }),
     field('helloPrompt', '主动打招呼提示词', '定时主动聊天时用于生成短消息的提示词。', 'InputTextArea'),
     field('enableBYM', '开启随机参与群聊', '按概率观察普通群消息并自然参与，固定使用当前 OpenAI-compatible API。', 'Switch'),
+    field(
+      'bymRecognizeLeadingAlias',
+      '识别句首称呼',
+      '开启后，消息以 Yunzai 机器人别名或助手称呼开头时视为明确点名并触发回复；关闭后句中、句尾称呼仍会触发。',
+      'Switch'
+    ),
     field('bymRate', '随机参与触发概率', '每条符合条件的群消息触发随机参与的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
     field('bymDisableGroup', '随机参与禁用群', '这些群不会触发随机参与；输入群号标签。', 'GTags', { allowAdd: true, closable: true }),
     field('bymThinkingMode', '随机参与思考模式', '随机参与请求单独使用的 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),

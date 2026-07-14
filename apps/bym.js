@@ -5,6 +5,7 @@ import { generateAudio, getImg, getMasterQQ, getUin } from '../utils/common.js'
 import { getChatHistoryGroup } from '../utils/chat.js'
 import { newFetch } from '../utils/proxy.js'
 import { getYunzaiAgentServiceBridge } from '../dist/runtime/agent-service-bridge.js'
+import { decideBymTrigger } from '../dist/runtime/bym-trigger.js'
 import { toolResourceFromLegacySegment } from '../dist/runtime/tools/yunzai-tool-runtime.js'
 
 const productionAgentServiceBridge = () => getYunzaiAgentServiceBridge({
@@ -75,9 +76,18 @@ export class bym extends plugin {
       return false
     }
 
+    const trigger = decideBymTrigger({
+      message: e.msg,
+      assistantLabel: Config.assistantLabel,
+      hasLeadingAlias: e.hasAlias === true,
+      recognizeLeadingAlias: Config.bymRecognizeLeadingAlias
+    })
+    if (trigger.prompt === null) return false
+    const prompt = trigger.prompt
+
     let sender = e.sender.user_id
     let prop = Math.floor(Math.random() * 100)
-    if (Config.assistantLabel && e.msg?.includes(Config.assistantLabel)) {
+    if (trigger.explicitlyAddressed) {
       prop = -1
     }
     // 去掉吧 频率有点逆天
@@ -87,7 +97,7 @@ export class bym extends plugin {
 
     let fuck = false
     let candidate = Config.bymPreset
-    if (Config.bymFuckList?.find(i => e.msg?.includes(i))) {
+    if (Config.bymFuckList?.find(i => prompt.includes(i))) {
       // 检查是否在黑名单中
       if (!Config.bymFuckBlacklist?.includes(sender.toString())) {
         fuck = true
@@ -100,7 +110,7 @@ export class bym extends plugin {
         candidate +
         `\n你的回复应该尽可能简练，像人类一样随意，不要附加任何奇怪的东西，如聊天记录的格式（比如${Config.assistantLabel}：），禁止重复聊天记录。`
 
-      const rsp = await this.agentServiceBridge.handleEphemeral(e, e.msg, {
+      const rsp = await this.agentServiceBridge.handleEphemeral(e, trigger.prompt, {
         systemInstructions: [system],
         enableGroupContext: true,
         thinkingMode: Config.bymThinkingMode,

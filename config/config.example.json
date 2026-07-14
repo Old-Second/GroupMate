@@ -108,6 +108,7 @@
   "apiStream": false,
   "apiMaxToken": 4096,
   "enableBYM": false,
+  "bymRecognizeLeadingAlias": true,
   "bymRate": 5,
   "bymDisableGroup": [],
   "bymPreset": "",
