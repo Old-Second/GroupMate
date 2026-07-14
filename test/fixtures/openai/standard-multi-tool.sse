@@ -1,0 +1,13 @@
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call-web","type":"function","function":{"name":"website","arguments":"{\"url\":"}}]}}]}
+
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-weather","type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}
+
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"https://fixture.invalid/\"}"}}]}}]}
+
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Wuhan\"}"}}]}}]}
+
+data: {"id":"fixture-standard-tools","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":18,"completion_tokens":9,"total_tokens":27}}
+
+data: [DONE]
