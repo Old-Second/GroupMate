@@ -16,10 +16,12 @@ import {
 } from '../../src/runtime/tools/policy-fetch.js'
 import {
   ToolRuntimeConfigurationError,
-  createExternalPluginEventFacade,
-  createLegacyToolRuntimeBridge,
-  createYunzaiToolRuntimeBridge
+  createLegacyToolRuntimeBridge
 } from '../../src/runtime/tools/legacy-tool-runtime-bridge.js'
+import {
+  createExternalPluginEventFacade,
+  createYunzaiToolRuntimeBridge
+} from '../../src/runtime/tools/yunzai-tool-runtime.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
 const root = process.cwd()
@@ -729,7 +731,7 @@ test('Phase 4 Yunzai bridge never treats quoted message content as current manag
 
 test('Phase 4 production source has one compiled bridge and no legacy execution table', async () => {
   const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-  assert.match(core, /dist\/runtime\/tools\/legacy-tool-runtime-bridge\.js/)
+  assert.match(core, /dist\/runtime\/tools\/yunzai-tool-runtime\.js/)
   for (const marker of [
     'collectTools', 'funcMap', 'fullFuncMap', 'executeLegacyToolCall',
     'shouldFinalizeAfterTool', '.exec.call', 'utils/tools/'
@@ -743,7 +745,10 @@ test('Phase 4 production source has one compiled bridge and no legacy execution 
       ? ['model/core.js']
       : sourcePath === 'apps'
         ? ['apps/chat.js', 'apps/approval.js']
-        : ['src/runtime/tools/legacy-tool-runtime-bridge.ts']
+        : [
+            'src/runtime/tools/legacy-tool-runtime-bridge.ts',
+            'src/runtime/tools/yunzai-tool-runtime.ts'
+          ]
     for (const file of files) {
       const source = await readFile(path.join(root, file), 'utf8')
       assert.equal(source.includes('utils/tools/'), false, `${file} imports a deleted tool implementation`)

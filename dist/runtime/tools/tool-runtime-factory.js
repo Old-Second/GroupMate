@@ -25,6 +25,10 @@ import { createHandleMessageTool } from '../../tools/HandleMessageTool.js';
 import { createJinyanTool } from '../../tools/JinyanTool.js';
 import { createKickOutTool } from '../../tools/KickOutTool.js';
 import { createSetTitleTool } from '../../tools/SetTitleTool.js';
+export function createToolRuntimeRegistry(...definitionGroups) {
+    const definitions = Object.freeze(definitionGroups.flatMap(group => [...group]));
+    return Object.freeze({ definitions, registry: new ToolRegistry(definitions) });
+}
 export function createVisibleToolDefinitions(services) {
     return Object.freeze([
         createDrawTool(services),
@@ -76,5 +80,5 @@ export function createQueryToolRuntime(options) {
         createSearchMusicTool(common),
         createImageCaptionTool({ ...common, apiBaseUrl: options.config.extraUrl })
     ]);
-    return Object.freeze({ definitions, registry: new ToolRegistry(definitions) });
+    return createToolRuntimeRegistry(definitions);
 }

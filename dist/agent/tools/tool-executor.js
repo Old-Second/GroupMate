@@ -1,5 +1,6 @@
 import { ToolUnavailableError } from './tool-registry.js';
 import { ToolInputError, validateToolInputRecord } from './schema-validator.js';
+import { completedPreparedCall, parseSerializablePreparedCapability } from './prepared-capability.js';
 import { parseToolResult, shouldFinalizeToolExecution } from './tool-result.js';
 const idempotencyTtlSeconds = 300;
 function failedResult(errorCode) {
@@ -71,6 +72,19 @@ function idempotencyKey(definition, call, argumentHash, hash) {
     return definition.idempotency === 'semantic'
         ? hash(JSON.stringify({ version: 2, tool: definition.name, runId: call.runId, argumentHash }))
         : hash(JSON.stringify({ version: 1, tool: definition.name, runId: call.runId, callId: call.callId }));
+}
+function sameJson(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+function safeRequestedName(value) {
+    return typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(value)
+        ? value
+        : 'unavailable';
+}
+function safeCallId(value) {
+    return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+        ? value
+        : 'invalid-call';
 }
 export class ToolExecutor {
     #options;
@@ -174,7 +188,6 @@ export class ToolExecutor {
             this.#options.pendingCalls.delete(pendingCallId);
             return completed(definition, failedResult('tool_control_unavailable'));
         }
-        await this.#tryAudit('approval_required', definition, request, { reasonCode: 'approval_required' });
         return Object.freeze({
             kind: 'approval_required',
             toolName: definition.name,
@@ -196,96 +209,221 @@ export class ToolExecutor {
         }
         return completed(definition, failedResult(stored.errorCode));
     }
-    async execute(request) {
-        const requestedName = typeof request.call.requestedName === 'string' ? request.call.requestedName : 'unavailable';
-        if (isAborted(request.signal))
-            return completed(requestedName, failedResult('tool_cancelled'));
+    async #discover(call, context, snapshot) {
+        const requestedName = safeRequestedName(call.requestedName);
+        const callId = safeCallId(call.callId);
         let definition;
         try {
-            definition = request.snapshot.resolveCall(request.call).definition;
+            definition = snapshot.resolveCall(call).definition;
         }
         catch (error) {
-            if (error instanceof ToolUnavailableError) {
-                return completed(requestedName, deniedResult('tool_unavailable', '该工具在当前场景不可用。'));
-            }
-            return completed(requestedName, failedResult('tool_execution_failed'));
+            return completedPreparedCall(callId, requestedName, error instanceof ToolUnavailableError
+                ? deniedResult('tool_unavailable', '该工具在当前场景不可用。')
+                : failedResult('tool_execution_failed'));
         }
-        if (!await this.#tryAudit('requested', definition, request)) {
-            return completed(definition, failedResult('tool_control_unavailable'));
+        const auditRequest = { call, profile: context.profile };
+        if (!await this.#tryAudit('requested', definition, auditRequest)) {
+            return completedPreparedCall(callId, definition.name, failedResult('tool_control_unavailable'));
         }
         let input;
         let target;
-        let refreshedFacts;
         try {
-            const parsed = parseArguments(request.call);
-            input = validateToolInputRecord(definition.inputSchema, parsed);
-            target = definition.resolveTarget(input, request.initialFacts);
-            refreshedFacts = await request.refreshFacts(target, request.signal ?? new AbortController().signal);
+            input = validateToolInputRecord(definition.inputSchema, parseArguments(call));
+            target = definition.resolveTarget(input, context.facts);
         }
         catch (error) {
-            if (isAborted(request.signal))
-                return completed(definition, failedResult('tool_cancelled'));
-            if (error instanceof ToolInputError || error instanceof SyntaxError) {
-                if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'invalid_arguments' })) {
-                    return completed(definition, failedResult('tool_control_unavailable'));
-                }
-                return completed(definition, deniedResult('invalid_arguments', '工具参数无效。'));
+            const invalid = error instanceof ToolInputError || error instanceof SyntaxError;
+            const reasonCode = invalid ? 'invalid_arguments' : 'permission_denied';
+            if (!await this.#tryAudit('denied', definition, auditRequest, { reasonCode })) {
+                return completedPreparedCall(callId, definition.name, failedResult('tool_control_unavailable'));
             }
-            if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'permission_denied' })) {
-                return completed(definition, failedResult('tool_control_unavailable'));
-            }
-            return completed(definition, deniedResult('permission_denied', '当前身份不能执行该操作。'));
+            return completedPreparedCall(callId, definition.name, invalid
+                ? deniedResult('invalid_arguments', '工具参数无效。')
+                : deniedResult('permission_denied', '当前身份不能执行该操作。'));
         }
+        let resourceKeys;
+        try {
+            resourceKeys = definition.resourceKeys(input, context.facts);
+        }
+        catch {
+            resourceKeys = Object.freeze([]);
+        }
+        return Object.freeze({ definition, call, input, target, resourceKeys });
+    }
+    async #finishPreparation(discovered, context) {
+        const { definition, call, input, target, resourceKeys } = discovered;
+        const auditRequest = { call, profile: context.profile };
         let decision;
         try {
             decision = this.#options.policy.decide({
-                profile: request.profile,
+                profile: context.profile,
                 definition,
                 input,
-                facts: refreshedFacts,
+                facts: context.facts,
                 target,
-                intent: request.intent
+                intent: context.intent
             });
         }
         catch {
-            decision = { kind: 'deny', reasonCode: 'permission_denied', userMessage: '当前身份不能执行该操作。' };
+            decision = {
+                kind: 'deny', reasonCode: 'permission_denied',
+                userMessage: '当前身份不能执行该操作。'
+            };
         }
         if (decision.kind === 'deny') {
-            if (!await this.#tryAudit('denied', definition, request, { reasonCode: decision.reasonCode })) {
-                return completed(definition, failedResult('tool_control_unavailable'));
+            if (!await this.#tryAudit('denied', definition, auditRequest, {
+                reasonCode: decision.reasonCode
+            })) {
+                return completedPreparedCall(safeCallId(call.callId), definition.name, failedResult('tool_control_unavailable'));
             }
-            return completed(definition, parseToolResult({
+            return completedPreparedCall(safeCallId(call.callId), definition.name, parseToolResult({
                 status: 'denied', effect: 'none', reasonCode: decision.reasonCode,
                 userMessage: decision.userMessage, retryable: false
             }));
         }
-        if (decision.kind === 'approval_required' && this.#options.approvalMode === 'disabled') {
-            if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'approval_unavailable' })) {
-                return completed(definition, failedResult('tool_control_unavailable'));
-            }
-            return completed(definition, deniedResult('approval_unavailable', '该操作需要人工确认，当前审批流程不可用，未执行操作。'));
+        let capability;
+        try {
+            capability = parseSerializablePreparedCapability({
+                schemaVersion: 1,
+                callId: call.callId,
+                toolName: definition.name,
+                toolVersion: 1,
+                snapshotId: call.snapshotId,
+                canonicalArguments: input,
+                argumentHash: this.#options.hash(JSON.stringify(input)),
+                target,
+                resourceKeys,
+                executionClass: definition.executionClass,
+                retrySafe: definition.retrySafe
+            });
         }
-        const argumentHash = this.#options.hash(JSON.stringify(input));
+        catch {
+            return completedPreparedCall(safeCallId(call.callId), definition.name, failedResult('tool_execution_failed'));
+        }
         if (decision.kind === 'approval_required') {
-            if (request.approvalGrant === undefined) {
-                return this.#approval(definition, input, target, request, argumentHash, decision.summaryCode);
+            if (!await this.#tryAudit('approval_required', definition, auditRequest, {
+                reasonCode: 'approval_required'
+            })) {
+                return completedPreparedCall(capability.callId, definition.name, failedResult('tool_control_unavailable'));
             }
-            if (request.approvalGrant.callId !== request.call.callId || request.approvalGrant.argumentHash !== argumentHash) {
-                if (!await this.#tryAudit('denied', definition, request, { reasonCode: 'approval_invalid' })) {
-                    return completed(definition, failedResult('tool_control_unavailable'));
-                }
-                return completed(definition, deniedResult('approval_invalid', '该审批已失效，请重新发起。'));
-            }
+            return Object.freeze({
+                kind: 'approval_required', capability, summaryCode: decision.summaryCode
+            });
         }
-        const key = idempotencyKey(definition, request.call, argumentHash, this.#options.hash);
+        return Object.freeze({ kind: 'ready', capability });
+    }
+    async prepare(call, context, snapshot) {
+        const discovered = await this.#discover(call, context, snapshot);
+        return 'kind' in discovered
+            ? discovered
+            : await this.#finishPreparation(discovered, context);
+    }
+    async executePrepared(inputPrepared, freshContext, snapshot, signal) {
+        let prepared;
+        try {
+            prepared = parseSerializablePreparedCapability(inputPrepared);
+        }
+        catch {
+            return failedResult('tool_execution_failed');
+        }
+        if (signal.aborted)
+            return failedResult('tool_cancelled');
+        if (prepared.snapshotId !== snapshot.id) {
+            return deniedResult('tool_unavailable', '该工具在当前场景不可用。');
+        }
+        const call = Object.freeze({
+            runId: freshContext.runId,
+            callId: prepared.callId,
+            snapshotId: prepared.snapshotId,
+            requestedName: prepared.toolName,
+            arguments: prepared.canonicalArguments
+        });
+        let definition;
+        try {
+            definition = snapshot.resolveCall(call).definition;
+        }
+        catch {
+            return deniedResult('tool_unavailable', '该工具在当前场景不可用。');
+        }
+        if (definition.version !== prepared.toolVersion ||
+            definition.executionClass !== prepared.executionClass ||
+            definition.retrySafe !== prepared.retrySafe ||
+            this.#options.hash(JSON.stringify(prepared.canonicalArguments)) !== prepared.argumentHash) {
+            return deniedResult('approval_invalid', '该审批已失效，请重新发起。');
+        }
+        let target;
+        let resourceKeys;
+        try {
+            target = definition.resolveTarget(prepared.canonicalArguments, freshContext.facts);
+        }
+        catch {
+            return deniedResult('permission_denied', '当前身份不能执行该操作。');
+        }
+        try {
+            resourceKeys = definition.resourceKeys(prepared.canonicalArguments, freshContext.facts);
+        }
+        catch {
+            resourceKeys = Object.freeze([]);
+        }
+        if (!sameJson(target, prepared.target) || !sameJson(resourceKeys, prepared.resourceKeys)) {
+            return deniedResult('approval_invalid', '该审批已失效，请重新发起。');
+        }
+        let decision;
+        try {
+            decision = this.#options.policy.decide({
+                profile: freshContext.profile,
+                definition,
+                input: prepared.canonicalArguments,
+                facts: freshContext.facts,
+                target,
+                intent: freshContext.intent
+            });
+        }
+        catch {
+            decision = {
+                kind: 'deny', reasonCode: 'permission_denied',
+                userMessage: '当前身份不能执行该操作。'
+            };
+        }
+        const auditRequest = { call, profile: freshContext.profile };
+        if (decision.kind === 'deny') {
+            if (!await this.#tryAudit('denied', definition, auditRequest, {
+                reasonCode: decision.reasonCode
+            }))
+                return failedResult('tool_control_unavailable');
+            return parseToolResult({
+                status: 'denied', effect: 'none', reasonCode: decision.reasonCode,
+                userMessage: decision.userMessage, retryable: false
+            });
+        }
+        if (decision.kind === 'approval_required' && freshContext.approval?.kind !== 'approved') {
+            if (!await this.#tryAudit('denied', definition, auditRequest, {
+                reasonCode: 'approval_invalid'
+            }))
+                return failedResult('tool_control_unavailable');
+            return deniedResult('approval_invalid', '该审批已失效，请重新发起。');
+        }
+        return await this.#dispatch(definition, prepared, freshContext, signal, auditRequest);
+    }
+    async #dispatch(definition, prepared, context, signal, auditRequest) {
+        if (signal.aborted)
+            return failedResult('tool_cancelled');
+        const call = Object.freeze({
+            runId: context.runId,
+            callId: prepared.callId,
+            snapshotId: prepared.snapshotId,
+            requestedName: prepared.toolName,
+            arguments: prepared.canonicalArguments
+        });
+        const key = idempotencyKey(definition, call, prepared.argumentHash, this.#options.hash);
         if (definition.idempotency !== 'none') {
             const record = Object.freeze({
                 schemaVersion: 1,
                 key,
                 toolName: definition.name,
                 toolVersion: 1,
-                runIdHash: this.#options.hash(request.call.runId),
-                callIdHash: this.#options.hash(request.call.callId),
+                runIdHash: this.#options.hash(call.runId),
+                callIdHash: this.#options.hash(call.callId),
                 startedAt: this.#options.now().toISOString()
             });
             let reservation;
@@ -293,13 +431,14 @@ export class ToolExecutor {
                 reservation = await this.#options.idempotencyStore.reserve(record, idempotencyTtlSeconds);
             }
             catch {
-                return completed(definition, failedResult('tool_control_unavailable'));
+                return failedResult('tool_control_unavailable');
             }
-            if (reservation.kind !== 'acquired')
-                return this.#duplicateOutcome(definition, reservation);
+            if (reservation.kind !== 'acquired') {
+                return this.#duplicateOutcome(definition, reservation).result;
+            }
         }
         const startedAt = this.#options.now().getTime();
-        if (!await this.#tryAudit('started', definition, request)) {
+        if (!await this.#tryAudit('started', definition, auditRequest)) {
             if (definition.idempotency !== 'none') {
                 try {
                     await this.#options.idempotencyStore.complete(key, {
@@ -309,23 +448,25 @@ export class ToolExecutor {
                 }
                 catch { }
             }
-            return completed(definition, failedResult('tool_control_unavailable'));
+            return failedResult('tool_control_unavailable');
         }
         const controller = new AbortController();
         const externalAbort = () => controller.abort();
-        request.signal?.addEventListener('abort', externalAbort, { once: true });
+        signal.addEventListener('abort', externalAbort, { once: true });
         const timer = setTimeout(() => controller.abort(), definition.timeoutMs);
-        const handlerPromise = Promise.resolve().then(async () => definition.execute(input, {
-            runId: request.call.runId,
-            callId: request.call.callId,
-            snapshotId: request.call.snapshotId,
-            facts: refreshedFacts,
-            target,
+        const handlerPromise = Promise.resolve().then(async () => definition.execute(prepared.canonicalArguments, {
+            runId: context.runId,
+            callId: prepared.callId,
+            snapshotId: prepared.snapshotId,
+            facts: context.facts,
+            target: prepared.target,
             signal: controller.signal
         }));
         handlerPromise.catch(() => { });
         const abortPromise = new Promise((_resolve, reject) => {
-            controller.signal.addEventListener('abort', () => reject(new DOMException('operation was aborted', 'AbortError')), { once: true });
+            controller.signal.addEventListener('abort', () => {
+                reject(new DOMException('operation was aborted', 'AbortError'));
+            }, { once: true });
         });
         try {
             const rawResult = await Promise.race([handlerPromise, abortPromise]);
@@ -336,27 +477,31 @@ export class ToolExecutor {
             catch (error) {
                 if (definition.effect !== 'read_only')
                     throw error;
-                const code = error instanceof TypeError && /output byte limit|exceeds output byte/.test(error.message)
+                result = failedResult(error instanceof TypeError && /output byte limit|exceeds output byte/.test(error.message)
                     ? 'tool_output_too_large'
-                    : 'tool_invalid_result';
-                result = failedResult(code);
+                    : 'tool_invalid_result');
             }
             if (definition.idempotency !== 'none') {
                 const stored = result.status === 'success'
-                    ? { status: 'success', effect: result.effect, completedAt: this.#options.now().toISOString() }
+                    ? {
+                        status: 'success', effect: result.effect,
+                        completedAt: this.#options.now().toISOString()
+                    }
                     : {
                         status: 'failed', effect: 'none',
-                        errorCode: result.status === 'failed' ? result.errorCode : 'tool_execution_failed',
+                        errorCode: result.status === 'failed'
+                            ? result.errorCode
+                            : 'tool_execution_failed',
                         completedAt: this.#options.now().toISOString()
                     };
                 await this.#options.idempotencyStore.complete(key, stored, idempotencyTtlSeconds);
             }
-            await this.#tryAudit(result.status === 'success' ? 'completed' : 'failed', definition, request, {
+            await this.#tryAudit(result.status === 'success' ? 'completed' : 'failed', definition, auditRequest, {
                 ...(result.status === 'failed' ? { errorCode: result.errorCode } : {}),
                 outputBytes: Buffer.byteLength(JSON.stringify(result), 'utf8'),
                 startedAt
             });
-            return completed(definition, result);
+            return result;
         }
         catch {
             if (definition.effect !== 'read_only') {
@@ -366,21 +511,99 @@ export class ToolExecutor {
                     }
                     catch { }
                 }
-                await this.#tryAudit('indeterminate', definition, request, {
+                await this.#tryAudit('indeterminate', definition, auditRequest, {
                     errorCode: 'tool_outcome_unknown', startedAt
                 });
-                return completed(definition, indeterminateResult());
+                return indeterminateResult();
             }
-            const code = controller.signal.aborted
-                ? (isAborted(request.signal) ? 'tool_cancelled' : 'tool_timeout')
+            const errorCode = controller.signal.aborted
+                ? (signal.aborted ? 'tool_cancelled' : 'tool_timeout')
                 : 'tool_execution_failed';
-            const result = failedResult(code);
-            await this.#tryAudit('failed', definition, request, { errorCode: code, startedAt });
-            return completed(definition, result);
+            const result = failedResult(errorCode);
+            await this.#tryAudit('failed', definition, auditRequest, {
+                errorCode, startedAt
+            });
+            return result;
         }
         finally {
             clearTimeout(timer);
-            request.signal?.removeEventListener('abort', externalAbort);
+            signal.removeEventListener('abort', externalAbort);
         }
+    }
+    async execute(request) {
+        const requestedName = safeRequestedName(request.call.requestedName);
+        if (isAborted(request.signal)) {
+            return completed(requestedName, failedResult('tool_cancelled'));
+        }
+        const signal = request.signal ?? new AbortController().signal;
+        const initialContext = Object.freeze({
+            runId: request.call.runId,
+            profile: request.profile,
+            facts: request.initialFacts,
+            intent: request.intent,
+            now: this.#options.now().toISOString()
+        });
+        const discovered = await this.#discover(request.call, initialContext, request.snapshot);
+        if ('kind' in discovered) {
+            if (discovered.kind !== 'completed') {
+                return completed(requestedName, failedResult('tool_execution_failed'));
+            }
+            return completed(discovered.toolName, discovered.result);
+        }
+        let refreshedFacts;
+        try {
+            refreshedFacts = await request.refreshFacts(discovered.target, signal);
+        }
+        catch {
+            if (signal.aborted) {
+                return completed(discovered.definition, failedResult('tool_cancelled'));
+            }
+            if (!await this.#tryAudit('denied', discovered.definition, request, {
+                reasonCode: 'permission_denied'
+            })) {
+                return completed(discovered.definition, failedResult('tool_control_unavailable'));
+            }
+            return completed(discovered.definition, deniedResult('permission_denied', '当前身份不能执行该操作。'));
+        }
+        const freshContext = Object.freeze({
+            ...initialContext,
+            facts: refreshedFacts,
+            ...(request.approvalGrant === undefined
+                ? {}
+                : {
+                    approval: Object.freeze({
+                        kind: 'approved',
+                        decidedAt: this.#options.now().toISOString()
+                    })
+                })
+        });
+        const prepared = await this.#finishPreparation(discovered, freshContext);
+        if (prepared.kind === 'completed') {
+            return completed(discovered.definition, prepared.result);
+        }
+        if (prepared.kind === 'approval_required') {
+            if (this.#options.approvalMode === 'disabled') {
+                if (!await this.#tryAudit('denied', discovered.definition, request, {
+                    reasonCode: 'approval_unavailable'
+                })) {
+                    return completed(discovered.definition, failedResult('tool_control_unavailable'));
+                }
+                return completed(discovered.definition, deniedResult('approval_unavailable', '该操作需要人工确认，当前审批流程不可用，未执行操作。'));
+            }
+            if (request.approvalGrant === undefined) {
+                return await this.#approval(discovered.definition, discovered.input, discovered.target, request, prepared.capability.argumentHash, prepared.summaryCode);
+            }
+            if (request.approvalGrant.callId !== prepared.capability.callId ||
+                request.approvalGrant.argumentHash !== prepared.capability.argumentHash) {
+                if (!await this.#tryAudit('denied', discovered.definition, request, {
+                    reasonCode: 'approval_invalid'
+                })) {
+                    return completed(discovered.definition, failedResult('tool_control_unavailable'));
+                }
+                return completed(discovered.definition, deniedResult('approval_invalid', '该审批已失效，请重新发起。'));
+            }
+        }
+        const result = await this.executePrepared(prepared.capability, freshContext, request.snapshot, signal);
+        return completed(discovered.definition, result);
     }
 }

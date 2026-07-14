@@ -3,6 +3,9 @@ import type {
   ChannelIdentity,
   ConversationScope
 } from '../contracts/identity.js'
+import type { ApprovalDecision } from '../run/interruption.js'
+import type { IntentEvidence } from '../../runtime/tools/intent-evidence.js'
+import type { ToolPolicyProfile } from './policy-engine.js'
 
 export type ToolTarget =
   | { readonly kind: 'none' }
@@ -30,4 +33,16 @@ export interface AuthorizedToolContext {
   readonly facts: ToolRuntimeFacts
   readonly target: ToolTarget
   readonly signal: AbortSignal
+}
+
+export interface ToolPreparationContext {
+  readonly runId: string
+  readonly profile: ToolPolicyProfile
+  readonly facts: ToolRuntimeFacts
+  readonly intent: IntentEvidence
+  readonly now: string
+}
+
+export interface ToolExecutionContext extends ToolPreparationContext {
+  readonly approval?: ApprovalDecision
 }

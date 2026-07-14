@@ -1,14 +1,10 @@
 import type { ApprovalRecord, ApprovalStore } from '../../agent/tools/approval-store.js'
+import type { RedisToolClient } from './redis-tool-client.js'
 
-export interface RedisToolControlClient {
-  get(key: string): Promise<string | null>
-  getDel(key: string): Promise<string | null>
-  set(key: string, value: string, options: { EX: number; NX?: boolean; XX?: boolean }): Promise<unknown>
-  del(key: string): Promise<number>
-}
+export type RedisToolControlClient = RedisToolClient
 
 export interface RedisApprovalStoreOptions {
-  readonly client: RedisToolControlClient
+  readonly client: RedisToolClient
   readonly botIdHash: string
 }
 
@@ -89,7 +85,7 @@ export function redisApprovalKey (botIdHash: string, tokenHash: string): string 
 }
 
 export class RedisApprovalStore implements ApprovalStore {
-  readonly #client: RedisToolControlClient
+  readonly #client: RedisToolClient
   readonly #botIdHash: string
 
   constructor (options: RedisApprovalStoreOptions) {

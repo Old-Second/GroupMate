@@ -23,7 +23,7 @@ import { createLegacySessionBridge } from '../dist/runtime/legacy-session-bridge
 import {
   createYunzaiToolRuntimeBridge,
   toolResourceFromLegacySegment
-} from '../dist/runtime/tools/legacy-tool-runtime-bridge.js'
+} from '../dist/runtime/tools/yunzai-tool-runtime.js'
 import { shouldFinalizeToolResult } from '../dist/agent/tools/tool-result.js'
 import { withInvalidFormatRecovery } from '../dist/runtime/provider-request-recovery.js'
 

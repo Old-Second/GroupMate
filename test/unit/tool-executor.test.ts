@@ -93,7 +93,7 @@ function harness (options: HarnessOptions = {}) {
     resourceKeys: () => Object.freeze([]),
     resolveTarget: input => {
       assert.equal(Object.isFrozen(input), true)
-      calls.push('schema.validate', 'target.resolve')
+      calls.push('target.resolve')
       return target
     },
     execute: async input => {
@@ -231,9 +231,9 @@ test('executor runs one validated tool call in the fixed order', async () => {
   assert.equal(outcome.kind === 'completed' && outcome.result.status, 'success')
   assert.equal(outcome.kind === 'completed' && outcome.finalize, true)
   assert.deepEqual(fixture.calls, [
-    'snapshot.resolve', 'schema.validate', 'target.resolve', 'facts.refresh',
-    'policy.decide', 'idempotency.reserve', 'audit.started', 'handler.execute',
-    'idempotency.complete', 'audit.completed'
+    'snapshot.resolve', 'target.resolve', 'facts.refresh', 'policy.decide',
+    'snapshot.resolve', 'target.resolve', 'policy.decide', 'idempotency.reserve',
+    'audit.started', 'handler.execute', 'idempotency.complete', 'audit.completed'
   ])
   assert.equal(fixture.handlerCalls(), 1)
   assert.deepEqual(fixture.audits.map(event => event.eventType), ['requested', 'started', 'completed'])

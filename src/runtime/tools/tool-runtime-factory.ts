@@ -73,6 +73,13 @@ export interface QueryToolRuntime {
   readonly registry: ToolRegistry
 }
 
+export function createToolRuntimeRegistry (
+  ...definitionGroups: readonly (readonly ToolDefinition[])[]
+): QueryToolRuntime {
+  const definitions = Object.freeze(definitionGroups.flatMap(group => [...group]))
+  return Object.freeze({ definitions, registry: new ToolRegistry(definitions) })
+}
+
 export function createVisibleToolDefinitions (services: VisibleToolServices): readonly ToolDefinition[] {
   return Object.freeze([
     createDrawTool(services),
@@ -128,5 +135,5 @@ export function createQueryToolRuntime (options: QueryToolRuntimeOptions): Query
     createSearchMusicTool(common),
     createImageCaptionTool({ ...common, apiBaseUrl: options.config.extraUrl })
   ])
-  return Object.freeze({ definitions, registry: new ToolRegistry(definitions) })
+  return createToolRuntimeRegistry(definitions)
 }

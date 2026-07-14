@@ -5,10 +5,10 @@ import type {
   StoredToolOutcome
 } from '../../agent/tools/idempotency-store.js'
 import { parseToolResult } from '../../agent/tools/tool-result.js'
-import type { RedisToolControlClient } from './redis-approval-store.js'
+import type { RedisToolClient } from './redis-tool-client.js'
 
 export interface RedisIdempotencyStoreOptions {
-  readonly client: RedisToolControlClient
+  readonly client: RedisToolClient
   readonly botIdHash: string
 }
 
@@ -93,7 +93,7 @@ function parseState (raw: string): IdempotencyReservation | null {
 }
 
 export class RedisIdempotencyStore implements IdempotencyStore {
-  readonly #client: RedisToolControlClient
+  readonly #client: RedisToolClient
   readonly #botIdHash: string
 
   constructor (options: RedisIdempotencyStoreOptions) {
