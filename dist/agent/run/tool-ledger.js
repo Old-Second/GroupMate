@@ -1,0 +1,170 @@
+import { parseJsonValue } from '../model/json-value.js';
+import { parseToolResult, toolResultForModel } from '../tools/tool-result.js';
+const CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
+const terminalStatuses = new Set([
+    'denied', 'rejected', 'expired', 'succeeded', 'failed', 'cancelled', 'indeterminate'
+]);
+function freezeCall(call) {
+    return Object.freeze({ ...call });
+}
+function freezeLedger(step, calls) {
+    return Object.freeze({
+        schemaVersion: 1,
+        step,
+        calls: Object.freeze(calls.map(freezeCall))
+    });
+}
+function resultStatus(result) {
+    if (result.status === 'success')
+        return 'succeeded';
+    if (result.status === 'denied')
+        return 'denied';
+    if (result.status === 'indeterminate')
+        return 'indeterminate';
+    return result.errorCode === 'tool_cancelled' ? 'cancelled' : 'failed';
+}
+function cancelledResult() {
+    return parseToolResult({
+        status: 'failed', effect: 'none', errorCode: 'tool_cancelled',
+        userMessage: '工具执行已取消。', retryable: false
+    });
+}
+function indeterminateResult() {
+    return parseToolResult({
+        status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
+        userMessage: '操作结果暂时无法确认。', retryable: false
+    });
+}
+export function isTerminalToolLedgerStatus(status) {
+    return terminalStatuses.has(status);
+}
+export function createToolExecutionLedger(step, inputCalls) {
+    if (!Number.isSafeInteger(step) || step < 0 || !Array.isArray(inputCalls) ||
+        inputCalls.length === 0 || inputCalls.length > 64) {
+        throw new TypeError('tool ledger input is invalid');
+    }
+    const calls = [...inputCalls].sort((left, right) => left.index - right.index);
+    const callIds = new Set();
+    const indexes = new Set();
+    const entries = calls.map((call, position) => {
+        if (!Number.isSafeInteger(call.index) || call.index < 0 || call.index !== position ||
+            indexes.has(call.index) || !CALL_ID.test(call.callId) || callIds.has(call.callId) ||
+            !TOOL_NAME.test(call.name)) {
+            throw new TypeError('tool ledger call identity is invalid');
+        }
+        const parsed = parseJsonValue(call.arguments, {
+            maxBytes: 32 * 1_024,
+            maxDepth: 8,
+            maxNodes: 512
+        });
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new TypeError('tool ledger arguments are invalid');
+        }
+        indexes.add(call.index);
+        callIds.add(call.callId);
+        return {
+            occurrenceId: `${step}:${call.index}`,
+            step,
+            index: call.index,
+            callId: call.callId,
+            toolName: call.name,
+            arguments: parsed,
+            status: 'planned',
+            capability: null,
+            result: null
+        };
+    });
+    return freezeLedger(step, entries);
+}
+export function applyToolPreflight(ledger, batch) {
+    if (batch.schemaVersion !== 1 || batch.calls.length !== ledger.calls.length) {
+        throw new TypeError('prepared tool batch does not match the ledger');
+    }
+    const calls = ledger.calls.map((call, index) => {
+        const prepared = batch.calls[index];
+        if (prepared.kind === 'completed') {
+            if (prepared.callId !== call.callId || prepared.toolName !== call.toolName) {
+                throw new TypeError('prepared tool result does not match the ledger');
+            }
+            const result = parseToolResult(prepared.result);
+            return {
+                ...call,
+                status: resultStatus(result),
+                result
+            };
+        }
+        const capability = prepared.capability;
+        if (capability.callId !== call.callId || capability.toolName !== call.toolName) {
+            throw new TypeError('prepared capability does not match the ledger');
+        }
+        return {
+            ...call,
+            status: prepared.kind === 'approval_required' ? 'waiting_approval' : 'ready',
+            capability,
+            result: null
+        };
+    });
+    return freezeLedger(ledger.step, calls);
+}
+export function completeToolExecutionLedger(ledger, scheduled) {
+    if (scheduled.length !== ledger.calls.length) {
+        throw new TypeError('scheduled results do not match the ledger');
+    }
+    const calls = ledger.calls.map((call, index) => {
+        const completed = scheduled[index];
+        if (completed.callId !== call.callId || completed.toolName !== call.toolName) {
+            throw new TypeError('scheduled result identity does not match the ledger');
+        }
+        const result = parseToolResult(completed.result);
+        return {
+            ...call,
+            status: resultStatus(result),
+            result
+        };
+    });
+    return freezeLedger(ledger.step, calls);
+}
+export function failToolExecutionLedger(ledger, inputResult) {
+    const result = parseToolResult(inputResult);
+    const status = resultStatus(result);
+    return freezeLedger(ledger.step, ledger.calls.map(call => (isTerminalToolLedgerStatus(call.status)
+        ? call
+        : { ...call, status, result })));
+}
+export function cancelToolExecutionLedger(ledger, startedCallIds = new Set()) {
+    return freezeLedger(ledger.step, ledger.calls.map(call => {
+        if (isTerminalToolLedgerStatus(call.status))
+            return call;
+        const possibleEffect = startedCallIds.has(call.callId) && call.capability !== null &&
+            call.capability.executionClass !== 'read_only';
+        const result = possibleEffect ? indeterminateResult() : cancelledResult();
+        return {
+            ...call,
+            status: possibleEffect ? 'indeterminate' : 'cancelled',
+            result
+        };
+    }));
+}
+export function toolLedgerIsTerminal(ledger) {
+    return ledger.calls.every(call => isTerminalToolLedgerStatus(call.status));
+}
+export function toolLedgerHasVisibleOutput(ledger) {
+    return ledger.calls.some(call => call.result?.status === 'success' && call.result.effect === 'visible');
+}
+export function toolLedgerHasIndeterminate(ledger) {
+    return ledger.calls.some(call => call.status === 'indeterminate');
+}
+export function toolLedgerModelMessages(ledger) {
+    if (!toolLedgerIsTerminal(ledger))
+        throw new TypeError('tool ledger is not terminal');
+    return Object.freeze(ledger.calls.map(call => {
+        if (call.result === null)
+            throw new TypeError('terminal tool ledger result is missing');
+        return Object.freeze({
+            role: 'tool',
+            content: toolResultForModel(call.result),
+            toolCallId: call.callId
+        });
+    }));
+}
