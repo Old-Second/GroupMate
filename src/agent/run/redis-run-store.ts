@@ -227,11 +227,44 @@ if operation == 'admission_release' then
   return 'ok'
 end
 
+if operation == 'approval_index_create' then
+  if redis.call('EXISTS', KEYS[1]) > 0 then return 'conflict' end
+  local projected = {
+    bytes = current.bytes + string.len(ARGV[2]),
+    checkpoints = current.checkpoints,
+    events = current.events,
+    tombstones = current.tombstones,
+    indexes = current.indexes + 1
+  }
+  if invalid(projected) then return 'reconcile' end
+  if exceeds(projected) then return 'budget' end
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]), 'NX')
+  save(projected)
+  return 'ok'
+end
+
+if operation == 'approval_index_delete' then
+  local value = redis.call('GET', KEYS[1])
+  if value ~= ARGV[2] then return 'conflict' end
+  local projected = {
+    bytes = current.bytes - string.len(value),
+    checkpoints = current.checkpoints,
+    events = current.events,
+    tombstones = current.tombstones,
+    indexes = current.indexes - 1
+  }
+  if invalid(projected) then return 'reconcile' end
+  redis.call('DEL', KEYS[1])
+  save(projected)
+  return 'ok'
+end
+
 return 'invalid_operation'
 `
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const ACTIVE_TTL_SECONDS = 600
+const APPROVAL_WAIT_TTL_SECONDS = 600
 const TOMBSTONE_TTL_SECONDS = 86_400
 const NAMESPACE_SCAN_COUNT = 128
 
@@ -473,6 +506,40 @@ export async function recoverAdmissionClaim (
   requireMutationSuccess(result, 'admission_recover')
 }
 
+export async function createApprovalRunIndex (
+  client: RedisRunClient,
+  key: string,
+  value: string,
+  ttlSeconds: number
+): Promise<boolean> {
+  if (!key.startsWith(`${RUN_STORE_NAMESPACE}approval-index:`) ||
+    Buffer.byteLength(value, 'utf8') > 1_024 ||
+    !Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > 900) {
+    throw new TypeError('approval run index is invalid')
+  }
+  const result = await mutate(client, 'approval_index_create', [key], [
+    value,
+    String(ttlSeconds)
+  ])
+  if (result === 'conflict') return false
+  requireMutationSuccess(result, 'approval_index_create')
+  return true
+}
+
+export async function deleteApprovalRunIndex (
+  client: RedisRunClient,
+  key: string,
+  value: string
+): Promise<void> {
+  if (!key.startsWith(`${RUN_STORE_NAMESPACE}approval-index:`) ||
+    Buffer.byteLength(value, 'utf8') > 1_024) {
+    throw new TypeError('approval run index is invalid')
+  }
+  const result = await mutate(client, 'approval_index_delete', [key], [value])
+  if (result === 'conflict') return
+  requireMutationSuccess(result, 'approval_index_delete')
+}
+
 export class RedisRunStore implements RunStore {
   readonly #client: RedisRunClient
   readonly #codec = new RunCheckpointCodec()
@@ -540,6 +607,9 @@ export class RedisRunStore implements RunStore {
     const keys = redisRunKeys(expected.runId)
     const terminal = isTerminalRunStatus(next.status)
     const tombstone = terminal ? encodeTombstone(createRunTombstone(next)) : ''
+    const activeTtlSeconds = next.status === 'waiting_approval'
+      ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
+      : this.#activeTtlSeconds
     const result = await mutate(this.#client, 'cas', [
       keys.checkpoint, keys.events, keys.tombstone
     ], [
@@ -547,7 +617,7 @@ export class RedisRunStore implements RunStore {
       expectedEncoded.events,
       nextEncoded.checkpoint,
       nextEncoded.events,
-      String(this.#activeTtlSeconds),
+      String(activeTtlSeconds),
       terminal ? '1' : '0',
       tombstone,
       String(TOMBSTONE_TTL_SECONDS)

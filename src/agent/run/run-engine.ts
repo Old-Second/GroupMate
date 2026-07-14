@@ -15,15 +15,28 @@ import type {
   ModelTurn
 } from '../model/model-adapter.js'
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js'
-import type { JsonObject } from '../model/json-value.js'
+import type { JsonObject, JsonValue } from '../model/json-value.js'
 import type { OpenAICompatibleProfile } from '../model/openai-compatible-profile.js'
+import { canonicalSessionKey } from '../session/conversation-scope.js'
 import type { ToolExecutionContext, ToolPreparationContext } from '../tools/tool-context.js'
 import type { ToolCall } from '../tools/tool-call.js'
-import { completedPreparedCall } from '../tools/prepared-capability.js'
-import type { SerializablePreparedCapability } from '../tools/prepared-capability.js'
+import {
+  completedPreparedCall,
+  type PreparedToolCall,
+  type SerializablePreparedCapability
+} from '../tools/prepared-capability.js'
 import type { ToolSnapshot } from '../tools/tool-registry.js'
 import { parseToolResult, type ToolResult } from '../tools/tool-result.js'
-import type { ApprovalActorRole, ApprovalInterruption } from './interruption.js'
+import {
+  decideApprovalInterruption,
+  displayApprovalInterruption,
+  isApprovalActorEligible,
+  parseApprovalInterruption,
+  type ApprovalActorReference,
+  type ApprovalActorRole,
+  type ApprovalDecision,
+  type ApprovalInterruption
+} from './interruption.js'
 import type { RunBudget, RunBudgetCounters } from './run-budget.js'
 import {
   createInitialRunCheckpoint,
@@ -45,6 +58,7 @@ import {
   failRecoveredToolExecutionLedger,
   failToolExecutionLedger,
   resetToolExecutionLedgerForRecovery,
+  resolveToolApproval,
   toolLedgerHasIndeterminate,
   toolLedgerHasUnresolvedNonRead,
   toolLedgerHasVisibleOutput,
@@ -78,6 +92,32 @@ export interface RunRuntimeBinding {
     error: ModelProviderError,
     signal: AbortSignal
   ): Promise<PreparedRunContext | undefined>
+  approvalControlContext?(
+    checkpoint: RunCheckpoint,
+    context: ToolPreparationContext,
+    signal: AbortSignal
+  ): Promise<ApprovalControlContext>
+}
+
+export interface ApprovalControlContext {
+  readonly eligibleApprovers: readonly ApprovalActorReference[]
+}
+
+export interface RunApprovalDisplayCommand {
+  readonly runId: string
+  readonly approvalId: string
+  readonly messageId: string
+  readonly displayedAt: string
+  readonly ttlSeconds: number
+}
+
+export interface RunApprovalDecisionCommand {
+  readonly runId: string
+  readonly approvalId: string
+  readonly kind: ApprovalDecision['kind']
+  readonly decidedAt: string
+  readonly sessionAddress: SessionAddress
+  readonly actor?: ApprovalActorReference
 }
 
 export interface StartRunInput {
@@ -244,6 +284,46 @@ function failedToolResult (message = '工具调用已超过本次任务的资源
   })
 }
 
+function approvalUnavailableResult (): ToolResult {
+  return parseToolResult({
+    status: 'denied',
+    effect: 'none',
+    reasonCode: 'approval_unavailable',
+    userMessage: '当前没有另一名合格审批者，操作未执行。',
+    retryable: false
+  })
+}
+
+function approvalRejectedResult (): ToolResult {
+  return parseToolResult({
+    status: 'denied',
+    effect: 'none',
+    reasonCode: 'approval_invalid',
+    userMessage: '用户已拒绝本次操作，操作未执行。',
+    retryable: false
+  })
+}
+
+function approvalExpiredResult (): ToolResult {
+  return parseToolResult({
+    status: 'denied',
+    effect: 'none',
+    reasonCode: 'approval_invalid',
+    userMessage: '本次操作审批已过期，操作未执行。',
+    retryable: false
+  })
+}
+
+function authorizationChangedResult (): ToolResult {
+  return parseToolResult({
+    status: 'denied',
+    effect: 'none',
+    reasonCode: 'approval_invalid',
+    userMessage: '当前权限、目标或工具配置已变化，操作未执行。',
+    retryable: false
+  })
+}
+
 function completedBatchFromLedger (ledger: ToolExecutionLedger): PreparedToolBatch {
   return Object.freeze({
     schemaVersion: 1,
@@ -264,10 +344,40 @@ function actorRole (context: ToolPreparationContext): ApprovalActorRole {
 function targetLabel (capability: SerializablePreparedCapability): string {
   switch (capability.target.kind) {
     case 'none': return 'current_context'
-    case 'private': return 'private_user'
-    case 'group': return 'group'
-    case 'member': return 'group_member'
-    case 'message': return 'group_message'
+    case 'private': return `private:${capability.target.userId}`
+    case 'group': return `group:${capability.target.groupId}`
+    case 'member': return `member:${capability.target.groupId}:${capability.target.userId}`
+    case 'message': return `message:${capability.target.groupId}:${capability.target.messageId}`
+  }
+}
+
+function boundedKeyParameter (key: string, value: JsonValue): string | null {
+  if (value === null || typeof value === 'object') return null
+  if (typeof value === 'string' && /(?:text|message|content|prompt)/i.test(key)) {
+    return `${key}=<${[...value].length} chars>`
+  }
+  const rendered = `${key}=${String(value)}`
+  return [...rendered].slice(0, 128).join('')
+}
+
+function approvalKeyParameters (
+  capability: SerializablePreparedCapability
+): readonly string[] {
+  return Object.freeze(Object.entries(capability.canonicalArguments)
+    .map(([key, value]) => boundedKeyParameter(key, value))
+    .filter((value): value is string => value !== null)
+    .slice(0, 8))
+}
+
+function sameJson (left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function sameAddress (left: SessionAddress, right: SessionAddress): boolean {
+  try {
+    return canonicalSessionKey(left) === canonicalSessionKey(right)
+  } catch {
+    return false
   }
 }
 
@@ -299,6 +409,259 @@ export class RunEngine {
     this.#now = options.now ?? (() => new Date())
     this.#generateId = options.generateId ?? (() => crypto.randomUUID())
     this.#observer = options.observer
+  }
+
+  async pendingApproval (
+    runId: string,
+    approvalId: string
+  ): Promise<ApprovalInterruption | null> {
+    const checkpoint = await this.#store.load(runId)
+    if (checkpoint?.status !== 'waiting_approval' ||
+      checkpoint.interruption?.approvalId !== approvalId) return null
+    return parseApprovalInterruption(checkpoint.interruption)
+  }
+
+  async displayApproval (
+    input: RunApprovalDisplayCommand
+  ): Promise<ApprovalInterruption | null> {
+    const checkpoint = await this.#store.load(input.runId)
+    if (checkpoint?.status !== 'waiting_approval' ||
+      checkpoint.interruption?.approvalId !== input.approvalId) return null
+    let interruption: ApprovalInterruption
+    try {
+      interruption = displayApprovalInterruption(checkpoint.interruption, {
+        messageId: input.messageId,
+        displayedAt: input.displayedAt,
+        ttlSeconds: input.ttlSeconds
+      })
+    } catch {
+      return null
+    }
+    const next = this.#next(checkpoint, 'waiting_approval', { interruption }, [{
+      type: 'approval.requested',
+      payload: {
+        approvalId: interruption.approvalId,
+        callId: interruption.callId,
+        ttlSeconds: input.ttlSeconds
+      }
+    }])
+    try {
+      const stored = await this.#store.compareAndSet(checkpoint, next)
+      this.#notifyNewEvents(checkpoint, stored)
+      return stored.interruption
+    } catch (error) {
+      if (error instanceof RunStoreConflictError) return null
+      throw error
+    }
+  }
+
+  async decideApproval (
+    input: RunApprovalDecisionCommand,
+    runtime?: RunRuntimeBinding,
+    options: RunControlOptions = {}
+  ): Promise<RunAdvanceResult | null> {
+    if (runtime !== undefined) this.#runtimeBindings.set(input.runId, runtime)
+    const checkpoint = await this.#store.load(input.runId)
+    if (checkpoint === null || checkpoint.status !== 'waiting_approval' ||
+      checkpoint.interruption === null) return null
+    const interruption = checkpoint.interruption
+    if (
+      interruption.approvalId !== input.approvalId ||
+      interruption.approvalMessageId === undefined || interruption.displayedAt === undefined ||
+      interruption.expiresAt === undefined || interruption.decision !== undefined ||
+      checkpoint.preparedBatch === null || !sameAddress(
+        input.sessionAddress,
+        interruption.approvalAddress
+      )) return null
+
+    let decidedAtMs: number
+    try {
+      decidedAtMs = new Date(input.decidedAt).getTime()
+      if (new Date(input.decidedAt).toISOString() !== input.decidedAt) return null
+    } catch {
+      return null
+    }
+    const expiresAtMs = new Date(interruption.expiresAt).getTime()
+    const displayedAtMs = new Date(interruption.displayedAt).getTime()
+    if (decidedAtMs < displayedAtMs ||
+      (input.kind === 'expired' && decidedAtMs < expiresAtMs)) return null
+    const kind: ApprovalDecision['kind'] = decidedAtMs >= expiresAtMs
+      ? 'expired'
+      : input.kind
+    if (kind !== 'expired' && (input.actor === undefined ||
+      !isApprovalActorEligible(interruption, input.actor))) return null
+    const decision: ApprovalDecision = Object.freeze({
+      kind,
+      decidedAt: input.decidedAt,
+      ...(kind === 'expired' ? {} : { actor: input.actor as ApprovalActorReference })
+    })
+    let decided: ApprovalInterruption
+    try {
+      decided = decideApprovalInterruption(interruption, decision)
+    } catch {
+      return null
+    }
+
+    const ledger = checkpoint.toolLedgers.at(-1)
+    const batch = checkpoint.preparedBatch
+    if (ledger === undefined || ledger.step !== checkpoint.step) return null
+    const index = batch.calls.findIndex(call => (
+      call.kind === 'approval_required' && call.capability.callId === interruption.callId
+    ))
+    if (index < 0) return null
+    const pendingCall = batch.calls[index]
+    if (pendingCall.kind !== 'approval_required' ||
+      pendingCall.capability.argumentHash !== interruption.argumentHash ||
+      checkpoint.toolSnapshot.fingerprint !== interruption.toolFingerprint) return null
+
+    const controller = this.#controllers.get(input.runId) ?? new AbortController()
+    this.#controllers.set(input.runId, controller)
+    const detach = this.#linkExternalSignal(options.signal, controller)
+    let preparedBatch = batch
+    let resolvedLedger = ledger
+    let preparationContext: ToolPreparationContext | undefined
+    try {
+      if (kind === 'approved') {
+        let prepared: {
+          readonly capability: SerializablePreparedCapability
+          readonly context: ToolPreparationContext
+        } | null
+        try {
+          prepared = await this.#revalidateApprovedCapability(
+            checkpoint,
+            pendingCall.capability,
+            interruption,
+            decision.actor as ApprovalActorReference,
+            controller.signal
+          )
+        } catch {
+          prepared = null
+        }
+        if (prepared === null) {
+          const result = authorizationChangedResult()
+          preparedBatch = this.#replacePreparedCall(
+            preparedBatch,
+            index,
+            completedPreparedCall(
+              pendingCall.capability.callId,
+              pendingCall.capability.toolName,
+              result
+            )
+          )
+          resolvedLedger = resolveToolApproval(resolvedLedger, interruption.callId, {
+            kind: 'denied', result
+          })
+        } else {
+          preparedBatch = this.#replacePreparedCall(
+            preparedBatch,
+            index,
+            Object.freeze({ kind: 'ready' as const, capability: prepared.capability })
+          )
+          resolvedLedger = resolveToolApproval(resolvedLedger, interruption.callId, {
+            kind: 'approved', capability: prepared.capability
+          })
+          preparationContext = prepared.context
+        }
+      } else {
+        const result = kind === 'rejected'
+          ? approvalRejectedResult()
+          : approvalExpiredResult()
+        preparedBatch = this.#replacePreparedCall(
+          preparedBatch,
+          index,
+          completedPreparedCall(
+            pendingCall.capability.callId,
+            pendingCall.capability.toolName,
+            result
+          )
+        )
+        resolvedLedger = resolveToolApproval(resolvedLedger, interruption.callId, {
+          kind, result
+        })
+      }
+
+      const activated = await this.#activateNextApproval(
+        checkpoint,
+        preparedBatch,
+        resolvedLedger,
+        preparationContext,
+        controller.signal
+      )
+      preparedBatch = activated.batch
+      resolvedLedger = activated.ledger
+      const nextInterruption = activated.interruption
+      const paused = nextInterruption !== null
+      const waitMs = Math.max(0, decidedAtMs - new Date(interruption.createdAt).getTime())
+      const deadlineAt = new Date(
+        new Date(checkpoint.deadlineAt).getTime() + waitMs
+      ).toISOString()
+      const history = Object.freeze([...checkpoint.approvalHistory, decided])
+      const resolutionEvents: EventDraft[] = [
+        {
+          type: kind === 'expired' ? 'approval.expired' : 'approval.decided',
+          payload: {
+            approvalId: interruption.approvalId,
+            callId: interruption.callId,
+            decision: kind
+          }
+        },
+        {
+          type: 'approval.resolved',
+          payload: {
+            approvalId: interruption.approvalId,
+            callId: interruption.callId,
+            decision: kind
+          }
+        }
+      ]
+      if (paused && nextInterruption !== null) {
+        resolutionEvents.push({
+          type: 'approval.required',
+          payload: {
+            approvalId: nextInterruption.approvalId,
+            callId: nextInterruption.callId
+          }
+        }, { type: 'run.paused', payload: { reason: 'approval_required' } })
+      } else {
+        resolutionEvents.push(
+          { type: 'run.resumed', payload: { reason: 'approval_resolved' } },
+          ...this.#toolExecutionEvents(resolvedLedger)
+        )
+      }
+      const next = this.#next(
+        checkpoint,
+        paused ? 'waiting_approval' : 'executing_tools',
+        {
+          toolLedgers: this.#replaceLastLedger(checkpoint, resolvedLedger),
+          preparedBatch,
+          interruption: nextInterruption,
+          approvalHistory: history,
+          deadlineAt
+        },
+        resolutionEvents
+      )
+      let stored: RunCheckpoint
+      try {
+        stored = await this.#store.compareAndSet(checkpoint, next)
+      } catch (error) {
+        if (error instanceof RunStoreConflictError) return null
+        throw error
+      }
+      this.#notifyNewEvents(checkpoint, stored)
+      if (stored.status === 'waiting_approval') return terminalResult(stored)
+      const timer = this.#deadlineTimer(stored, controller)
+      try {
+        return await this.#drive(stored, controller)
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        const latest = await this.#store.load(input.runId).catch(() => null)
+        if (latest === null || isTerminalRunStatus(latest.status)) {
+          this.#cleanupRun(input.runId, controller)
+        }
+      }
+    } finally {
+      detach()
+    }
   }
 
   async start (
@@ -1002,47 +1365,42 @@ export class RunEngine {
       })))
     }
 
-    const preparedLedger = applyToolPreflight(ledger, preflight.batch)
+    let preparedLedger = applyToolPreflight(ledger, preflight.batch)
+    let preparedBatch = preflight.batch
     if (preflight.kind === 'approval_required') {
-      const approval = preflight.batch.calls.find(call => call.kind === 'approval_required')
-      if (approval === undefined || approval.kind !== 'approval_required') {
-        throw new TypeError('approval batch does not contain an approval')
-      }
-      const interruption = this.#approvalInterruption(
+      const activated = await this.#activateNextApproval(
         checkpoint,
-        approval.capability,
-        preparationContext
+        preparedBatch,
+        preparedLedger,
+        preparationContext,
+        signal
       )
-      return await this.#commit(checkpoint, 'waiting_approval', {
-        toolLedgers: this.#replaceLastLedger(checkpoint, preparedLedger),
-        preparedBatch: preflight.batch,
-        budgetCounters: counters,
-        interruption
-      }, [
-        {
-          type: 'approval.required',
-          payload: { approvalId: interruption.approvalId, callId: interruption.callId }
-        },
-        { type: 'run.paused', payload: { reason: 'approval_required' } }
-      ])
+      preparedBatch = activated.batch
+      preparedLedger = activated.ledger
+      if (activated.interruption !== null) {
+        return await this.#commit(checkpoint, 'waiting_approval', {
+          toolLedgers: this.#replaceLastLedger(checkpoint, preparedLedger),
+          preparedBatch,
+          budgetCounters: counters,
+          interruption: activated.interruption
+        }, [
+          {
+            type: 'approval.required',
+            payload: {
+              approvalId: activated.interruption.approvalId,
+              callId: activated.interruption.callId
+            }
+          },
+          { type: 'run.paused', payload: { reason: 'approval_required' } }
+        ])
+      }
     }
 
     return await this.#commit(checkpoint, 'executing_tools', {
       toolLedgers: this.#replaceLastLedger(checkpoint, preparedLedger),
-      preparedBatch: preflight.batch,
+      preparedBatch,
       budgetCounters: counters
-    }, preparedLedger.calls.flatMap(call => {
-      const requested: EventDraft = {
-        type: 'tool.requested',
-        payload: { callId: call.callId, toolName: call.toolName }
-      }
-      return call.capability === null
-        ? [requested]
-        : [requested, {
-            type: 'tool.started' as const,
-            payload: { callId: call.callId, toolName: call.toolName }
-          }]
-    }))
+    }, this.#toolExecutionEvents(preparedLedger))
   }
 
   async #executeTools (
@@ -1062,8 +1420,14 @@ export class RunEngine {
       contextFor: async capability => {
         const context = await runtime.contextFor(capability, checkpoint, signal)
         this.#assertNotAborted(signal)
+        const approved = checkpoint.approvalHistory.find(item => (
+          item.callId === capability.callId && item.step === checkpoint.step &&
+          item.decision?.kind === 'approved'
+        ))
         this.#markToolStarted(checkpoint.runId, capability.callId)
-        return context
+        return approved?.decision === undefined
+          ? context
+          : Object.freeze({ ...context, approval: approved.decision })
       },
       signal
     }), signal)
@@ -1301,18 +1665,176 @@ export class RunEngine {
     })
   }
 
-  #approvalInterruption (
+  async #revalidateApprovedCapability (
     checkpoint: RunCheckpoint,
     capability: SerializablePreparedCapability,
-    context: ToolPreparationContext
-  ): ApprovalInterruption {
+    interruption: ApprovalInterruption,
+    approver: ApprovalActorReference,
+    signal: AbortSignal
+  ): Promise<{
+      readonly capability: SerializablePreparedCapability
+      readonly context: ToolPreparationContext
+    } | null> {
+    const runtime = this.#runtime(checkpoint.runId)
+    this.#assertSnapshot(checkpoint, runtime.snapshot)
+    const context = await this.#raceAbort(
+      runtime.prepareToolContext(checkpoint, signal),
+      signal
+    )
+    const currentRole = actorRole(context)
+    if (context.profile !== interruption.approverPolicy.profile ||
+      context.facts.botId !== checkpoint.sessionAddress.botId ||
+      context.facts.actor.userId !== interruption.requester.userId ||
+      currentRole !== interruption.requester.role ||
+      !sameAddress({
+        botId: context.facts.botId,
+        scope: context.facts.scope
+      }, checkpoint.sessionAddress)) return null
+
+    const currentControl = runtime.approvalControlContext === undefined
+      ? Object.freeze({
+          eligibleApprovers: Object.freeze([interruption.requester])
+        })
+      : await this.#raceAbort(
+        runtime.approvalControlContext(checkpoint, context, signal),
+        signal
+      )
+    if (!Array.isArray(currentControl.eligibleApprovers) ||
+      !currentControl.eligibleApprovers.some(actor => (
+        actor.userId === approver.userId && actor.role === approver.role
+      ))) return null
+
+    const call: ToolCall = Object.freeze({
+      runId: checkpoint.runId,
+      callId: capability.callId,
+      snapshotId: checkpoint.toolSnapshot.id,
+      requestedName: capability.toolName,
+      arguments: capability.canonicalArguments
+    })
+    const preflight = await this.#raceAbort(this.#scheduler.preflight([call], {
+      snapshot: runtime.snapshot,
+      context,
+      remainingToolCalls: 1
+    }), signal)
+    if (preflight.kind === 'failed' || preflight.batch.calls.length !== 1) return null
+    const prepared = preflight.batch.calls[0]
+    if (prepared.kind === 'completed' || !sameJson(prepared.capability, capability)) return null
+    return Object.freeze({ capability: prepared.capability, context })
+  }
+
+  async #activateNextApproval (
+    checkpoint: RunCheckpoint,
+    inputBatch: PreparedToolBatch,
+    inputLedger: ToolExecutionLedger,
+    inputContext: ToolPreparationContext | undefined,
+    signal: AbortSignal
+  ): Promise<{
+      readonly batch: PreparedToolBatch
+      readonly ledger: ToolExecutionLedger
+      readonly interruption: ApprovalInterruption | null
+    }> {
+    let batch = inputBatch
+    let ledger = inputLedger
+    let context = inputContext
+    while (true) {
+      const index = batch.calls.findIndex(call => call.kind === 'approval_required')
+      if (index < 0) return Object.freeze({ batch, ledger, interruption: null })
+      const call = batch.calls[index]
+      if (call.kind !== 'approval_required') {
+        throw new TypeError('approval batch call is invalid')
+      }
+      if (context === undefined) {
+        const runtime = this.#runtime(checkpoint.runId)
+        this.#assertSnapshot(checkpoint, runtime.snapshot)
+        context = await this.#raceAbort(
+          runtime.prepareToolContext(checkpoint, signal),
+          signal
+        )
+      }
+      const interruption = await this.#approvalInterruption(
+        checkpoint,
+        call.capability,
+        context,
+        signal
+      )
+      if (interruption !== null) {
+        return Object.freeze({ batch, ledger, interruption })
+      }
+      const result = approvalUnavailableResult()
+      batch = this.#replacePreparedCall(batch, index, completedPreparedCall(
+        call.capability.callId,
+        call.capability.toolName,
+        result
+      ))
+      ledger = resolveToolApproval(ledger, call.capability.callId, {
+        kind: 'denied', result
+      })
+    }
+  }
+
+  async #approvalInterruption (
+    checkpoint: RunCheckpoint,
+    capability: SerializablePreparedCapability,
+    context: ToolPreparationContext,
+    signal: AbortSignal
+  ): Promise<ApprovalInterruption | null> {
     const createdAt = this.#timestamp()
     const role = actorRole(context)
     const profile = context.profile
-    const allowedRoles: readonly ApprovalActorRole[] = profile === 'strict'
-      ? Object.freeze(['bot_master'])
-      : Object.freeze(['bot_master', 'group_owner', 'group_admin'])
-    return Object.freeze({
+    const allowedRoles: readonly ApprovalActorRole[] = Object.freeze([
+      'bot_master', 'group_owner', 'group_admin'
+    ])
+    const requester: ApprovalActorReference = Object.freeze({
+      userId: context.facts.actor.userId,
+      role
+    })
+    const runtime = this.#runtime(checkpoint.runId)
+    const control = runtime.approvalControlContext === undefined
+      ? Object.freeze({ eligibleApprovers: Object.freeze([requester]) })
+      : await this.#raceAbort(
+        runtime.approvalControlContext(checkpoint, context, signal),
+        signal
+      )
+    if (!Array.isArray(control.eligibleApprovers) ||
+      control.eligibleApprovers.length > 32) {
+      throw new TypeError('approval control context is invalid')
+    }
+    const seen = new Set<string>()
+    let eligible = control.eligibleApprovers.map(actor => {
+      if (typeof actor.userId !== 'string' || actor.userId.length === 0 ||
+        actor.userId.length > 128 ||
+        !['bot_master', 'group_owner', 'group_admin', 'member'].includes(actor.role)) {
+        throw new TypeError('approval control actor is invalid')
+      }
+      return Object.freeze({ userId: actor.userId, role: actor.role })
+    }).filter(actor => {
+      if (!allowedRoles.includes(actor.role) || seen.has(actor.userId)) return false
+      seen.add(actor.userId)
+      return profile !== 'strict' || actor.userId !== requester.userId
+    })
+    if (eligible.length === 0) return null
+
+    let approvalAddress: SessionAddress
+    if (checkpoint.sessionAddress.scope.kind === 'private') {
+      const selected = eligible.find(actor => (
+        actor.userId === requester.userId && profile !== 'strict'
+      )) ?? eligible.find(actor => actor.role === 'bot_master')
+      if (selected === undefined) return null
+      eligible = [selected]
+      approvalAddress = Object.freeze({
+        botId: checkpoint.sessionAddress.botId,
+        scope: Object.freeze({ kind: 'private', userId: selected.userId })
+      })
+    } else {
+      approvalAddress = Object.freeze({
+        botId: checkpoint.sessionAddress.botId,
+        scope: Object.freeze({
+          kind: 'group',
+          groupId: checkpoint.sessionAddress.scope.groupId
+        })
+      })
+    }
+    return parseApprovalInterruption({
       schemaVersion: 1,
       approvalId: this.#generateId(),
       runId: checkpoint.runId,
@@ -1322,17 +1844,64 @@ export class RunEngine {
       argumentHash: capability.argumentHash,
       action: capability.toolName,
       target: targetLabel(capability),
-      keyParameters: Object.freeze([]),
-      requester: Object.freeze({
-        userId: context.facts.actor.userId,
-        role
-      }),
+      keyParameters: approvalKeyParameters(capability),
+      requester,
       approverPolicy: Object.freeze({
         profile,
         allowedRoles,
-        requireDifferentActor: false
+        eligibleActorIds: Object.freeze(eligible.map(actor => actor.userId)),
+        requireDifferentActor: profile === 'strict'
       }),
+      approvalAddress,
       createdAt
+    })
+  }
+
+  #replacePreparedCall (
+    batch: PreparedToolBatch,
+    index: number,
+    replacement: PreparedToolCall
+  ): PreparedToolBatch {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= batch.calls.length) {
+      throw new TypeError('prepared tool call index is invalid')
+    }
+    return Object.freeze({
+      schemaVersion: 1,
+      calls: Object.freeze(batch.calls.map((call, position) => (
+        position === index ? replacement : call
+      )))
+    })
+  }
+
+  #toolExecutionEvents (ledger: ToolExecutionLedger): readonly EventDraft[] {
+    return ledger.calls.flatMap(call => {
+      const requested: EventDraft = {
+        type: 'tool.requested',
+        payload: { callId: call.callId, toolName: call.toolName }
+      }
+      if (call.status === 'ready') {
+        return [requested, {
+          type: 'tool.started' as const,
+          payload: { callId: call.callId, toolName: call.toolName }
+        }]
+      }
+      if (call.status === 'succeeded') {
+        return [requested, {
+          type: 'tool.completed' as const,
+          payload: { callId: call.callId, toolName: call.toolName, status: call.status }
+        }]
+      }
+      if (call.status === 'denied' || call.status === 'rejected' ||
+        call.status === 'expired') {
+        return [requested, {
+          type: 'tool.denied' as const,
+          payload: { callId: call.callId, toolName: call.toolName, status: call.status }
+        }]
+      }
+      return [requested, {
+        type: 'tool.failed' as const,
+        payload: { callId: call.callId, toolName: call.toolName, status: call.status }
+      }]
     })
   }
 

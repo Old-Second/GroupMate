@@ -5,7 +5,10 @@ function record (records, value) {
 }
 
 export function createLegacyYunzaiFake ({
-  isGroup = true
+  isGroup = true,
+  message = 'fixture message',
+  sourceMessageId = null,
+  senderRole = 'owner'
 } = {}) {
   const calls = {
     replies: [],
@@ -44,9 +47,16 @@ export function createLegacyYunzaiFake ({
   }
   const event = {
     event_id: 'fixture-event',
+    message_id: 'fixture-message',
     group_id: 'fixture-group',
     isGroup,
-    sender: { user_id: 'fixture-user' },
+    message,
+    raw_message: message,
+    msg: message,
+    source: sourceMessageId === null
+      ? undefined
+      : { message_id: sourceMessageId, seq: sourceMessageId },
+    sender: { user_id: 'fixture-user', role: senderRole },
     group: isGroup ? group : undefined,
     friend,
     runtime: { handler },

@@ -183,12 +183,62 @@ export function completeToolExecutionLedger (
       throw new TypeError('scheduled result identity does not match the ledger')
     }
     const result = parseToolResult(completed.result)
+    if ((call.status === 'rejected' || call.status === 'expired') &&
+      call.result !== null && JSON.stringify(call.result) === JSON.stringify(result)) {
+      return call
+    }
     return {
       ...call,
       status: resultStatus(result),
       result
     }
   })
+  return freezeLedger(ledger.step, calls)
+}
+
+export function resolveToolApproval (
+  ledger: ToolExecutionLedger,
+  callId: string,
+  resolution:
+    | {
+        readonly kind: 'approved'
+        readonly capability: SerializablePreparedCapability
+      }
+    | {
+        readonly kind: 'denied' | 'rejected' | 'expired'
+        readonly result: ToolResult
+      }
+): ToolExecutionLedger {
+  let matched = false
+  const calls = ledger.calls.map(call => {
+    if (call.callId !== callId) return call
+    if (matched || call.status !== 'waiting_approval' || call.capability === null) {
+      throw new TypeError('tool approval ledger state is invalid')
+    }
+    matched = true
+    if (resolution.kind === 'approved') {
+      if (resolution.capability.callId !== call.callId ||
+        resolution.capability.toolName !== call.toolName) {
+        throw new TypeError('approved capability does not match the ledger')
+      }
+      return {
+        ...call,
+        status: 'ready' as const,
+        capability: resolution.capability,
+        result: null
+      }
+    }
+    const result = parseToolResult(resolution.result)
+    if (result.status === 'success' || result.status === 'indeterminate') {
+      throw new TypeError('approval terminal result is invalid')
+    }
+    return {
+      ...call,
+      status: resolution.kind,
+      result
+    }
+  })
+  if (!matched) throw new TypeError('tool approval ledger call is missing')
   return freezeLedger(ledger.step, calls)
 }
 

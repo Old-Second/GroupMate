@@ -232,6 +232,36 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       return 'ok'
     }
 
+    if (operation === 'approval_index_create') {
+      const indexKey = options.keys[0]
+      if (indexKey === undefined || this.entries.has(indexKey)) return 'conflict'
+      const projected = {
+        ...usage,
+        bytes: usage.bytes + this.bytes(args[1]),
+        indexes: usage.indexes + 1
+      }
+      if (this.invalidRunUsage(projected)) return 'reconcile'
+      if (this.exceedsRunLimits(projected)) return 'budget'
+      this.setDirect(indexKey, args[1], Number(args[2]))
+      this.saveRunNamespaceUsage(metadataKey, projected)
+      return 'ok'
+    }
+
+    if (operation === 'approval_index_delete') {
+      const indexKey = options.keys[0]
+      const value = this.entryValue(indexKey)
+      if (indexKey === undefined || value !== args[1]) return 'conflict'
+      const projected = {
+        ...usage,
+        bytes: usage.bytes - this.bytes(value),
+        indexes: usage.indexes - 1
+      }
+      if (this.invalidRunUsage(projected)) return 'reconcile'
+      this.entries.delete(indexKey)
+      this.saveRunNamespaceUsage(metadataKey, projected)
+      return 'ok'
+    }
+
     return 'invalid_operation'
   }
 

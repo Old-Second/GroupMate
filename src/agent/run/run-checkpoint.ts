@@ -57,6 +57,7 @@ export interface RunCheckpoint {
   readonly toolLedgers: readonly ToolExecutionLedger[]
   readonly preparedBatch: PreparedToolBatch | null
   readonly interruption: ApprovalInterruption | null
+  readonly approvalHistory: readonly ApprovalInterruption[]
   readonly budgetLimits: RunBudgetLimits
   readonly budgetCounters: RunBudgetCounters
   readonly recoveryUsed: boolean
@@ -95,6 +96,7 @@ export type RunCheckpointChanges = Partial<Pick<RunCheckpoint,
   | 'toolLedgers'
   | 'preparedBatch'
   | 'interruption'
+  | 'approvalHistory'
   | 'budgetCounters'
   | 'recoveryUsed'
   | 'forceCorrection'
@@ -102,6 +104,7 @@ export type RunCheckpointChanges = Partial<Pick<RunCheckpoint,
   | 'visibleOutput'
   | 'error'
   | 'cancellationReason'
+  | 'deadlineAt'
 >>
 
 const CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
@@ -159,7 +162,7 @@ const CHECKPOINT_KEYS = Object.freeze([
   'schemaVersion', 'kernelVersion', 'profileId', 'profileVersion', 'runId',
   'sessionId', 'sessionAddress', 'revision', 'status', 'step', 'model',
   'messages', 'estimatedInputTokens', 'modelTurn', 'toolSnapshot',
-  'toolLedgers', 'preparedBatch', 'interruption', 'budgetLimits',
+  'toolLedgers', 'preparedBatch', 'interruption', 'approvalHistory', 'budgetLimits',
   'budgetCounters', 'recoveryUsed', 'forceCorrection', 'output',
   'visibleOutput', 'error', 'cancellationReason', 'events',
   'nextEventSequence', 'deadlineAt', 'createdAt', 'updatedAt'
@@ -504,9 +507,27 @@ export function parseRunCheckpoint (value: unknown): RunCheckpoint {
   validatePreparedBatch(parsed.preparedBatch, parsed.toolSnapshot.id)
   if (parsed.interruption !== null) {
     const interruption = parseApprovalInterruption(parsed.interruption)
-    if (interruption.runId !== parsed.runId || interruption.step !== parsed.step) {
+    if (interruption.runId !== parsed.runId || interruption.step !== parsed.step ||
+      interruption.approvalAddress.botId !== parsed.sessionAddress.botId ||
+      interruption.decision !== undefined) {
       throw new TypeError('run interruption identity is invalid')
     }
+  }
+  if (!Array.isArray(parsed.approvalHistory) || parsed.approvalHistory.length > 8) {
+    throw new TypeError('run approval history is invalid')
+  }
+  const approvalIds = new Set<string>()
+  for (const rawInterruption of parsed.approvalHistory) {
+    const interruption = parseApprovalInterruption(rawInterruption)
+    if (interruption.runId !== parsed.runId || interruption.step > parsed.step ||
+      interruption.approvalAddress.botId !== parsed.sessionAddress.botId ||
+      interruption.decision === undefined || approvalIds.has(interruption.approvalId)) {
+      throw new TypeError('run approval history is invalid')
+    }
+    approvalIds.add(interruption.approvalId)
+  }
+  if (parsed.interruption !== null && approvalIds.has(parsed.interruption.approvalId)) {
+    throw new TypeError('active run approval is already in history')
   }
   validateBudgets(parsed.budgetLimits, parsed.budgetCounters)
   if (typeof parsed.recoveryUsed !== 'boolean' || typeof parsed.forceCorrection !== 'boolean' ||
@@ -536,6 +557,10 @@ export function parseRunCheckpoint (value: unknown): RunCheckpoint {
   }
   if (parsed.status === 'cancelled' && parsed.cancellationReason === null) {
     throw new TypeError('cancelled run checkpoint is invalid')
+  }
+  if ((parsed.status === 'waiting_approval') !== (parsed.interruption !== null) ||
+    (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
+    throw new TypeError('run approval checkpoint state is invalid')
   }
   return parsed
 }
@@ -590,6 +615,7 @@ export function createInitialRunCheckpoint (
     toolLedgers: Object.freeze([]),
     preparedBatch: null,
     interruption: null,
+    approvalHistory: Object.freeze([]),
     budgetLimits: input.budgetLimits,
     budgetCounters: input.budgetCounters,
     recoveryUsed: false,

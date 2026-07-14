@@ -1,3 +1,9 @@
+import type { SessionAddress } from '../contracts/identity.js'
+import {
+  canonicalSessionKey,
+  parseCanonicalSessionKey
+} from '../session/conversation-scope.js'
+
 export type ApprovalActorRole = 'bot_master' | 'group_owner' | 'group_admin' | 'member'
 
 export interface ApprovalActorReference {
@@ -8,6 +14,7 @@ export interface ApprovalActorReference {
 export interface ApproverPolicy {
   readonly profile: 'compatible' | 'safe' | 'strict'
   readonly allowedRoles: readonly ApprovalActorRole[]
+  readonly eligibleActorIds: readonly string[]
   readonly requireDifferentActor: boolean
 }
 
@@ -30,11 +37,18 @@ export interface ApprovalInterruption {
   readonly keyParameters: readonly string[]
   readonly requester: ApprovalActorReference
   readonly approverPolicy: ApproverPolicy
+  readonly approvalAddress: SessionAddress
   readonly approvalMessageId?: string
   readonly createdAt: string
   readonly displayedAt?: string
   readonly expiresAt?: string
   readonly decision?: ApprovalDecision
+}
+
+export interface ApprovalDisplayMetadata {
+  readonly messageId: string
+  readonly displayedAt: string
+  readonly ttlSeconds: number
 }
 
 const actorRoles: readonly ApprovalActorRole[] = [
@@ -60,7 +74,8 @@ function assertOnlyKeys (value: Record<string, unknown>, keys: readonly string[]
 }
 
 function readString (value: unknown, label: string, maxLength = 256): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength ||
+    /[\u0000-\u001f\u007f]/.test(value)) {
     throw new TypeError(`${label} is invalid`)
   }
   return value
@@ -86,7 +101,9 @@ function parseActor (value: unknown): ApprovalActorReference {
 
 function parsePolicy (value: unknown): ApproverPolicy {
   const policy = asRecord(value, 'approver policy')
-  assertOnlyKeys(policy, ['profile', 'allowedRoles', 'requireDifferentActor'], 'approver policy')
+  assertOnlyKeys(policy, [
+    'profile', 'allowedRoles', 'eligibleActorIds', 'requireDifferentActor'
+  ], 'approver policy')
   if (!policyProfiles.includes(policy.profile as ApproverPolicy['profile'])) {
     throw new TypeError('approver policy profile is invalid')
   }
@@ -94,7 +111,7 @@ function parsePolicy (value: unknown): ApproverPolicy {
     throw new TypeError('approver policy roles are invalid')
   }
   const allowedRoles = policy.allowedRoles.map(role => {
-    if (!actorRoles.includes(role as ApprovalActorRole)) {
+    if (!actorRoles.includes(role as ApprovalActorRole) || role === 'member') {
       throw new TypeError('approver policy role is invalid')
     }
     return role as ApprovalActorRole
@@ -102,13 +119,45 @@ function parsePolicy (value: unknown): ApproverPolicy {
   if (new Set(allowedRoles).size !== allowedRoles.length) {
     throw new TypeError('approver policy roles contain duplicates')
   }
+  if (!Array.isArray(policy.eligibleActorIds) || policy.eligibleActorIds.length === 0 ||
+    policy.eligibleActorIds.length > 32) {
+    throw new TypeError('approver policy eligible actors are invalid')
+  }
+  const eligibleActorIds = policy.eligibleActorIds.map((actorId, index) => (
+    readString(actorId, `approver policy eligible actor ${index}`, 128)
+  ))
+  if (new Set(eligibleActorIds).size !== eligibleActorIds.length) {
+    throw new TypeError('approver policy eligible actors contain duplicates')
+  }
   if (typeof policy.requireDifferentActor !== 'boolean') {
     throw new TypeError('approver policy actor requirement is invalid')
+  }
+  if ((policy.profile === 'strict') !== policy.requireDifferentActor) {
+    throw new TypeError('approver policy separation requirement is invalid')
   }
   return Object.freeze({
     profile: policy.profile as ApproverPolicy['profile'],
     allowedRoles: Object.freeze(allowedRoles),
+    eligibleActorIds: Object.freeze(eligibleActorIds),
     requireDifferentActor: policy.requireDifferentActor
+  })
+}
+
+function parseAddress (value: unknown): SessionAddress {
+  const address = asRecord(value, 'approval address') as unknown as SessionAddress
+  let canonical: string
+  try {
+    canonical = canonicalSessionKey(address)
+  } catch (error) {
+    throw new TypeError('approval address is invalid', { cause: error })
+  }
+  const parsed = parseCanonicalSessionKey(canonical)
+  if (parsed === null || canonicalSessionKey(parsed) !== canonical) {
+    throw new TypeError('approval address is invalid')
+  }
+  return Object.freeze({
+    botId: parsed.botId,
+    scope: Object.freeze({ ...parsed.scope })
   })
 }
 
@@ -118,11 +167,43 @@ function parseDecision (value: unknown): ApprovalDecision {
   if (!['approved', 'rejected', 'expired'].includes(String(decision.kind))) {
     throw new TypeError('approval decision kind is invalid')
   }
+  const kind = decision.kind as ApprovalDecision['kind']
+  if (kind === 'expired' && decision.actor !== undefined) {
+    throw new TypeError('expired approval decision actor is invalid')
+  }
+  if (kind !== 'expired' && decision.actor === undefined) {
+    throw new TypeError('approval decision actor is missing')
+  }
   return Object.freeze({
-    kind: decision.kind as ApprovalDecision['kind'],
+    kind,
     decidedAt: readTimestamp(decision.decidedAt, 'approval decision timestamp'),
     ...(decision.actor === undefined ? {} : { actor: parseActor(decision.actor) })
   })
+}
+
+export function parseApprovalReplyText (value: unknown): ApprovalDecision['kind'] | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.normalize('NFC').trim()
+  if (normalized === '确认') return 'approved'
+  if (normalized === '拒绝') return 'rejected'
+  return null
+}
+
+export function isApprovalActorEligible (
+  interruption: ApprovalInterruption,
+  actor: ApprovalActorReference
+): boolean {
+  return isActorEligible(interruption.approverPolicy, interruption.requester, actor)
+}
+
+function isActorEligible (
+  policy: ApproverPolicy,
+  requester: ApprovalActorReference,
+  actor: ApprovalActorReference
+): boolean {
+  return policy.allowedRoles.includes(actor.role) &&
+    policy.eligibleActorIds.includes(actor.userId) &&
+    (!policy.requireDifferentActor || actor.userId !== requester.userId)
 }
 
 export function parseApprovalInterruption (value: unknown): ApprovalInterruption {
@@ -130,8 +211,8 @@ export function parseApprovalInterruption (value: unknown): ApprovalInterruption
   assertOnlyKeys(input, [
     'schemaVersion', 'approvalId', 'runId', 'step', 'callId', 'toolFingerprint',
     'argumentHash', 'action', 'target', 'keyParameters', 'requester',
-    'approverPolicy', 'approvalMessageId', 'createdAt', 'displayedAt', 'expiresAt',
-    'decision'
+    'approverPolicy', 'approvalAddress', 'approvalMessageId', 'createdAt',
+    'displayedAt', 'expiresAt', 'decision'
   ], 'approval interruption')
   if (input.schemaVersion !== 1) throw new TypeError('approval interruption version is invalid')
   if (!Number.isSafeInteger(input.step) || Number(input.step) < 0) {
@@ -143,6 +224,53 @@ export function parseApprovalInterruption (value: unknown): ApprovalInterruption
   const keyParameters = input.keyParameters.map((parameter, index) => (
     readString(parameter, `approval interruption parameter ${index}`, 256)
   ))
+  const requester = parseActor(input.requester)
+  const approverPolicy = parsePolicy(input.approverPolicy)
+  const createdAt = readTimestamp(input.createdAt, 'approval creation timestamp')
+  const hasDisplay = input.approvalMessageId !== undefined || input.displayedAt !== undefined ||
+    input.expiresAt !== undefined
+  if (hasDisplay && (input.approvalMessageId === undefined || input.displayedAt === undefined ||
+    input.expiresAt === undefined)) {
+    throw new TypeError('approval display metadata is incomplete')
+  }
+  const displayedAt = input.displayedAt === undefined
+    ? undefined
+    : readTimestamp(input.displayedAt, 'approval display timestamp')
+  const expiresAt = input.expiresAt === undefined
+    ? undefined
+    : readTimestamp(input.expiresAt, 'approval expiration timestamp')
+  if (displayedAt !== undefined && expiresAt !== undefined) {
+    const createdMs = new Date(createdAt).getTime()
+    const displayedMs = new Date(displayedAt).getTime()
+    const expiresMs = new Date(expiresAt).getTime()
+    const ttlMs = expiresMs - displayedMs
+    if (displayedMs < createdMs || ttlMs < 30_000 || ttlMs > 300_000) {
+      throw new TypeError('approval display timing is invalid')
+    }
+  }
+  const decision = input.decision === undefined ? undefined : parseDecision(input.decision)
+  if (decision !== undefined) {
+    if (displayedAt === undefined || expiresAt === undefined) {
+      throw new TypeError('approval decision display metadata is missing')
+    }
+    const decidedMs = new Date(decision.decidedAt).getTime()
+    const displayedMs = new Date(displayedAt).getTime()
+    const expiresMs = new Date(expiresAt).getTime()
+    if (decidedMs < displayedMs ||
+      (decision.kind === 'expired' ? decidedMs < expiresMs : decidedMs >= expiresMs) ||
+      (decision.actor !== undefined && !isActorEligible(
+        approverPolicy,
+        requester,
+        decision.actor
+      ))) {
+      throw new TypeError('approval decision is invalid')
+    }
+  }
+  const approvalAddress = parseAddress(input.approvalAddress)
+  if (approvalAddress.scope.kind === 'private' &&
+    !approverPolicy.eligibleActorIds.includes(approvalAddress.scope.userId)) {
+    throw new TypeError('approval private address is not eligible')
+  }
   return Object.freeze({
     schemaVersion: 1,
     approvalId: readString(input.approvalId, 'approval ID', 128),
@@ -154,18 +282,45 @@ export function parseApprovalInterruption (value: unknown): ApprovalInterruption
     action: readString(input.action, 'approval action'),
     target: readString(input.target, 'approval target'),
     keyParameters: Object.freeze(keyParameters),
-    requester: parseActor(input.requester),
-    approverPolicy: parsePolicy(input.approverPolicy),
+    requester,
+    approverPolicy,
+    approvalAddress,
     ...(input.approvalMessageId === undefined
       ? {}
       : { approvalMessageId: readString(input.approvalMessageId, 'approval message ID', 128) }),
-    createdAt: readTimestamp(input.createdAt, 'approval creation timestamp'),
-    ...(input.displayedAt === undefined
-      ? {}
-      : { displayedAt: readTimestamp(input.displayedAt, 'approval display timestamp') }),
-    ...(input.expiresAt === undefined
-      ? {}
-      : { expiresAt: readTimestamp(input.expiresAt, 'approval expiration timestamp') }),
-    ...(input.decision === undefined ? {} : { decision: parseDecision(input.decision) })
+    createdAt,
+    ...(displayedAt === undefined ? {} : { displayedAt }),
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+    ...(decision === undefined ? {} : { decision })
   })
+}
+
+export function displayApprovalInterruption (
+  interruption: ApprovalInterruption,
+  metadata: ApprovalDisplayMetadata
+): ApprovalInterruption {
+  const current = parseApprovalInterruption(interruption)
+  if (current.approvalMessageId !== undefined || current.decision !== undefined ||
+    !Number.isSafeInteger(metadata.ttlSeconds) || metadata.ttlSeconds < 30 ||
+    metadata.ttlSeconds > 300) {
+    throw new TypeError('approval cannot be displayed')
+  }
+  const displayedAt = readTimestamp(metadata.displayedAt, 'approval display timestamp')
+  return parseApprovalInterruption({
+    ...current,
+    approvalMessageId: readString(metadata.messageId, 'approval message ID', 128),
+    displayedAt,
+    expiresAt: new Date(
+      new Date(displayedAt).getTime() + metadata.ttlSeconds * 1_000
+    ).toISOString()
+  })
+}
+
+export function decideApprovalInterruption (
+  interruption: ApprovalInterruption,
+  decision: ApprovalDecision
+): ApprovalInterruption {
+  const current = parseApprovalInterruption(interruption)
+  if (current.decision !== undefined) throw new TypeError('approval is already decided')
+  return parseApprovalInterruption({ ...current, decision })
 }

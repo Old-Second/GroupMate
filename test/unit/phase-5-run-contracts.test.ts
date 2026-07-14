@@ -43,7 +43,12 @@ const interruption = {
   approverPolicy: {
     profile: 'safe',
     allowedRoles: ['bot_master', 'group_owner'],
+    eligibleActorIds: ['actor-1'],
     requireDifferentActor: false
+  },
+  approvalAddress: {
+    botId: 'bot-1',
+    scope: { kind: 'group', groupId: 'group-1' }
   },
   createdAt: timestamp
 } as const

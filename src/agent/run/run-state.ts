@@ -32,7 +32,13 @@ const allowedTransitions: Readonly<Record<RunStatus, ReadonlySet<RunStatus>>> = 
     'failed',
     'cancelled'
   ]),
-  waiting_approval: new Set<RunStatus>(['evaluating_tools', 'failed', 'cancelled']),
+  waiting_approval: new Set<RunStatus>([
+    'waiting_approval',
+    'evaluating_tools',
+    'executing_tools',
+    'failed',
+    'cancelled'
+  ]),
   executing_tools: new Set<RunStatus>(['calling_model', 'failed', 'cancelled']),
   correcting: new Set<RunStatus>(['completed', 'failed', 'cancelled']),
   completed: new Set<RunStatus>(),
