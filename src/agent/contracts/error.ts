@@ -4,8 +4,48 @@ export type AgentErrorCode =
   | 'storage_unavailable'
   | 'storage_invalid_data'
   | 'context_budget_exceeded'
+  | 'provider_authentication'
+  | 'provider_invalid_request'
+  | 'provider_rate_limited'
+  | 'provider_unavailable'
+  | 'provider_timeout'
+  | 'provider_protocol_error'
+  | 'run_budget_exceeded'
+  | 'checkpoint_conflict'
+  | 'checkpoint_invalid'
+  | 'approval_expired'
+  | 'authorization_changed'
+  | 'tool_outcome_unknown'
   | 'cancelled'
+  | 'internal_error'
   | 'internal'
+
+export const AGENT_ERROR_CODES: readonly AgentErrorCode[] = Object.freeze([
+  'invalid_request',
+  'invalid_session',
+  'storage_unavailable',
+  'storage_invalid_data',
+  'context_budget_exceeded',
+  'provider_authentication',
+  'provider_invalid_request',
+  'provider_rate_limited',
+  'provider_unavailable',
+  'provider_timeout',
+  'provider_protocol_error',
+  'run_budget_exceeded',
+  'checkpoint_conflict',
+  'checkpoint_invalid',
+  'approval_expired',
+  'authorization_changed',
+  'tool_outcome_unknown',
+  'cancelled',
+  'internal_error',
+  'internal'
+])
+
+export function isAgentErrorCode (value: unknown): value is AgentErrorCode {
+  return typeof value === 'string' && AGENT_ERROR_CODES.includes(value as AgentErrorCode)
+}
 
 export type AgentErrorDetails = Readonly<Record<string, string | number | boolean | null>>
 

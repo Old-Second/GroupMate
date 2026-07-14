@@ -59,6 +59,78 @@ const STATUS_PRESENTATIONS = new Map([
             resetConversation: false
         }]
 ]);
+const STABLE_ERROR_PRESENTATIONS = new Map([
+    ['provider_authentication', {
+            code: 'provider_auth_failed',
+            message: 'AI 服务鉴权失败，请联系机器人主人',
+            resetConversation: false
+        }],
+    ['provider_invalid_request', {
+            code: 'provider_invalid_format',
+            message: '请求格式不正确，请联系机器人主人',
+            resetConversation: false
+        }],
+    ['provider_rate_limited', {
+            code: 'provider_rate_limited',
+            message: 'AI 服务请求过多，请稍后重试',
+            resetConversation: false
+        }],
+    ['provider_unavailable', {
+            code: 'provider_overloaded',
+            message: 'AI 服务繁忙，请稍后重试',
+            resetConversation: false
+        }],
+    ['provider_timeout', {
+            code: 'provider_timeout',
+            message: 'AI 服务响应超时，请稍后重试',
+            resetConversation: false
+        }],
+    ['provider_protocol_error', {
+            code: 'provider_protocol_error',
+            message: 'AI 服务响应格式异常，请稍后重试',
+            resetConversation: false
+        }],
+    ['run_budget_exceeded', {
+            code: 'run_budget_exceeded',
+            message: '任务执行已达到资源上限，请稍后重试',
+            resetConversation: false
+        }],
+    ['checkpoint_conflict', {
+            code: 'checkpoint_conflict',
+            message: '任务状态已更新，请重试',
+            resetConversation: false
+        }],
+    ['checkpoint_invalid', {
+            code: 'checkpoint_invalid',
+            message: '任务状态无法恢复，请重新发起',
+            resetConversation: false
+        }],
+    ['approval_expired', {
+            code: 'approval_expired',
+            message: '本次操作审批已过期，请重新发起',
+            resetConversation: false
+        }],
+    ['authorization_changed', {
+            code: 'authorization_changed',
+            message: '当前权限或目标状态已变化，操作未执行',
+            resetConversation: false
+        }],
+    ['tool_outcome_unknown', {
+            code: 'tool_outcome_unknown',
+            message: '操作结果暂时无法确认，请勿重复提交',
+            resetConversation: false
+        }],
+    ['cancelled', {
+            code: 'cancelled',
+            message: '任务已取消',
+            resetConversation: false
+        }],
+    ['internal_error', {
+            code: 'internal_error',
+            message: '处理请求时出现异常，请稍后重试',
+            resetConversation: false
+        }]
+]);
 function readDataProperty(value, property) {
     if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
         return undefined;
@@ -116,6 +188,13 @@ export function getChatErrorPresentation(error) {
     if (error === LEGACY_CONVERSATION_NOT_FOUND) {
         return createPresentation('conversation_not_found', '当前对话异常，已经清除，请重试', null, true);
     }
+    const code = readStringProperty(error, 'code');
+    const stablePresentation = code === undefined
+        ? undefined
+        : STABLE_ERROR_PRESENTATIONS.get(code);
+    if (stablePresentation) {
+        return { ...stablePresentation, statusCode: getStatusCode(error) };
+    }
     const statusCode = getStatusCode(error);
     const statusPresentation = statusCode === null
         ? undefined
@@ -128,7 +207,6 @@ export function getChatErrorPresentation(error) {
         return createPresentation('provider_config_missing', 'AI 服务尚未配置，请联系机器人主人', statusCode);
     }
     const name = readStringProperty(error, 'name');
-    const code = readStringProperty(error, 'code');
     if ((name && TIMEOUT_NAMES.has(name)) || (code && TIMEOUT_CODES.has(code))) {
         return createPresentation('provider_timeout', 'AI 服务响应超时，请稍后重试', statusCode);
     }

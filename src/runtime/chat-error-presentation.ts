@@ -10,6 +10,15 @@ export type ChatErrorPresentationCode =
   | 'provider_overloaded'
   | 'provider_timeout'
   | 'provider_connection_failed'
+  | 'provider_protocol_error'
+  | 'run_budget_exceeded'
+  | 'checkpoint_conflict'
+  | 'checkpoint_invalid'
+  | 'approval_expired'
+  | 'authorization_changed'
+  | 'tool_outcome_unknown'
+  | 'cancelled'
+  | 'internal_error'
   | 'provider_unknown_error'
 
 export interface ChatErrorPresentation {
@@ -91,6 +100,79 @@ const STATUS_PRESENTATIONS = new Map<number, Omit<ChatErrorPresentation, 'status
   }]
 ])
 
+const STABLE_ERROR_PRESENTATIONS = new Map<string, Omit<ChatErrorPresentation, 'statusCode'>>([
+  ['provider_authentication', {
+    code: 'provider_auth_failed',
+    message: 'AI 服务鉴权失败，请联系机器人主人',
+    resetConversation: false
+  }],
+  ['provider_invalid_request', {
+    code: 'provider_invalid_format',
+    message: '请求格式不正确，请联系机器人主人',
+    resetConversation: false
+  }],
+  ['provider_rate_limited', {
+    code: 'provider_rate_limited',
+    message: 'AI 服务请求过多，请稍后重试',
+    resetConversation: false
+  }],
+  ['provider_unavailable', {
+    code: 'provider_overloaded',
+    message: 'AI 服务繁忙，请稍后重试',
+    resetConversation: false
+  }],
+  ['provider_timeout', {
+    code: 'provider_timeout',
+    message: 'AI 服务响应超时，请稍后重试',
+    resetConversation: false
+  }],
+  ['provider_protocol_error', {
+    code: 'provider_protocol_error',
+    message: 'AI 服务响应格式异常，请稍后重试',
+    resetConversation: false
+  }],
+  ['run_budget_exceeded', {
+    code: 'run_budget_exceeded',
+    message: '任务执行已达到资源上限，请稍后重试',
+    resetConversation: false
+  }],
+  ['checkpoint_conflict', {
+    code: 'checkpoint_conflict',
+    message: '任务状态已更新，请重试',
+    resetConversation: false
+  }],
+  ['checkpoint_invalid', {
+    code: 'checkpoint_invalid',
+    message: '任务状态无法恢复，请重新发起',
+    resetConversation: false
+  }],
+  ['approval_expired', {
+    code: 'approval_expired',
+    message: '本次操作审批已过期，请重新发起',
+    resetConversation: false
+  }],
+  ['authorization_changed', {
+    code: 'authorization_changed',
+    message: '当前权限或目标状态已变化，操作未执行',
+    resetConversation: false
+  }],
+  ['tool_outcome_unknown', {
+    code: 'tool_outcome_unknown',
+    message: '操作结果暂时无法确认，请勿重复提交',
+    resetConversation: false
+  }],
+  ['cancelled', {
+    code: 'cancelled',
+    message: '任务已取消',
+    resetConversation: false
+  }],
+  ['internal_error', {
+    code: 'internal_error',
+    message: '处理请求时出现异常，请稍后重试',
+    resetConversation: false
+  }]
+])
+
 function readDataProperty (value: unknown, property: PropertyKey): unknown {
   if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
     return undefined
@@ -164,6 +246,14 @@ export function getChatErrorPresentation (error: unknown): ChatErrorPresentation
     )
   }
 
+  const code = readStringProperty(error, 'code')
+  const stablePresentation = code === undefined
+    ? undefined
+    : STABLE_ERROR_PRESENTATIONS.get(code)
+  if (stablePresentation) {
+    return { ...stablePresentation, statusCode: getStatusCode(error) }
+  }
+
   const statusCode = getStatusCode(error)
   const statusPresentation = statusCode === null
     ? undefined
@@ -182,7 +272,6 @@ export function getChatErrorPresentation (error: unknown): ChatErrorPresentation
   }
 
   const name = readStringProperty(error, 'name')
-  const code = readStringProperty(error, 'code')
   if ((name && TIMEOUT_NAMES.has(name)) || (code && TIMEOUT_CODES.has(code))) {
     return createPresentation(
       'provider_timeout',

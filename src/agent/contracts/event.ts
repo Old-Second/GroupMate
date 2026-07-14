@@ -1,7 +1,9 @@
 export type AgentEventType =
-  | 'run.started' | 'context.prepared' | 'model.started' | 'model.delta'
-  | 'model.completed' | 'tool.requested' | 'tool.denied' | 'approval.required'
-  | 'approval.resolved' | 'tool.started' | 'tool.completed' | 'tool.failed'
+  | 'run.created' | 'run.started' | 'run.paused' | 'run.resumed' | 'run.progress'
+  | 'context.prepared' | 'model.started' | 'model.delta' | 'model.completed'
+  | 'tool.batch_planned' | 'tool.requested' | 'tool.denied' | 'tool.started'
+  | 'tool.completed' | 'tool.failed' | 'approval.required' | 'approval.resolved'
+  | 'approval.requested' | 'approval.decided' | 'approval.expired'
   | 'run.completed' | 'run.failed' | 'run.cancelled'
 
 export interface AgentEvent {
@@ -14,12 +16,14 @@ export interface AgentEvent {
   readonly type: AgentEventType
   readonly payload: Readonly<Record<string, string | number | boolean | null>>
 }
-const eventTypes: readonly AgentEventType[] = [
-  'run.started', 'context.prepared', 'model.started', 'model.delta',
-  'model.completed', 'tool.requested', 'tool.denied', 'approval.required',
-  'approval.resolved', 'tool.started', 'tool.completed', 'tool.failed',
+export const AGENT_EVENT_TYPES: readonly AgentEventType[] = Object.freeze([
+  'run.created', 'run.started', 'run.paused', 'run.resumed', 'run.progress',
+  'context.prepared', 'model.started', 'model.delta', 'model.completed',
+  'tool.batch_planned', 'tool.requested', 'tool.denied', 'tool.started',
+  'tool.completed', 'tool.failed', 'approval.required', 'approval.resolved',
+  'approval.requested', 'approval.decided', 'approval.expired',
   'run.completed', 'run.failed', 'run.cancelled'
-]
+])
 
 export function parseAgentEvent (value: unknown): AgentEvent {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent event must be an object')
@@ -34,7 +38,7 @@ export function parseAgentEvent (value: unknown): AgentEvent {
   if (typeof event.occurredAt !== 'string' || new Date(event.occurredAt).toISOString() !== event.occurredAt) {
     throw new TypeError('event timestamp is invalid')
   }
-  if (!eventTypes.includes(event.type as AgentEventType)) throw new TypeError('event type is invalid')
+  if (!AGENT_EVENT_TYPES.includes(event.type as AgentEventType)) throw new TypeError('event type is invalid')
   if (event.payload === null || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
     throw new TypeError('event payload is invalid')
   }
