@@ -219,6 +219,10 @@ export function toolLedgerIsTerminal(ledger) {
 export function toolLedgerHasVisibleOutput(ledger) {
     return ledger.calls.some(call => call.result?.status === 'success' && call.result.effect === 'visible');
 }
+export function toolLedgerRequiresToolDisabledFinalResponse(ledger) {
+    return ledger.calls.some(call => (call.capability?.executionClass === 'side_effect' &&
+        call.result?.status === 'success' && call.result.effect === 'background'));
+}
 export function toolLedgerHasIndeterminate(ledger) {
     return ledger.calls.some(call => call.status === 'indeterminate');
 }

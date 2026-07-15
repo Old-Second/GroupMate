@@ -245,7 +245,7 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
         sendMsg: async (message: unknown) => {
           if (String(userId) === 'master-1') {
             approvalMessages.push(message)
-            return { message_id: 'approval-private-1' }
+            return { message_id: `approval-private-${approvalMessages.length}` }
           }
           targetMessages.push(message)
           return { message_id: 'target-private-1' }
@@ -290,7 +290,7 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   assert.equal(routed, true)
   assert.deepEqual(targetMessages, [])
   assert.deepEqual(originalReplies, ['审批任务完成。'])
-  assert.deepEqual(approverReplies, [])
+  assert.equal(approverReplies.length, 0)
   const approvalRequestMessages = requests.slice(2).flatMap(request => (
     Array.isArray(request.messages) ? request.messages : []
   )) as Array<{ role?: unknown; content?: unknown }>
@@ -301,6 +301,47 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     JSON.stringify(approvalRequestMessages),
     /approval-private-1|approval-reply-1/
   )
+
+  responses.push(
+    modelToolResponse('call-private-send-approved', 'sendMessage', {
+      text: 'approved fixture delivery', targetKind: 'private', targetId: '2002'
+    }),
+    modelResponse('消息发送完成。')
+  )
+  const approvedRequestEvent = {
+    ...privateRequestEvent,
+    message_id: 'message-4',
+    msg: '请再次发送给用户 2002 一条测试消息',
+    message: [{ type: 'text', text: '请再次发送给用户 2002 一条测试消息' }]
+  }
+  const approvedPaused = await bridge.handle(
+    approvedRequestEvent,
+    '请再次发送给用户 2002 一条测试消息',
+    { systemInstructions: ['You are GroupMate.'] }
+  )
+  assert.equal(approvedPaused.kind, 'paused')
+  assert.equal(approvalMessages.length, 2)
+
+  const approvedRouted = await bridge.routeApprovalReply({
+    ...approvalEventBase,
+    user_id: 'master-1',
+    message_id: 'approval-reply-2',
+    msg: '确认',
+    message: [{ type: 'text', text: '确认' }],
+    source: { message_id: 'approval-private-2' },
+    sender: { user_id: 'master-1', nickname: 'master', role: 'member' },
+    reply: async (message: unknown) => {
+      approverReplies.push(message)
+      return { message_id: 'approver-reply-2' }
+    }
+  })
+  assert.equal(approvedRouted, true)
+  assert.deepEqual(targetMessages, ['approved fixture delivery'])
+  assert.deepEqual(originalReplies, ['审批任务完成。', '消息发送完成。'])
+  assert.equal(approverReplies.length, 0)
+  const approvedFollowUp = requests.at(-1) ?? {}
+  assert.equal(Object.hasOwn(approvedFollowUp, 'tools'), false)
+  assert.equal(approvedFollowUp.tool_choice, 'none')
 
   config.toolPolicyProfile = 'compatible'
   responses.push(modelResponse('group reply'))

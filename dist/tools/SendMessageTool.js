@@ -1,5 +1,5 @@
 import { invalidArguments } from './query-tool-support.js';
-import { cancelledResult, crossChannelDefinition, executionFailure, visibleResult } from './visible-tool-support.js';
+import { cancelledResult, crossChannelDefinition, executionFailure } from './visible-tool-support.js';
 import { actorMaySendCrossChannel } from '../agent/tools/cross-channel-access.js';
 import { crossChannelResourceKeys } from '../agent/tools/resource-key.js';
 const inputSchema = {
@@ -41,7 +41,10 @@ export function createSendMessageTool(services) {
             }
             try {
                 await services.qq.sendText(context.target, text, context.signal);
-                return visibleResult('消息已发送。');
+                return {
+                    status: 'success', effect: 'background',
+                    content: [{ type: 'text', text: '消息已发送。' }], retryable: false
+                };
             }
             catch {
                 return context.signal.aborted ? cancelledResult() : executionFailure('消息发送失败。');

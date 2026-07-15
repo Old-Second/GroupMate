@@ -63,6 +63,7 @@ import {
   toolLedgerHasUnresolvedNonRead,
   toolLedgerHasVisibleOutput,
   toolLedgerModelMessages,
+  toolLedgerRequiresToolDisabledFinalResponse,
   type ToolExecutionLedger
 } from './tool-ledger.js'
 import {
@@ -1432,6 +1433,8 @@ export class RunEngine {
       signal
     }), signal)
     const completedLedger = completeToolExecutionLedger(ledger, execution.results)
+    const forceCorrection = checkpoint.forceCorrection ||
+      toolLedgerRequiresToolDisabledFinalResponse(completedLedger)
     const toolMessages = toolLedgerModelMessages(completedLedger)
     const messages = Object.freeze([...checkpoint.messages, ...toolMessages])
     const estimatedInputTokens = checkpoint.estimatedInputTokens +
@@ -1455,7 +1458,8 @@ export class RunEngine {
       toolLedgers: this.#replaceLastLedger(checkpoint, completedLedger),
       preparedBatch: null,
       interruption: null,
-      modelTurn: null
+      modelTurn: null,
+      forceCorrection
     }
     if (toolLedgerHasVisibleOutput(completedLedger)) {
       const readyToComplete = await this.#commit(checkpoint, 'calling_model', {
@@ -1477,7 +1481,7 @@ export class RunEngine {
 
     const normalLimit = checkpoint.budgetLimits.maxModelTurns -
       checkpoint.budgetLimits.maxCorrectionTurns
-    if (!checkpoint.forceCorrection && checkpoint.budgetCounters.modelTurns < normalLimit) {
+    if (!forceCorrection && checkpoint.budgetCounters.modelTurns < normalLimit) {
       const reservationCheckpoint = Object.freeze({
         ...checkpoint,
         messages,

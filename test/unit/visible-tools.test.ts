@@ -210,7 +210,7 @@ test('sendMessage cross-channel target is exact and capability runs once after a
   assert.deepEqual(target, { kind: 'group', groupId: '88' })
   const result = await definition.execute(input, { ...context, target })
   assert.equal(result.status, 'success')
-  if (result.status === 'success') assert.equal(result.effect, 'visible')
+  if (result.status === 'success') assert.equal(result.effect, 'background')
   assert.deepEqual(calls, [{ kind: 'text', target: { kind: 'group', groupId: '88' }, value: 'hello' }])
 })
 
