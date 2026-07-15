@@ -45,12 +45,8 @@ export const providerSurfaceManifest = {
       'dist/agent/model/deepseek-compatibility-profile.js',
       'src/runtime/model-runtime-config.ts',
       'dist/runtime/model-runtime-config.js',
-      'utils/openai/chatgpt-api.js',
-      'utils/openai/fetch-sse.js',
-      'utils/chat.js',
-      'utils/randomMessage.js',
-      'utils/translate.js',
-      'model/core.js'
+      'src/runtime/completion-facade.ts',
+      'dist/runtime/completion-facade.js'
     ],
     chatgptWeb: [],
     bing: [],

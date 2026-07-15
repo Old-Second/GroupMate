@@ -1,15 +1,25 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ToolExecutor } from '../../agent/tools/tool-executor.js';
 import { ToolPolicyEngine } from '../../agent/tools/policy-engine.js';
-import { InMemoryPendingCallStore } from './in-memory-pending-call-store.js';
 import { extractIntentEvidence } from './intent-evidence.js';
-import { ToolRuntimeConfigurationError, createLegacyToolRuntimeBridge } from './legacy-tool-runtime-bridge.js';
 import { PolicyFetch } from './policy-fetch.js';
-import { RedisApprovalStore } from './redis-approval-store.js';
 import { RedisIdempotencyStore } from './redis-idempotency-store.js';
 import { resolveToolRuntimeFacts } from './runtime-facts.js';
 import { resolveCrossChannelAccess } from './cross-channel-policy.js';
 import { createManagementToolDefinitions, createQueryToolRuntime, createToolRuntimeRegistry, createVisibleToolDefinitions } from './tool-runtime-factory.js';
+export class ToolRuntimeConfigurationError extends Error {
+    code = 'unknown_policy_profile';
+    constructor() {
+        super('工具权限策略配置无效。');
+        this.name = 'ToolRuntimeConfigurationError';
+    }
+}
+function policyProfile(value) {
+    if (value !== 'compatible' && value !== 'safe' && value !== 'strict') {
+        throw new ToolRuntimeConfigurationError();
+    }
+    return value;
+}
 function runtimeId() {
     return randomUUID().replace(/-/g, '');
 }
@@ -698,198 +708,132 @@ export function toolResourceFromLegacySegment(value) {
 }
 export function createYunzaiToolRuntimeBridge(options) {
     const policyFetch = options.policyFetch ?? new PolicyFetch();
-    const productionRuns = new Map();
     const controls = new Map();
-    const approvalOwners = new Map();
-    const pendingCalls = new InMemoryPendingCallStore({
-        now: Date.now, maxEntries: 128, maxEntryBytes: 16 * 1024,
-        maxTotalBytes: 512 * 1024, ttlMs: 5 * 60 * 1_000
-    });
-    const approvalRouter = {
-        create: async (record, ttlSeconds) => {
-            const owner = [...controls.values()].find(item => item.botIdHash === record.botIdHash);
-            if (owner === undefined)
-                throw new ToolRuntimeConfigurationError('runtime_not_found');
-            await owner.approvals.create(record, ttlSeconds);
-            approvalOwners.set(record.tokenHash, owner.botId);
-        },
-        get: async (tokenHash) => {
-            const ownerId = approvalOwners.get(tokenHash);
-            if (ownerId === undefined)
-                return null;
-            const record = await (controls.get(ownerId)?.approvals.get(tokenHash) ?? null);
-            if (record === null)
-                approvalOwners.delete(tokenHash);
-            return record;
-        },
-        consume: async (tokenHash, expectedRawVersion) => {
-            const ownerId = approvalOwners.get(tokenHash);
-            if (ownerId === undefined)
-                return null;
-            const record = await (controls.get(ownerId)?.approvals.consume(tokenHash, expectedRawVersion) ?? null);
-            approvalOwners.delete(tokenHash);
-            return record;
-        }
-    };
     const ensureControl = (botId) => {
         const existing = controls.get(botId);
         if (existing !== undefined)
             return existing;
         const botIdHash = sha256Value(botId);
-        const approvals = new RedisApprovalStore({ client: options.redis, botIdHash });
         const executor = new ToolExecutor({
             policy: new ToolPolicyEngine(),
-            approvalMode: 'disabled',
-            approvalStore: approvalRouter,
-            pendingCalls,
             idempotencyStore: new RedisIdempotencyStore({ client: options.redis, botIdHash }),
             audit: safeAudit(options.logger),
             generateId: runtimeId,
-            generateToken: () => randomBytes(18).toString('base64url'),
             hash: sha256Value,
-            now: () => new Date(),
-            approvalTtlSeconds: 120
+            now: () => new Date()
         });
-        const created = Object.freeze({ botId, botIdHash, executor, approvals });
+        const created = Object.freeze({ executor });
         controls.set(botId, created);
         return created;
-    };
-    const executorRouter = {
-        execute: async (request) => ensureControl(request.initialFacts.botId).executor.execute(request)
     };
     const runtime = Object.freeze({
         prepare: async (call, context, snapshot) => await ensureControl(context.facts.botId).executor.prepare(call, context, snapshot),
         executePrepared: async (capability, context, snapshot, signal) => await ensureControl(context.facts.botId).executor.executePrepared(capability, context, snapshot, signal)
     });
-    const bridge = createLegacyToolRuntimeBridge({
-        generateId: runtimeId,
-        executor: executorRouter,
-        onRunCaptured: run => {
-            productionRuns.set(run.snapshot.id, Object.freeze({
-                profile: run.profile,
-                snapshot: run.snapshot,
-                initialFacts: run.initialFacts,
-                intent: run.intent,
-                refreshFacts: run.refreshFacts
-            }));
-            while (productionRuns.size > 64) {
-                const oldest = productionRuns.keys().next().value;
-                if (oldest === undefined)
-                    break;
-                productionRuns.delete(oldest);
-            }
-        },
-        onRunExpired: snapshotId => productionRuns.delete(snapshotId),
-        capture: async (input) => {
-            const event = eventRecord(input.event);
-            const masters = await options.getMasterIds();
-            const source = await sourceFor(options, event, masters);
-            const initialFacts = await resolveToolRuntimeFacts(source, { kind: 'none' });
-            ensureControl(initialFacts.botId);
-            const refreshFacts = async (target, signal) => {
-                const currentSource = await sourceFor(options, event, await options.getMasterIds());
-                return resolveToolRuntimeFacts(currentSource, target, signal);
-            };
-            const visibleToolServices = visibleServices(options, event, policyFetch);
-            const query = createQueryToolRuntime({
-                policyFetch,
-                config: queryConfig(options.config),
-                currentGroupMembers: async (groupId, signal) => currentMembers(event, groupId, signal),
-                queryGame: async (gameInput, signal) => {
-                    return options.queryGame === undefined
-                        ? queryWithMiaoPlugin(event, gameInput, signal)
-                        : options.queryGame(event, gameInput, signal);
-                },
-                sendGameImage: async (resource, target, signal) => {
-                    await visibleToolServices.qq.sendImage(target, resource, signal);
-                }
-            });
-            const visible = createVisibleToolDefinitions(visibleToolServices);
-            const management = createManagementToolDefinitions(managementCapabilities(event));
-            const { definitions, registry } = createToolRuntimeRegistry(query.definitions, visible, management);
-            const enabledTools = definitions
-                .filter(definition => {
-                if (definition.name === 'draw')
-                    return visibleToolServices.drawingAvailable;
-                if (definition.name === 'processPicture')
-                    return visibleToolServices.pictureProcessingAvailable;
-                if (definition.name === 'sendAudioMessage') {
-                    return options.synthesizeAudio !== undefined && [
-                        'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
-                    ].some(key => configText(options.config, key) !== '');
-                }
-                return true;
-            })
-                .map(definition => definition.name);
-            const replyId = await replyMessageId(event);
-            const images = legacyImageUrls(options.getImages === undefined ? undefined : await options.getImages(event));
-            const intentText = boundedIntentText(typeof event.groupmateCurrentRequestText === 'string'
-                ? event.groupmateCurrentRequestText
-                : input.prompt);
-            return {
-                profile: options.config.toolPolicyProfile ?? 'compatible',
-                approvalTtlSeconds: finiteInteger(options.config.toolApprovalTtlSeconds, 120, 30, 300),
-                registry,
-                enabledTools,
-                initialFacts,
-                refreshFacts,
-                intent: extractIntentEvidence({
-                    text: intentText,
-                    mentions: mentions(event),
-                    reply: replyId === null ? null : { messageId: replyId },
-                    ...(event.message_id === undefined ? {} : { currentMessageId: event.message_id })
-                }),
-                promptAddition: images.length === 0 ? '' : `\nthe url of the picture(s) above: ${images.join(', ')}`,
-                systemAddition: replyId === null
-                    ? '\nNever manage the current request message itself.\n'
-                    : `\nthe current request is replying to messageId ${replyId}. Only manage that message when explicitly requested.\nNever manage the current request message itself.\n`
-            };
+    const capture = async (input) => {
+        if (typeof input.prompt !== 'string' || Buffer.byteLength(input.prompt, 'utf8') > 128 * 1024) {
+            throw new TypeError('tool run input is invalid');
         }
-    });
+        const event = eventRecord(input.event);
+        const masters = await options.getMasterIds();
+        const source = await sourceFor(options, event, masters);
+        const initialFacts = await resolveToolRuntimeFacts(source, { kind: 'none' });
+        ensureControl(initialFacts.botId);
+        const refreshFacts = async (target, signal) => {
+            const currentSource = await sourceFor(options, event, await options.getMasterIds());
+            return resolveToolRuntimeFacts(currentSource, target, signal);
+        };
+        const visibleToolServices = visibleServices(options, event, policyFetch);
+        const query = createQueryToolRuntime({
+            policyFetch,
+            config: queryConfig(options.config),
+            currentGroupMembers: async (groupId, signal) => currentMembers(event, groupId, signal),
+            queryGame: async (gameInput, signal) => {
+                return options.queryGame === undefined
+                    ? queryWithMiaoPlugin(event, gameInput, signal)
+                    : options.queryGame(event, gameInput, signal);
+            },
+            sendGameImage: async (resource, target, signal) => {
+                await visibleToolServices.qq.sendImage(target, resource, signal);
+            }
+        });
+        const visible = createVisibleToolDefinitions(visibleToolServices);
+        const management = createManagementToolDefinitions(managementCapabilities(event));
+        const { definitions, registry } = createToolRuntimeRegistry(query.definitions, visible, management);
+        const enabledTools = definitions
+            .filter(definition => {
+            if (definition.name === 'draw')
+                return visibleToolServices.drawingAvailable;
+            if (definition.name === 'processPicture')
+                return visibleToolServices.pictureProcessingAvailable;
+            if (definition.name === 'sendAudioMessage') {
+                return options.synthesizeAudio !== undefined && [
+                    'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
+                ].some(key => configText(options.config, key) !== '');
+            }
+            return true;
+        })
+            .map(definition => definition.name);
+        const replyId = await replyMessageId(event);
+        const images = legacyImageUrls(options.getImages === undefined ? undefined : await options.getImages(event));
+        const intentText = boundedIntentText(typeof event.groupmateCurrentRequestText === 'string'
+            ? event.groupmateCurrentRequestText
+            : input.prompt);
+        return {
+            profile: options.config.toolPolicyProfile ?? 'compatible',
+            registry,
+            enabledTools,
+            initialFacts,
+            refreshFacts,
+            intent: extractIntentEvidence({
+                text: intentText,
+                mentions: mentions(event),
+                reply: replyId === null ? null : { messageId: replyId },
+                ...(event.message_id === undefined ? {} : { currentMessageId: event.message_id })
+            }),
+            promptAddition: images.length === 0 ? '' : `\nthe url of the picture(s) above: ${images.join(', ')}`,
+            systemAddition: replyId === null
+                ? '\nNever manage the current request message itself.\n'
+                : `\nthe current request is replying to messageId ${replyId}. Only manage that message when explicitly requested.\nNever manage the current request message itself.\n`
+        };
+    };
     return Object.freeze({
         runtime,
-        begin: async (input) => await bridge.begin(input),
-        execute: async (input) => (await bridge.execute(input)),
-        finish: (snapshotId, finishOptions) => bridge.finish(snapshotId, finishOptions),
         async prepareAgentRun(input) {
-            const started = await bridge.begin(input);
-            try {
-                const run = productionRuns.get(started.snapshotId);
-                if (run === undefined)
-                    throw new ToolRuntimeConfigurationError('runtime_not_found');
-                const binding = Object.freeze({
-                    snapshot: run.snapshot,
-                    prepareToolContext: async (checkpoint, signal) => Object.freeze({
-                        runId: checkpoint.runId,
-                        profile: run.profile,
-                        facts: await run.refreshFacts(Object.freeze({ kind: 'none' }), signal),
-                        intent: run.intent,
-                        now: new Date().toISOString()
-                    }),
-                    contextFor: async (capability, checkpoint, signal) => Object.freeze({
-                        runId: checkpoint.runId,
-                        profile: run.profile,
-                        facts: await run.refreshFacts(capability.target, signal),
-                        intent: run.intent,
-                        now: new Date().toISOString()
-                    }),
-                    approvalControlContext: async () => Object.freeze({
-                        eligibleApprovers: await eligibleApprovers(options, eventRecord(input.event))
-                    })
-                });
-                return Object.freeze({
-                    profile: run.profile,
-                    snapshot: run.snapshot,
-                    promptAddition: started.promptAddition,
-                    systemAddition: started.systemAddition,
-                    binding
-                });
-            }
-            finally {
-                // The native binding closes over the immutable run data. Keeping the
-                // legacy capture would retain the full QQ event until its TTL expires.
-                bridge.finish(started.snapshotId);
-            }
+            const captured = await capture(input);
+            const profile = policyProfile(captured.profile);
+            const snapshot = captured.registry.createSnapshot({
+                id: runtimeId(),
+                facts: captured.initialFacts,
+                enabledTools: captured.enabledTools
+            });
+            const binding = Object.freeze({
+                snapshot,
+                prepareToolContext: async (checkpoint, signal) => Object.freeze({
+                    runId: checkpoint.runId,
+                    profile,
+                    facts: await captured.refreshFacts(Object.freeze({ kind: 'none' }), signal),
+                    intent: captured.intent,
+                    now: new Date().toISOString()
+                }),
+                contextFor: async (capability, checkpoint, signal) => Object.freeze({
+                    runId: checkpoint.runId,
+                    profile,
+                    facts: await captured.refreshFacts(capability.target, signal),
+                    intent: captured.intent,
+                    now: new Date().toISOString()
+                }),
+                approvalControlContext: async () => Object.freeze({
+                    eligibleApprovers: await eligibleApprovers(options, eventRecord(input.event))
+                })
+            });
+            return Object.freeze({
+                profile,
+                snapshot,
+                promptAddition: captured.promptAddition,
+                systemAddition: captured.systemAddition,
+                binding
+            });
         }
     });
 }

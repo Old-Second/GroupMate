@@ -1,230 +1,137 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { test } from 'node:test'
-import type { ToolRuntimeFacts, ToolTarget } from '../../src/agent/tools/tool-context.js'
-import type { ToolDefinition } from '../../src/agent/tools/tool-definition.js'
-import type { ToolExecutionOutcome } from '../../src/agent/tools/tool-executor.js'
-import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
+import type { SerializablePreparedCapability } from '../../src/agent/tools/prepared-capability.js'
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
-import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
-import { extractIntentEvidence } from '../../src/runtime/tools/intent-evidence.js'
-import {
-  PolicyFetch,
-  type PolicyTransportRequest,
-  type PolicyTransportResponse
-} from '../../src/runtime/tools/policy-fetch.js'
-import {
-  ToolRuntimeConfigurationError,
-  createLegacyToolRuntimeBridge
-} from '../../src/runtime/tools/legacy-tool-runtime-bridge.js'
 import {
   createExternalPluginEventFacade,
-  createYunzaiToolRuntimeBridge
+  createYunzaiToolRuntimeBridge,
+  type YunzaiAgentToolRun,
+  type YunzaiToolRuntimeBridge
 } from '../../src/runtime/tools/yunzai-tool-runtime.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
 const root = process.cwd()
-const facts: ToolRuntimeFacts = Object.freeze({
-  botId: '10000',
-  actor: Object.freeze({ userId: '7', role: 'member', isBotMaster: false }),
-  channel: Object.freeze({ kind: 'group', botId: '10000', groupId: '9' }),
-  scope: Object.freeze({ kind: 'group', groupId: '9' }),
-  botGroupRole: 'member', actorGroupRole: 'member', targetRole: 'none',
-  targetIsBotMaster: false, targetExists: true
-})
 
-function result (effect: 'none' | 'visible' = 'none'): ToolResult {
+function config (overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    toolPolicyProfile: 'compatible',
+    toolApprovalTtlSeconds: 120,
+    serpSource: 'ikechan8370',
+    imageSearchSource: 'ikechan8370',
+    extraUrl: '',
+    enableToolCrossGroupSend: false,
+    enableToolPrivateSend: false,
+    enableToolVideoDownload: false,
+    groupMerge: true,
+    ...overrides
+  }
+}
+
+interface NativeToolOutcome {
+  readonly preparedKind: 'ready' | 'approval_required' | 'completed'
+  readonly capability?: SerializablePreparedCapability
+  readonly result: ToolResult | null
+}
+
+async function executeNativeTool (
+  bridge: YunzaiToolRuntimeBridge,
+  run: YunzaiAgentToolRun,
+  input: Readonly<{
+    runId: string
+    callId: string
+    requestedName: string
+    arguments: Readonly<Record<string, unknown>>
+    approved?: boolean
+  }>
+): Promise<NativeToolOutcome> {
+  const signal = new AbortController().signal
+  const checkpoint = { runId: input.runId } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const preparationContext = await run.binding.prepareToolContext(checkpoint, signal)
+  const prepared = await bridge.runtime.prepare(Object.freeze({
+    runId: input.runId,
+    callId: input.callId,
+    snapshotId: run.snapshot.id,
+    requestedName: input.requestedName,
+    arguments: input.arguments
+  }), preparationContext, run.snapshot)
+  if (prepared.kind === 'completed') {
+    return Object.freeze({ preparedKind: 'completed', result: prepared.result })
+  }
+  if (prepared.kind === 'approval_required' && input.approved !== true) {
+    return Object.freeze({
+      preparedKind: 'approval_required',
+      capability: prepared.capability,
+      result: null
+    })
+  }
+  const executionContext = await run.binding.contextFor(
+    prepared.capability,
+    checkpoint,
+    signal
+  )
+  const result = await bridge.runtime.executePrepared(
+    prepared.capability,
+    Object.freeze({
+      ...executionContext,
+      ...(input.approved === true
+        ? { approval: Object.freeze({ kind: 'approved' as const, decidedAt: new Date().toISOString() }) }
+        : {})
+    }),
+    run.snapshot,
+    signal
+  )
   return Object.freeze({
-    status: 'success', effect,
-    content: Object.freeze(effect === 'visible'
-      ? [Object.freeze({ type: 'text' as const, text: '消息已发送。' })]
-      : []),
-    retryable: false
+    preparedKind: prepared.kind,
+    capability: prepared.capability,
+    result
   })
 }
 
-function definition (): ToolDefinition {
-  return Object.freeze({
-    name: 'fixture', version: 1, aliases: Object.freeze([]), description: 'fixture',
-    inputSchema: Object.freeze({
-      type: 'object' as const, properties: Object.freeze({ text: Object.freeze({ type: 'string' as const }) }),
-      required: Object.freeze(['text']), additionalProperties: false as const
-    }),
-    effect: 'read_only', risk: 'low', readOnly: true, destructive: false,
-    idempotency: 'none', openWorld: false, timeoutMs: 1_000, maxOutputBytes: 4_096,
-    network: 'none', permission: 'any_user',
-    executionClass: 'read_only', retrySafe: true,
-    resourceKeys: () => Object.freeze([]),
-    resolveTarget: () => Object.freeze({ kind: 'none' as const }),
-    execute: async () => result()
-  })
+async function missing (file: string): Promise<boolean> {
+  try {
+    await access(path.join(root, file))
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
 }
 
-function harness (outcome: ToolExecutionOutcome, profile: unknown = 'compatible') {
-  let captureCalls = 0
-  const executionRequests: unknown[] = []
-  const registry = new ToolRegistry([definition()])
-  const bridge = createLegacyToolRuntimeBridge({
-    capture: async () => {
-      captureCalls += 1
-      return {
-        profile,
-        registry,
-        enabledTools: ['fixture'],
-        initialFacts: facts,
-        intent: extractIntentEvidence({ text: 'hello', mentions: [], reply: null }),
-        refreshFacts: async (_target: ToolTarget) => facts
-      }
-    },
-    executor: {
-      execute: async request => {
-        executionRequests.push(request)
-        return outcome
-      }
-    },
-    generateId: (() => {
-      let value = 0
-      return () => `runtime-${++value}`
-    })()
-  })
-  return { bridge, executionRequests, getCaptureCalls: () => captureCalls }
-}
+test('Phase 5 production tool runtime has no legacy bridge or token approval stores', async () => {
+  const runtime = await readFile(path.join(root, 'src/runtime/tools/yunzai-tool-runtime.ts'), 'utf8')
+  const executor = await readFile(path.join(root, 'src/agent/tools/tool-executor.ts'), 'utf8')
 
-test('Phase 4 tool wiring captures approval TTL per run instead of caching startup config', async () => {
-  let ttl = 120
-  const requests: Array<{ approvalTtlSeconds?: number }> = []
-  const registry = new ToolRegistry([definition()])
-  const bridge = createLegacyToolRuntimeBridge({
-    capture: async () => ({
-      profile: 'safe', approvalTtlSeconds: ttl,
-      registry, enabledTools: ['fixture'], initialFacts: facts,
-      intent: extractIntentEvidence({ text: 'hello', mentions: [], reply: null }),
-      refreshFacts: async () => facts
-    }),
-    executor: {
-      execute: async request => {
-        requests.push(request)
-        return { kind: 'completed', toolName: 'fixture', result: result(), finalize: false }
-      }
-    },
-    generateId: (() => { let value = 0; return () => `ttl-${++value}` })()
-  })
-  const first = await bridge.begin({ event: {}, prompt: 'one' })
-  await bridge.execute({
-    snapshotId: first.snapshotId, requestedName: 'fixture', arguments: { text: 'one' }, callId: 'call-1'
-  })
-  ttl = 30
-  const second = await bridge.begin({ event: {}, prompt: 'two' })
-  await bridge.execute({
-    snapshotId: second.snapshotId, requestedName: 'fixture', arguments: { text: 'two' }, callId: 'call-2'
-  })
-  assert.deepEqual(requests.map(request => request.approvalTtlSeconds), [120, 30])
+  for (const marker of [
+    'legacy-tool-runtime-bridge',
+    'approval-store',
+    'pending-call-store',
+    'RedisApprovalStore',
+    'InMemoryPendingCallStore',
+    'createLegacyToolRuntimeBridge',
+    'approvalMode',
+    'generateToken',
+    'async execute (request:'
+  ]) {
+    assert.equal(`${runtime}\n${executor}`.includes(marker), false, `${marker} must be retired`)
+  }
+  for (const file of [
+    'src/runtime/tools/legacy-tool-runtime-bridge.ts',
+    'src/runtime/tools/approval-command.ts',
+    'src/runtime/tools/in-memory-pending-call-store.ts',
+    'src/runtime/tools/redis-approval-store.ts',
+    'src/agent/tools/approval-store.ts',
+    'src/agent/tools/pending-call-store.ts'
+  ]) {
+    assert.equal(await missing(file), true, `${file} must be removed`)
+  }
 })
 
-test('Phase 4 tool wiring exposes approval as deterministic control output', async () => {
-  const approval = harness({
-    kind: 'approval_required',
-    toolName: 'fixture',
-    token: 'approval-token-123456',
-    expiresAt: '2026-07-14T00:00:00.000Z',
-    summaryCode: 'fixture_approval'
-  })
-  const run = await approval.bridge.begin({ event: {}, prompt: 'mute member' })
-  const outcome = await approval.bridge.execute({
-    snapshotId: run.snapshotId,
-    requestedName: 'fixture',
-    arguments: { text: 'one' },
-    callId: 'call-approval'
-  })
-  const presentation = (outcome as typeof outcome & {
-    readonly presentation?: Readonly<{ kind: 'approval'; text: string }>
-  }).presentation
-
-  assert.deepEqual(presentation, {
-    kind: 'approval',
-    text: '操作需要确认。请在 2026-07-14T00:00:00.000Z 前发送“#确认 approval-token-123456”，或发送“#拒绝 approval-token-123456”。'
-  })
-  assert.equal(outcome.approvalRequired, true)
-  assert.equal(outcome.finalize, true)
-})
-
-test('Phase 4 tool wiring captures profile and one immutable snapshot for the whole run', async () => {
-  const success = result()
-  const runtime = harness({ kind: 'completed', toolName: 'fixture', result: success, finalize: false })
-  const started = await runtime.bridge.begin({ event: {}, prompt: 'hello' })
-
-  assert.equal(started.profile, 'compatible')
-  assert.equal(started.modelFunctions.length, 1)
-  assert.equal(started.modelFunctions[0]?.name, 'fixture')
-  assert.equal(runtime.getCaptureCalls(), 1)
-
-  const executed = await runtime.bridge.execute({
-    snapshotId: started.snapshotId,
-    requestedName: 'fixture', arguments: '{"text":"one"}', callId: 'call-1'
-  })
-  assert.equal(executed.modelFeedback, '工具执行完成。')
-  assert.equal(executed.finalize, false)
-  assert.equal(runtime.getCaptureCalls(), 1)
-  assert.equal(runtime.executionRequests.length, 1)
-  assert.equal((runtime.executionRequests[0] as { call: { snapshotId: string } }).call.snapshotId, started.snapshotId)
-
-  runtime.bridge.finish(started.snapshotId)
-  await assert.rejects(
-    runtime.bridge.execute({
-      snapshotId: started.snapshotId, requestedName: 'fixture', arguments: {}, callId: 'call-finished'
-    }),
-    ToolRuntimeConfigurationError
-  )
-
-  await assert.rejects(
-    runtime.bridge.execute({ snapshotId: 'unknown', requestedName: 'fixture', arguments: {}, callId: 'call-2' }),
-    ToolRuntimeConfigurationError
-  )
-  assert.equal(runtime.executionRequests.length, 1)
-})
-
-test('Phase 4 tool wiring returns stable denial and visible feedback without a fallback path', async () => {
-  const denied: ToolResult = Object.freeze({
-    status: 'denied', effect: 'none', reasonCode: 'permission_denied',
-    userMessage: '当前身份不能执行该操作。', retryable: false
-  })
-  const deniedRuntime = harness({ kind: 'completed', toolName: 'fixture', result: denied, finalize: false })
-  const deniedRun = await deniedRuntime.bridge.begin({ event: {}, prompt: 'hello' })
-  assert.deepEqual(await deniedRuntime.bridge.execute({
-    snapshotId: deniedRun.snapshotId, requestedName: 'fixture', arguments: {}, callId: 'call-1'
-  }), {
-    toolName: 'fixture', modelFeedback: '当前身份不能执行该操作。',
-    result: denied, finalize: false, approvalRequired: false
-  })
-
-  const visible = result('visible')
-  const visibleRuntime = harness({ kind: 'completed', toolName: 'fixture', result: visible, finalize: true })
-  const visibleRun = await visibleRuntime.bridge.begin({ event: {}, prompt: 'send image' })
-  const visibleOutcome = await visibleRuntime.bridge.execute({
-    snapshotId: visibleRun.snapshotId, requestedName: 'fixture', arguments: {}, callId: 'call-2'
-  })
-  assert.equal(visibleOutcome.modelFeedback, '消息已发送。')
-  assert.equal(visibleOutcome.finalize, true)
-  assert.doesNotMatch(visibleOutcome.modelFeedback, /没有任何回复/)
-})
-
-test('Phase 4 tool wiring fails closed for an unknown policy profile', async () => {
-  const runtime = harness({ kind: 'completed', toolName: 'fixture', result: result(), finalize: false }, 'unknown')
-  await assert.rejects(
-    runtime.bridge.begin({ event: {}, prompt: 'hello' }),
-    (error: unknown) => error instanceof ToolRuntimeConfigurationError && error.code === 'unknown_policy_profile'
-  )
-})
-
-test('Phase 4 Yunzai bridge exposes strict model schemas and executes through the shared executor', async () => {
+test('Yunzai runtime exposes strict schemas and executes through the native two-stage runtime', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
+    config: config(),
     redis: new FakeRedis(),
     getMasterIds: async () => ['1'],
     getBotId: () => '10000',
@@ -237,8 +144,8 @@ test('Phase 4 Yunzai bridge exposes strict model schemas and executes through th
     bot: { pickFriend: () => ({ sendMsg: async () => {} }) },
     message: []
   }
-  const started = await bridge.begin({ event, prompt: '我是谁' })
-  const userinfo = started.modelFunctions.find(item => item.name === 'queryUserinfo')
+  const run = await bridge.prepareAgentRun({ event, prompt: '我是谁' })
+  const userinfo = run.snapshot.modelTools.find(item => item.function.name === 'queryUserinfo')?.function
   assert.ok(userinfo)
   if (!('type' in userinfo.parameters) || userinfo.parameters.type !== 'object') {
     assert.fail('queryUserinfo must expose an object schema')
@@ -247,113 +154,18 @@ test('Phase 4 Yunzai bridge exposes strict model schemas and executes through th
   assert.equal(Object.hasOwn(userinfo.parameters.properties, 'sender'), false)
   assert.equal(Object.hasOwn(userinfo.parameters.properties, 'isAdmin'), false)
 
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId,
+  const outcome = await executeNativeTool(bridge, run, {
+    runId: 'run-userinfo',
+    callId: 'call-userinfo',
     requestedName: 'queryUserinfo',
-    arguments: { userId: '7' },
-    callId: 'call-private-userinfo'
+    arguments: Object.freeze({ userId: '7' })
   })
   assert.equal(outcome.result?.status, 'success')
-  assert.match(outcome.modelFeedback, /"userId":"7"/)
 })
 
-test('Phase 5 Yunzai bridge exposes a native run binding without entering the legacy loop', async () => {
+test('Yunzai runtime creates one native snapshot and no legacy execution surface', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 90,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(),
-    getMasterIds: async () => ['1'],
-    getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const event = {
-    isGroup: true, group_id: 9, user_id: 7, self_id: 10000,
-    sender: { user_id: 7, nickname: 'fixture', role: 'owner' },
-    group: { gml: new Map([[7, { user_id: 7, role: 'owner' }]]) },
-    bot: { pickGroup: () => ({ sendMsg: async () => {} }) },
-    message: []
-  }
-
-  const run = await bridge.prepareAgentRun({ event, prompt: '读取网页' })
-  const checkpoint = { runId: 'run-native' } as Parameters<
-    typeof run.binding.prepareToolContext
-  >[0]
-  const context = await run.binding.prepareToolContext(
-    checkpoint,
-    new AbortController().signal
-  )
-
-  assert.equal(run.profile, 'safe')
-  assert.equal(run.binding.snapshot.id, run.snapshot.id)
-  assert.ok(run.snapshot.modelTools.some(tool => tool.function.name === 'website'))
-  assert.equal(context.runId, 'run-native')
-  assert.equal(context.profile, 'safe')
-  assert.equal(typeof bridge.runtime.prepare, 'function')
-  await assert.rejects(
-    bridge.execute({
-      snapshotId: run.snapshot.id,
-      requestedName: 'website',
-      arguments: { url: 'https://fixture.invalid/' },
-      callId: 'legacy-after-native'
-    }),
-    (error: unknown) => error instanceof ToolRuntimeConfigurationError &&
-      error.code === 'runtime_not_found'
-  )
-})
-
-test('Phase 5 Yunzai approval keeps bot master authority for a group owner', async () => {
-  const members = new Map<unknown, Record<string, unknown>>([
-    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
-    [10000, { user_id: 10000, role: 'admin', nickname: 'bot' }]
-  ])
-  const group = { getMemberMap: async () => members }
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: true,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(),
-    getMasterIds: async () => ['7'],
-    getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const event = {
-    isGroup: true, group_id: 9, user_id: 7, self_id: 10000,
-    sender: { user_id: 7, nickname: 'owner', role: 'owner' },
-    group,
-    bot: { pickGroup: () => group },
-    message: []
-  }
-
-  const run = await bridge.prepareAgentRun({ event, prompt: '发送一条测试消息' })
-  const checkpoint = { runId: 'run-owner-master' } as Parameters<
-    typeof run.binding.prepareToolContext
-  >[0]
-  const signal = new AbortController().signal
-  const context = await run.binding.prepareToolContext(checkpoint, signal)
-  const approvalControlContext = run.binding.approvalControlContext
-  assert.ok(approvalControlContext)
-  const control = await approvalControlContext(checkpoint, context, signal)
-
-  assert.deepEqual(control.eligibleApprovers.find(actor => actor.userId === '7'), {
-    userId: '7', role: 'bot_master'
-  })
-})
-
-test('Phase 4 Yunzai bridge treats a missing legacy image result as no images', async () => {
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
+    config: config({ toolPolicyProfile: 'safe' }),
     redis: new FakeRedis(),
     getMasterIds: async () => ['1'],
     getBotId: () => '10000',
@@ -367,215 +179,223 @@ test('Phase 4 Yunzai bridge treats a missing legacy image result as no images', 
     bot: { pickFriend: () => ({ sendMsg: async () => {} }) },
     message: []
   }
+  const run = await bridge.prepareAgentRun({ event, prompt: '读取网页' })
+  const checkpoint = { runId: 'run-native' } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const context = await run.binding.prepareToolContext(
+    checkpoint,
+    new AbortController().signal
+  )
 
-  const started = await bridge.begin({ event, prompt: '纯文字消息' })
-
-  assert.equal(started.promptAddition, '')
-  assert.ok(started.modelFunctions.some(item => item.name === 'website'))
+  assert.equal(run.profile, 'safe')
+  assert.equal(run.binding.snapshot.id, run.snapshot.id)
+  assert.ok(run.snapshot.modelTools.some(tool => tool.function.name === 'website'))
+  assert.equal(run.promptAddition, '')
+  assert.equal(context.profile, 'safe')
+  assert.deepEqual(Object.keys(bridge).sort(), ['prepareAgentRun', 'runtime'])
 })
 
-test('Phase 4 production bridge keeps drawing, image processing, and game panels reachable', async () => {
+test('Yunzai approval keeps bot master authority for a group owner', async () => {
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
+    [10000, { user_id: 10000, role: 'admin', nickname: 'bot' }]
+  ])
+  const group = { getMemberMap: async () => members }
   const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370',
-      extraUrl: 'https://extra.example', enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    config: config({ toolPolicyProfile: 'safe', enableToolPrivateSend: true }),
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
     segment: () => ({})
   })
   const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: { pickFriend: () => ({ sendMsg: async () => {} }) }
+    isGroup: true,
+    group_id: 9,
+    user_id: 7,
+    self_id: 10000,
+    sender: { user_id: 7, nickname: 'owner', role: 'owner' },
+    group,
+    bot: { pickGroup: () => group },
+    message: []
   }
-  const started = await bridge.begin({ event, prompt: 'test inventory' })
-  const names = new Set(started.modelFunctions.map(item => item.name))
-  for (const name of ['draw', 'processPicture', 'queryGenshin', 'queryStarRail']) {
-    assert.equal(names.has(name), true, `${name} must remain reachable in production`)
-  }
+  const run = await bridge.prepareAgentRun({ event, prompt: '发送一条测试消息' })
+  const checkpoint = { runId: 'run-owner-master' } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const signal = new AbortController().signal
+  const context = await run.binding.prepareToolContext(checkpoint, signal)
+  assert.ok(run.binding.approvalControlContext)
+  const control = await run.binding.approvalControlContext(checkpoint, context, signal)
+
+  assert.deepEqual(control.eligibleApprovers.find(actor => actor.userId === '7'), {
+    userId: '7', role: 'bot_master'
+  })
 })
 
-test('Phase 4 production bridge routes restored media capabilities through typed results', async () => {
-  const networkCalls: PolicyTransportRequest[] = []
-  const policyFetch = new PolicyFetch({
-    networkPolicy: new NetworkPolicy({
-      resolve: async () => [{ address: '93.184.216.34', family: 4 }]
-    }),
-    transport: {
-      request: async request => {
-        networkCalls.push(request)
-        const picture = request.url.hostname === 'image.example'
-        const body = picture ? Buffer.from('image') : Buffer.from('/processed.png')
-        const response: PolicyTransportResponse = {
-          status: 200, statusText: 'OK',
-          headers: { 'content-type': picture ? 'image/png' : 'text/plain' },
-          body: (async function * () { yield body })()
-        }
-        return response
-      }
-    }
-  })
+test('Yunzai runtime freezes cross-channel policy per run', async () => {
+  const mutableConfig = config({ enableToolPrivateSend: true })
   const sent: unknown[] = []
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370',
-      extraUrl: 'https://extra.example', enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), policyFetch,
-    getMasterIds: async () => ['1'], getBotId: () => '10000',
-    generateImage: async () => ({
-      kind: 'buffer', data: Buffer.from('draw'), mimeType: 'image/png', byteLength: 4
-    }),
-    queryGame: async () => ({
-      kind: 'buffer', data: Buffer.from('game'), mimeType: 'image/png', byteLength: 4
-    }),
-    segment: () => ({ image: (file: unknown) => ({ type: 'image', file }) })
-  })
   const receiver = { sendMsg: async (message: unknown) => { sent.push(message) } }
   const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: { pickFriend: () => receiver }
-  }
-  const started = await bridge.begin({ event, prompt: '画图并查询游戏面板' })
-  const draw = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'draw',
-    arguments: { prompt: 'cat' }, callId: 'call-draw'
-  })
-  const game = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'queryGenshin',
-    arguments: { userId: '7', uid: '', character: '' }, callId: 'call-game'
-  })
-  const processed = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'processPicture',
-    arguments: { type: 'hed', imageUrl: 'https://image.example/cat.png', userId: '' },
-    callId: 'call-process'
-  })
-  assert.equal(draw.result?.status, 'success')
-  assert.equal(game.result?.status, 'success')
-  assert.equal(processed.result?.status, 'success')
-  assert.equal(processed.result?.effect, 'background')
-  assert.equal(processed.finalize, false)
-  assert.equal(sent.length, 2)
-  assert.deepEqual(networkCalls.map(call => `${call.method} ${call.url.origin}${call.url.pathname}`), [
-    'GET https://image.example/cat.png', 'POST https://extra.example/image2hed'
-  ])
-})
-
-test('Phase 4 production bridge converts fetched image bytes to a Node Buffer for Yunzai', async () => {
-  const policyFetch = new PolicyFetch({
-    networkPolicy: new NetworkPolicy({
-      resolve: async () => [{ address: '93.184.216.34', family: 4 }]
-    }),
-    transport: {
-      request: async () => ({
-        status: 200, statusText: 'OK', headers: { 'content-type': 'image/png' },
-        body: (async function * () { yield new Uint8Array([1, 2, 3]) })()
-      })
+    isGroup: false,
+    user_id: 7,
+    sender: { user_id: 7 },
+    message: [],
+    bot: {
+      getFriendList: async () => [8],
+      pickFriend: () => receiver
     }
-  })
-  const imageInputs: unknown[] = []
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), policyFetch,
-    getMasterIds: async () => ['1'], getBotId: () => '10000',
-    segment: () => ({
-      image: (file: unknown) => {
-        imageInputs.push(file)
-        return { type: 'image', file }
-      }
-    })
-  })
-  const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: { pickFriend: () => ({ sendMsg: async () => {} }) }
   }
-  const started = await bridge.begin({ event, prompt: '发送我的头像' })
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'sendAvatar',
-    arguments: { userIds: ['7'] }, callId: 'call-avatar-buffer'
-  })
-
-  assert.equal(outcome.result?.status, 'success')
-  assert.equal(imageInputs.length, 1)
-  assert.equal(Buffer.isBuffer(imageInputs[0]), true)
-})
-
-test('Phase 4 production bridge creates QQ dice segments without an invalid fixed value', async () => {
-  const diceArguments: unknown[][] = []
-  const sent: unknown[] = []
   const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
-    segment: () => ({
-      dice: (...values: unknown[]) => {
-        diceArguments.push(values)
-        return { type: 'dice' }
-      }
-    })
-  })
-  const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: { pickFriend: () => ({ sendMsg: async (message: unknown) => { sent.push(message) } }) }
-  }
-  const started = await bridge.begin({ event, prompt: '请发送一枚骰子' })
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'sendDice',
-    arguments: { count: 1 }, callId: 'call-dice'
-  })
-
-  assert.equal(outcome.result?.status, 'success')
-  assert.equal(outcome.result?.effect, 'visible')
-  assert.deepEqual(diceArguments, [[]])
-  assert.deepEqual(sent, [{ type: 'dice' }])
-})
-
-test('Phase 4 production bridge falls back to standard magic segments when factories are absent', async () => {
-  const sent: unknown[] = []
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000',
+    config: mutableConfig,
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
     segment: () => ({})
   })
-  const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: { pickFriend: () => ({ sendMsg: async (message: unknown) => { sent.push(message) } }) }
-  }
-  const diceRun = await bridge.begin({ event, prompt: '请发送一枚骰子' })
-  const dice = await bridge.execute({
-    snapshotId: diceRun.snapshotId, requestedName: 'sendDice',
-    arguments: { count: 1 }, callId: 'call-fallback-dice'
+  const first = await bridge.prepareAgentRun({ event, prompt: '发送给用户 8：你好' })
+  mutableConfig.enableToolPrivateSend = false
+  const firstResult = await executeNativeTool(bridge, first, {
+    runId: 'run-private-enabled',
+    callId: 'call-private-enabled',
+    requestedName: 'sendMessage',
+    arguments: Object.freeze({ targetKind: 'private', targetId: '8', text: '你好' })
   })
-  const rpsRun = await bridge.begin({ event, prompt: '请发送一次猜拳' })
-  const rps = await bridge.execute({
-    snapshotId: rpsRun.snapshotId, requestedName: 'sendRPS',
-    arguments: { value: 2 }, callId: 'call-fallback-rps'
-  })
+  assert.equal(firstResult.result?.status, 'success')
 
-  assert.equal(dice.result?.status, 'success')
-  assert.equal(rps.result?.status, 'success')
-  assert.deepEqual(sent, [
-    { type: 'dice', data: {} },
-    { type: 'rps', data: {} }
-  ])
+  const second = await bridge.prepareAgentRun({ event, prompt: '发送给用户 8：你好' })
+  const secondResult = await executeNativeTool(bridge, second, {
+    runId: 'run-private-disabled',
+    callId: 'call-private-disabled',
+    requestedName: 'sendMessage',
+    arguments: Object.freeze({ targetKind: 'private', targetId: '8', text: '你好' })
+  })
+  assert.equal(secondResult.result?.status, 'denied')
+  assert.deepEqual(sent, ['你好'])
 })
 
-test('Phase 4 external plugin facade captures sends and blocks host mutations', async () => {
+test('approved management capability rechecks fresh bot authority before dispatch', async () => {
+  let muteCalls = 0
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
+    [8, { user_id: 8, role: 'member', nickname: 'member' }],
+    [10000, { user_id: 10000, role: 'owner', nickname: 'bot' }]
+  ])
+  const group = {
+    getMemberMap: async () => members,
+    muteMember: async () => { muteCalls += 1 },
+    kickMember: async () => {},
+    setCard: async () => {},
+    setTitle: async () => {},
+    recallMsg: async () => {}
+  }
+  const event = {
+    isGroup: true,
+    group_id: 9,
+    user_id: 7,
+    message_id: 'current-safe',
+    sender: { user_id: 7, role: 'owner', nickname: 'owner' },
+    group,
+    bot: {
+      pickGroup: () => group,
+      setEssenceMessage: async () => {},
+      removeEssenceMessage: async () => {}
+    },
+    message: []
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: config({ toolPolicyProfile: 'safe' }),
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const run = await bridge.prepareAgentRun({ event, prompt: '请禁言 QQ:8 60 秒' })
+  const signal = new AbortController().signal
+  const checkpoint = { runId: 'run-reauthorize' } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const preparationContext = await run.binding.prepareToolContext(checkpoint, signal)
+  const prepared = await bridge.runtime.prepare(Object.freeze({
+    runId: checkpoint.runId,
+    callId: 'call-mute',
+    snapshotId: run.snapshot.id,
+    requestedName: 'jinyan',
+    arguments: Object.freeze({ userId: '8', seconds: 60 })
+  }), preparationContext, run.snapshot)
+  assert.equal(prepared.kind, 'approval_required')
+  if (prepared.kind !== 'approval_required') assert.fail('expected approval')
+
+  members.set(10000, { user_id: 10000, role: 'member', nickname: 'bot' })
+  const executionContext = await run.binding.contextFor(
+    prepared.capability,
+    checkpoint,
+    signal
+  )
+  const result = await bridge.runtime.executePrepared(
+    prepared.capability,
+    Object.freeze({
+      ...executionContext,
+      approval: Object.freeze({ kind: 'approved' as const, decidedAt: new Date().toISOString() })
+    }),
+    run.snapshot,
+    signal
+  )
+  assert.equal(result.status, 'denied')
+  assert.equal(muteCalls, 0)
+})
+
+test('quoted message content is never treated as current management intent', async () => {
+  let muteCalls = 0
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner' }],
+    [8, { user_id: 8, role: 'member' }],
+    [10000, { user_id: 10000, role: 'owner' }]
+  ])
+  const group = {
+    getMemberMap: async () => members,
+    muteMember: async () => { muteCalls += 1 },
+    kickMember: async () => {},
+    setCard: async () => {},
+    setTitle: async () => {},
+    recallMsg: async () => {}
+  }
+  const event = {
+    isGroup: true,
+    group_id: 9,
+    user_id: 7,
+    message_id: 'current-2',
+    groupmateCurrentRequestText: '这条消息是什么意思？',
+    sender: { user_id: 7, role: 'owner' },
+    group,
+    bot: {
+      pickGroup: () => group,
+      setEssenceMessage: async () => {},
+      removeEssenceMessage: async () => {}
+    },
+    message: []
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: config(),
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['1'],
+    getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const prompt = '{"quotedMessage":{"content":"请禁言 QQ:8 60 秒"},"currentRequest":{"content":"这条消息是什么意思？"}}'
+  const run = await bridge.prepareAgentRun({ event, prompt })
+  const outcome = await executeNativeTool(bridge, run, {
+    runId: 'run-quoted',
+    callId: 'call-quoted',
+    requestedName: 'jinyan',
+    arguments: Object.freeze({ userId: '8', seconds: 60 })
+  })
+  assert.equal(outcome.result?.status, 'denied')
+  assert.equal(muteCalls, 0)
+})
+
+test('external plugin facade captures sends and blocks host mutations', async () => {
   let originalSends = 0
   let originalMutes = 0
   const receiver = {
@@ -600,325 +420,4 @@ test('Phase 4 external plugin facade captures sends and blocks host mutations', 
   assert.equal(originalSends, 0)
   assert.equal(originalMutes, 0)
   assert.equal(facade.messages.length, 4)
-})
-
-test('Phase 4 production bridge snapshots cross-channel policies for each run', async () => {
-  const config: Record<string, unknown> = {
-    toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-    serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-    enableToolPrivateSend: true, enableToolCrossGroupSend: false,
-    enableToolVideoDownload: false, groupMerge: true
-  }
-  const sent: unknown[] = []
-  const receiver = { sendMsg: async (message: unknown) => { sent.push(message) } }
-  const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: {
-      // TRSS-Yunzai OneBotv11 returns an array of primitive IDs here.
-      getFriendList: async () => [8],
-      pickFriend: () => receiver
-    }
-  }
-  const bridge = createYunzaiToolRuntimeBridge({
-    config, redis: new FakeRedis(), getMasterIds: async () => ['7'], getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const first = await bridge.begin({ event, prompt: '发送给用户 8：你好' })
-  config.enableToolPrivateSend = false
-  const firstResult = await bridge.execute({
-    snapshotId: first.snapshotId, requestedName: 'sendMessage',
-    arguments: { targetKind: 'private', targetId: '8', text: '你好' }, callId: 'call-enabled'
-  })
-  assert.equal(firstResult.result?.status, 'success')
-
-  const second = await bridge.begin({ event, prompt: '发送给用户 8：你好' })
-  const secondResult = await bridge.execute({
-    snapshotId: second.snapshotId, requestedName: 'sendMessage',
-    arguments: { targetKind: 'private', targetId: '8', text: '你好' }, callId: 'call-disabled'
-  })
-  assert.equal(secondResult.result?.status, 'denied')
-  if (secondResult.result?.status === 'denied') {
-    assert.equal(secondResult.result.reasonCode, 'tool_unavailable')
-  }
-  assert.deepEqual(sent, ['你好'])
-})
-
-test('Phase 4 production bridge recognizes TRSS primitive group ID lists', async () => {
-  const config: Record<string, unknown> = {
-    toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-    serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-    enableToolPrivateSend: true, enableToolCrossGroupSend: false,
-    enableToolVideoDownload: false, groupMerge: true
-  }
-  let sends = 0
-  const event = {
-    isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
-    bot: {
-      // TRSS-Yunzai OneBotv11 returns an array of primitive IDs here.
-      getGroupList: async () => [9],
-      pickGroup: () => ({ sendMsg: async () => { sends += 1 } })
-    }
-  }
-  const bridge = createYunzaiToolRuntimeBridge({
-    config, redis: new FakeRedis(), getMasterIds: async () => ['7'], getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const run = await bridge.begin({ event, prompt: '发送给群 9：你好' })
-  const outcome = await bridge.execute({
-    snapshotId: run.snapshotId, requestedName: 'sendMessage',
-    arguments: { targetKind: 'group', targetId: '9', text: '你好' }, callId: 'call-group-disabled'
-  })
-  assert.equal(outcome.result?.status, 'denied')
-  if (outcome.result?.status === 'denied') {
-    assert.equal(outcome.result.reasonCode, 'cross_channel_disabled')
-  }
-  assert.equal(sends, 0)
-})
-
-test('Phase 4 production bridge retires legacy approval without control state or side effects', async () => {
-  let muteCalls = 0
-  const members = new Map<unknown, Record<string, unknown>>([
-    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
-    [8, { user_id: 8, role: 'member', nickname: 'member' }],
-    [10000, { user_id: 10000, role: 'owner', nickname: 'bot' }]
-  ])
-  const group = {
-    getMemberMap: async () => members,
-    muteMember: async () => { muteCalls += 1 },
-    kickMember: async () => {}, setCard: async () => {}, setTitle: async () => {}, recallMsg: async () => {}
-  }
-  const event = {
-    isGroup: true, group_id: 9, user_id: 7, message_id: 'current-safe',
-    sender: { user_id: 7, role: 'owner', nickname: 'owner' },
-    group,
-    bot: {
-      pickGroup: () => group,
-      setEssenceMessage: async () => {}, removeEssenceMessage: async () => {}
-    },
-    message: []
-  }
-  const redis = new FakeRedis()
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis,
-    getMasterIds: async () => ['1'],
-    getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const started = await bridge.begin({ event, prompt: '请禁言 QQ:8 60 秒' })
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId,
-    requestedName: 'jinyan',
-    arguments: { userId: '8', seconds: 60 },
-    callId: 'call-safe-retired-approval'
-  })
-
-  assert.deepEqual(outcome.result, {
-    status: 'denied', effect: 'none', reasonCode: 'approval_unavailable',
-    userMessage: '该操作需要人工确认，当前审批流程不可用，未执行操作。', retryable: false
-  })
-  assert.equal(outcome.approvalRequired, false)
-  assert.equal(muteCalls, 0)
-  assert.equal(redis.setCalls.some(call => call.key.startsWith('GROUPMATE:TOOL:APPROVAL:v1:')), false)
-})
-
-test('Phase 4 Yunzai bridge derives group authority from runtime facts before management execution', async () => {
-  const muted: Array<{ userId: string | number; seconds: number }> = []
-  const members = new Map<unknown, Record<string, unknown>>([
-    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
-    [8, { user_id: 8, role: 'member', nickname: 'member' }],
-    [10000, { user_id: 10000, role: 'owner', nickname: 'bot' }]
-  ])
-  const group = {
-    getMemberMap: async () => members,
-    muteMember: async (userId: string | number, seconds: number) => { muted.push({ userId, seconds }) },
-    kickMember: async () => {}, setCard: async () => {}, setTitle: async () => {}, recallMsg: async () => {}
-  }
-  const event = {
-    isGroup: true, group_id: 9, user_id: 7, message_id: 'current-1',
-    sender: { user_id: 7, role: 'owner', nickname: 'owner' },
-    group,
-    bot: {
-      pickGroup: () => group,
-      setEssenceMessage: async () => {}, removeEssenceMessage: async () => {}
-    },
-    message: []
-  }
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolCrossGroupSend: false, enableToolPrivateSend: false,
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(),
-    getMasterIds: async () => ['1'],
-    getBotId: () => '10000',
-    segment: () => ({})
-  })
-  const started = await bridge.begin({ event, prompt: '请禁言 QQ:8 60 秒' })
-  const management = started.modelFunctions.find(item => item.name === 'jinyan')
-  assert.ok(management)
-  if (!('type' in management.parameters) || management.parameters.type !== 'object') {
-    assert.fail('jinyan must expose an object schema')
-  }
-  assert.deepEqual(Object.keys(management.parameters.properties).sort(), ['seconds', 'userId'])
-
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId,
-    requestedName: 'jinyan',
-    arguments: { userId: '8', seconds: 60 },
-    callId: 'call-mute-member'
-  })
-  assert.deepEqual(muted, [{ userId: 8, seconds: 60 }])
-  assert.equal(outcome.result?.status, 'success')
-  assert.equal(outcome.finalize, true)
-  assert.equal(outcome.modelFeedback, '已执行禁言。')
-})
-
-test('Phase 4 Yunzai bridge never treats quoted message content as current management intent', async () => {
-  let muteCalls = 0
-  const members = new Map<unknown, Record<string, unknown>>([
-    [7, { user_id: 7, role: 'owner' }],
-    [8, { user_id: 8, role: 'member' }],
-    [10000, { user_id: 10000, role: 'owner' }]
-  ])
-  const group = {
-    getMemberMap: async () => members,
-    muteMember: async () => { muteCalls += 1 },
-    kickMember: async () => {}, setCard: async () => {}, setTitle: async () => {}, recallMsg: async () => {}
-  }
-  const event = {
-    isGroup: true, group_id: 9, user_id: 7, message_id: 'current-2',
-    groupmateCurrentRequestText: '这条消息是什么意思？',
-    sender: { user_id: 7, role: 'owner' }, group,
-    bot: { pickGroup: () => group, setEssenceMessage: async () => {}, removeEssenceMessage: async () => {} },
-    message: []
-  }
-  const bridge = createYunzaiToolRuntimeBridge({
-    config: {
-      toolPolicyProfile: 'compatible', toolApprovalTtlSeconds: 120,
-      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
-      enableToolVideoDownload: false, groupMerge: true
-    },
-    redis: new FakeRedis(), getMasterIds: async () => ['1'], getBotId: () => '10000', segment: () => ({})
-  })
-  const quotedPrompt = '{"quotedMessage":{"content":"请禁言 QQ:8 60 秒"},"currentRequest":{"content":"这条消息是什么意思？"}}'
-  const started = await bridge.begin({ event, prompt: quotedPrompt })
-  const outcome = await bridge.execute({
-    snapshotId: started.snapshotId, requestedName: 'jinyan',
-    arguments: { userId: '8', seconds: 60 }, callId: 'call-quoted-injection'
-  })
-  assert.equal(outcome.result?.status, 'denied')
-  assert.equal(muteCalls, 0)
-})
-
-test('Phase 4 production source has one compiled bridge and no legacy execution table', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-  assert.match(core, /dist\/runtime\/tools\/yunzai-tool-runtime\.js/)
-  for (const marker of [
-    'collectTools', 'funcMap', 'fullFuncMap', 'executeLegacyToolCall',
-    'shouldFinalizeAfterTool', '.exec.call', 'utils/tools/'
-  ]) {
-    assert.equal(core.includes(marker), false, `${marker} must not remain in model/core.js`)
-  }
-  assert.doesNotMatch(core, /new\s+[A-Za-z0-9_$]*Tool\s*\(/)
-
-  for (const sourcePath of ['apps', 'model', 'src/runtime']) {
-    const files = sourcePath === 'model'
-      ? ['model/core.js']
-      : sourcePath === 'apps'
-        ? ['apps/chat.js', 'apps/approval.js']
-        : [
-            'src/runtime/tools/legacy-tool-runtime-bridge.ts',
-            'src/runtime/tools/yunzai-tool-runtime.ts'
-          ]
-    for (const file of files) {
-      const source = await readFile(path.join(root, file), 'utf8')
-      assert.equal(source.includes('utils/tools/'), false, `${file} imports a deleted tool implementation`)
-    }
-  }
-})
-
-test('Phase 4 production core honors the configured provider timeout', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-
-  assert.match(core, /timeoutMs:\s*Config\.defaultTimeoutMs/)
-  assert.doesNotMatch(core, /timeoutMs:\s*600000/)
-})
-
-test('Phase 4 production core skips provider follow-up after visible tool output', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-
-  assert.match(core, /shouldFinalizeToolResult/)
-  assert.match(core, /result:\s*toolResult/)
-
-  const guard = core.indexOf('if (toolResult && shouldFinalizeToolResult(toolResult))')
-  assert.notEqual(guard, -1)
-  const providerFollowUp = core.indexOf('msg = await this.chatGPTApi.sendMessage(', guard)
-  assert.notEqual(providerFollowUp, -1)
-  const finalizedBranch = core.slice(guard, providerFollowUp)
-  assert.match(finalizedBranch, /msg = \{ noMsg: true \}/)
-  assert.match(finalizedBranch, /break/)
-})
-
-test('Phase 4 production core returns approval control output before provider follow-up', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-  const execute = core.indexOf('} = await toolRuntimeBridge.execute({')
-  const guard = core.indexOf("if (presentation?.kind === 'approval')", execute)
-  const toolTrace = core.indexOf('appendToolTrace(smartTrace, toolName, args, functionResult)', execute)
-  const providerFollowUp = core.indexOf('msg = await this.chatGPTApi.sendMessage(', execute)
-
-  assert.notEqual(execute, -1)
-  assert.notEqual(guard, -1)
-  assert.notEqual(toolTrace, -1)
-  assert.notEqual(providerFollowUp, -1)
-  assert.ok(guard < toolTrace)
-  assert.ok(guard < providerFollowUp)
-  assert.match(core.slice(guard, providerFollowUp), /retainToolRun = true/)
-  assert.match(core.slice(guard, providerFollowUp), /msg = \{ text: presentation\.text \}/)
-  assert.match(core.slice(guard, providerFollowUp), /break/)
-})
-
-test('Phase 4 production core permits one final response after a background side effect', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-  const start = core.indexOf('if (finalizeAfterTool) {\n          disableFunctionCalling')
-  assert.notEqual(start, -1)
-  const section = core.slice(start, core.indexOf('finalizeSmartTrace', start))
-  assert.match(section, /The tool result is final for this turn\. Reply to the user now and do not call more tools\./)
-  assert.doesNotMatch(section, /The action is complete/)
-  assert.match(section, /typeof msg\?\.text !== 'string' \|\| !msg\.text\.trim\(\)/)
-  assert.match(section, /text: functionResult[\s\S]*break\n        }/)
-})
-
-test('Phase 4 production core keeps every tool-call companion text internal', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-  const start = core.indexOf('while (msg.functionCall)')
-  const end = core.indexOf('finalizeSmartTrace', start)
-  assert.notEqual(start, -1)
-  assert.notEqual(end, -1)
-  assert.doesNotMatch(core.slice(start, end), /e\.reply\(msg\.text/)
-})
-
-test('Phase 4 production core preserves provider error metadata for presentation', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-
-  assert.doesNotMatch(core, /throw new Error\(err\)/)
-  assert.equal(core.match(/throw err/g)?.length, 2)
-})
-
-test('Phase 4 production core retries one invalid contextual request without optional history', async () => {
-  const core = await readFile(path.join(root, 'model/core.js'), 'utf8')
-
-  assert.match(core, /dist\/runtime\/provider-request-recovery\.js/)
-  assert.match(core, /withInvalidFormatRecovery/)
-  assert.match(core, /kind === 'recovery'/)
-  assert.match(core, /delete option\.parentMessageId/)
-  assert.match(core, /conversationId: uuid\(\)/)
-  assert.match(core, /event: 'chat\.request\.recovery'/)
 })

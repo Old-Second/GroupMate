@@ -97,14 +97,12 @@ function definition (
 function executor (tool: ToolDefinition) {
   return new ToolExecutor({
     policy: new ToolPolicyEngine(),
-    approvalStore: { create: async () => {}, get: async () => null, consume: async () => null },
-    pendingCalls: { put: () => {}, take: () => null, delete: () => true },
     idempotencyStore: {
       reserve: async () => Object.freeze({ kind: 'acquired' as const }),
       complete: async () => {}, markIndeterminate: async () => {}
     },
     audit: { emit: () => {} },
-    generateId: () => 'generated-id', generateToken: () => 'generated-token',
+    generateId: () => 'generated-id',
     hash: value => createHash('sha256').update(value).digest('hex'),
     now: () => new Date('2026-07-14T00:00:00.000Z')
   })

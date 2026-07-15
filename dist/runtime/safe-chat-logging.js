@@ -45,13 +45,6 @@ export function createChatResponseLog({ mode, response }) {
         failed: Boolean(value.error)
     };
 }
-export function createToolExecutionLog({ name, result }) {
-    return {
-        event: 'chat.tool.result',
-        tool: getSafeMode(name),
-        resultCharacters: getStringLength(result)
-    };
-}
 export function createChatErrorLog({ mode, error, category }) {
     const metadata = readChatErrorMetadata(error);
     return {

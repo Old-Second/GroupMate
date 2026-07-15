@@ -15,6 +15,7 @@ const providerIds = [
 ] as const
 
 test('provider manifest defines every baseline category with exact source entries', () => {
+  const openAICompatibleSources: readonly string[] = providerSurfaceManifest.sources.openaiCompatible
   assert.deepEqual(Object.keys(providerSurfaceManifest.sources), providerIds)
   assert.ok(providerSurfaceManifest.sources.openaiCompatible.length > 0)
   for (const providerId of providerIds.slice(1)) {
@@ -24,12 +25,22 @@ test('provider manifest defines every baseline category with exact source entrie
       `${providerId} must have no retained exact source`
     )
   }
-  assert.ok(providerSurfaceManifest.sources.openaiCompatible.includes(
+  assert.ok(openAICompatibleSources.includes(
     'src/agent/model/deepseek-compatibility-profile.ts'
   ))
-  assert.ok(providerSurfaceManifest.sources.openaiCompatible.includes(
+  assert.ok(openAICompatibleSources.includes(
     'dist/agent/model/deepseek-compatibility-profile.js'
   ))
+  assert.ok(openAICompatibleSources.includes(
+    'src/runtime/completion-facade.ts'
+  ))
+  for (const retired of [
+    'model/core.js',
+    'utils/openai/chatgpt-api.js',
+    'utils/openai/fetch-sse.js'
+  ]) {
+    assert.equal(openAICompatibleSources.includes(retired), false)
+  }
   assert.ok(providerSurfaceManifest.configFields.openaiCompatible.includes(
     'openAiCompatibilityProfile'
   ))

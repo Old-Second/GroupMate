@@ -14,11 +14,6 @@ interface ChatResponseLogInput {
   response?: unknown
 }
 
-interface ToolExecutionLogInput {
-  name?: unknown
-  result?: unknown
-}
-
 interface ChatErrorLogInput {
   mode?: unknown
   error?: unknown
@@ -99,14 +94,6 @@ export function createChatResponseLog ({ mode, response }: ChatResponseLogInput)
     hasThinking: getStringLength(value.thinking_text) > 0 || thinkingSegments > 0,
     toolCallCount: toolCalls || (hasFunctionCall ? 1 : 0),
     failed: Boolean(value.error)
-  } as const
-}
-
-export function createToolExecutionLog ({ name, result }: ToolExecutionLogInput) {
-  return {
-    event: 'chat.tool.result',
-    tool: getSafeMode(name),
-    resultCharacters: getStringLength(result)
   } as const
 }
 

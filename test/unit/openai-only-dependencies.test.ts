@@ -24,11 +24,12 @@ test('package keeps only dependencies used by the supported provider path', asyn
     'cycletls',
     'openai',
     'asn1.js',
-    'eventsource'
+    'eventsource',
+    'quick-lru'
   ]) {
     assert.equal(Object.hasOwn(allRuntime, dependency), false, `${dependency} must be removed`)
   }
-  for (const dependency of ['quick-lru', 'eventsource-parser']) {
+  for (const dependency of ['eventsource-parser']) {
     assert.equal(Object.hasOwn(allRuntime, dependency), true, `${dependency} must remain`)
   }
   assert.deepEqual(packageJson.pnpm?.patchedDependencies ?? {}, {})

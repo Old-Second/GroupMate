@@ -38,12 +38,6 @@ importers:
       https-proxy-agent:
         specifier: 7.0.1
         version: 7.0.1
-      js-tiktoken:
-        specifier: ^1.0.5
-        version: 1.0.7
-      keyv:
-        specifier: ^4.5.3
-        version: 4.5.3
       keyv-file:
         specifier: ^0.2.0
         version: 0.2.0
@@ -56,21 +50,12 @@ importers:
       node-fetch:
         specifier: ^3.3.1
         version: 3.3.1
-      p-timeout:
-        specifier: ^6.1.2
-        version: 6.1.2
-      quick-lru:
-        specifier: 6.1.1
-        version: 6.1.1
       random:
         specifier: ^4.1.0
         version: 4.1.0
       undici:
         specifier: ^5.21.0
         version: 5.22.1
-      uuid:
-        specifier: ^9.0.0
-        version: 9.0.0
       ws:
         specifier: ^8.13.0
         version: 8.13.0
@@ -978,14 +963,8 @@ packages:
   jpeg-js@0.4.4:
     resolution: {integrity: sha512-WZzeDOEtTOBK4Mdsar0IqEU5sMr3vSV2RqkAIzUEV2BHnUfKGyswWFPFwK5EeDo93K3FohSHbLAjj0s1Wzd+dg==}
 
-  js-tiktoken@1.0.7:
-    resolution: {integrity: sha512-biba8u/clw7iesNEWLOLwrNGoBP2lA+hTaBLs/D45pJdUPFXyxD6nhcDVtADChghv4GgyAiMKYMiRx7x6h7Biw==}
-
   jsbn@0.1.1:
     resolution: {integrity: sha1-peZUwuWi3rXyAdls77yoDA7y9RM=}
-
-  json-buffer@3.0.1:
-    resolution: {integrity: sha1-kziAKjDTtmBfvgYT4JQAjKjAWhM=}
 
   json-schema-traverse@0.4.1:
     resolution: {integrity: sha1-afaofZUTq4u4/mO9sJecRI5oRmA=}
@@ -1011,9 +990,6 @@ packages:
 
   keyv-file@0.2.0:
     resolution: {integrity: sha512-zUQ11eZRmilEUpV1gJSj8mBAHjyXpleQo1iCS0khb+GFRhiPfwavWgn4eDUKNlOyMZzmExnISl8HE1hNbim0gw==}
-
-  keyv@4.5.3:
-    resolution: {integrity: sha512-QCiSav9WaX1PgETJ+SpNnx2PRRapJ/oRSXM4VO5OGYGSjrxbKPVFVhB3l2OCbLCk329N8qyAtsJjSjvVBWzEug==}
 
   lie@3.3.0:
     resolution: {integrity: sha1-3Pgt7lRfRgdNryAMfBxaCOD0D2o=}
@@ -1190,10 +1166,6 @@ packages:
     resolution: {integrity: sha1-4drMvnjQ0TiMoYxk/qOOPlfjcGs=}
     engines: {node: '>=10'}
 
-  p-timeout@6.1.2:
-    resolution: {integrity: sha512-UbD77BuZ9Bc9aABo74gfXhNvzC9Tx7SxtHSh1fxvx3jTLLYvmVhiQZZrJzqqU0jKbN32kb5VOKiLEQI/3bIjgQ==}
-    engines: {node: '>=14.16'}
-
   pako@1.0.11:
     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
 
@@ -1298,10 +1270,6 @@ packages:
 
   quick-format-unescaped@4.0.4:
     resolution: {integrity: sha1-k+9t2NNFPLx5cN1hT61MWVTWtac=}
-
-  quick-lru@6.1.1:
-    resolution: {integrity: sha512-S27GBT+F0NTRiehtbrgaSE1idUAJ5bX8dPAQTdylEyNlrdcH5X4Lz7Edz3DYzecbsCluD5zO8ZNEe04z3D3u6Q==}
-    engines: {node: '>=12'}
 
   random@4.1.0:
     resolution: {integrity: sha512-6Ajb7XmMSE9EFAMGC3kg9mvE7fGlBip25mYYuSMzw/uUSrmGilvZo2qwX3RnTRjwXkwkS+4swse9otZ92VjAtQ==}
@@ -2732,14 +2700,8 @@ snapshots:
   jpeg-js@0.4.4:
     optional: true
 
-  js-tiktoken@1.0.7:
-    dependencies:
-      base64-js: 1.5.1
-
   jsbn@0.1.1:
     optional: true
-
-  json-buffer@3.0.1: {}
 
   json-schema-traverse@0.4.1:
     optional: true
@@ -2779,10 +2741,6 @@ snapshots:
       tslib: 1.14.1
     transitivePeerDependencies:
       - supports-color
-
-  keyv@4.5.3:
-    dependencies:
-      json-buffer: 3.0.1
 
   lie@3.3.0:
     dependencies:
@@ -3002,8 +2960,6 @@ snapshots:
     dependencies:
       yocto-queue: 0.1.0
 
-  p-timeout@6.1.2: {}
-
   pako@1.0.11:
     optional: true
 
@@ -3153,8 +3109,6 @@ snapshots:
     optional: true
 
   quick-format-unescaped@4.0.4: {}
-
-  quick-lru@6.1.1: {}
 
   random@4.1.0:
     dependencies:

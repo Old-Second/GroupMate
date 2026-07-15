@@ -1,7 +1,7 @@
 import { ToolUnavailableError } from './tool-registry.js';
 import { ToolInputError, validateToolInputRecord } from './schema-validator.js';
 import { completedPreparedCall, parseSerializablePreparedCapability } from './prepared-capability.js';
-import { parseToolResult, shouldFinalizeToolExecution } from './tool-result.js';
+import { parseToolResult } from './tool-result.js';
 const idempotencyTtlSeconds = 300;
 function failedResult(errorCode) {
     const messages = {
@@ -30,15 +30,6 @@ function indeterminateResult() {
         userMessage: '操作结果暂时无法确认。', retryable: false
     });
 }
-function completed(tool, result) {
-    const toolName = typeof tool === 'string' ? tool : tool.name;
-    return Object.freeze({
-        kind: 'completed',
-        toolName,
-        result,
-        finalize: typeof tool === 'string' ? false : shouldFinalizeToolExecution(tool.effect, result)
-    });
-}
 function parseArguments(call) {
     if (typeof call.arguments !== 'string')
         return call.arguments;
@@ -48,9 +39,6 @@ function parseArguments(call) {
     catch {
         throw new ToolInputError('invalid_type');
     }
-}
-function isAborted(signal) {
-    return signal?.aborted === true;
 }
 function durationBucket(milliseconds) {
     if (milliseconds < 10)
@@ -62,11 +50,6 @@ function durationBucket(milliseconds) {
     if (milliseconds < 10_000)
         return 'lt_10s';
     return 'gte_10s';
-}
-function channelKey(facts) {
-    return facts.channel.kind === 'private'
-        ? `private:${facts.channel.userId}`
-        : `group:${facts.channel.groupId}`;
 }
 function idempotencyKey(definition, call, argumentHash, hash) {
     return definition.idempotency === 'semantic'
@@ -88,13 +71,8 @@ function safeCallId(value) {
 }
 export class ToolExecutor {
     #options;
-    #approvalTtlSeconds;
     constructor(options) {
-        const ttl = options.approvalTtlSeconds ?? 120;
-        if (!Number.isInteger(ttl) || ttl < 30 || ttl > 300)
-            throw new TypeError('approval TTL is invalid');
         this.#options = options;
-        this.#approvalTtlSeconds = ttl;
     }
     async #audit(eventType, definition, request, fields = {}) {
         const now = this.#options.now();
@@ -126,88 +104,18 @@ export class ToolExecutor {
             return false;
         }
     }
-    async #approval(definition, input, target, request, argumentHash, summaryCode) {
-        const approvalTtlSeconds = request.approvalTtlSeconds ?? this.#approvalTtlSeconds;
-        if (!Number.isInteger(approvalTtlSeconds) || approvalTtlSeconds < 30 || approvalTtlSeconds > 300) {
-            throw new TypeError('approval TTL is invalid');
-        }
-        const token = this.#options.generateToken();
-        const tokenHash = this.#options.hash(token);
-        const pendingCallId = this.#options.generateId();
-        const rawVersion = this.#options.generateId();
-        const createdAt = this.#options.now();
-        const expiresAt = new Date(createdAt.getTime() + approvalTtlSeconds * 1_000);
-        const pending = Object.freeze({
-            schemaVersion: 1,
-            pendingCallId,
-            toolName: definition.name,
-            toolVersion: 1,
-            profile: request.profile,
-            call: Object.freeze({
-                runId: request.call.runId,
-                callId: request.call.callId,
-                snapshotId: request.call.snapshotId,
-                requestedName: request.call.requestedName
-            }),
-            input,
-            intent: request.intent,
-            argumentHash,
-            createdAt: createdAt.toISOString(),
-            expiresAt: expiresAt.toISOString()
-        });
-        const record = Object.freeze({
-            schemaVersion: 1,
-            rawVersion,
-            tokenHash,
-            toolName: definition.name,
-            toolVersion: 1,
-            profile: request.profile,
-            runId: request.call.runId,
-            callId: request.call.callId,
-            snapshotId: request.call.snapshotId,
-            argumentHash,
-            pendingCallId,
-            botIdHash: this.#options.hash(request.initialFacts.botId),
-            actorIdHash: this.#options.hash(request.initialFacts.actor.userId),
-            channelHash: this.#options.hash(channelKey(request.initialFacts)),
-            targetHash: this.#options.hash(JSON.stringify(target)),
-            summaryCode,
-            createdAt: createdAt.toISOString(),
-            expiresAt: expiresAt.toISOString()
-        });
-        try {
-            this.#options.pendingCalls.put(pending);
-        }
-        catch {
-            return completed(definition, failedResult('tool_control_unavailable'));
-        }
-        try {
-            await this.#options.approvalStore.create(record, approvalTtlSeconds);
-        }
-        catch {
-            this.#options.pendingCalls.delete(pendingCallId);
-            return completed(definition, failedResult('tool_control_unavailable'));
-        }
-        return Object.freeze({
-            kind: 'approval_required',
-            toolName: definition.name,
-            token,
-            expiresAt: expiresAt.toISOString(),
-            summaryCode
-        });
-    }
-    #duplicateOutcome(definition, reservation) {
+    #duplicateResult(reservation) {
         if (reservation.kind === 'running')
-            return completed(definition, failedResult('tool_in_progress'));
+            return failedResult('tool_in_progress');
         if (reservation.kind === 'indeterminate')
-            return completed(definition, indeterminateResult());
+            return indeterminateResult();
         const stored = reservation.outcome;
         if (stored.status === 'success') {
-            return completed(definition, parseToolResult({
+            return parseToolResult({
                 status: 'success', effect: stored.effect, content: [], retryable: false
-            }));
+            });
         }
-        return completed(definition, failedResult(stored.errorCode));
+        return failedResult(stored.errorCode);
     }
     async #discover(call, context, snapshot) {
         const requestedName = safeRequestedName(call.requestedName);
@@ -434,7 +342,7 @@ export class ToolExecutor {
                 return failedResult('tool_control_unavailable');
             }
             if (reservation.kind !== 'acquired') {
-                return this.#duplicateOutcome(definition, reservation).result;
+                return this.#duplicateResult(reservation);
             }
         }
         const startedAt = this.#options.now().getTime();
@@ -529,81 +437,5 @@ export class ToolExecutor {
             clearTimeout(timer);
             signal.removeEventListener('abort', externalAbort);
         }
-    }
-    async execute(request) {
-        const requestedName = safeRequestedName(request.call.requestedName);
-        if (isAborted(request.signal)) {
-            return completed(requestedName, failedResult('tool_cancelled'));
-        }
-        const signal = request.signal ?? new AbortController().signal;
-        const initialContext = Object.freeze({
-            runId: request.call.runId,
-            profile: request.profile,
-            facts: request.initialFacts,
-            intent: request.intent,
-            now: this.#options.now().toISOString()
-        });
-        const discovered = await this.#discover(request.call, initialContext, request.snapshot);
-        if ('kind' in discovered) {
-            if (discovered.kind !== 'completed') {
-                return completed(requestedName, failedResult('tool_execution_failed'));
-            }
-            return completed(discovered.toolName, discovered.result);
-        }
-        let refreshedFacts;
-        try {
-            refreshedFacts = await request.refreshFacts(discovered.target, signal);
-        }
-        catch {
-            if (signal.aborted) {
-                return completed(discovered.definition, failedResult('tool_cancelled'));
-            }
-            if (!await this.#tryAudit('denied', discovered.definition, request, {
-                reasonCode: 'permission_denied'
-            })) {
-                return completed(discovered.definition, failedResult('tool_control_unavailable'));
-            }
-            return completed(discovered.definition, deniedResult('permission_denied', '当前身份不能执行该操作。'));
-        }
-        const freshContext = Object.freeze({
-            ...initialContext,
-            facts: refreshedFacts,
-            ...(request.approvalGrant === undefined
-                ? {}
-                : {
-                    approval: Object.freeze({
-                        kind: 'approved',
-                        decidedAt: this.#options.now().toISOString()
-                    })
-                })
-        });
-        const prepared = await this.#finishPreparation(discovered, freshContext);
-        if (prepared.kind === 'completed') {
-            return completed(discovered.definition, prepared.result);
-        }
-        if (prepared.kind === 'approval_required') {
-            if (this.#options.approvalMode === 'disabled') {
-                if (!await this.#tryAudit('denied', discovered.definition, request, {
-                    reasonCode: 'approval_unavailable'
-                })) {
-                    return completed(discovered.definition, failedResult('tool_control_unavailable'));
-                }
-                return completed(discovered.definition, deniedResult('approval_unavailable', '该操作需要人工确认，当前审批流程不可用，未执行操作。'));
-            }
-            if (request.approvalGrant === undefined) {
-                return await this.#approval(discovered.definition, discovered.input, discovered.target, request, prepared.capability.argumentHash, prepared.summaryCode);
-            }
-            if (request.approvalGrant.callId !== prepared.capability.callId ||
-                request.approvalGrant.argumentHash !== prepared.capability.argumentHash) {
-                if (!await this.#tryAudit('denied', discovered.definition, request, {
-                    reasonCode: 'approval_invalid'
-                })) {
-                    return completed(discovered.definition, failedResult('tool_control_unavailable'));
-                }
-                return completed(discovered.definition, deniedResult('approval_invalid', '该审批已失效，请重新发起。'));
-            }
-        }
-        const result = await this.executePrepared(prepared.capability, freshContext, request.snapshot, signal);
-        return completed(discovered.definition, result);
     }
 }

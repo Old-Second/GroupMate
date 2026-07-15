@@ -21,42 +21,44 @@ const removedRuntimeFiles = [
   'utils/xinghuo/xinghuo.js'
 ]
 
+const retiredPhaseFiveRuntimeFiles = [
+  'model/core.js',
+  'utils/openai/chatgpt-api.js',
+  'utils/openai/fetch-sse.js',
+  'utils/openai/stream-async-iterable.js',
+  'utils/openai/tokenizer.js',
+  'utils/openai/types.js',
+  'src/runtime/provider-request-recovery.ts',
+  'dist/runtime/provider-request-recovery.js',
+  'src/runtime/legacy-session-bridge.ts',
+  'dist/runtime/legacy-session-bridge.js',
+  'src/runtime/tools/legacy-tool-runtime-bridge.ts',
+  'dist/runtime/tools/legacy-tool-runtime-bridge.js',
+  'src/runtime/tools/approval-command.ts',
+  'dist/runtime/tools/approval-command.js',
+  'src/runtime/tools/in-memory-pending-call-store.ts',
+  'dist/runtime/tools/in-memory-pending-call-store.js',
+  'src/runtime/tools/redis-approval-store.ts',
+  'dist/runtime/tools/redis-approval-store.js',
+  'src/agent/tools/approval-store.ts',
+  'dist/agent/tools/approval-store.js',
+  'src/agent/tools/pending-call-store.ts',
+  'dist/agent/tools/pending-call-store.js'
+]
+
 async function readSource (file: string): Promise<string> {
   return await readFile(path.join(root, file), 'utf8')
 }
 
-test('core runtime contains only the OpenAI-compatible provider path', async () => {
-  const source = await readSource('model/core.js')
-  const removedMarkers = [
-    'OfficialChatGPTClient',
-    'SydneyAIClient',
-    'ClaudeAPIClient',
-    'ClaudeAIClient',
-    'XinghuoClient',
-    'CustomGoogleGeminiClient',
-    'ChatGLM4Client',
-    'QwenApi',
-    "use === 'bing'",
-    "use === 'api3'",
-    "use === 'claude'",
-    "use === 'claude2'",
-    "use === 'xh'",
-    "use === 'azure'",
-    "use === 'qwen'",
-    "use === 'gemini'",
-    "use === 'chatglm4'"
-  ]
-
-  for (const marker of removedMarkers) {
-    assert.equal(source.includes(marker), false, `${marker} must be removed from model/core.js`)
-  }
-
-  for (const marker of ['ChatGPTAPI', 'createYunzaiToolRuntimeBridge']) {
-    assert.equal(source.includes(marker), true, `${marker} must remain in model/core.js`)
-  }
-
-  for (const marker of ['executeLegacyToolCall', 'shouldFinalizeAfterTool', 'utils/tools/']) {
-    assert.equal(source.includes(marker), false, `${marker} must be removed from model/core.js`)
+test('retired Phase 5 model and control runtimes are deleted', async () => {
+  for (const file of retiredPhaseFiveRuntimeFiles) {
+    let error: NodeJS.ErrnoException | undefined
+    try {
+      await access(path.join(root, file))
+    } catch (caught) {
+      error = caught as NodeJS.ErrnoException
+    }
+    assert.equal(error?.code, 'ENOENT', `${file} must be deleted`)
   }
 })
 

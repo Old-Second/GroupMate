@@ -11,15 +11,15 @@ const runtimePath = path.join(projectRoot, 'dist', 'runtime', 'safe-chat-logging
 test('safe chat log summaries expose bounded metadata without message content', async () => {
   assert.equal(existsSync(runtimePath), true, 'compiled safe chat logging module must exist')
 
+  const logging = await import(pathToFileURL(runtimePath).href)
   const {
     createChatRequestLog,
     createChatResponseLog,
     createChatErrorLog,
-    createToolExecutionLog,
     createMessageInputLog,
     createAgentRunLog
-  } = await import(pathToFileURL(runtimePath).href)
-  assert.equal(typeof createToolExecutionLog, 'function')
+  } = logging
+  assert.equal(Object.hasOwn(logging, 'createToolExecutionLog'), false)
   assert.equal(typeof createChatErrorLog, 'function')
   const secretPrompt = 'secret prompt qq=123456 https://private.example/token'
   const secretResponse = 'secret response with private content'
@@ -36,10 +36,6 @@ test('safe chat log summaries expose bounded metadata without message content', 
       toolCalls: [{ id: 'private-id', function: { arguments: '{"secret":true}' } }],
       conversationId: 'private-conversation-id'
     }
-  })
-  const tool = createToolExecutionLog({
-    name: 'weather',
-    result: 'secret tool result https://private.example'
   })
   const error = createChatErrorLog({
     mode: 'api',
@@ -94,11 +90,6 @@ test('safe chat log summaries expose bounded metadata without message content', 
     toolCallCount: 1,
     failed: false
   })
-  assert.deepEqual(tool, {
-    event: 'chat.tool.result',
-    tool: 'weather',
-    resultCharacters: 42
-  })
   assert.deepEqual(error, {
     event: 'chat.error',
     mode: 'api',
@@ -133,7 +124,7 @@ test('safe chat log summaries expose bounded metadata without message content', 
   })
   assert.match(agentRun.runRef, /^[a-f0-9]{16}$/)
 
-  const serialized = JSON.stringify({ request, response, tool, error, messageInput, agentRun })
+  const serialized = JSON.stringify({ request, response, error, messageInput, agentRun })
   assert.doesNotMatch(serialized, /secret|private|123456|https:|conversation|arguments/)
 })
 
@@ -177,17 +168,6 @@ test('active chat sources do not pass raw conversation values to loggers', () =>
         /logger\.mark\('思考过程', thinking\)/,
         /logger\.(?:error|warn)\(err\)/
       ]
-    },
-    {
-      file: 'model/core.js',
-      patterns: [
-        /logger\.debug\(system\)/,
-        /logger\.info\(data\?\.text \|\| data\.functionCall \|\| data\)/,
-        /logger\.info\(msg\)/,
-        /logger\.mark\(`function \$\{name\} execution result: \$\{functionResult\}`\)/,
-        /logger\.mark\(`\[chatgpt-plugin\] tool result feedback: name=\$\{toolName\}, toolCallId=\$\{option\.toolCallId\}`\)/,
-        /logger\.(?:error|warn)\(err\)/
-      ]
     }
   ]
   const offenders: string[] = []
@@ -202,13 +182,17 @@ test('active chat sources do not pass raw conversation values to loggers', () =>
   assert.deepEqual(offenders, [])
 })
 
-test('safe chat summaries use a visible log level behind the debug switch', () => {
+test('active chat and run summaries use only the safe logging boundary', () => {
   const chatSource = readFileSync(path.join(projectRoot, 'apps', 'chat.js'), 'utf8')
-  const coreSource = readFileSync(path.join(projectRoot, 'model', 'core.js'), 'utf8')
+  const serviceSource = readFileSync(path.join(projectRoot, 'src', 'runtime', 'agent-service.ts'), 'utf8')
+  const bridgeSource = readFileSync(path.join(projectRoot, 'src', 'runtime', 'agent-service-bridge.ts'), 'utf8')
 
   assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatRequestLog/)
   assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatResponseLog/)
-  assert.match(coreSource, /if \(Config\.debug\) logger\.info\(createChatResponseLog/)
-  assert.match(coreSource, /if \(Config\.debug\) logger\.info\(createToolExecutionLog/)
-  assert.doesNotMatch(`${chatSource}\n${coreSource}`, /logger\.debug\(create(?:Chat|Tool)/)
+  assert.match(serviceSource, /this\.#onRunLog\?\.\(createAgentRunLog\(\{/)
+  assert.match(bridgeSource, /onRunLog: entry => options\.logger\?\.info\?\.\(entry\)/)
+  assert.doesNotMatch(
+    `${chatSource}\n${serviceSource}\n${bridgeSource}`,
+    /logger\.debug\(create(?:Chat|Agent)/
+  )
 })
