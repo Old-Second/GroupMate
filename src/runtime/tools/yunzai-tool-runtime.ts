@@ -292,7 +292,7 @@ async function eligibleApprovers (
   }
   const actorId = identifier(event.sender?.user_id ?? event.user_id, 'actor ID')
   const actorGroupRole = role(event.sender?.role)
-  if (actorGroupRole === 'owner') actors.set(actorId, 'group_owner')
+  if (actorGroupRole === 'owner' && !actors.has(actorId)) actors.set(actorId, 'group_owner')
   if (actorGroupRole === 'admin' && !actors.has(actorId)) actors.set(actorId, 'group_admin')
   if (event.isGroup === true) {
     try {
@@ -301,7 +301,7 @@ async function eligibleApprovers (
         if (actors.size >= 32) break
         const userId = identifier(value.user_id ?? key, 'member ID')
         const memberRole = role(value.role)
-        if (memberRole === 'owner') actors.set(userId, 'group_owner')
+        if (memberRole === 'owner' && !actors.has(userId)) actors.set(userId, 'group_owner')
         if (memberRole === 'admin' && !actors.has(userId)) actors.set(userId, 'group_admin')
       }
     } catch {}

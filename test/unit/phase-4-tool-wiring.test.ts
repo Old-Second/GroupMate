@@ -305,6 +305,47 @@ test('Phase 5 Yunzai bridge exposes a native run binding without entering the le
   )
 })
 
+test('Phase 5 Yunzai approval keeps bot master authority for a group owner', async () => {
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
+    [10000, { user_id: 10000, role: 'admin', nickname: 'bot' }]
+  ])
+  const group = { getMemberMap: async () => members }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: {
+      toolPolicyProfile: 'safe', toolApprovalTtlSeconds: 120,
+      serpSource: 'ikechan8370', imageSearchSource: 'ikechan8370', extraUrl: '',
+      enableToolCrossGroupSend: false, enableToolPrivateSend: true,
+      enableToolVideoDownload: false, groupMerge: true
+    },
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
+    segment: () => ({})
+  })
+  const event = {
+    isGroup: true, group_id: 9, user_id: 7, self_id: 10000,
+    sender: { user_id: 7, nickname: 'owner', role: 'owner' },
+    group,
+    bot: { pickGroup: () => group },
+    message: []
+  }
+
+  const run = await bridge.prepareAgentRun({ event, prompt: '发送一条测试消息' })
+  const checkpoint = { runId: 'run-owner-master' } as Parameters<
+    typeof run.binding.prepareToolContext
+  >[0]
+  const signal = new AbortController().signal
+  const context = await run.binding.prepareToolContext(checkpoint, signal)
+  const approvalControlContext = run.binding.approvalControlContext
+  assert.ok(approvalControlContext)
+  const control = await approvalControlContext(checkpoint, context, signal)
+
+  assert.deepEqual(control.eligibleApprovers.find(actor => actor.userId === '7'), {
+    userId: '7', role: 'bot_master'
+  })
+})
+
 test('Phase 4 Yunzai bridge treats a missing legacy image result as no images', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
     config: {
