@@ -18,6 +18,14 @@ import type { SafeTextAtom } from './presentation/yunzai-outbound-port.js'
 export {
   UNAVAILABLE_TTS_REPLY_PORT
 } from './presentation/yunzai-tts-reply-port.js'
+export {
+  UNAVAILABLE_GROUPMATE_PICTURE_RENDERER
+} from './presentation/groupmate-picture-renderer.js'
+export type {
+  BrowserPicturePort,
+  GroupMatePictureRenderer,
+  Live2dAssetResolver
+} from './presentation/groupmate-picture-renderer.js'
 export type {
   TtsReplyPort,
   TtsSynthesisResult,

@@ -19,6 +19,7 @@ import webUser from './modules/user.js'
 import webPrompt from './modules/prompts.js'
 import Guoba from './modules/guoba.js'
 import SettingView from './modules/setting_view.js'
+import groupMateReplyRoute from './modules/groupmate_reply_route.js'
 
 const isTrss = Array.isArray(Bot.uin)
 const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
@@ -148,6 +149,7 @@ export async function createServer () {
     }
   })
   await server.register(fastifyCookie)
+  await server.register(groupMateReplyRoute)
   await server.register(webRoute)
   await server.register(webUser)
   await server.register(SettingView)

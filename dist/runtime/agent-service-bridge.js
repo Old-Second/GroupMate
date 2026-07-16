@@ -26,7 +26,7 @@ import { ReplyPresenter } from './presentation/reply-presenter.js';
 import { TTS_SYNTHESIS_DIAGNOSTIC_EVENT } from './presentation/tts-reply-presentation.js';
 import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
 import { plainTextPart } from './presentation/text-presentation.js';
-import { PLAIN_TEXT_PRESENTATION_HOOKS, UNAVAILABLE_TTS_REPLY_PORT } from './runtime-presentation-hooks.js';
+import { PLAIN_TEXT_PRESENTATION_HOOKS, UNAVAILABLE_GROUPMATE_PICTURE_RENDERER, UNAVAILABLE_TTS_REPLY_PORT } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
 import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
@@ -253,6 +253,7 @@ class ApprovalRoutePresenter {
             outboundFactory: input.outboundFactory,
             tts: UNAVAILABLE_TTS_REPLY_PORT,
             ttsDiagnostics: input.ttsDiagnostics,
+            pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
             random: Math.random,
             sleep: async (milliseconds) => await new Promise(resolve => setTimeout(resolve, milliseconds)),
             schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)

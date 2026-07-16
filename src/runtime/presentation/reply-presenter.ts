@@ -42,11 +42,14 @@ import {
 } from './tts-reply-presentation.js'
 import type { TtsReplyPort } from './yunzai-tts-reply-port.js'
 import type { PresentationInput } from '../runtime-presentation-hooks.js'
+import { presentPictureReply } from '../picture-reply.js'
+import type { GroupMatePictureRenderer } from './groupmate-picture-renderer.js'
 
 export interface ReplyPresenterDependencies {
   readonly outboundFactory: YunzaiOutboundPortFactory
   readonly tts: TtsReplyPort
   readonly ttsDiagnostics: TtsPresentationDiagnosticPort
+  readonly pictureRenderer: GroupMatePictureRenderer
   readonly random: () => number
   readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>
   readonly schedule: (
@@ -216,14 +219,13 @@ async function presentOrdinary (
   const port = await dependencies.outboundFactory.forTarget(input.route.sessionAddress)
   const children: PresentationResult[] = []
   const citations = normalizeCitationForwards(input.citationForwards)
-  if (citations.length > 0) {
-    children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
-      ...(input.signal === undefined ? {} : { signal: input.signal })
-    }))
-  }
-
   const quote = quoteMessageId(input, profile)
   if (input.settings.tts.enabled) {
+    if (citations.length > 0) {
+      children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
+        ...(input.signal === undefined ? {} : { signal: input.signal })
+      }))
+    }
     children.push(await presentTtsReply({
       text,
       target: input.route.sessionAddress,
@@ -235,7 +237,35 @@ async function presentOrdinary (
       diagnostics: dependencies.ttsDiagnostics,
       outboundFactory: dependencies.outboundFactory
     }))
+    if (reasoningView !== undefined) {
+      children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
+        ...(input.signal === undefined ? {} : { signal: input.signal })
+      }))
+    }
+  } else if (
+    profile.forcePicture ||
+    input.settings.picture.userEnabled ||
+    (input.settings.picture.autoEnabled &&
+      codePointLength(text) >= input.settings.picture.autoThreshold)
+  ) {
+    children.push(await presentPictureReply({
+      text,
+      target: input.route.sessionAddress,
+      citations,
+      reasoningView: reasoningView ?? null,
+      settings: input.settings.picture,
+      ...(quote === undefined ? {} : { quoteMessageId: quote }),
+      ...(input.signal === undefined ? {} : { signal: input.signal })
+    }, {
+      renderer: dependencies.pictureRenderer,
+      outboundFactory: dependencies.outboundFactory
+    }))
   } else {
+    if (citations.length > 0) {
+      children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
+        ...(input.signal === undefined ? {} : { signal: input.signal })
+      }))
+    }
     const atoms = await input.hooks.convertText({
       text,
       enableRobotAt: input.settings.enableRobotAt,
@@ -245,12 +275,11 @@ async function presentOrdinary (
       ...(quote === undefined ? {} : { quoteMessageId: quote }),
       ...(input.signal === undefined ? {} : { signal: input.signal })
     }))
-  }
-
-  if (reasoningView !== undefined) {
-    children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-      ...(input.signal === undefined ? {} : { signal: input.signal })
-    }))
+    if (reasoningView !== undefined) {
+      children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
+        ...(input.signal === undefined ? {} : { signal: input.signal })
+      }))
+    }
   }
 
   if (input.settings.enableSuggestedResponses) {

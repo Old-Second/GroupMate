@@ -24,6 +24,7 @@ import type {
 } from '../../src/runtime/presentation/presentation-settings.js'
 import {
   PLAIN_TEXT_PRESENTATION_HOOKS,
+  UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
   UNAVAILABLE_TTS_REPLY_PORT
 } from '../../src/runtime/runtime-presentation-hooks.js'
 import type { YunzaiOutboundPort } from '../../src/runtime/presentation/yunzai-outbound-port.js'
@@ -613,6 +614,7 @@ test('legacy null route recovers without actor message id or rich presentation',
     outboundFactory: { forTarget: async () => outbound },
     tts: UNAVAILABLE_TTS_REPLY_PORT,
     ttsDiagnostics: { reportSynthesisFailure: () => undefined },
+    pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
     random: () => 1,
     sleep: async () => undefined,
     schedule: callback => setTimeout(callback, 1)

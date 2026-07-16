@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GroupMate</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 36px; color: #1f2937; background: #eef2f7; }
+    main { max-width: 1120px; margin: 0 auto; padding: 34px; border-radius: 22px; background: #fff; box-shadow: 0 12px 36px rgba(15,23,42,.08); }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: .02em; }
+    #groupmate-reply { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 22px; line-height: 1.72; }
+    section { margin-top: 28px; padding-top: 22px; border-top: 1px solid #e5e7eb; }
+    h2 { margin: 0 0 14px; font-size: 18px; }
+    ol { margin: 0; padding-left: 24px; }
+    li { margin: 10px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+    #groupmate-reasoning { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; color: #4b5563; }
+    #groupmate-qr { width: 148px; min-width: 148px; }
+    #groupmate-qr svg { display: block; width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>GroupMate</h1>
+      <div id="groupmate-qr" hidden aria-label="当前回复页面二维码"></div>
+    </header>
+    <p id="groupmate-reply"></p>
+    <section id="groupmate-citations-section" hidden>
+      <h2>引用资料</h2>
+      <ol id="groupmate-citations"></ol>
+    </section>
+    <section id="groupmate-reasoning-section" hidden>
+      <h2>思考过程</h2>
+      <p id="groupmate-reasoning"></p>
+    </section>
+  </main>
+  <script id="groupmate-document" type="application/json"><!--__GROUPMATE_DOCUMENT__--></script>
+  <script>
+    (() => {
+      const source = document.getElementById('groupmate-document')
+      if (!source) return
+      let value
+      try { value = JSON.parse(source.textContent || '') } catch { return }
+      const reply = document.getElementById('groupmate-reply')
+      if (reply) reply.textContent = value.replyText
+      const list = document.getElementById('groupmate-citations')
+      const citationSection = document.getElementById('groupmate-citations-section')
+      if (list && citationSection && Array.isArray(value.citations) && value.citations.length > 0) {
+        for (const citation of value.citations) {
+          const item = document.createElement('li')
+          item.textContent = citation.title + '\n' + citation.text +
+            (citation.sourceUrl ? '\n' + citation.sourceUrl : '')
+          list.appendChild(item)
+        }
+        citationSection.hidden = false
+      }
+      const reasoning = document.getElementById('groupmate-reasoning')
+      const reasoningSection = document.getElementById('groupmate-reasoning-section')
+      if (reasoning && reasoningSection && value.reasoningView) {
+        reasoning.textContent = value.reasoningView.text
+        reasoningSection.hidden = false
+      }
+      if (value.live2d) {
+        globalThis.__GROUPMATE_LIVE2D_READY__ = false
+        globalThis.__GROUPMATE_LIVE2D_DECORATION__ = Object.freeze({
+          modelFileUrl: value.live2d.modelFileUrl,
+          scale: value.live2d.scale,
+          positionX: value.live2d.positionX,
+          positionY: value.live2d.positionY,
+          rotation: value.live2d.rotation,
+          alpha: value.live2d.alpha
+        })
+      }
+    })()
+  </script>
+  <script><!--__GROUPMATE_QR_SCRIPT__--></script>
+</body>
+</html>

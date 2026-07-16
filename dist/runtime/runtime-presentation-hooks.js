@@ -1,5 +1,6 @@
 import { normalizeReasoningView } from './presentation/reply-content.js';
 export { UNAVAILABLE_TTS_REPLY_PORT } from './presentation/yunzai-tts-reply-port.js';
+export { UNAVAILABLE_GROUPMATE_PICTURE_RENDERER } from './presentation/groupmate-picture-renderer.js';
 function normalizeText(value) {
     return value.trim().normalize('NFC');
 }

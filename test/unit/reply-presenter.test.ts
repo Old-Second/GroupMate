@@ -25,6 +25,10 @@ import {
   SESSION_PERSISTENCE_FAILED_MESSAGE
 } from '../../src/runtime/presentation/response-presentation-safety.js'
 import { ReplyPresenter } from '../../src/runtime/presentation/reply-presenter.js'
+import type {
+  GroupMatePictureRenderer,
+  PictureRenderResult
+} from '../../src/runtime/presentation/groupmate-picture-renderer.js'
 import type { TtsPresentationDiagnosticPort } from '../../src/runtime/presentation/tts-reply-presentation.js'
 import {
   createRuntimePresentationHooks,
@@ -228,6 +232,7 @@ function fixture (input: {
   readonly recall?: (receipt: RuntimeDeliveryReceipt) => Promise<RecallResult>
   readonly synthesis?: TtsSynthesisResult
   readonly diagnostic?: (code: TtsSynthesisErrorCode) => void | Promise<void>
+  readonly pictureResult?: PictureRenderResult
 } = {}) {
   const deliveries = [...(input.deliveries ?? [])]
   const calls: OutboundCall[] = []
@@ -239,6 +244,7 @@ function fixture (input: {
   const conversions: Array<{ text: string; enableRobotAt: boolean; enableMarkdown: boolean }> = []
   const ttsCalls: object[] = []
   const ttsDiagnosticCalls: TtsSynthesisErrorCode[] = []
+  const pictureCalls: object[] = []
   const random = [...(input.random ?? [])]
   const port: YunzaiOutboundPort = {
     target: groupAddress,
@@ -286,10 +292,24 @@ function fixture (input: {
       return input.diagnostic?.(code)
     }
   }
+  const pictureRenderer: GroupMatePictureRenderer = {
+    render: async value => {
+      pictureCalls.push(value)
+      return input.pictureResult ?? Object.freeze({
+        kind: 'rendered',
+        resource: Object.freeze({
+          kind: 'buffer', data: new Uint8Array([137, 80, 78, 71]),
+          mimeType: 'image/png', byteLength: 4
+        }),
+        source: 'local'
+      })
+    }
+  }
   const presenter = new ReplyPresenter({
     outboundFactory,
     tts,
     ttsDiagnostics,
+    pictureRenderer,
     random: () => random.shift() ?? 0.5,
     sleep: async milliseconds => { sleeps.push(milliseconds) },
     schedule: (callback, milliseconds) => {
@@ -308,6 +328,7 @@ function fixture (input: {
     conversions,
     ttsCalls,
     ttsDiagnosticCalls,
+    pictureCalls,
     hooks
   }
 }
@@ -834,7 +855,7 @@ test('recovered legacy profile cannot use rich presentation or silence', async (
   assert.deepEqual(sentTexts(blocked.calls), [BLOCKED_RESPONSE_MESSAGE])
 })
 
-test('ReplyPresenter selects TTS before text with required port', async () => {
+test('ReplyPresenter selects TTS then picture then text with required renderer', async () => {
   const ttsSettings = settings({
     tts: Object.freeze({
       enabled: true,
@@ -844,6 +865,10 @@ test('ReplyPresenter selects TTS before text with required port', async () => {
       autoFallbackThreshold: 299,
       filter: null,
       azureEmotionEnabled: false
+    }),
+    picture: Object.freeze({
+      ...settings().picture,
+      userEnabled: true
     })
   })
   const ordinary = fixture()
@@ -855,35 +880,87 @@ test('ReplyPresenter selects TTS before text with required port', async () => {
   }))
   assert.equal(ordinaryResult.outcome, 'complete')
   assert.equal(ordinary.ttsCalls.length, 1)
+  assert.equal(ordinary.pictureCalls.length, 0)
   assert.deepEqual(ordinary.calls.map(call => call.part.media), ['voice'])
   assert.equal(ordinary.conversions.length, 0)
+
+  const picture = fixture({
+    hooks: {
+      postprocess: async ({ text }) => ({
+        text,
+        reasoningView: { text: '图片内推理', truncated: false }
+      })
+    }
+  })
+  await picture.presenter.present(input(completed({ kind: 'reply_text', text: '图片正文' }), {
+    citationForwards: Object.freeze([{
+      title: '图片内来源', text: '图片内引用', sourceUrl: 'https://example.com/source'
+    }]),
+    settings: settings({
+      picture: Object.freeze({ ...settings().picture, userEnabled: true })
+    }),
+    hooks: picture.hooks
+  }))
+  assert.equal(picture.ttsCalls.length, 0)
+  assert.equal(picture.pictureCalls.length, 1)
+  assert.deepEqual(picture.calls.map(call => call.part.media), ['picture'])
+  assert.equal(picture.conversions.length, 0)
+  assert.deepEqual(picture.pictureCalls[0], {
+    replyText: '图片正文',
+    citations: [{
+      title: '图片内来源', text: '图片内引用', sourceUrl: 'https://example.com/source'
+    }],
+    reasoningView: { text: '图片内推理', truncated: false },
+    settings: settings({
+      picture: Object.freeze({ ...settings().picture, userEnabled: true })
+    }).picture
+  })
+
+  const autoMiss = fixture()
+  await autoMiss.presenter.present(input(completed({ kind: 'reply_text', text: '四个字啊' }), {
+    settings: settings({
+      picture: Object.freeze({
+        ...settings().picture, autoEnabled: true, autoThreshold: 6
+      })
+    }),
+    hooks: autoMiss.hooks
+  }))
+  assert.equal(autoMiss.pictureCalls.length, 0)
+  assert.deepEqual(autoMiss.calls.map(call => call.part.media), ['text'])
+
+  const autoHit = fixture()
+  await autoHit.presenter.present(input(completed({ kind: 'reply_text', text: '六个汉字正好' }), {
+    settings: settings({
+      picture: Object.freeze({
+        ...settings().picture, autoEnabled: true, autoThreshold: 6
+      })
+    }),
+    hooks: autoHit.hooks
+  }))
+  assert.equal(autoHit.pictureCalls.length, 1)
+  assert.deepEqual(autoHit.calls.map(call => call.part.media), ['picture'])
+
+  const forced = fixture()
+  await forced.presenter.present(input(completed({ kind: 'reply_text', text: '强制图片' }), {
+    route: Object.freeze({
+      ...ordinaryRoute,
+      presentationIntent: Object.freeze({
+        schemaVersion: 1 as const, kind: 'ordinary' as const, forcePicture: true
+      })
+    }),
+    profile: ordinaryProfile({ forcePicture: true, quoteCurrentRequest: true }),
+    hooks: forced.hooks
+  }))
+  assert.equal(forced.pictureCalls.length, 1)
+  assert.deepEqual(forced.calls.map(call => call.part.media), ['picture'])
 
   const disabled = fixture()
   await disabled.presenter.present(input(completed({ kind: 'reply_text', text: '普通文本' }), {
     hooks: disabled.hooks
   }))
   assert.equal(disabled.ttsCalls.length, 0)
+  assert.equal(disabled.pictureCalls.length, 0)
   assert.deepEqual(disabled.calls.map(call => call.part.media), ['text'])
-
-  const proactive = fixture()
-  await proactive.presenter.present(input(completed({ kind: 'reply_text', text: '主动正文' }), {
-    route: proactiveRoute,
-    profile: proactiveProfile({ recallAfterMs: 2_000 }),
-    settings: ttsSettings,
-    hooks: proactive.hooks
-  }))
-  assert.equal(proactive.ttsCalls.length, 0)
-  assert.deepEqual(proactive.calls.map(call => call.part.media), ['text'])
-
-  const legacy = fixture()
-  await legacy.presenter.present(input(completed({ kind: 'reply_text', text: '恢复正文' }), {
-    route: recoveredRoute,
-    profile: RECOVERED_LEGACY_PROFILE,
-    settings: ttsSettings,
-    hooks: legacy.hooks
-  }))
-  assert.equal(legacy.ttsCalls.length, 0)
-  assert.deepEqual(legacy.calls.map(call => call.part.media), ['text'])
 
   const textFirstFailure = fixture({
     synthesis: Object.freeze({ kind: 'failed_definite', code: 'synthesis_rejected' }),
@@ -910,4 +987,33 @@ test('ReplyPresenter selects TTS before text with required port', async () => {
   )
   assert.deepEqual(sentTexts(textFirstFailure.calls).at(-1), SESSION_PERSISTENCE_FAILED_MESSAGE)
   assert.deepEqual(textFirstFailure.ttsDiagnosticCalls, ['synthesis_rejected'])
+  assert.equal(textFirstFailure.pictureCalls.length, 0)
+})
+
+test('ReplyPresenter bypasses picture for proactive and recovered legacy profiles', async () => {
+  const richSettings = settings({
+    tts: Object.freeze({ ...settings().tts, enabled: true }),
+    picture: Object.freeze({ ...settings().picture, userEnabled: true, autoEnabled: true })
+  })
+  const proactive = fixture()
+  await proactive.presenter.present(input(completed({ kind: 'reply_text', text: '主动正文' }), {
+    route: proactiveRoute,
+    profile: proactiveProfile({ recallAfterMs: 2_000 }),
+    settings: richSettings,
+    hooks: proactive.hooks
+  }))
+  assert.equal(proactive.ttsCalls.length, 0)
+  assert.equal(proactive.pictureCalls.length, 0)
+  assert.deepEqual(proactive.calls.map(call => call.part.media), ['text'])
+
+  const legacy = fixture()
+  await legacy.presenter.present(input(completed({ kind: 'reply_text', text: '恢复正文' }), {
+    route: recoveredRoute,
+    profile: RECOVERED_LEGACY_PROFILE,
+    settings: richSettings,
+    hooks: legacy.hooks
+  }))
+  assert.equal(legacy.ttsCalls.length, 0)
+  assert.equal(legacy.pictureCalls.length, 0)
+  assert.deepEqual(legacy.calls.map(call => call.part.media), ['text'])
 })

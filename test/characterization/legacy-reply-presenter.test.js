@@ -9,6 +9,7 @@ import {
 import { createLegacyYunzaiFake } from '../helpers/legacy-yunzai-fake.js'
 import { ReplyPresenter } from '../../dist/runtime/presentation/reply-presenter.js'
 import { ordinaryProfile } from '../../dist/runtime/presentation/presentation-profile.js'
+import { UNAVAILABLE_GROUPMATE_PICTURE_RENDERER } from '../../dist/runtime/runtime-presentation-hooks.js'
 import {
   createInitialRunObservationCounters,
   terminalObservationId
@@ -226,6 +227,7 @@ test('typed presenter preserves quote forward trusted button and response-post b
     ttsDiagnostics: {
       reportSynthesisFailure () {}
     },
+    pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
     random: () => 0.5,
     sleep: async () => undefined,
     schedule: () => undefined

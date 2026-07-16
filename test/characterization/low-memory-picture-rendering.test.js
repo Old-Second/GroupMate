@@ -2,32 +2,64 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import { buildGuobaSchemas } from '../../dist/runtime/guoba-schema.js'
+import { presentPictureReply } from '../../dist/runtime/picture-reply.js'
+import { createGroupMatePictureRenderer } from '../../dist/runtime/presentation/groupmate-picture-renderer.js'
 
-test('chat picture mode delegates one-shot rendering to the TypeScript coordinator', async () => {
-  const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
+test('typed picture renderer preserves one-shot low-memory release behavior without chat source coupling', async () => {
+  const renderCalls = []
+  const outboundParts = []
+  const renderer = createGroupMatePictureRenderer({
+    template: '<script><!--__GROUPMATE_DOCUMENT__--></script><script><!--__GROUPMATE_QR_SCRIPT__--></script>',
+    remote: null,
+    chatViewWidth: 720.9,
+    live2dAssets: { resolve: () => null },
+    browser: {
+      async render (input) {
+        renderCalls.push(input)
+        return {
+          kind: 'rendered',
+          source: 'local',
+          resource: {
+            kind: 'buffer', data: new Uint8Array([137, 80, 78, 71]),
+            mimeType: 'image/png', byteLength: 4
+          }
+        }
+      }
+    }
+  })
+  const target = { botId: 'bot-1', scope: { kind: 'group', groupId: 'group-1' } }
+  const result = await presentPictureReply({
+    text: '低内存正文', target, citations: [], reasoningView: null,
+    settings: {
+      userEnabled: true, autoEnabled: false, autoThreshold: 1200,
+      deviceScaleFactor: 9, closeBrowserAfterRender: true,
+      showQRCode: false, live2d: null
+    }
+  }, {
+    renderer,
+    outboundFactory: {
+      async forTarget () {
+        return {
+          target,
+          async deliver (part, attempt) {
+            outboundParts.push(part)
+            return {
+              kind: 'sent', media: part.media, attempt,
+              receipt: { schemaVersion: 1, media: part.media, messageId: 'picture-1' }
+            }
+          },
+          async recall () { return { kind: 'recalled' } }
+        }
+      }
+    }
+  })
 
-  assert.match(
-    source,
-    /import\s*\{\s*presentPictureReply\s*\}\s*from '\.\.\/dist\/runtime\/picture-reply\.js'/
-  )
-  const branchStart = source.indexOf("} else if (presentationMode === 'picture') {")
-  const branchEnd = source.indexOf('\n      } else {', branchStart)
-  assert.notEqual(branchStart, -1)
-  assert.notEqual(branchEnd, -1)
-  const pictureBranch = source.slice(branchStart, branchEnd)
-
-  assert.equal(pictureBranch.match(/\bpresentPictureReply\(\{/g)?.length ?? 0, 1)
-  assert.equal(pictureBranch.match(/\bthis\.renderImage\(/g)?.length ?? 0, 1)
-  assert.match(pictureBranch, /const pictureReplyResult = await presentPictureReply/)
-  assert.match(pictureBranch, /sendTextFallback:\s*sendTextReply/)
-  assert.match(
-    pictureBranch,
-    /reportFailure:\s*\(error\)\s*=>\s*logger\.error\(createChatErrorLog/
-  )
-  assert.match(
-    pictureBranch,
-    /if \(pictureReplyResult === 'picture' && Config\.enableSuggestedResponses/
-  )
+  assert.equal(result.outcome, 'complete')
+  assert.equal(renderCalls.length, 1)
+  assert.equal(renderCalls[0].closeBrowserAfterRender, true)
+  assert.equal(renderCalls[0].maxContentHeightCssPx, 4096)
+  assert.deepEqual(renderCalls[0].viewport, { width: 720, deviceScaleFactor: 4 })
+  assert.deepEqual(outboundParts.map(part => part.media), ['picture'])
 })
 
 test('local Chromium rendering always closes its page and optionally its browser', async () => {

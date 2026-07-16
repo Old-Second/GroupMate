@@ -5,6 +5,7 @@ import { BLOCKED_RESPONSE_MESSAGE, CANCELLED_MESSAGE, POSTPROCESS_EMPTY_MESSAGE,
 import { citationForwardPart, codePointLength, plainTextPart, reasoningForwardPart, repairCodeFences, splitProactiveText, textPart } from './text-presentation.js';
 import { deliverWithDefiniteRetry } from './yunzai-outbound-port.js';
 import { presentTtsReply } from './tts-reply-presentation.js';
+import { presentPictureReply } from '../picture-reply.js';
 function frozenResult(outcome, deliveries, skipReason) {
     return Object.freeze({
         schemaVersion: 1,
@@ -127,13 +128,13 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
     const port = await dependencies.outboundFactory.forTarget(input.route.sessionAddress);
     const children = [];
     const citations = normalizeCitationForwards(input.citationForwards);
-    if (citations.length > 0) {
-        children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
-            ...(input.signal === undefined ? {} : { signal: input.signal })
-        }));
-    }
     const quote = quoteMessageId(input, profile);
     if (input.settings.tts.enabled) {
+        if (citations.length > 0) {
+            children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
+                ...(input.signal === undefined ? {} : { signal: input.signal })
+            }));
+        }
         children.push(await presentTtsReply({
             text,
             target: input.route.sessionAddress,
@@ -145,8 +146,35 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             diagnostics: dependencies.ttsDiagnostics,
             outboundFactory: dependencies.outboundFactory
         }));
+        if (reasoningView !== undefined) {
+            children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
+                ...(input.signal === undefined ? {} : { signal: input.signal })
+            }));
+        }
+    }
+    else if (profile.forcePicture ||
+        input.settings.picture.userEnabled ||
+        (input.settings.picture.autoEnabled &&
+            codePointLength(text) >= input.settings.picture.autoThreshold)) {
+        children.push(await presentPictureReply({
+            text,
+            target: input.route.sessionAddress,
+            citations,
+            reasoningView: reasoningView ?? null,
+            settings: input.settings.picture,
+            ...(quote === undefined ? {} : { quoteMessageId: quote }),
+            ...(input.signal === undefined ? {} : { signal: input.signal })
+        }, {
+            renderer: dependencies.pictureRenderer,
+            outboundFactory: dependencies.outboundFactory
+        }));
     }
     else {
+        if (citations.length > 0) {
+            children.push(await deliverLogicalPart(port, citationForwardPart(citations), {
+                ...(input.signal === undefined ? {} : { signal: input.signal })
+            }));
+        }
         const atoms = await input.hooks.convertText({
             text,
             enableRobotAt: input.settings.enableRobotAt,
@@ -156,11 +184,11 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             ...(quote === undefined ? {} : { quoteMessageId: quote }),
             ...(input.signal === undefined ? {} : { signal: input.signal })
         }));
-    }
-    if (reasoningView !== undefined) {
-        children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-            ...(input.signal === undefined ? {} : { signal: input.signal })
-        }));
+        if (reasoningView !== undefined) {
+            children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
+                ...(input.signal === undefined ? {} : { signal: input.signal })
+            }));
+        }
     }
     if (input.settings.enableSuggestedResponses) {
         const suggestions = normalizeSuggestions(input.suggestions);

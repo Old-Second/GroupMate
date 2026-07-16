@@ -99,6 +99,7 @@ import {
 import { plainTextPart } from './presentation/text-presentation.js'
 import {
   PLAIN_TEXT_PRESENTATION_HOOKS,
+  UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
   UNAVAILABLE_TTS_REPLY_PORT,
   type PresentationInput
 } from './runtime-presentation-hooks.js'
@@ -480,6 +481,7 @@ class ApprovalRoutePresenter {
       outboundFactory: input.outboundFactory,
       tts: UNAVAILABLE_TTS_REPLY_PORT,
       ttsDiagnostics: input.ttsDiagnostics,
+      pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
       random: Math.random,
       sleep: async milliseconds => await new Promise(resolve => setTimeout(resolve, milliseconds)),
       schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
