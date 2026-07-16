@@ -95,18 +95,21 @@ function explicitTarget (target: ToolTarget, facts: ToolRuntimeFacts, intent: In
   return intent.explicitTargetIds.includes(target.groupId)
 }
 
-function intendedAction (definition: ToolDefinition, input: Readonly<Record<string, unknown>>): IntentAction | null {
-  if (definition.name === 'sendMessage') return 'send'
-  if (definition.name === 'jinyan') return input.seconds === 0 ? 'unmute' : 'mute'
-  if (definition.name === 'kickOut') return 'kick'
-  if (definition.name === 'editCard') return 'edit_card'
-  if (definition.name === 'setTitle') return 'set_title'
-  if (definition.name === 'handleMsg') {
+export function intentActionForToolCapability (
+  toolName: string,
+  input: Readonly<Record<string, unknown>>
+): IntentAction | null {
+  if (toolName === 'sendMessage') return 'send'
+  if (toolName === 'jinyan') return input.seconds === 0 ? 'unmute' : 'mute'
+  if (toolName === 'kickOut') return 'kick'
+  if (toolName === 'editCard') return 'edit_card'
+  if (toolName === 'setTitle') return 'set_title'
+  if (toolName === 'handleMsg') {
     if (input.type === 'essence') return 'set_essence'
     if (input.type === 'unessence') return 'unset_essence'
     return 'recall'
   }
-  return mediaActions[definition.name] ?? null
+  return mediaActions[toolName] ?? null
 }
 
 function hasManagementCapability (facts: ToolRuntimeFacts): boolean {
@@ -130,7 +133,7 @@ function hardManagementGate (input: ToolPolicyInput): ToolPolicyDecision | null 
     return deny('current_message_protected')
   }
   if (!explicitTarget(target, facts, intent)) return deny('explicit_intent_required')
-  const action = intendedAction(definition, input.input)
+  const action = intentActionForToolCapability(definition.name, input.input)
   if (action === null || !intent.actions.includes(action)) return deny('explicit_intent_required')
   if (!hasManagementCapability(facts)) return deny('bot_permission_denied')
 
@@ -221,7 +224,7 @@ export class ToolPolicyEngine {
       return allowed()
     }
 
-    const action = intendedAction(input.definition, input.input)
+    const action = intentActionForToolCapability(input.definition.name, input.input)
     if (input.definition.permission === 'current_channel') {
       if (!currentTarget(input.target, input.facts)) return deny('target_invalid')
       if (action === null || !input.intent.actions.includes(action)) return deny('explicit_intent_required')

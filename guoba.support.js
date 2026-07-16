@@ -4,7 +4,10 @@ import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-az
 import { supportConfigurations as voxRoleList } from './utils/tts/voicevox.js'
 import { normalizeGuobaConfigValue } from './dist/runtime/guoba-config.js'
 import { buildGuobaSchemas } from './dist/runtime/guoba-schema.js'
+import { createPendingIndicatorConfigPort } from './dist/runtime/presentation/pending-indicator-config.js'
 import { pluginId, repositoryUrl } from './dist/runtime/plugin-context.js'
+
+const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
 
 function roleOption (name) {
   return { label: name, value: name }
@@ -37,16 +40,23 @@ export function supportGuoba () {
           azureRoleList.map(item => roleOption(item.roleInfo || item.code))
         )
       }),
-      getConfigData () {
-        return Config
+      async getConfigData () {
+        return {
+          ...Config,
+          turnConfirm: await pendingIndicatorConfig.getEnabled()
+        }
       },
-      setConfigData (data, { Result }) {
+      async setConfigData (data, { Result }) {
         // 先完成全部校验，避免无效枚举导致配置只保存一半。
         const normalized = Object.entries(data).map(([keyPath, rawValue]) => [
           keyPath,
           normalizeGuobaConfigValue(keyPath, rawValue)
         ])
         for (const [keyPath, value] of normalized) {
+          if (keyPath === 'turnConfirm') {
+            await pendingIndicatorConfig.setEnabled(value)
+            continue
+          }
           if (Config[keyPath] !== value) {
             Config[keyPath] = value
           }

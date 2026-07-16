@@ -17,6 +17,11 @@ import type {
   ModelProviderError
 } from '../agent/model/model-adapter.js'
 import type {
+  PresentationRouteV1,
+  RecoveredLegacyPresentationRoute
+} from '../agent/contracts/interaction.js'
+import { recoveredLegacyRoute } from '../agent/contracts/interaction.js'
+import type {
   RunApprovalDecisionCommand,
   RunApprovalDisplayCommand,
   RunControlOptions,
@@ -51,9 +56,15 @@ import type { SessionStore } from '../agent/session/session-store.js'
 import type { TerminalCommitReceiptV1 } from '../agent/run/run-store.js'
 import type { RunTerminalSnapshotV2 } from '../agent/run/run-observation.js'
 import {
+  progressResumeStateFromEvents,
   RunProgressPresenter,
   type ProgressDelivery
 } from './run-progress-presenter.js'
+import type { RunPresentationLifecycle } from './run-presentation-lifecycle.js'
+import type {
+  OutboundPart,
+  YunzaiOutboundPort
+} from './presentation/yunzai-outbound-port.js'
 import {
   activateRequestObservation,
   beginRequestObservation,
@@ -95,6 +106,12 @@ export type FinalChatReplyEnvelope =
 
 export type ChatReplyEnvelope = PausedChatReplyEnvelope | FinalChatReplyEnvelope
 
+export interface ActivePresentationContext {
+  readonly runRef: string
+  readonly requestRef: string
+  readonly route: PresentationRouteV1 | RecoveredLegacyPresentationRoute
+}
+
 export interface AgentServiceRequestOptions extends RunControlOptions {
   readonly requestObservationContext?: RequestObservationContextV1
 }
@@ -131,6 +148,9 @@ export interface AgentServiceOptions {
   readonly createEngine: (observer: (event: AgentEvent) => void) => RunEngine
   readonly createRuntime: (request: YunzaiAgentRequest) => Promise<AgentServiceRunRuntime>
   readonly recoverRuntime?: (checkpoint: RunCheckpoint) => Promise<AgentServiceRunRuntime>
+  readonly createPresentationLifecycle?: (
+    route: PresentationRouteV1 | RecoveredLegacyPresentationRoute
+  ) => RunPresentationLifecycle | Promise<RunPresentationLifecycle>
   readonly now?: () => Date
   readonly generateId?: () => string
   readonly createRunRef?: () => string
@@ -151,6 +171,7 @@ interface PendingRun {
   readonly lease: RunLease
   readonly ephemeral: boolean
   readonly requestObservationContext: ActiveRequestObservationContextV1
+  readonly progress?: ProgressDelivery
 }
 
 function isApprovalRecoveryDeferred (
@@ -160,6 +181,77 @@ function isApprovalRecoveryDeferred (
 }
 
 const EMPTY_ITEMS: readonly ContextItem[] = Object.freeze([])
+
+function callbackPresentationLifecycle (
+  route: PresentationRouteV1 | RecoveredLegacyPresentationRoute,
+  progress: RunProgressPresenter,
+  delivery: ProgressDelivery | undefined
+): RunPresentationLifecycle {
+  let started = false
+  let settled: Promise<void> | undefined
+  const outbound: YunzaiOutboundPort = Object.freeze({
+    target: route.sessionAddress,
+    async deliver (part: OutboundPart, attempt: 1 | 2) {
+      if (delivery === undefined || part.media !== 'text' ||
+        part.atoms.some(atom => atom.kind !== 'text')) {
+        return Object.freeze({
+          kind: 'failed_definite', media: part.media, attempt, code: 'invalid_target'
+        }) as never
+      }
+      await delivery(part.atoms.map(atom => atom.kind === 'text' ? atom.text : '').join(''))
+      return Object.freeze({
+        kind: 'sent', media: part.media, attempt,
+        receipt: Object.freeze({ schemaVersion: 1, media: part.media })
+      }) as never
+    },
+    async recall () {
+      return Object.freeze({ kind: 'failed_definite', code: 'message_id_unavailable' })
+    }
+  })
+  return Object.freeze({
+    async onRunStarted (
+      input: Parameters<RunPresentationLifecycle['onRunStarted']>[0]
+    ): Promise<void> {
+      if (started) return
+      started = true
+      progress.attach(Object.freeze({
+        runId: input.runId,
+        runRef: input.runRef,
+        requestKind: route.requestKind === 'legacy_unknown'
+          ? 'recovered_legacy_plain_text'
+          : route.requestKind,
+        observationPolicy: input.observationPolicy,
+        resume: input.progressResume ?? Object.freeze({
+          attempts: 0,
+          seenStages: Object.freeze([])
+        }),
+        outbound,
+        indicator: null
+      }))
+    },
+    async onRunSettled (
+      input: Parameters<RunPresentationLifecycle['onRunSettled']>[0]
+    ): Promise<void> {
+      if (!started) return
+      if (settled === undefined) {
+        settled = (async () => {
+          try {
+            await progress.drain(input.runId)
+          } catch {
+            // Compatibility progress cleanup remains best effort.
+          } finally {
+            try {
+              progress.detach(input.runId)
+            } catch {
+              // Detach failure cannot escape or cause a second cleanup pass.
+            }
+          }
+        })()
+      }
+      await settled
+    }
+  })
+}
 
 function internalError (cause: unknown): AgentError {
   return new AgentError({
@@ -646,6 +738,7 @@ export class AgentService {
   readonly #progressPresenter: RunProgressPresenter
   readonly #createRuntime: AgentServiceOptions['createRuntime']
   readonly #recoverRuntime?: AgentServiceOptions['recoverRuntime']
+  readonly #createPresentationLifecycle?: AgentServiceOptions['createPresentationLifecycle']
   readonly #now: () => Date
   readonly #generateId: () => string
   readonly #createRunRef: () => string
@@ -668,6 +761,7 @@ export class AgentService {
     this.#progressPresenter = options.progressPresenter
     this.#createRuntime = options.createRuntime
     this.#recoverRuntime = options.recoverRuntime
+    this.#createPresentationLifecycle = options.createPresentationLifecycle
     this.#now = options.now ?? (() => new Date())
     this.#generateId = options.generateId ?? randomUUID
     this.#createRunRef = options.createRunRef ?? createRunRef
@@ -725,6 +819,8 @@ export class AgentService {
   ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(runId)
+    let presentationLifecycle: RunPresentationLifecycle | undefined
+    let presentationStatus: 'paused' | 'terminal' = 'terminal'
     try {
       if (pending === undefined) {
         pending = await this.#recoverPending(runId, linked.signal)
@@ -733,10 +829,12 @@ export class AgentService {
       if (linked.signal.aborted) {
         return await this.cancel(runId, linked.signal.reason)
       }
+      presentationLifecycle = await this.#beginResumedPresentation(pending)
       const result = await this.#engine.resume(runId, pending.binding, {
         ...options,
         signal: linked.signal
       })
+      presentationStatus = result.kind === 'paused' ? 'paused' : 'terminal'
       return await this.#finish(pending, result)
     } catch (error) {
       if (linked.signal.aborted) {
@@ -746,6 +844,12 @@ export class AgentService {
       if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
       return await this.#abortPending(pending, error)
     } finally {
+      if (presentationLifecycle !== undefined) {
+        await presentationLifecycle.onRunSettled({
+          runId,
+          status: presentationStatus
+        }).catch(() => undefined)
+      }
       linked.dispose()
     }
   }
@@ -761,8 +865,6 @@ export class AgentService {
       return await this.#finish(pending, result)
     } catch (error) {
       this.#pending.delete(runId)
-      await this.#progressPresenter.drain(runId).catch(() => undefined)
-      this.#progressPresenter.detach(runId)
       await pending.lease.release().catch(() => undefined)
       return activeFinalEnvelope(
         failedRunResult(runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef),
@@ -797,12 +899,25 @@ export class AgentService {
     return await this.#engine.displayApproval(input)
   }
 
+  async presentationContext (runId: string): Promise<ActivePresentationContext | null> {
+    const checkpoint = await this.#engine.loadCheckpoint(runId)
+    if (checkpoint === null || isTerminalRunStatus(checkpoint.status)) return null
+    const route = checkpoint.presentationRoute ?? recoveredLegacyRoute(checkpoint.sessionAddress)
+    return Object.freeze({
+      runRef: checkpoint.runRef,
+      requestRef: checkpoint.requestRef,
+      route
+    })
+  }
+
   async decideApproval (
     input: RunApprovalDecisionCommand,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(input.runId)
+    let presentationLifecycle: RunPresentationLifecycle | undefined
+    let presentationStatus: 'paused' | 'terminal' = 'paused'
     try {
       if (pending === undefined) {
         pending = await this.#recoverPending(input.runId, linked.signal)
@@ -811,14 +926,22 @@ export class AgentService {
       if (linked.signal.aborted) {
         return await this.cancel(input.runId, linked.signal.reason)
       }
+      presentationLifecycle = await this.#beginResumedPresentation(pending)
       const result = await this.#engine.decideApproval(
         input,
         pending.binding,
         { ...options, signal: linked.signal }
       )
       if (result === null) return null
+      presentationStatus = result.kind === 'paused' ? 'paused' : 'terminal'
       return await this.#finish(pending, result)
     } finally {
+      if (presentationLifecycle !== undefined) {
+        await presentationLifecycle.onRunSettled({
+          runId: input.runId,
+          status: presentationStatus
+        }).catch(() => undefined)
+      }
       linked.dispose()
     }
   }
@@ -934,40 +1057,58 @@ export class AgentService {
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       let binding = this.#bindingFor(runId, request, session, runtime)
-      this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined))
+      const presentationLifecycle = await this.#lifecycleFor(
+        request.presentationRoute,
+        runtime.progress
+      )
+      let presentationStarted = false
       let result: RunAdvanceResult | undefined
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const observationPolicy = createFrozenObservationPolicy({
-          levelAtStart,
-          runRef
-        })
-        try {
-          result = await this.#engine.start({
+      try {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const observationPolicy = createFrozenObservationPolicy({
+            levelAtStart,
+            runRef
+          })
+          try {
+            result = await this.#engine.start({
+              runId,
+              runRef,
+              requestRef: request.requestRef,
+              requestKind: request.requestKind,
+              presentationRoute: request.presentationRoute,
+              observationPolicy,
+              sessionId,
+              sessionAddress: request.sessionAddress,
+              deadlineAt: request.deadlineAt,
+              model: request.model,
+              runtime: binding
+            }, {
+              signal: linked.signal,
+              afterCheckpointCreated: async claimed => {
+                presentationStarted = true
+                await presentationLifecycle.onRunStarted(claimed)
+              }
+            })
+            break
+          } catch (error) {
+            if (!(error instanceof RunReferenceConflictError) || attempt !== 0) throw error
+            runRef = this.#createRunRef()
+            request = freezeRequest(draft, runRef)
+            binding = this.#bindingFor(runId, request, session, runtime)
+          }
+        }
+      } finally {
+        if (presentationStarted) {
+          await presentationLifecycle.onRunSettled({
             runId,
-            runRef,
-            requestRef: request.requestRef,
-            requestKind: request.requestKind,
-            presentationRoute: request.presentationRoute,
-            observationPolicy,
-            sessionId,
-            sessionAddress: request.sessionAddress,
-            deadlineAt: request.deadlineAt,
-            model: request.model,
-            runtime: binding
-          }, { signal: linked.signal })
-          break
-        } catch (error) {
-          if (!(error instanceof RunReferenceConflictError) || attempt !== 0) throw error
-          runRef = this.#createRunRef()
-          request = freezeRequest(draft, runRef)
-          binding = this.#bindingFor(runId, request, session, runtime)
+            status: result?.kind === 'paused' ? 'paused' : 'terminal'
+          }).catch(() => undefined)
         }
       }
       if (result === undefined) throw new RunReferenceConflictError()
       if (result.runRef === 'unavailable') {
         await lease.release().catch(() => undefined)
         lease = undefined
-        this.#progressPresenter.detach(runId)
         if (result.kind === 'paused' || result.kind === 'completed') {
           throw new TypeError('run result lacks a claimed reference')
         }
@@ -993,7 +1134,10 @@ export class AgentService {
         binding,
         lease,
         ephemeral,
-        requestObservationContext: activeContext
+        requestObservationContext: activeContext,
+        ...(this.#createPresentationLifecycle !== undefined || runtime.progress === undefined
+          ? {}
+          : { progress: runtime.progress })
       })
       this.#pending.set(runId, pending)
       return await this.#finish(pending, result)
@@ -1005,7 +1149,6 @@ export class AgentService {
         await lease.release().catch(() => undefined)
       }
       this.#pending.delete(runId)
-      this.#progressPresenter.detach(runId)
       const result = linked.signal.aborted
         ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
         : failedRunResult(runId, error)
@@ -1020,6 +1163,46 @@ export class AgentService {
     } finally {
       linked.dispose()
     }
+  }
+
+  async #lifecycleFor (
+    route: PresentationRouteV1 | RecoveredLegacyPresentationRoute,
+    progressDelivery?: ProgressDelivery
+  ): Promise<RunPresentationLifecycle> {
+    if (this.#createPresentationLifecycle !== undefined) {
+      return await this.#createPresentationLifecycle(route)
+    }
+    return callbackPresentationLifecycle(route, this.#progressPresenter, progressDelivery)
+  }
+
+  async #beginResumedPresentation (
+    pending: PendingRun
+  ): Promise<RunPresentationLifecycle | undefined> {
+    const checkpoint = await this.#engine.loadCheckpoint(pending.runId)
+    if (checkpoint === null || isTerminalRunStatus(checkpoint.status)) return undefined
+    let route: PresentationRouteV1 | RecoveredLegacyPresentationRoute
+    try {
+      route = checkpoint.presentationRoute ?? recoveredLegacyRoute(checkpoint.sessionAddress)
+    } catch {
+      return undefined
+    }
+    let lifecycle: RunPresentationLifecycle
+    try {
+      lifecycle = await this.#lifecycleFor(route, pending.progress)
+    } catch {
+      return undefined
+    }
+    try {
+      await lifecycle.onRunStarted({
+        runId: checkpoint.runId,
+        runRef: checkpoint.runRef,
+        observationPolicy: checkpoint.observationPolicy,
+        progressResume: progressResumeStateFromEvents(checkpoint.events)
+      })
+    } catch {
+      // Presentation remains best effort; settle still cleans partial state.
+    }
+    return lifecycle
   }
 
   #bindingFor (
@@ -1147,14 +1330,12 @@ export class AgentService {
           sessionLoadDurationMs: checkpoint.requestKind === 'proactive_chat'
             ? 'not_attempted'
             : 'unavailable'
-        })
+        }),
+        ...(this.#createPresentationLifecycle !== undefined || runtime.progress === undefined
+          ? {}
+          : { progress: runtime.progress })
       })
       this.#pending.set(runId, pending)
-      this.#progressPresenter.attach(
-        runId,
-        runtime.progress ?? (async () => undefined),
-        checkpoint.events
-      )
       return pending
     } catch (error) {
       await lease.release().catch(() => undefined)
@@ -1167,7 +1348,6 @@ export class AgentService {
     result: RunAdvanceResult
   ): Promise<ChatReplyEnvelope> {
     if (result.kind === 'paused') {
-      await this.#progressPresenter.drain(pending.runId)
       return Object.freeze({
         ...result,
         requestObservationContext: pending.requestObservationContext
@@ -1185,7 +1365,6 @@ export class AgentService {
         this.#reportObserverFailure()
       }
     }
-    await this.#progressPresenter.drain(pending.runId)
     let sessionPersistence: SessionPersistenceOutcome = 'not_attempted'
     let sessionSaveDurationMs: number | 'unavailable' | 'not_attempted' = 'not_attempted'
     try {
@@ -1218,7 +1397,6 @@ export class AgentService {
       }
     } finally {
       this.#pending.delete(pending.runId)
-      this.#progressPresenter.detach(pending.runId)
       await pending.lease.release().catch(() => undefined)
     }
     return activeFinalEnvelope(
@@ -1243,8 +1421,6 @@ export class AgentService {
       return await this.#finish(pending, cancelled)
     }
     this.#pending.delete(pending.runId)
-    await this.#progressPresenter.drain(pending.runId)
-    this.#progressPresenter.detach(pending.runId)
     await pending.lease.release().catch(() => undefined)
     return activeFinalEnvelope(
       failedRunResult(

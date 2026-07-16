@@ -16,8 +16,17 @@ import { beginRequestObservation, createRequestObservationDraft } from './reques
 import { createAgentRunLog } from './safe-chat-logging.js';
 import { TerminalFactCollector } from './terminal-fact-collector.js';
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js';
-import { RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
+import { APPROVAL_RECOVERY_DEFERRED_MESSAGE, RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
 import { RunProgressPresenter } from './run-progress-presenter.js';
+import { ordinaryProfile, proactiveProfile, RECOVERED_LEGACY_PROFILE } from './presentation/presentation-profile.js';
+import { createPendingIndicatorConfigPort } from './presentation/pending-indicator-config.js';
+import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
+import { createPresentationSettingsPort } from './presentation/presentation-settings.js';
+import { ReplyPresenter } from './presentation/reply-presenter.js';
+import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
+import { plainTextPart } from './presentation/text-presentation.js';
+import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
+import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
 import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.';
@@ -53,6 +62,9 @@ export class AgentServiceBridge {
     async displayApproval(input) {
         return await this.#service.displayApproval(input);
     }
+    async presentationContext(runId) {
+        return await this.#service.presentationContext(runId);
+    }
     async decideApproval(input, options = {}) {
         return await this.#service.decideApproval(input, options);
     }
@@ -70,11 +82,236 @@ function configInteger(config, key, fallback, minimum, maximum) {
         ? Math.min(Math.max(Math.trunc(value), minimum), maximum)
         : fallback;
 }
+const RECOVERED_LEGACY_SETTINGS = Object.freeze({
+    schemaVersion: 1,
+    quoteReply: false,
+    enableRobotAt: false,
+    enableMarkdown: false,
+    enableSuggestedResponses: false,
+    forwardReasoning: false,
+    blockWords: Object.freeze([]),
+    promptBlockWords: Object.freeze([]),
+    tts: Object.freeze({
+        enabled: false,
+        mode: 'vits-uma-genshin-honkai',
+        activeVoice: 'default',
+        alsoSendText: false,
+        autoFallbackThreshold: 299,
+        filter: null,
+        azureEmotionEnabled: false
+    }),
+    picture: Object.freeze({
+        userEnabled: false,
+        autoEnabled: false,
+        autoThreshold: 1_200,
+        deviceScaleFactor: 1,
+        closeBrowserAfterRender: true,
+        showQRCode: false,
+        live2d: null
+    })
+});
+function presentationProfile(route, settings) {
+    if (route.requestKind === 'ordinary_chat') {
+        return ordinaryProfile({
+            forcePicture: route.presentationIntent.forcePicture,
+            quoteCurrentRequest: settings.quoteReply && route.requestMessageId !== undefined &&
+                route.sessionAddress.scope.kind !== 'private'
+        });
+    }
+    if (route.requestKind === 'proactive_chat') {
+        return proactiveProfile({ recallAfterMs: route.presentationIntent.recallAfterMs });
+    }
+    return RECOVERED_LEGACY_PROFILE;
+}
+export async function buildApprovalPresentationInput(input) {
+    if (input.context.runRef !== input.result.runRef) {
+        throw new TypeError('approval presentation run reference is invalid');
+    }
+    const route = input.context.route;
+    const settings = route.requestKind === 'legacy_unknown'
+        ? RECOVERED_LEGACY_SETTINGS
+        : await input.settings.load(route.actorId);
+    const common = {
+        result: input.result,
+        sessionPersistence: input.result.sessionPersistence,
+        settings,
+        citationForwards: Object.freeze([]),
+        suggestions: Object.freeze([]),
+        hooks: PLAIN_TEXT_PRESENTATION_HOOKS
+    };
+    if (route.requestKind === 'ordinary_chat') {
+        return Object.freeze({
+            ...common,
+            route,
+            profile: presentationProfile(route, settings)
+        });
+    }
+    if (route.requestKind === 'proactive_chat') {
+        return Object.freeze({
+            ...common,
+            route,
+            profile: presentationProfile(route, settings)
+        });
+    }
+    return Object.freeze({
+        ...common,
+        route,
+        profile: RECOVERED_LEGACY_PROFILE
+    });
+}
+function outboundResource(resource) {
+    if (resource.kind === 'buffer') {
+        return `base64://${Buffer.from(resource.data).toString('base64')}`;
+    }
+    return resource.kind === 'remote_url' ? resource.url : resource.path;
+}
+function outboundAtom(segment, atom) {
+    if (atom.kind === 'text')
+        return atom.text;
+    if (atom.kind === 'at') {
+        const target = atom.target === 'all' ? 'all' : atom.target.userId;
+        return typeof segment.at === 'function'
+            ? Reflect.apply(segment.at, segment, [target])
+            : { type: 'at', qq: target };
+    }
+    if (atom.kind === 'face') {
+        return typeof segment.face === 'function'
+            ? Reflect.apply(segment.face, segment, [atom.faceId])
+            : { type: 'face', id: atom.faceId };
+    }
+    return typeof segment.markdown === 'function'
+        ? Reflect.apply(segment.markdown, segment, [atom.markdown])
+        : { type: 'markdown', data: { content: atom.markdown } };
+}
+function outboundValue(segment, part) {
+    if (part.media === 'text') {
+        const values = part.atoms.map(atom => outboundAtom(segment, atom));
+        if (part.buttons !== undefined)
+            values.push({ type: 'button', content: part.buttons });
+        return values.length === 1 ? values[0] : values;
+    }
+    if (part.media === 'picture') {
+        return typeof segment.image === 'function'
+            ? Reflect.apply(segment.image, segment, [outboundResource(part.resource)])
+            : { type: 'image', file: outboundResource(part.resource) };
+    }
+    if (part.media === 'voice') {
+        return typeof segment.record === 'function'
+            ? Reflect.apply(segment.record, segment, [outboundResource(part.resource)])
+            : { type: 'record', file: outboundResource(part.resource) };
+    }
+    if (part.media === 'video') {
+        return typeof segment.video === 'function'
+            ? Reflect.apply(segment.video, segment, [outboundResource(part.resource)])
+            : { type: 'video', file: outboundResource(part.resource) };
+    }
+    if (part.media === 'music') {
+        return typeof segment.music === 'function'
+            ? Reflect.apply(segment.music, segment, [part.provider, part.id])
+            : { type: 'music', platform: part.provider, id: part.id };
+    }
+    if (part.media === 'dice')
+        return { type: 'dice' };
+    if (part.media === 'rps')
+        return { type: 'rps', value: part.value };
+    return {
+        type: 'forward',
+        data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
+    };
+}
+export function createApprovalOutboundPortFactory(input) {
+    const host = Object.freeze({
+        async forTarget(target) {
+            const bot = await input.botPicker.pick(target.botId);
+            if (bot === null)
+                return null;
+            const receiver = target.scope.kind === 'group'
+                ? await bot.pickGroup?.(target.scope.groupId)
+                : await bot.pickFriend?.(target.scope.userId);
+            if (receiver === null || typeof receiver !== 'object')
+                return null;
+            const record = receiver;
+            if (typeof record.sendMsg !== 'function')
+                return null;
+            return Object.freeze({
+                dispatch: async (part) => await Reflect.apply(record.sendMsg, receiver, [outboundValue(input.segment(), part)]),
+                recall: async (messageId) => typeof record.recallMsg === 'function'
+                    ? await Reflect.apply(record.recallMsg, receiver, [messageId])
+                    : false
+            });
+        }
+    });
+    return createYunzaiOutboundPortFactory(host);
+}
+class ApprovalRoutePresenter {
+    #settings;
+    #presenter;
+    constructor(input) {
+        this.#settings = input.settings;
+        this.#presenter = new ReplyPresenter({
+            outboundFactory: input.outboundFactory,
+            random: Math.random,
+            sleep: async (milliseconds) => await new Promise(resolve => setTimeout(resolve, milliseconds)),
+            schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
+        });
+    }
+    async present(context, result) {
+        await this.#presenter.present(await buildApprovalPresentationInput({
+            context,
+            result,
+            settings: this.#settings
+        }));
+    }
+}
 function configNumber(config, key, minimum, maximum) {
     const value = config[key];
     return typeof value === 'number' && Number.isFinite(value)
         ? Math.min(Math.max(value, minimum), maximum)
         : undefined;
+}
+function configStringList(config, key) {
+    const value = config[key];
+    return Object.freeze(Array.isArray(value)
+        ? value.filter((item) => typeof item === 'string')
+        : []);
+}
+function presentationSettingsSource(options) {
+    return Object.freeze({
+        loadUserJson: async (actorId) => await options.redis.get(`CHATGPT:USER:${actorId}`),
+        currentSafeConfig: () => Object.freeze({
+            quoteReply: configBoolean(options.config, 'quoteReply', true),
+            enableRobotAt: configBoolean(options.config, 'enableRobotAt', true),
+            enableMd: configBoolean(options.config, 'enableMd', false),
+            enableSuggestedResponses: configBoolean(options.config, 'enableSuggestedResponses', false),
+            forwardReasoning: configBoolean(options.config, 'forwardReasoning', true),
+            blockWords: configStringList(options.config, 'blockWords'),
+            promptBlockWords: configStringList(options.config, 'promptBlockWords'),
+            defaultUsePicture: configBoolean(options.config, 'defaultUsePicture', false),
+            defaultUseTTS: configBoolean(options.config, 'defaultUseTTS', false),
+            defaultTTSRole: configText(options.config, 'defaultTTSRole'),
+            azureTTSSpeaker: configText(options.config, 'azureTTSSpeaker'),
+            voicevoxTTSSpeaker: configText(options.config, 'voicevoxTTSSpeaker'),
+            ttsMode: options.config.ttsMode === 'azure' || options.config.ttsMode === 'voicevox'
+                ? options.config.ttsMode
+                : 'vits-uma-genshin-honkai',
+            alsoSendText: configBoolean(options.config, 'alsoSendText', false),
+            ttsAutoFallbackThreshold: configInteger(options.config, 'ttsAutoFallbackThreshold', 299, 1, 24_000),
+            ttsRegex: configText(options.config, 'ttsRegex'),
+            enhanceAzureTTSEmotion: configBoolean(options.config, 'enhanceAzureTTSEmotion', false),
+            autoUsePicture: configBoolean(options.config, 'autoUsePicture', true),
+            autoUsePictureThreshold: configInteger(options.config, 'autoUsePictureThreshold', 1_200, 1, 24_000),
+            cloudDPR: configNumber(options.config, 'cloudDPR', 0.5, 4) ?? 1,
+            closeBrowserAfterRender: configBoolean(options.config, 'closeBrowserAfterRender', true),
+            showQRCode: configBoolean(options.config, 'showQRCode', true),
+            live2d: configBoolean(options.config, 'live2d', false),
+            live2dModel: configText(options.config, 'live2dModel'),
+            live2dOption_scale: configNumber(options.config, 'live2dOption_scale', 0, 10) ?? 0.1,
+            live2dOption_positionX: configNumber(options.config, 'live2dOption_positionX', -4_096, 4_096) ?? 0,
+            live2dOption_positionY: configNumber(options.config, 'live2dOption_positionY', -4_096, 4_096) ?? 0,
+            live2dOption_rotation: configNumber(options.config, 'live2dOption_rotation', -360, 360) ?? 0,
+            live2dOption_alpha: configNumber(options.config, 'live2dOption_alpha', 0, 1) ?? 1
+        })
+    });
 }
 function compatibilityConfig(config) {
     return resolveOpenAICompatibleModelRuntimeConfig(Object.hasOwn(config, 'openAiCompatibilityProfile')
@@ -304,25 +541,6 @@ function safeMonotonicNow(clock) {
         return 'unavailable';
     }
 }
-function messageIdentifier(value) {
-    if (Array.isArray(value)) {
-        for (const item of value) {
-            const id = messageIdentifier(item);
-            if (id !== null)
-                return id;
-        }
-        return null;
-    }
-    if (value === null || typeof value !== 'object')
-        return null;
-    const record = value;
-    const candidate = record.message_id ?? record.messageId ?? record.id;
-    if ((typeof candidate === 'string' || typeof candidate === 'number') &&
-        String(candidate).length > 0 && String(candidate).length <= 128) {
-        return String(candidate);
-    }
-    return messageIdentifier(record.data);
-}
 function approvalText(interruption, ttlSeconds) {
     const parameters = interruption.keyParameters.length === 0
         ? '无'
@@ -334,29 +552,6 @@ function approvalText(interruption, ttlSeconds) {
         `关键参数：${parameters}`,
         `请在 ${ttlSeconds} 秒内引用本消息回复“确认”或“拒绝”。`
     ].join('\n');
-}
-async function sendToAddress(event, address, text) {
-    const currentGroupId = event.isGroup === true ? String(event.group_id ?? '') : '';
-    const currentUserId = String(event.sender?.user_id ?? event.user_id ?? '');
-    if (address.scope.kind === 'group') {
-        if (currentGroupId === address.scope.groupId && event.reply !== undefined) {
-            return await event.reply(text, true, { recallMsg: 0 });
-        }
-        const receiver = await event.bot?.pickGroup?.(address.scope.groupId);
-        if (receiver?.sendMsg === undefined)
-            throw new Error('approval group is unavailable');
-        return await receiver.sendMsg(text);
-    }
-    const targetUserId = address.scope.kind === 'private'
-        ? address.scope.userId
-        : address.scope.userId;
-    if (currentUserId === targetUserId && event.reply !== undefined) {
-        return await event.reply(text, false, { recallMsg: 0 });
-    }
-    const receiver = await event.bot?.pickFriend?.(targetUserId);
-    if (receiver?.sendMsg === undefined)
-        throw new Error('approval friend is unavailable');
-    return await receiver.sendMsg(text);
 }
 function modelConfig(config, options) {
     const model = configText(config, 'model');
@@ -388,8 +583,10 @@ export class YunzaiAgentServiceBridge {
     #router;
     #toolRuntime;
     #prepared;
-    #deliveryEvents = new Map();
     #approvalTimers = new Map();
+    #outboundFactory;
+    #approvalPresenter;
+    #rememberBot;
     #now;
     #generateId;
     #createRequestRef;
@@ -400,6 +597,9 @@ export class YunzaiAgentServiceBridge {
         this.#router = input.router;
         this.#toolRuntime = input.toolRuntime;
         this.#prepared = input.prepared;
+        this.#outboundFactory = input.outboundFactory;
+        this.#approvalPresenter = input.approvalPresenter;
+        this.#rememberBot = input.rememberBot;
         this.#now = input.options.now ?? (() => new Date());
         this.#generateId = input.options.generateId ?? randomUUID;
         this.#createRequestRef = input.options.createRequestRef ?? createRequestRef;
@@ -413,14 +613,15 @@ export class YunzaiAgentServiceBridge {
         for (const timer of this.#approvalTimers.values())
             clearTimeout(timer);
         this.#approvalTimers.clear();
-        this.#deliveryEvents.clear();
         this.#prepared.clear();
         return shutdown;
     }
     async handle(event, prompt, options) {
+        this.#rememberBot(event);
         return await this.#execute(event, prompt, options, 'ordinary_chat');
     }
     async handleEphemeral(event, prompt, options) {
+        this.#rememberBot(event);
         return await this.#execute(event, prompt, options, 'proactive_chat');
     }
     async routeApprovalReply(event) {
@@ -432,9 +633,8 @@ export class YunzaiAgentServiceBridge {
         });
         if (projection === null)
             return false;
-        return await this.#router.route(projection, async (result, reference) => {
-            this.#clearApprovalTimer(reference.runId);
-            await this.#presentRunResultSafely(event, result);
+        return await this.#router.route(projection, async (result, reference, context) => {
+            await this.#handleApprovalOutcome(result, reference, context);
         });
     }
     async #execute(event, prompt, options, requestKind) {
@@ -489,8 +689,7 @@ export class YunzaiAgentServiceBridge {
                 ? await this.#bridge.handleEphemeral(request, { requestObservationContext })
                 : await this.#bridge.handle(request, { requestObservationContext });
             if (result.kind === 'paused') {
-                this.#deliveryEvents.set(result.runId, event);
-                return await this.#displayApprovalOrCancel(event, result);
+                return await this.#displayApprovalOrCancel(result);
             }
             return result;
         }
@@ -498,13 +697,12 @@ export class YunzaiAgentServiceBridge {
             this.#prepared.delete(requestId);
         }
     }
-    async #displayApprovalOrCancel(event, result) {
+    async #displayApprovalOrCancel(result) {
         try {
-            await this.#displayApproval(event, result.interruption);
+            await this.#displayApproval(result.interruption);
             return result;
         }
         catch (error) {
-            this.#deliveryEvents.delete(result.runId);
             this.#clearApprovalTimer(result.runId);
             const cancelled = await this.#bridge.cancel(result.runId, 'approval_delivery_failed');
             if (cancelled === null)
@@ -512,10 +710,14 @@ export class YunzaiAgentServiceBridge {
             return cancelled;
         }
     }
-    async #displayApproval(event, interruption) {
+    async #displayApproval(interruption) {
         const ttlSeconds = configInteger(this.#options.config, 'toolApprovalTtlSeconds', 120, 30, 300);
-        const sent = await sendToAddress(event, interruption.approvalAddress, approvalText(interruption, ttlSeconds));
-        const messageId = messageIdentifier(sent);
+        const outbound = await this.#outboundFactory.forTarget(interruption.approvalAddress);
+        const attempts = await deliverWithDefiniteRetry(outbound, plainTextPart(approvalText(interruption, ttlSeconds)));
+        const delivery = attempts.at(-1);
+        const messageId = delivery?.kind === 'sent'
+            ? delivery.receipt.messageId ?? null
+            : null;
         if (messageId === null)
             throw new Error('approval message ID is unavailable');
         const displayedAt = this.#now().toISOString();
@@ -531,7 +733,7 @@ export class YunzaiAgentServiceBridge {
         this.#clearApprovalTimer(displayed.runId);
         const timer = setTimeout(() => {
             this.#approvalTimers.delete(displayed.runId);
-            void this.#router.expire(displayed.approvalAddress, messageId, this.#now().toISOString(), async (result) => await this.#presentRunResultSafely(event, result)).catch(() => undefined);
+            void this.#router.expire(displayed.approvalAddress, messageId, this.#now().toISOString(), async (result, reference, context) => await this.#handleApprovalOutcome(result, reference, context)).catch(() => undefined);
         }, ttlSeconds * 1_000);
         timer.unref?.();
         this.#approvalTimers.set(displayed.runId, timer);
@@ -542,41 +744,28 @@ export class YunzaiAgentServiceBridge {
             clearTimeout(timer);
         this.#approvalTimers.delete(runId);
     }
-    async #presentRunResultSafely(event, result) {
-        try {
-            await this.#presentRunResult(event, result);
-        }
-        catch {
-            this.#options.logger?.warn?.('运行结果发送失败，请检查当前会话是否可用。');
-        }
-    }
-    async #presentRunResult(fallbackEvent, result) {
-        const event = this.#deliveryEvents.get(result.runId) ?? fallbackEvent;
-        if (result.kind === 'paused') {
-            const displayed = await this.#displayApprovalOrCancel(event, result);
-            if (displayed.kind !== 'paused') {
-                await this.#presentRunResult(event, displayed);
+    async #handleApprovalOutcome(result, reference, context) {
+        if (result.kind === 'approval_deferred') {
+            try {
+                const outbound = await this.#outboundFactory.forTarget(reference.approvalAddress);
+                await deliverWithDefiniteRetry(outbound, plainTextPart(APPROVAL_RECOVERY_DEFERRED_MESSAGE));
             }
+            catch { }
             return;
         }
+        this.#clearApprovalTimer(reference.runId);
         try {
-            if (result.kind === 'completed') {
-                const text = result.completion.kind === 'reply_text'
-                    ? result.completion.text
-                    : null;
-                if (text !== null && event.reply !== undefined) {
-                    await event.reply(text, event.isGroup === true, { recallMsg: 0 });
+            if (result.kind === 'paused') {
+                const displayed = await this.#displayApprovalOrCancel(result);
+                if (displayed.kind !== 'paused') {
+                    await this.#approvalPresenter.present(context, displayed);
                 }
                 return;
             }
-            const text = result.kind === 'failed' ? result.error.userMessage : '任务已取消。';
-            if (event.reply !== undefined) {
-                await event.reply(text, event.isGroup === true, { recallMsg: 0 });
-            }
+            await this.#approvalPresenter.present(context, result);
         }
-        finally {
-            this.#clearApprovalTimer(result.runId);
-            this.#deliveryEvents.delete(result.runId);
+        catch {
+            this.#options.logger?.warn?.('运行结果发送失败，请检查原始会话是否可用。');
         }
     }
 }
@@ -657,11 +846,73 @@ export function getAgentServiceBridge(createService) {
     }
     return processSingleton;
 }
-function createYunzaiAgentServiceBridge(options) {
+function createBotAccess(options) {
+    const remembered = new Map();
+    const remember = (event) => {
+        if (event.bot === undefined || event.bot === null)
+            return;
+        let botId;
+        try {
+            botId = String(options.getBotId(event));
+        }
+        catch {
+            return;
+        }
+        if (botId.length === 0 || botId.length > 128)
+            return;
+        remembered.delete(botId);
+        remembered.set(botId, event.bot);
+        while (remembered.size > 8) {
+            const oldest = remembered.keys().next().value;
+            if (oldest === undefined)
+                break;
+            remembered.delete(oldest);
+        }
+    };
+    const picker = Object.freeze({
+        async pick(botId) {
+            const known = remembered.get(botId);
+            if (known !== undefined)
+                return known;
+            try {
+                const selected = await options.botPicker?.pick(botId);
+                if (selected !== undefined && selected !== null)
+                    return selected;
+            }
+            catch { }
+            try {
+                const globalBot = Reflect.get(globalThis, 'Bot');
+                if (globalBot === undefined || globalBot === null)
+                    return null;
+                const indexed = Reflect.get(globalBot, botId);
+                if (indexed !== undefined && indexed !== null)
+                    return indexed;
+                const uin = Reflect.get(globalBot, 'uin');
+                return String(uin) === botId ? globalBot : null;
+            }
+            catch {
+                return null;
+            }
+        }
+    });
+    return Object.freeze({ picker, remember });
+}
+export function createYunzaiAgentServiceBridge(options) {
     const selected = compatibilityConfig(options.config);
     const now = options.now ?? (() => new Date());
     const generateId = options.generateId ?? randomUUID;
     const prepared = new Map();
+    const botAccess = createBotAccess(options);
+    const outboundFactory = createApprovalOutboundPortFactory({
+        botPicker: botAccess.picker,
+        segment: options.segment
+    });
+    const settings = createPresentationSettingsPort(presentationSettingsSource(options));
+    const pendingConfig = createPendingIndicatorConfigPort(options.redis);
+    const pendingIndicator = new PendingIndicatorPresenter({
+        onDeliveryFailure: failure => options.logger?.warn?.(`运行提示发送失败：${failure.resultCode}`)
+    });
+    const approvalPresenter = new ApprovalRoutePresenter({ settings, outboundFactory });
     const toolRuntime = createYunzaiToolRuntimeBridge({
         ...options,
         config: options.config,
@@ -729,6 +980,33 @@ function createYunzaiAgentServiceBridge(options) {
             });
             return value;
         },
+        recoverRuntime: async (checkpoint) => {
+            const bot = await botAccess.picker.pick(checkpoint.sessionAddress.botId);
+            if (bot === null) {
+                throw new AgentError({
+                    code: 'checkpoint_invalid',
+                    stage: 'agent.bridge.runtime_recovery',
+                    retryable: false,
+                    userMessage: '任务运行环境已失效，请重新发起。'
+                });
+            }
+            const recovered = await toolRuntime.recoverAgentRun({ checkpoint, bot });
+            return Object.freeze({ binding: recovered.binding });
+        },
+        createPresentationLifecycle: async (route) => {
+            const routeSettings = route.requestKind === 'legacy_unknown'
+                ? RECOVERED_LEGACY_SETTINGS
+                : await settings.load(route.actorId);
+            const pendingEnabled = await pendingConfig.getEnabled().catch(() => false);
+            return createRunPresentationLifecycle({
+                route,
+                profile: presentationProfile(route, routeSettings),
+                pendingEnabled,
+                outboundFactory,
+                pending: pendingIndicator,
+                progress: progressPresenter
+            });
+        },
         now,
         generateId,
         observationLevel: () => options.config.observabilityLevel,
@@ -742,6 +1020,7 @@ function createYunzaiAgentServiceBridge(options) {
         control: {
             pendingApproval: async (runId, approvalId) => await bridge.pendingApproval(runId, approvalId),
             displayApproval: async (input) => await bridge.displayApproval(input),
+            presentationContext: async (runId) => await bridge.presentationContext(runId),
             decideApproval: async (input) => await bridge.decideApproval(input)
         },
         index: new RedisApprovalReferenceIndex(options.redis)
@@ -751,7 +1030,10 @@ function createYunzaiAgentServiceBridge(options) {
         bridge,
         router,
         toolRuntime,
-        prepared
+        prepared,
+        outboundFactory,
+        approvalPresenter,
+        rememberBot: botAccess.remember
     });
 }
 export function getYunzaiAgentServiceBridge(options) {

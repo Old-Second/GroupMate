@@ -512,11 +512,6 @@ export class chatgpt extends plugin {
       await this.reply('主人不让我回答你这种问题，真是抱歉了呢', true)
       return false
     }
-    let confirm = await redis.get('CHATGPT:CONFIRM')
-    let confirmOn = (!confirm || confirm === 'on') // confirm默认开启
-    if (confirmOn) {
-      await this.reply('我正在思考如何回复你，请稍等', true, { recallMsg: 8 })
-    }
     const emotionFlag = await redis.get(`CHATGPT:WRONG_EMOTION:${e.sender.user_id}`)
     let userReplySetting = await getUserReplySetting(this.e)
     // 图片模式就不管了，降低抱歉概率

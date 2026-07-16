@@ -58,3 +58,12 @@ test('normalizes the tool policy profile and approval TTL fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 999), 300)
   assert.equal(normalizeGuobaConfigValue('toolApprovalTtlSeconds', 'bad'), 120)
 })
+
+test('normalizes pending indicator compatibility as a boolean-only field', () => {
+  assert.equal(normalizeGuobaConfigValue('turnConfirm', true), true)
+  assert.equal(normalizeGuobaConfigValue('turnConfirm', false), false)
+  assert.throws(
+    () => normalizeGuobaConfigValue('turnConfirm', 'on'),
+    /正在思考提示配置无效/
+  )
+})

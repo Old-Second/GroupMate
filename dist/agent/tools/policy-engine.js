@@ -66,25 +66,25 @@ function explicitTarget(target, facts, intent) {
     }
     return intent.explicitTargetIds.includes(target.groupId);
 }
-function intendedAction(definition, input) {
-    if (definition.name === 'sendMessage')
+export function intentActionForToolCapability(toolName, input) {
+    if (toolName === 'sendMessage')
         return 'send';
-    if (definition.name === 'jinyan')
+    if (toolName === 'jinyan')
         return input.seconds === 0 ? 'unmute' : 'mute';
-    if (definition.name === 'kickOut')
+    if (toolName === 'kickOut')
         return 'kick';
-    if (definition.name === 'editCard')
+    if (toolName === 'editCard')
         return 'edit_card';
-    if (definition.name === 'setTitle')
+    if (toolName === 'setTitle')
         return 'set_title';
-    if (definition.name === 'handleMsg') {
+    if (toolName === 'handleMsg') {
         if (input.type === 'essence')
             return 'set_essence';
         if (input.type === 'unessence')
             return 'unset_essence';
         return 'recall';
     }
-    return mediaActions[definition.name] ?? null;
+    return mediaActions[toolName] ?? null;
 }
 function hasManagementCapability(facts) {
     return facts.botGroupRole === 'owner' || facts.botGroupRole === 'admin';
@@ -112,7 +112,7 @@ function hardManagementGate(input) {
     }
     if (!explicitTarget(target, facts, intent))
         return deny('explicit_intent_required');
-    const action = intendedAction(definition, input.input);
+    const action = intentActionForToolCapability(definition.name, input.input);
     if (action === null || !intent.actions.includes(action))
         return deny('explicit_intent_required');
     if (!hasManagementCapability(facts))
@@ -214,7 +214,7 @@ export class ToolPolicyEngine {
             }
             return allowed();
         }
-        const action = intendedAction(input.definition, input.input);
+        const action = intentActionForToolCapability(input.definition.name, input.input);
         if (input.definition.permission === 'current_channel') {
             if (!currentTarget(input.target, input.facts))
                 return deny('target_invalid');

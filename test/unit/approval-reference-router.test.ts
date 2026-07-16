@@ -15,6 +15,7 @@ import {
   type ApprovalDisplayInput,
   type ApprovalReference,
   type ApprovalReferenceIndex,
+  type ActivePresentationContext,
   type RunApprovalControl
 } from '../../src/runtime/run-approval-router.js'
 import { AgentError } from '../../src/agent/contracts/error.js'
@@ -117,6 +118,25 @@ class FakeApprovalControl implements RunApprovalControl {
   current: ApprovalInterruption | null = pending()
   readonly decisions: ApprovalDecisionInput[] = []
   deferredReason: ApprovalRecoveryDeferred['reason'] | null = null
+
+  async presentationContext (runId: string): Promise<ActivePresentationContext | null> {
+    if (this.current?.runId !== runId) return null
+    return Object.freeze({
+      runRef: completedRunRef,
+      requestRef: '2'.repeat(32),
+      route: Object.freeze({
+        schemaVersion: 1,
+        requestKind: 'ordinary_chat',
+        profile: 'ordinary',
+        presentationIntent: Object.freeze({
+          schemaVersion: 1, kind: 'ordinary', forcePicture: false
+        }),
+        sessionAddress: groupAddress,
+        actorId: 'actor-1',
+        requestMessageId: 'request-message-1'
+      })
+    })
+  }
 
   async pendingApproval (runId: string, approvalId: string): Promise<ApprovalInterruption | null> {
     return this.current?.runId === runId && this.current.approvalId === approvalId
@@ -232,10 +252,15 @@ test('reference approval requires an exact quote before deciding', async () => {
   assert.equal(control.decisions[0]?.kind, 'approved')
 })
 
-test('approval recovery deferral preserves the reference and allows the same decision to retry', async () => {
+test('approval recovery admission deferred retains reference and never finalizes', async () => {
   for (const reason of ['queue_full', 'queue_aborted', 'unavailable'] as const) {
     const control = new FakeApprovalControl()
     const index = new MemoryReferenceIndex()
+    const callbacks: Array<{
+      result: unknown
+      reference: ApprovalReference
+      context: ActivePresentationContext
+    }> = []
     const router = new RunApprovalRouter({ control, index })
     assert.notEqual(await router.registerDisplayed({
       runId: 'run-1', approvalId: 'approval-1', messageId: 'approval-message-1',
@@ -243,15 +268,24 @@ test('approval recovery deferral preserves the reference and allows the same dec
     }), null)
     control.deferredReason = reason
 
-    assert.equal(await router.route(reply()), true)
+    assert.equal(await router.route(reply(), (result, reference, context) => {
+      callbacks.push({ result, reference, context })
+    }), true)
     assert.equal(index.values.size, 1)
     assert.notEqual(control.current, null)
     assert.equal(control.decisions.length, 0)
+    assert.equal(callbacks.length, 1)
+    assert.equal((callbacks[0]?.result as ApprovalRecoveryDeferred).reason, reason)
+    assert.equal(callbacks[0]?.reference.messageId, 'approval-message-1')
+    assert.equal(callbacks[0]?.context.requestRef, '2'.repeat(32))
 
-    assert.equal(await router.route(reply()), true)
+    assert.equal(await router.route(reply(), (result, reference, context) => {
+      callbacks.push({ result, reference, context })
+    }), true)
     assert.equal(index.values.size, 0)
     assert.equal(control.current, null)
     assert.equal(control.decisions.length, 1)
+    assert.equal(callbacks.length, 2)
   }
 })
 

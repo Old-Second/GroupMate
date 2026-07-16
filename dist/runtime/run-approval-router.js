@@ -3,6 +3,7 @@ import { isApprovalActorEligible, parseApprovalReplyText } from '../agent/run/in
 import { createApprovalRunIndex, deleteApprovalRunIndex, RUN_STORE_NAMESPACE } from '../agent/run/redis-run-store.js';
 import { canonicalSessionKey } from '../agent/session/conversation-scope.js';
 import { buildModelMessageInput } from './message-input.js';
+export const APPROVAL_RECOVERY_DEFERRED_MESSAGE = '任务繁忙，审批未消费，可稍后重试';
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const INDEX_GRACE_SECONDS = 300;
 function boundedIdentifier(value, label) {
@@ -192,6 +193,9 @@ export class RunApprovalRouter {
         const reference = await this.#index.load(reply.sessionAddress, reply.quotedMessageId);
         if (reference === null)
             return false;
+        const context = await this.#control.presentationContext(reference.runId);
+        if (context === null)
+            return false;
         const pending = await this.#control.pendingApproval(reference.runId, reference.approvalId);
         if (pending === null || pending.approvalMessageId !== reference.messageId ||
             pending.displayedAt === undefined || pending.expiresAt === undefined ||
@@ -211,15 +215,23 @@ export class RunApprovalRouter {
         }, runtime);
         if (result === null)
             return false;
-        if (result.kind === 'approval_deferred')
+        if (result.kind === 'approval_deferred') {
+            try {
+                await onResult?.(result, reference, context);
+            }
+            catch { }
             return true;
+        }
         await this.#index.delete(reference);
-        await onResult?.(result, reference);
+        await onResult?.(result, reference, context);
         return true;
     }
     async expire(address, messageId, occurredAt, onResult) {
         const reference = await this.#index.load(address, messageId);
         if (reference === null)
+            return false;
+        const context = await this.#control.presentationContext(reference.runId);
+        if (context === null)
             return false;
         const pending = await this.#control.pendingApproval(reference.runId, reference.approvalId);
         if (pending === null || pending.expiresAt === undefined ||
@@ -236,10 +248,15 @@ export class RunApprovalRouter {
         }, runtime);
         if (result === null)
             return false;
-        if (result.kind === 'approval_deferred')
+        if (result.kind === 'approval_deferred') {
+            try {
+                await onResult?.(result, reference, context);
+            }
+            catch { }
             return true;
+        }
         await this.#index.delete(reference);
-        await onResult?.(result, reference);
+        await onResult?.(result, reference, context);
         return true;
     }
 }

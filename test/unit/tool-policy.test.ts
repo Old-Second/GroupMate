@@ -9,6 +9,7 @@ import type {
   ToolRisk
 } from '../../src/agent/tools/tool-definition.js'
 import {
+  intentActionForToolCapability,
   ToolPolicyEngine,
   type ToolPolicyDecision,
   type ToolPolicyProfile
@@ -118,6 +119,32 @@ function decide (input: {
     intent: input.intent ?? intent('查询天气')
   })
 }
+
+test('policy exposes one canonical tool capability to intent action mapping', () => {
+  const cases = [
+    ['sendMessage', {}, 'send'],
+    ['jinyan', { seconds: 60 }, 'mute'],
+    ['jinyan', { seconds: 0 }, 'unmute'],
+    ['kickOut', {}, 'kick'],
+    ['editCard', {}, 'edit_card'],
+    ['setTitle', {}, 'set_title'],
+    ['handleMsg', { type: 'recall' }, 'recall'],
+    ['handleMsg', { type: 'essence' }, 'set_essence'],
+    ['handleMsg', { type: 'unessence' }, 'unset_essence'],
+    ['draw', {}, 'image'],
+    ['sendVideo', {}, 'video'],
+    ['sendAudioMessage', {}, 'audio'],
+    ['sendMusic', {}, 'music'],
+    ['sendDice', {}, 'dice'],
+    ['sendRPS', {}, 'rps'],
+    ['queryStarRail', {}, 'game']
+  ] as const
+  for (const [toolName, input, expected] of cases) {
+    assert.equal(intentActionForToolCapability(toolName, input), expected, toolName)
+  }
+  assert.equal(intentActionForToolCapability('website', {}), null)
+  assert.equal(intentActionForToolCapability('unknownTool', {}), null)
+})
 
 test('runtime facts use only normalized trusted source values', async () => {
   let targetLookups = 0

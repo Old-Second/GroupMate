@@ -1,16 +1,85 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
+import { recoveredLegacyRoute } from '../agent/contracts/interaction.js';
 import { RunAdmissionRejectionError } from '../agent/run/run-admission.js';
 import { RunReferenceConflictError } from '../agent/run/run-store.js';
 import { createFrozenObservationPolicy } from '../agent/run/run-observation.js';
 import { createRunRef } from '../agent/run/run-reference.js';
 import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
+import { progressResumeStateFromEvents } from './run-progress-presenter.js';
 import { activateRequestObservation, beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
 function isApprovalRecoveryDeferred(value) {
     return 'kind' in value && value.kind === 'approval_deferred';
 }
 const EMPTY_ITEMS = Object.freeze([]);
+function callbackPresentationLifecycle(route, progress, delivery) {
+    let started = false;
+    let settled;
+    const outbound = Object.freeze({
+        target: route.sessionAddress,
+        async deliver(part, attempt) {
+            if (delivery === undefined || part.media !== 'text' ||
+                part.atoms.some(atom => atom.kind !== 'text')) {
+                return Object.freeze({
+                    kind: 'failed_definite', media: part.media, attempt, code: 'invalid_target'
+                });
+            }
+            await delivery(part.atoms.map(atom => atom.kind === 'text' ? atom.text : '').join(''));
+            return Object.freeze({
+                kind: 'sent', media: part.media, attempt,
+                receipt: Object.freeze({ schemaVersion: 1, media: part.media })
+            });
+        },
+        async recall() {
+            return Object.freeze({ kind: 'failed_definite', code: 'message_id_unavailable' });
+        }
+    });
+    return Object.freeze({
+        async onRunStarted(input) {
+            if (started)
+                return;
+            started = true;
+            progress.attach(Object.freeze({
+                runId: input.runId,
+                runRef: input.runRef,
+                requestKind: route.requestKind === 'legacy_unknown'
+                    ? 'recovered_legacy_plain_text'
+                    : route.requestKind,
+                observationPolicy: input.observationPolicy,
+                resume: input.progressResume ?? Object.freeze({
+                    attempts: 0,
+                    seenStages: Object.freeze([])
+                }),
+                outbound,
+                indicator: null
+            }));
+        },
+        async onRunSettled(input) {
+            if (!started)
+                return;
+            if (settled === undefined) {
+                settled = (async () => {
+                    try {
+                        await progress.drain(input.runId);
+                    }
+                    catch {
+                        // Compatibility progress cleanup remains best effort.
+                    }
+                    finally {
+                        try {
+                            progress.detach(input.runId);
+                        }
+                        catch {
+                            // Detach failure cannot escape or cause a second cleanup pass.
+                        }
+                    }
+                })();
+            }
+            await settled;
+        }
+    });
+}
 function internalError(cause) {
     return new AgentError({
         code: 'internal_error',
@@ -414,6 +483,7 @@ export class AgentService {
     #progressPresenter;
     #createRuntime;
     #recoverRuntime;
+    #createPresentationLifecycle;
     #now;
     #generateId;
     #createRunRef;
@@ -435,6 +505,7 @@ export class AgentService {
         this.#progressPresenter = options.progressPresenter;
         this.#createRuntime = options.createRuntime;
         this.#recoverRuntime = options.recoverRuntime;
+        this.#createPresentationLifecycle = options.createPresentationLifecycle;
         this.#now = options.now ?? (() => new Date());
         this.#generateId = options.generateId ?? randomUUID;
         this.#createRunRef = options.createRunRef ?? createRunRef;
@@ -468,6 +539,8 @@ export class AgentService {
     async resume(runId, options = {}) {
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(runId);
+        let presentationLifecycle;
+        let presentationStatus = 'terminal';
         try {
             if (pending === undefined) {
                 pending = await this.#recoverPending(runId, linked.signal);
@@ -477,10 +550,12 @@ export class AgentService {
             if (linked.signal.aborted) {
                 return await this.cancel(runId, linked.signal.reason);
             }
+            presentationLifecycle = await this.#beginResumedPresentation(pending);
             const result = await this.#engine.resume(runId, pending.binding, {
                 ...options,
                 signal: linked.signal
             });
+            presentationStatus = result.kind === 'paused' ? 'paused' : 'terminal';
             return await this.#finish(pending, result);
         }
         catch (error) {
@@ -494,6 +569,12 @@ export class AgentService {
             return await this.#abortPending(pending, error);
         }
         finally {
+            if (presentationLifecycle !== undefined) {
+                await presentationLifecycle.onRunSettled({
+                    runId,
+                    status: presentationStatus
+                }).catch(() => undefined);
+            }
             linked.dispose();
         }
     }
@@ -507,8 +588,6 @@ export class AgentService {
         }
         catch (error) {
             this.#pending.delete(runId);
-            await this.#progressPresenter.drain(runId).catch(() => undefined);
-            this.#progressPresenter.detach(runId);
             await pending.lease.release().catch(() => undefined);
             return activeFinalEnvelope(failedRunResult(runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
         }
@@ -528,9 +607,22 @@ export class AgentService {
     async displayApproval(input) {
         return await this.#engine.displayApproval(input);
     }
+    async presentationContext(runId) {
+        const checkpoint = await this.#engine.loadCheckpoint(runId);
+        if (checkpoint === null || isTerminalRunStatus(checkpoint.status))
+            return null;
+        const route = checkpoint.presentationRoute ?? recoveredLegacyRoute(checkpoint.sessionAddress);
+        return Object.freeze({
+            runRef: checkpoint.runRef,
+            requestRef: checkpoint.requestRef,
+            route
+        });
+    }
     async decideApproval(input, options = {}) {
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(input.runId);
+        let presentationLifecycle;
+        let presentationStatus = 'paused';
         try {
             if (pending === undefined) {
                 pending = await this.#recoverPending(input.runId, linked.signal);
@@ -540,12 +632,20 @@ export class AgentService {
             if (linked.signal.aborted) {
                 return await this.cancel(input.runId, linked.signal.reason);
             }
+            presentationLifecycle = await this.#beginResumedPresentation(pending);
             const result = await this.#engine.decideApproval(input, pending.binding, { ...options, signal: linked.signal });
             if (result === null)
                 return null;
+            presentationStatus = result.kind === 'paused' ? 'paused' : 'terminal';
             return await this.#finish(pending, result);
         }
         finally {
+            if (presentationLifecycle !== undefined) {
+                await presentationLifecycle.onRunSettled({
+                    runId: input.runId,
+                    status: presentationStatus
+                }).catch(() => undefined);
+            }
             linked.dispose();
         }
     }
@@ -621,35 +721,52 @@ export class AgentService {
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
             let binding = this.#bindingFor(runId, request, session, runtime);
-            this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined));
+            const presentationLifecycle = await this.#lifecycleFor(request.presentationRoute, runtime.progress);
+            let presentationStarted = false;
             let result;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-                const observationPolicy = createFrozenObservationPolicy({
-                    levelAtStart,
-                    runRef
-                });
-                try {
-                    result = await this.#engine.start({
-                        runId,
-                        runRef,
-                        requestRef: request.requestRef,
-                        requestKind: request.requestKind,
-                        presentationRoute: request.presentationRoute,
-                        observationPolicy,
-                        sessionId,
-                        sessionAddress: request.sessionAddress,
-                        deadlineAt: request.deadlineAt,
-                        model: request.model,
-                        runtime: binding
-                    }, { signal: linked.signal });
-                    break;
+            try {
+                for (let attempt = 0; attempt < 2; attempt += 1) {
+                    const observationPolicy = createFrozenObservationPolicy({
+                        levelAtStart,
+                        runRef
+                    });
+                    try {
+                        result = await this.#engine.start({
+                            runId,
+                            runRef,
+                            requestRef: request.requestRef,
+                            requestKind: request.requestKind,
+                            presentationRoute: request.presentationRoute,
+                            observationPolicy,
+                            sessionId,
+                            sessionAddress: request.sessionAddress,
+                            deadlineAt: request.deadlineAt,
+                            model: request.model,
+                            runtime: binding
+                        }, {
+                            signal: linked.signal,
+                            afterCheckpointCreated: async (claimed) => {
+                                presentationStarted = true;
+                                await presentationLifecycle.onRunStarted(claimed);
+                            }
+                        });
+                        break;
+                    }
+                    catch (error) {
+                        if (!(error instanceof RunReferenceConflictError) || attempt !== 0)
+                            throw error;
+                        runRef = this.#createRunRef();
+                        request = freezeRequest(draft, runRef);
+                        binding = this.#bindingFor(runId, request, session, runtime);
+                    }
                 }
-                catch (error) {
-                    if (!(error instanceof RunReferenceConflictError) || attempt !== 0)
-                        throw error;
-                    runRef = this.#createRunRef();
-                    request = freezeRequest(draft, runRef);
-                    binding = this.#bindingFor(runId, request, session, runtime);
+            }
+            finally {
+                if (presentationStarted) {
+                    await presentationLifecycle.onRunSettled({
+                        runId,
+                        status: result?.kind === 'paused' ? 'paused' : 'terminal'
+                    }).catch(() => undefined);
                 }
             }
             if (result === undefined)
@@ -657,7 +774,6 @@ export class AgentService {
             if (result.runRef === 'unavailable') {
                 await lease.release().catch(() => undefined);
                 lease = undefined;
-                this.#progressPresenter.detach(runId);
                 if (result.kind === 'paused' || result.kind === 'completed') {
                     throw new TypeError('run result lacks a claimed reference');
                 }
@@ -676,7 +792,10 @@ export class AgentService {
                 binding,
                 lease,
                 ephemeral,
-                requestObservationContext: activeContext
+                requestObservationContext: activeContext,
+                ...(this.#createPresentationLifecycle !== undefined || runtime.progress === undefined
+                    ? {}
+                    : { progress: runtime.progress })
             });
             this.#pending.set(runId, pending);
             return await this.#finish(pending, result);
@@ -689,7 +808,6 @@ export class AgentService {
                 await lease.release().catch(() => undefined);
             }
             this.#pending.delete(runId);
-            this.#progressPresenter.detach(runId);
             const result = linked.signal.aborted
                 ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
                 : failedRunResult(runId, error);
@@ -698,6 +816,43 @@ export class AgentService {
         finally {
             linked.dispose();
         }
+    }
+    async #lifecycleFor(route, progressDelivery) {
+        if (this.#createPresentationLifecycle !== undefined) {
+            return await this.#createPresentationLifecycle(route);
+        }
+        return callbackPresentationLifecycle(route, this.#progressPresenter, progressDelivery);
+    }
+    async #beginResumedPresentation(pending) {
+        const checkpoint = await this.#engine.loadCheckpoint(pending.runId);
+        if (checkpoint === null || isTerminalRunStatus(checkpoint.status))
+            return undefined;
+        let route;
+        try {
+            route = checkpoint.presentationRoute ?? recoveredLegacyRoute(checkpoint.sessionAddress);
+        }
+        catch {
+            return undefined;
+        }
+        let lifecycle;
+        try {
+            lifecycle = await this.#lifecycleFor(route, pending.progress);
+        }
+        catch {
+            return undefined;
+        }
+        try {
+            await lifecycle.onRunStarted({
+                runId: checkpoint.runId,
+                runRef: checkpoint.runRef,
+                observationPolicy: checkpoint.observationPolicy,
+                progressResume: progressResumeStateFromEvents(checkpoint.events)
+            });
+        }
+        catch {
+            // Presentation remains best effort; settle still cleans partial state.
+        }
+        return lifecycle;
     }
     #bindingFor(runId, request, session, runtime) {
         const prepare = async (dropOptional, signal) => {
@@ -804,10 +959,12 @@ export class AgentService {
                     sessionLoadDurationMs: checkpoint.requestKind === 'proactive_chat'
                         ? 'not_attempted'
                         : 'unavailable'
-                })
+                }),
+                ...(this.#createPresentationLifecycle !== undefined || runtime.progress === undefined
+                    ? {}
+                    : { progress: runtime.progress })
             });
             this.#pending.set(runId, pending);
-            this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined), checkpoint.events);
             return pending;
         }
         catch (error) {
@@ -817,7 +974,6 @@ export class AgentService {
     }
     async #finish(pending, result) {
         if (result.kind === 'paused') {
-            await this.#progressPresenter.drain(pending.runId);
             return Object.freeze({
                 ...result,
                 requestObservationContext: pending.requestObservationContext
@@ -837,7 +993,6 @@ export class AgentService {
                 this.#reportObserverFailure();
             }
         }
-        await this.#progressPresenter.drain(pending.runId);
         let sessionPersistence = 'not_attempted';
         let sessionSaveDurationMs = 'not_attempted';
         try {
@@ -865,7 +1020,6 @@ export class AgentService {
         }
         finally {
             this.#pending.delete(pending.runId);
-            this.#progressPresenter.detach(pending.runId);
             await pending.lease.release().catch(() => undefined);
         }
         return activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs);
@@ -882,8 +1036,6 @@ export class AgentService {
             return await this.#finish(pending, cancelled);
         }
         this.#pending.delete(pending.runId);
-        await this.#progressPresenter.drain(pending.runId);
-        this.#progressPresenter.detach(pending.runId);
         await pending.lease.release().catch(() => undefined);
         return activeFinalEnvelope(failedRunResult(pending.runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
     }

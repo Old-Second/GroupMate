@@ -13,6 +13,7 @@ import {
 import { RunEngine, type StartRunInput } from '../../src/agent/run/run-engine.js'
 import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
 import {
+  RunReferenceConflictError,
   RunStoreConflictError,
   type RunStore
 } from '../../src/agent/run/run-store.js'
@@ -427,6 +428,67 @@ function outputText (result: Awaited<ReturnType<RunEngine['start']>>): string | 
   const part = result.output.parts[0]
   return part?.type === 'text' ? part.text : null
 }
+
+test('run engine calls checkpoint-created hook once before observer and provider drive', async () => {
+  const fixture = harness([modelText('hook complete')])
+  const calls: Array<Readonly<Record<string, unknown>>> = []
+
+  const result = await fixture.engine.start(fixture.input, {
+    afterCheckpointCreated: input => {
+      calls.push(Object.freeze({
+        ...input,
+        observerEvents: fixture.events.length,
+        providerCalls: fixture.adapter.requests.length
+      }))
+    }
+  })
+
+  assert.equal(result.kind, 'completed')
+  assert.deepEqual(calls, [{
+    runId: 'run-1',
+    runRef: '1'.repeat(32),
+    observationPolicy: fixture.input.observationPolicy,
+    observerEvents: 0,
+    providerCalls: 0
+  }])
+})
+
+test('checkpoint-created hook failure and losing runRef collision do not change run outcome', async () => {
+  const failedHook = harness([modelText('hook failure ignored')])
+  let hookCalls = 0
+  const completed = await failedHook.engine.start(failedHook.input, {
+    afterCheckpointCreated: async () => {
+      hookCalls += 1
+      throw new Error('private hook failure')
+    }
+  })
+  assert.equal(outputText(completed), 'hook failure ignored')
+  assert.equal(hookCalls, 1)
+
+  const base = new InMemoryRunStore()
+  const collisionStore: RunStore = {
+    ...base,
+    create: async () => { throw new RunReferenceConflictError() },
+    load: async runId => await base.load(runId),
+    upgrade: async (expected, next) => await base.upgrade(expected, next),
+    compareAndSet: async (expected, next) => await base.compareAndSet(expected, next),
+    appendEvents: async (expected, events) => await base.appendEvents(expected, events),
+    commitTerminal: async (expected, next, snapshot) => (
+      await base.commitTerminal(expected, next, snapshot)
+    ),
+    loadTombstone: async runId => await base.loadTombstone(runId)
+  }
+  const collision = harness([modelText('must not run')], { store: collisionStore })
+  let collisionHookCalls = 0
+  await assert.rejects(
+    collision.engine.start(collision.input, {
+      afterCheckpointCreated: () => { collisionHookCalls += 1 }
+    }),
+    error => error instanceof RunReferenceConflictError
+  )
+  assert.equal(collisionHookCalls, 0)
+  assert.equal(collision.adapter.requests.length, 0)
+})
 
 function terminalSnapshot (result: RunAdvanceResult) {
   return result.kind === 'paused' || result.terminal === null

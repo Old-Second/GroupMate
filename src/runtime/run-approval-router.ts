@@ -20,9 +20,13 @@ import {
   type MessageEventLike
 } from './message-input.js'
 import type {
+  ActivePresentationContext,
   ChatReplyEnvelope
 } from './agent-service.js'
 import type { ApprovalRecoveryDeferred } from './request-observation.js'
+
+export const APPROVAL_RECOVERY_DEFERRED_MESSAGE =
+  '任务繁忙，审批未消费，可稍后重试'
 
 export interface ApprovalReference {
   readonly schemaVersion: 1
@@ -66,6 +70,7 @@ export interface ApprovalReplyProjection {
 export interface RunApprovalControl {
   pendingApproval(runId: string, approvalId: string): Promise<ApprovalInterruption | null>
   displayApproval(input: ApprovalDisplayInput): Promise<ApprovalInterruption | null>
+  presentationContext(runId: string): Promise<ActivePresentationContext | null>
   decideApproval(
     input: ApprovalDecisionInput,
     runtime?: RunRuntimeBinding
@@ -97,10 +102,15 @@ export interface ProjectYunzaiApprovalReplyOptions {
   readonly now?: () => Date
 }
 
+export type ApprovalRouteOutcome = ChatReplyEnvelope | ApprovalRecoveryDeferred
+
 export type ApprovalRouteResultHandler = (
-  result: ChatReplyEnvelope,
-  reference: ApprovalReference
+  result: ApprovalRouteOutcome,
+  reference: ApprovalReference,
+  context: ActivePresentationContext
 ) => void | Promise<void>
+
+export type { ActivePresentationContext } from './agent-service.js'
 
 interface PersistedApprovalReference {
   readonly schemaVersion: 1
@@ -338,6 +348,8 @@ export class RunApprovalRouter {
     }
     const reference = await this.#index.load(reply.sessionAddress, reply.quotedMessageId)
     if (reference === null) return false
+    const context = await this.#control.presentationContext(reference.runId)
+    if (context === null) return false
     const pending = await this.#control.pendingApproval(reference.runId, reference.approvalId)
     if (pending === null || pending.approvalMessageId !== reference.messageId ||
       pending.displayedAt === undefined || pending.expiresAt === undefined ||
@@ -354,9 +366,14 @@ export class RunApprovalRouter {
       ...(expired ? {} : { actor: reply.actor })
     }, runtime)
     if (result === null) return false
-    if (result.kind === 'approval_deferred') return true
+    if (result.kind === 'approval_deferred') {
+      try {
+        await onResult?.(result, reference, context)
+      } catch {}
+      return true
+    }
     await this.#index.delete(reference)
-    await onResult?.(result, reference)
+    await onResult?.(result, reference, context)
     return true
   }
 
@@ -368,6 +385,8 @@ export class RunApprovalRouter {
   ): Promise<boolean> {
     const reference = await this.#index.load(address, messageId)
     if (reference === null) return false
+    const context = await this.#control.presentationContext(reference.runId)
+    if (context === null) return false
     const pending = await this.#control.pendingApproval(reference.runId, reference.approvalId)
     if (pending === null || pending.expiresAt === undefined ||
       new Date(timestamp(occurredAt, 'approval expiration timestamp')).getTime() <
@@ -381,9 +400,14 @@ export class RunApprovalRouter {
       sessionAddress: pending.approvalAddress
     }, runtime)
     if (result === null) return false
-    if (result.kind === 'approval_deferred') return true
+    if (result.kind === 'approval_deferred') {
+      try {
+        await onResult?.(result, reference, context)
+      } catch {}
+      return true
+    }
     await this.#index.delete(reference)
-    await onResult?.(result, reference)
+    await onResult?.(result, reference, context)
     return true
   }
 }

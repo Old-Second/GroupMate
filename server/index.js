@@ -12,6 +12,7 @@ import { Config } from '../utils/config.js'
 import { UserInfo, GetUser, AddUser, ReplaceUsers } from './modules/user_data.js'
 import { getPublicIP, getUserData, getMasterQQ, randomString, getUin } from '../utils/common.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
+import { createPendingIndicatorConfigPort } from '../dist/runtime/presentation/pending-indicator-config.js'
 
 import webRoute from './modules/web_route.js'
 import webUser from './modules/user.js'
@@ -20,6 +21,7 @@ import Guoba from './modules/guoba.js'
 import SettingView from './modules/setting_view.js'
 
 const isTrss = Array.isArray(Bot.uin)
+const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
 
 // 无法访问端口的情况下创建与media的通讯
 async function mediaLink () {
@@ -482,9 +484,7 @@ export async function createServer () {
       } else {
         redisConfig.bingTokens = []
       }
-      if (await redis.exists('CHATGPT:CONFIRM') != 0) {
-        redisConfig.turnConfirm = await redis.get('CHATGPT:CONFIRM') === 'on'
-      }
+      redisConfig.turnConfirm = await pendingIndicatorConfig.getEnabled()
       if (await redis.exists('CHATGPT:USE') != 0) {
         redisConfig.useMode = await redis.get('CHATGPT:USE')
       }
@@ -560,7 +560,7 @@ export async function createServer () {
         await redis.set('CHATGPT:BING_TOKENS', JSON.stringify(redisConfig.bingTokens))
       }
       if (redisConfig.turnConfirm != null) {
-        await redis.set('CHATGPT:CONFIRM', redisConfig.turnConfirm ? 'on' : 'off')
+        await pendingIndicatorConfig.setEnabled(redisConfig.turnConfirm === true)
       }
       if (redisConfig.useMode != null) {
         await redis.set('CHATGPT:USE', redisConfig.useMode)

@@ -9,7 +9,7 @@ import { decideApprovalInterruption, displayApprovalInterruption, isApprovalActo
 import { boundedMonotonicDurationMs } from './run-budget.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js';
-import { createRunTerminalSnapshot } from './run-observation.js';
+import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
 import { isTerminalRunStatus } from './run-state.js';
@@ -661,6 +661,16 @@ export class RunEngine {
                 error: serializeAgentError(asAgentError(error)),
                 terminal: null
             });
+        }
+        try {
+            await options.afterCheckpointCreated?.(Object.freeze({
+                runId: stored.runId,
+                runRef: stored.runRef,
+                observationPolicy: parseFrozenObservationPolicy(stored.observationPolicy)
+            }));
+        }
+        catch {
+            // The post-claim presentation seam is best effort and cannot alter a run.
         }
         this.#notify(event);
         this.#runtimeBindings.set(input.runId, input.runtime);

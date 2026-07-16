@@ -1,5 +1,7 @@
-import { createHash } from 'node:crypto';
 import { parseAgentEvent } from '../agent/contracts/event.js';
+import { parseFrozenObservationPolicy } from '../agent/run/run-observation.js';
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js';
+import { plainTextPart } from './presentation/text-presentation.js';
 const MAX_PROGRESS_MESSAGES = 5;
 const MAX_PROGRESS_CODE_POINTS = 200;
 const TOOL_PROGRESS = Object.freeze({
@@ -14,9 +16,6 @@ const TOOL_PROGRESS = Object.freeze({
     imageSearch: '正在搜索图片',
     processPicture: '正在处理图片'
 });
-function runReference(runId) {
-    return createHash('sha256').update(runId).digest('hex').slice(0, 16);
-}
 function normalizedProgress(text) {
     return [...text.normalize('NFC').trim()].slice(0, MAX_PROGRESS_CODE_POINTS).join('');
 }
@@ -39,46 +38,102 @@ function terminalEvent(event) {
     return event.type === 'run.completed' || event.type === 'run.failed' ||
         event.type === 'run.cancelled';
 }
+function progressRequestKind(value) {
+    if (value !== 'ordinary_chat' && value !== 'proactive_chat' &&
+        value !== 'recovered_legacy_plain_text') {
+        throw new TypeError('progress attachment is invalid');
+    }
+    return value;
+}
+async function dismissIndicatorBestEffort(indicator, reason) {
+    try {
+        await indicator?.dismiss(reason);
+    }
+    catch {
+        // Pending recall cannot suppress progress or poison a later queue task.
+    }
+}
+export function progressResumeStateFromEvents(rawEvents) {
+    const seenEventIds = new Set();
+    const seenStages = new Set();
+    for (const rawEvent of rawEvents) {
+        let event;
+        try {
+            event = parseAgentEvent(rawEvent);
+        }
+        catch {
+            continue;
+        }
+        if (seenEventIds.has(event.eventId))
+            continue;
+        seenEventIds.add(event.eventId);
+        const progress = progressFor(event);
+        if (progress !== null && seenStages.size < MAX_PROGRESS_MESSAGES) {
+            seenStages.add(progress.key);
+        }
+    }
+    const stages = Object.freeze([...seenStages]);
+    return Object.freeze({
+        // A definite host rejection may have caused two physical deliveries. The
+        // checkpoint deliberately persists no outbound receipts, so recovery
+        // reserves the worst case for every historical stage.
+        attempts: Math.min(MAX_PROGRESS_MESSAGES, stages.length * 2),
+        seenStages: stages
+    });
+}
 export class RunProgressPresenter {
     #states = new Map();
     #onDeliveryFailure;
+    #onAttachment;
     constructor(options = {}) {
         this.#onDeliveryFailure = options.onDeliveryFailure;
+        this.#onAttachment = options.onAttachment;
     }
-    attach(runId, delivery, persistedEvents = []) {
-        if (typeof runId !== 'string' || runId.length === 0 || runId.length > 128 ||
-            typeof delivery !== 'function') {
+    attach(input) {
+        if (typeof input.runId !== 'string' || input.runId.length === 0 || input.runId.length > 128 ||
+            typeof input.runRef !== 'string' || !RUN_REF_PATTERN.test(input.runRef)) {
             throw new TypeError('progress attachment is invalid');
         }
-        const state = this.#states.get(runId) ?? {
-            delivery,
+        const requestKind = progressRequestKind(input.requestKind);
+        if (!Number.isSafeInteger(input.resume.attempts) || input.resume.attempts < 0 ||
+            input.resume.attempts > MAX_PROGRESS_MESSAGES || !Array.isArray(input.resume.seenStages) ||
+            input.resume.seenStages.length > MAX_PROGRESS_MESSAGES ||
+            input.resume.seenStages.some(stage => typeof stage !== 'string' ||
+                !stage.startsWith('tool_started:') || stage.length > 256) ||
+            new Set(input.resume.seenStages).size !== input.resume.seenStages.length) {
+            throw new TypeError('progress resume state is invalid');
+        }
+        const observationPolicy = parseFrozenObservationPolicy(input.observationPolicy);
+        const resume = Object.freeze({
+            attempts: input.resume.attempts,
+            seenStages: Object.freeze([...input.resume.seenStages])
+        });
+        const state = {
+            runId: input.runId,
+            runRef: input.runRef,
+            requestKind,
+            observationPolicy,
+            outbound: input.outbound,
+            indicator: input.indicator,
             seenEventIds: new Set(),
-            seenStages: new Set(),
-            attempts: 0,
+            seenStages: new Set(resume.seenStages),
+            attempts: resume.attempts,
             terminal: false,
             queue: Promise.resolve()
         };
-        state.delivery = delivery;
-        for (const rawEvent of persistedEvents) {
-            let event;
-            try {
-                event = parseAgentEvent(rawEvent);
-            }
-            catch {
-                continue;
-            }
-            if (event.runId !== runId)
-                continue;
-            state.seenEventIds.add(event.eventId);
-            const progress = progressFor(event);
-            if (progress !== null && !state.seenStages.has(progress.key)) {
-                state.seenStages.add(progress.key);
-                state.attempts += 1;
-            }
-            if (terminalEvent(event))
-                state.terminal = true;
+        this.#states.set(input.runId, state);
+        try {
+            this.#onAttachment?.(Object.freeze({
+                runId: state.runId,
+                runRef: state.runRef,
+                requestKind: state.requestKind,
+                observationPolicy,
+                resume
+            }));
         }
-        this.#states.set(runId, state);
+        catch {
+            // A safe observation seam cannot affect presentation.
+        }
     }
     handle(rawEvent) {
         let event;
@@ -92,8 +147,12 @@ export class RunProgressPresenter {
         if (state === undefined || state.seenEventIds.has(event.eventId))
             return;
         state.seenEventIds.add(event.eventId);
-        if (terminalEvent(event)) {
+        if (event.type === 'run.paused' || terminalEvent(event)) {
             state.terminal = true;
+            const reason = event.type === 'run.paused' ? 'paused' : 'terminal';
+            state.queue = state.queue.then(async () => {
+                await dismissIndicatorBestEffort(state.indicator, reason);
+            });
             return;
         }
         if (state.terminal || state.attempts >= MAX_PROGRESS_MESSAGES)
@@ -103,14 +162,24 @@ export class RunProgressPresenter {
             return;
         state.seenStages.add(progress.key);
         state.attempts += 1;
-        const delivery = state.delivery;
         state.queue = state.queue.then(async () => {
+            await dismissIndicatorBestEffort(state.indicator, 'progress');
+            let resultCode = 'no_result';
             try {
-                await delivery(progress.text);
+                let final = await state.outbound.deliver(plainTextPart(progress.text), 1);
+                if (final.kind === 'failed_definite' && final.code === 'host_rejected' &&
+                    state.attempts < MAX_PROGRESS_MESSAGES) {
+                    state.attempts += 1;
+                    final = await state.outbound.deliver(plainTextPart(progress.text), 2);
+                }
+                if (final?.kind === 'sent')
+                    return;
+                resultCode = final?.kind ?? resultCode;
             }
             catch {
-                this.#reportFailure(event);
+                resultCode = 'exception';
             }
+            this.#reportFailure(state, event, resultCode);
         });
     }
     async drain(runId) {
@@ -119,13 +188,14 @@ export class RunProgressPresenter {
     detach(runId) {
         this.#states.delete(runId);
     }
-    #reportFailure(event) {
+    #reportFailure(state, event, resultCode) {
         try {
             this.#onDeliveryFailure?.(Object.freeze({
                 event: 'run.progress.delivery_failed',
-                runRef: runReference(event.runId),
+                runRef: state.runRef,
                 sequence: event.sequence,
-                eventType: event.type
+                eventType: event.type,
+                resultCode
             }));
         }
         catch {

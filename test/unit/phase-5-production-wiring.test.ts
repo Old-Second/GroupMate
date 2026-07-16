@@ -3,6 +3,7 @@ import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { test } from 'node:test'
 import { getYunzaiAgentServiceBridge } from '../../src/runtime/agent-service-bridge.js'
+import { createPendingIndicatorConfigPort } from '../../src/runtime/presentation/pending-indicator-config.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
 const root = process.cwd()
@@ -237,6 +238,7 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     enableToolPrivateSend: false,
     enableToolVideoDownload: false
   }
+  await createPendingIndicatorConfigPort(redis).setEnabled(false)
   const bridge = getYunzaiAgentServiceBridge({
     config,
     redis,
@@ -367,6 +369,10 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
             approvalMessages.push(message)
             return { message_id: `approval-private-${approvalMessages.length}` }
           }
+          if (String(userId) === 'actor-1') {
+            originalReplies.push(message)
+            return { message_id: `original-route-${originalReplies.length}` }
+          }
           targetMessages.push(message)
           return { message_id: 'target-private-1' }
         }
@@ -467,7 +473,11 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   })
   assert.equal(approvedRouted, true)
   assert.deepEqual(targetMessages, ['approved fixture delivery'])
-  assert.deepEqual(originalReplies, ['审批任务完成。', '消息发送完成。'])
+  assert.deepEqual(originalReplies, [
+    '审批任务完成。',
+    '正在执行任务步骤',
+    '消息发送完成。'
+  ])
   assert.equal(approverReplies.length, 0)
   const approvedFollowUp = requests.at(-1) ?? {}
   assert.equal(Object.hasOwn(approvedFollowUp, 'tools'), false)

@@ -3,6 +3,7 @@ import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { test } from 'node:test'
 import type { SerializablePreparedCapability } from '../../src/agent/tools/prepared-capability.js'
+import type { RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
 import {
   createExternalPluginEventFacade,
@@ -193,7 +194,9 @@ test('Yunzai runtime creates one native snapshot and no legacy execution surface
   assert.ok(run.snapshot.modelTools.some(tool => tool.function.name === 'website'))
   assert.equal(run.promptAddition, '')
   assert.equal(context.profile, 'safe')
-  assert.deepEqual(Object.keys(bridge).sort(), ['prepareAgentRun', 'runtime'])
+  assert.deepEqual(Object.keys(bridge).sort(), [
+    'prepareAgentRun', 'recoverAgentRun', 'runtime'
+  ])
 })
 
 test('Yunzai approval keeps bot master authority for a group owner', async () => {
@@ -397,6 +400,176 @@ test('quoted message content is never treated as current management intent', asy
     arguments: Object.freeze({ userId: '8', seconds: 60 })
   })
   assert.equal(outcome.result?.status, 'denied')
+  assert.equal(muteCalls, 0)
+})
+
+test('Yunzai recovery rebuilds group-user runtime and rejects snapshot or actor drift', async () => {
+  let muteCalls = 0
+  let recoveryImageReads = 0
+  let rejectImageRead = false
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner' }],
+    [8, { user_id: 8, role: 'member' }],
+    [10000, { user_id: 10000, role: 'owner' }]
+  ])
+  const group = {
+    getMemberMap: async () => members,
+    muteMember: async () => { muteCalls += 1 },
+    kickMember: async () => {},
+    setCard: async () => {},
+    setTitle: async () => {},
+    recallMsg: async () => {}
+  }
+  const bot = {
+    pickGroup: () => group,
+    getFriendList: async () => [7, 8],
+    pickFriend: () => ({ sendMsg: async () => true }),
+    setEssenceMessage: async () => {},
+    removeEssenceMessage: async () => {}
+  }
+  const baseOptions = {
+    config: config({
+      toolPolicyProfile: 'strict',
+      groupMerge: false,
+      enableToolPrivateSend: false
+    }),
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
+    getImages: async () => {
+      recoveryImageReads += 1
+      if (rejectImageRead) {
+        throw new Error('recovery must not inspect synthetic message images')
+      }
+      return undefined
+    },
+    segment: () => ({})
+  }
+  const bridge = createYunzaiToolRuntimeBridge(baseOptions)
+  const event = {
+    isGroup: true,
+    group_id: 9,
+    user_id: 7,
+    message_id: 'request-message',
+    sender: { user_id: 7, role: 'owner' },
+    group,
+    bot,
+    message: [{ type: 'at', qq: 8 }]
+  }
+  const run = await bridge.prepareAgentRun({ event, prompt: '请禁言 QQ:8 60 秒' })
+  const outcome = await executeNativeTool(bridge, run, {
+    runId: 'run-recovery',
+    callId: 'call-recovery-mute',
+    requestedName: 'jinyan',
+    arguments: Object.freeze({ userId: '8', seconds: 60 })
+  })
+  assert.equal(outcome.preparedKind, 'approval_required')
+  const capability = outcome.capability
+  assert.notEqual(capability, undefined)
+  if (capability === undefined) assert.fail('expected approval capability')
+  rejectImageRead = true
+  recoveryImageReads = 0
+  const sessionAddress = Object.freeze({
+    botId: '10000',
+    scope: Object.freeze({ kind: 'group_user' as const, groupId: '9', userId: '7' })
+  })
+  const checkpoint = {
+    runId: 'run-recovery',
+    sessionAddress,
+    presentationRoute: Object.freeze({
+      schemaVersion: 1 as const,
+      requestKind: 'ordinary_chat' as const,
+      profile: 'ordinary' as const,
+      presentationIntent: Object.freeze({
+        schemaVersion: 1 as const, kind: 'ordinary' as const, forcePicture: false
+      }),
+      sessionAddress,
+      actorId: '7',
+      requestMessageId: 'request-message'
+    }),
+    toolSnapshot: Object.freeze({
+      id: run.snapshot.id,
+      fingerprint: run.snapshot.fingerprint,
+      manifest: run.snapshot.manifest
+    }),
+    preparedBatch: Object.freeze({
+      schemaVersion: 1 as const,
+      calls: Object.freeze([Object.freeze({
+        kind: 'approval_required' as const,
+        capability,
+        summaryCode: 'jinyan_approval'
+      })])
+    }),
+    interruption: Object.freeze({
+      callId: capability.callId,
+      argumentHash: capability.argumentHash,
+      toolFingerprint: run.snapshot.fingerprint,
+      requester: Object.freeze({ userId: '7', role: 'bot_master' as const })
+    }),
+    approvalHistory: Object.freeze([])
+  } as unknown as RunCheckpoint
+
+  const recovered = await bridge.recoverAgentRun({ checkpoint, bot })
+  const recoveredContext = await recovered.binding.prepareToolContext(
+    checkpoint,
+    new AbortController().signal
+  )
+  assert.equal(recovered.snapshot.id, run.snapshot.id)
+  assert.equal(recovered.snapshot.fingerprint, run.snapshot.fingerprint)
+  assert.deepEqual(recoveredContext.facts.scope, {
+    kind: 'group_user', groupId: '9', userId: '7'
+  })
+  assert.deepEqual(recoveredContext.intent.actions, ['mute'])
+  assert.deepEqual(recoveredContext.intent.mentionUserIds, ['8'])
+  assert.equal(recoveryImageReads, 0)
+
+  const continuedCheckpoint = Object.freeze({
+    ...checkpoint,
+    interruption: null,
+    preparedBatch: Object.freeze({
+      schemaVersion: 1 as const,
+      calls: Object.freeze([Object.freeze({
+        kind: 'ready' as const,
+        capability
+      })])
+    }),
+    approvalHistory: Object.freeze([Object.freeze({
+      callId: capability.callId,
+      argumentHash: capability.argumentHash,
+      toolFingerprint: run.snapshot.fingerprint,
+      decision: Object.freeze({ kind: 'approved' as const })
+    })])
+  }) as unknown as RunCheckpoint
+  const continuedContext = await recovered.binding.prepareToolContext(
+    continuedCheckpoint,
+    new AbortController().signal
+  )
+  assert.deepEqual(continuedContext.intent, recoveredContext.intent)
+
+  const mismatchedActor = Object.freeze({
+    ...checkpoint,
+    presentationRoute: Object.freeze({
+      ...(checkpoint.presentationRoute as NonNullable<RunCheckpoint['presentationRoute']>),
+      actorId: '9'
+    })
+  }) as RunCheckpoint
+  await assert.rejects(
+    bridge.recoverAgentRun({ checkpoint: mismatchedActor, bot }),
+    /actor identity is inconsistent/
+  )
+
+  const drifted = createYunzaiToolRuntimeBridge({
+    ...baseOptions,
+    config: config({
+      toolPolicyProfile: 'strict',
+      groupMerge: false,
+      enableToolPrivateSend: true
+    })
+  })
+  await assert.rejects(
+    drifted.recoverAgentRun({ checkpoint, bot }),
+    /snapshot does not match checkpoint/
+  )
   assert.equal(muteCalls, 0)
 })
 

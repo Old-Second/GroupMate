@@ -37,6 +37,13 @@ function splitList (value: unknown, separator: RegExp): string[] {
 }
 
 export function normalizeGuobaConfigValue (key: string, value: unknown): unknown {
+  if (key === 'turnConfirm') {
+    if (typeof value !== 'boolean') {
+      throw new TypeError('正在思考提示配置无效。')
+    }
+    return value
+  }
+
   if (key === 'openAiCompatibilityProfile') {
     if (typeof value !== 'string' || !OPENAI_COMPATIBILITY_PROFILES.has(value)) {
       throw new TypeError('OpenAI API 兼容配置无效。')

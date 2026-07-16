@@ -62,6 +62,7 @@ import {
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js'
 import {
   createRunTerminalSnapshot,
+  parseFrozenObservationPolicy,
   type FrozenObservationPolicyV1,
   type ObservationCount,
   type RunObservationCountersV1
@@ -163,6 +164,18 @@ export interface StartRunInput {
 
 export interface RunControlOptions {
   readonly signal?: AbortSignal
+}
+
+export interface RunCheckpointCreatedHookInput {
+  readonly runId: string
+  readonly runRef: string
+  readonly observationPolicy: FrozenObservationPolicyV1
+}
+
+export interface RunStartOptions extends RunControlOptions {
+  readonly afterCheckpointCreated?: (
+    input: RunCheckpointCreatedHookInput
+  ) => void | Promise<void>
 }
 
 export interface RunEngineOptions {
@@ -903,7 +916,7 @@ export class RunEngine {
 
   async start (
     input: StartRunInput,
-    options: RunControlOptions = {}
+    options: RunStartOptions = {}
   ): Promise<RunAdvanceResult> {
     const createdAt = this.#timestamp()
     const event = createRunEvent({
@@ -964,6 +977,15 @@ export class RunEngine {
         error: serializeAgentError(asAgentError(error)),
         terminal: null
       })
+    }
+    try {
+      await options.afterCheckpointCreated?.(Object.freeze({
+        runId: stored.runId,
+        runRef: stored.runRef,
+        observationPolicy: parseFrozenObservationPolicy(stored.observationPolicy)
+      }))
+    } catch {
+      // The post-claim presentation seam is best effort and cannot alter a run.
     }
     this.#notify(event)
     this.#runtimeBindings.set(input.runId, input.runtime)

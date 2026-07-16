@@ -36,6 +36,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         }),
         field('assistantLabel', '群内名字', '模型使用的自称，也用于主动群聊判断是否有人点名机器人。'),
         field('enablePrivateChat', '允许私聊', '开启后允许用户在 QQ 私聊中触发普通对话。', 'Switch'),
+        field('turnConfirm', '显示正在思考提示', '普通聊天开始后显示一次提示，并在首条进度、审批暂停、终态或最多 8 秒后撤回；主动群聊不显示。', 'Switch'),
         field('enableRobotAt', '允许真实 @ 群友', '开启后，回复文本中的群成员提及会转换成真正的 QQ @。', 'Switch'),
         field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；修改后建议重启。'),
         field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),

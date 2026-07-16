@@ -9,7 +9,11 @@ import type {
 } from '../../agent/tools/tool-context.js'
 import type { ToolCall } from '../../agent/tools/tool-call.js'
 import { ToolExecutor } from '../../agent/tools/tool-executor.js'
-import { ToolPolicyEngine, type ToolPolicyProfile } from '../../agent/tools/policy-engine.js'
+import {
+  intentActionForToolCapability,
+  ToolPolicyEngine,
+  type ToolPolicyProfile
+} from '../../agent/tools/policy-engine.js'
 import type {
   PreparedToolCall,
   SerializablePreparedCapability
@@ -20,7 +24,10 @@ import type { ToolRuntime } from '../../agent/tools/tool-runtime.js'
 import type { ApprovalActorReference } from '../../agent/run/interruption.js'
 import type { RunRuntimeBinding } from '../../agent/run/run-engine.js'
 import type { RunCheckpoint } from '../../agent/run/run-checkpoint.js'
-import { extractIntentEvidence } from './intent-evidence.js'
+import {
+  extractIntentEvidence,
+  type IntentEvidence
+} from './intent-evidence.js'
 import { PolicyFetch } from './policy-fetch.js'
 import type { RedisToolClient } from './redis-tool-client.js'
 import { RedisIdempotencyStore } from './redis-idempotency-store.js'
@@ -117,6 +124,10 @@ export interface YunzaiAgentToolRun {
 export interface YunzaiToolRuntimeBridge {
   readonly runtime: ToolRuntime
   prepareAgentRun(input: YunzaiToolRunInput): Promise<YunzaiAgentToolRun>
+  recoverAgentRun(input: {
+    readonly checkpoint: RunCheckpoint
+    readonly bot: unknown
+  }): Promise<YunzaiAgentToolRun>
 }
 
 export class ToolRuntimeConfigurationError extends Error {
@@ -234,11 +245,21 @@ async function memberMap (event: YunzaiRecord, groupId: string): Promise<Map<unk
 async function sourceFor (
   options: YunzaiToolRuntimeBridgeOptions,
   event: YunzaiRecord,
-  masters: readonly YunzaiValue[]
+  masters: readonly YunzaiValue[],
+  trustedIdentity?: Readonly<{
+    botId: string
+    actorId: string
+    scope: SessionAddress['scope']
+  }>
 ): Promise<ToolRuntimeFactsSource> {
-  const botId = identifier(options.getBotId(event), 'bot ID')
-  const actorId = identifier(event.sender?.user_id ?? event.user_id, 'actor ID')
-  const groupId = event.isGroup === true ? identifier(event.group_id, 'group ID') : null
+  const botId = trustedIdentity?.botId ?? identifier(options.getBotId(event), 'bot ID')
+  const actorId = trustedIdentity?.actorId ?? identifier(
+    event.sender?.user_id ?? event.user_id,
+    'actor ID'
+  )
+  const groupId = trustedIdentity === undefined
+    ? event.isGroup === true ? identifier(event.group_id, 'group ID') : null
+    : trustedIdentity.scope.kind === 'private' ? null : trustedIdentity.scope.groupId
   let members: Map<unknown, YunzaiRecord> | null = null
   if (groupId !== null) {
     try { members = await memberMap(event, groupId) } catch {}
@@ -258,11 +279,11 @@ async function sourceFor (
     channel: groupId === null
       ? { kind: 'private', botId, userId: actorId }
       : { kind: 'group', botId, groupId },
-    scope: groupId === null
+    scope: trustedIdentity?.scope ?? (groupId === null
       ? { kind: 'private', userId: actorId }
       : configBoolean(options.config, 'groupMerge')
         ? { kind: 'group', groupId }
-        : { kind: 'group_user', groupId, userId: actorId },
+        : { kind: 'group_user', groupId, userId: actorId }),
     botMasterIds: masters,
     botGroupRole: botRole,
     actorGroupRole: groupId === null ? 'none' : actorRole,
@@ -895,6 +916,131 @@ function safeAudit (logger: YunzaiToolRuntimeBridgeOptions['logger']): ToolAudit
   }
 }
 
+function sameJson (left: unknown, right: unknown): boolean {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right)
+  } catch {
+    return false
+  }
+}
+
+function persistedCapability (
+  checkpoint: RunCheckpoint,
+  supplied?: SerializablePreparedCapability
+): SerializablePreparedCapability {
+  if (checkpoint.preparedBatch === null) {
+    throw new TypeError('recovered prepared batch is unavailable')
+  }
+  const interruption = checkpoint.interruption
+  const candidate = supplied ?? (() => {
+    if (interruption === null) throw new TypeError('recovered approval is unavailable')
+    const call = checkpoint.preparedBatch.calls.find(item => (
+      item.kind === 'approval_required' &&
+      item.capability.callId === interruption.callId
+    ))
+    if (call?.kind !== 'approval_required') {
+      throw new TypeError('recovered approval capability is unavailable')
+    }
+    return call.capability
+  })()
+  const persisted = checkpoint.preparedBatch.calls.find(item => (
+    item.kind !== 'completed' && item.capability.callId === candidate.callId
+  ))
+  if (persisted === undefined || persisted.kind === 'completed' ||
+    !sameJson(persisted.capability, candidate) ||
+    candidate.snapshotId !== checkpoint.toolSnapshot.id) {
+    throw new TypeError('recovered capability does not match checkpoint')
+  }
+  if (interruption !== null && candidate.callId === interruption.callId) {
+    if (candidate.argumentHash !== interruption.argumentHash ||
+      checkpoint.toolSnapshot.fingerprint !== interruption.toolFingerprint) {
+      throw new TypeError('recovered approval capability identity is invalid')
+    }
+    return candidate
+  }
+  const approved = checkpoint.approvalHistory.some(item => (
+    item.callId === candidate.callId &&
+    item.argumentHash === candidate.argumentHash &&
+    item.toolFingerprint === checkpoint.toolSnapshot.fingerprint &&
+    item.decision?.kind === 'approved'
+  ))
+  if (!approved) throw new TypeError('recovered capability is not approved')
+  return candidate
+}
+
+function intentForPersistedCapability (
+  checkpoint: RunCheckpoint,
+  supplied?: SerializablePreparedCapability
+): IntentEvidence {
+  const capability = persistedCapability(checkpoint, supplied)
+  const action = intentActionForToolCapability(
+    capability.toolName,
+    capability.canonicalArguments
+  )
+  if (action === null) throw new TypeError('recovered capability has no intent mapping')
+  const target = capability.target
+  return Object.freeze({
+    trustedSources: Object.freeze(['current_request'] as const),
+    actions: Object.freeze([action]),
+    mentionUserIds: Object.freeze(
+      target.kind === 'member' || target.kind === 'private' ? [target.userId] : []
+    ),
+    explicitTargetIds: Object.freeze(
+      target.kind === 'group'
+        ? [target.groupId]
+        : target.kind === 'member' || target.kind === 'private'
+          ? [target.userId]
+          : target.kind === 'message' ? [target.messageId] : []
+    ),
+    replyMessageId: target.kind === 'message' ? target.messageId : null,
+    currentMessageId: null
+  })
+}
+
+function recoveryIdentity (checkpoint: RunCheckpoint): Readonly<{
+  botId: string
+  actorId: string
+  scope: SessionAddress['scope']
+}> {
+  const scope = checkpoint.sessionAddress.scope
+  const requesterId = checkpoint.interruption?.requester.userId
+  const routeActorId = checkpoint.presentationRoute?.actorId
+  const scopeActorId = scope.kind === 'private' || scope.kind === 'group_user'
+    ? scope.userId
+    : undefined
+  const identities = [requesterId, routeActorId, scopeActorId]
+    .filter((value): value is string => value !== undefined)
+  if (identities.length === 0 || identities.some(value => value !== identities[0])) {
+    throw new TypeError('recovered actor identity is inconsistent')
+  }
+  const actorId = identities[0] as string
+  return Object.freeze({
+    botId: identifier(checkpoint.sessionAddress.botId, 'recovered bot ID'),
+    actorId: identifier(actorId, 'recovered actor ID'),
+    scope: Object.freeze({ ...scope })
+  })
+}
+
+function recoveryEvent (
+  checkpoint: RunCheckpoint,
+  bot: unknown
+): Readonly<{ event: YunzaiRecord; identity: ReturnType<typeof recoveryIdentity> }> {
+  if (bot === null || typeof bot !== 'object') throw new TypeError('recovered bot is unavailable')
+  const identity = recoveryIdentity(checkpoint)
+  const isGroup = identity.scope.kind !== 'private'
+  const event: YunzaiRecord = {
+    isGroup,
+    isPrivate: !isGroup,
+    self_id: identity.botId,
+    user_id: identity.actorId,
+    sender: { user_id: identity.actorId },
+    message: [],
+    bot
+  }
+  if (isGroup) event.group_id = identity.scope.groupId
+  return Object.freeze({ event, identity })
+}
+
 export function toolResourceFromLegacySegment (value: unknown): ToolResource {
   return legacyMediaResource(value, 'audio/mpeg')
 }
@@ -939,17 +1085,25 @@ export function createYunzaiToolRuntimeBridge (
       context.facts.botId
     ).executor.executePrepared(capability, context, snapshot, signal)
   })
-  const capture = async (input: YunzaiToolRunInput): Promise<YunzaiToolCapture> => {
+  const capture = async (
+    input: YunzaiToolRunInput,
+    trustedIdentity?: ReturnType<typeof recoveryIdentity>
+  ): Promise<YunzaiToolCapture> => {
     if (typeof input.prompt !== 'string' || Buffer.byteLength(input.prompt, 'utf8') > 128 * 1024) {
       throw new TypeError('tool run input is invalid')
     }
     const event = eventRecord(input.event)
     const masters = await options.getMasterIds()
-    const source = await sourceFor(options, event, masters)
+    const source = await sourceFor(options, event, masters, trustedIdentity)
     const initialFacts = await resolveToolRuntimeFacts(source, { kind: 'none' })
     ensureControl(initialFacts.botId)
     const refreshFacts = async (target: ToolTarget, signal: AbortSignal): Promise<ToolRuntimeFacts> => {
-      const currentSource = await sourceFor(options, event, await options.getMasterIds())
+      const currentSource = await sourceFor(
+        options,
+        event,
+        await options.getMasterIds(),
+        trustedIdentity
+      )
       return resolveToolRuntimeFacts(currentSource, target, signal)
     }
     const visibleToolServices = visibleServices(options, event, policyFetch, initialFacts.botId)
@@ -988,6 +1142,18 @@ export function createYunzaiToolRuntimeBridge (
         return true
       })
       .map(definition => definition.name)
+    if (trustedIdentity !== undefined) {
+      return {
+        profile: options.config.toolPolicyProfile ?? 'compatible',
+        registry,
+        enabledTools,
+        initialFacts,
+        refreshFacts,
+        intent: extractIntentEvidence({ text: '', mentions: [], reply: null }),
+        promptAddition: '',
+        systemAddition: ''
+      }
+    }
     const replyId = await replyMessageId(event)
     const images = legacyImageUrls(
       options.getImages === undefined ? undefined : await options.getImages(event)
@@ -1013,50 +1179,85 @@ export function createYunzaiToolRuntimeBridge (
         : `\nthe current request is replying to messageId ${replyId}. Only manage that message when explicitly requested.\nNever manage the current request message itself.\n`
     }
   }
+  const buildRun = (
+    captured: YunzaiToolCapture,
+    snapshot: ToolSnapshot,
+    event: YunzaiRecord,
+    recoveredIntent?: IntentEvidence
+  ): YunzaiAgentToolRun => {
+    const profile = policyProfile(captured.profile)
+    const binding: YunzaiAgentToolRun['binding'] = Object.freeze({
+      snapshot,
+      prepareToolContext: async (
+        checkpoint: RunCheckpoint,
+        signal: AbortSignal
+      ): Promise<ToolPreparationContext> => Object.freeze({
+        runId: checkpoint.runId,
+        profile,
+        facts: await captured.refreshFacts(Object.freeze({ kind: 'none' }), signal),
+        intent: recoveredIntent ?? captured.intent,
+        now: new Date().toISOString()
+      }),
+      contextFor: async (
+        capability: SerializablePreparedCapability,
+        checkpoint: RunCheckpoint,
+        signal: AbortSignal
+      ): Promise<ToolExecutionContext> => Object.freeze({
+        runId: checkpoint.runId,
+        profile,
+        facts: await captured.refreshFacts(capability.target, signal),
+        intent: recoveredIntent ?? captured.intent,
+        now: new Date().toISOString()
+      }),
+      approvalControlContext: async () => Object.freeze({
+        eligibleApprovers: await eligibleApprovers(options, event)
+      })
+    })
+    return Object.freeze({
+      profile,
+      snapshot,
+      promptAddition: captured.promptAddition,
+      systemAddition: captured.systemAddition,
+      binding
+    })
+  }
+
   return Object.freeze({
     runtime,
     async prepareAgentRun (input: YunzaiToolRunInput): Promise<YunzaiAgentToolRun> {
+      const event = eventRecord(input.event)
       const captured = await capture(input)
-      const profile = policyProfile(captured.profile)
       const snapshot = captured.registry.createSnapshot({
         id: runtimeId(),
         facts: captured.initialFacts,
         enabledTools: captured.enabledTools
       })
-      const binding: YunzaiAgentToolRun['binding'] = Object.freeze({
-        snapshot,
-        prepareToolContext: async (
-          checkpoint: RunCheckpoint,
-          signal: AbortSignal
-        ): Promise<ToolPreparationContext> => Object.freeze({
-          runId: checkpoint.runId,
-          profile,
-          facts: await captured.refreshFacts(Object.freeze({ kind: 'none' }), signal),
-          intent: captured.intent,
-          now: new Date().toISOString()
-        }),
-        contextFor: async (
-          capability: SerializablePreparedCapability,
-          checkpoint: RunCheckpoint,
-          signal: AbortSignal
-        ): Promise<ToolExecutionContext> => Object.freeze({
-          runId: checkpoint.runId,
-          profile,
-          facts: await captured.refreshFacts(capability.target, signal),
-          intent: captured.intent,
-          now: new Date().toISOString()
-        }),
-        approvalControlContext: async () => Object.freeze({
-          eligibleApprovers: await eligibleApprovers(options, eventRecord(input.event))
-        })
+      return buildRun(captured, snapshot, event)
+    },
+    async recoverAgentRun (input: {
+      readonly checkpoint: RunCheckpoint
+      readonly bot: unknown
+    }): Promise<YunzaiAgentToolRun> {
+      const recovered = recoveryEvent(input.checkpoint, input.bot)
+      const captured = await capture({
+        event: recovered.event,
+        prompt: ''
+      }, recovered.identity)
+      const snapshot = captured.registry.createSnapshot({
+        id: input.checkpoint.toolSnapshot.id,
+        facts: captured.initialFacts,
+        enabledTools: captured.enabledTools
       })
-      return Object.freeze({
-        profile,
-        snapshot,
-        promptAddition: captured.promptAddition,
-        systemAddition: captured.systemAddition,
-        binding
-      })
+      if (snapshot.fingerprint !== input.checkpoint.toolSnapshot.fingerprint ||
+        !sameJson(snapshot.manifest, input.checkpoint.toolSnapshot.manifest)) {
+        throw new TypeError('recovered tool snapshot does not match checkpoint')
+      }
+      // Validate once and retain only this bounded capability-derived proof.
+      // Later read-only turns can continue, while any new side effect still
+      // has to pass its own policy and approval checks against this narrow
+      // action/target evidence.
+      const recoveredIntent = intentForPersistedCapability(input.checkpoint)
+      return buildRun(captured, snapshot, recovered.event, recoveredIntent)
     }
   })
 }

@@ -106,6 +106,7 @@ const requiredGuobaFields = [
   'toggleMode',
   'assistantLabel',
   'enablePrivateChat',
+  'turnConfirm',
   'enableRobotAt',
   'debug',
   'proxy',
@@ -220,7 +221,7 @@ const expectedGuobaGroups = [
   {
     label: '基础与运行',
     fields: [
-      'toggleMode', 'assistantLabel', 'enablePrivateChat', 'enableRobotAt',
+      'toggleMode', 'assistantLabel', 'enablePrivateChat', 'turnConfirm', 'enableRobotAt',
       'proxy', 'defaultTimeoutMs', 'debug'
     ]
   },
@@ -349,9 +350,12 @@ test('Guoba exposes every supported user-facing configuration with an explanatio
 
   for (const field of requiredGuobaFields) {
     assert.equal(fields.has(field), true, `${field} must be configurable in Guoba`)
+    if (field === 'turnConfirm') continue
     assert.match(configSource, new RegExp(`^  ${field}:`, 'm'), `${field} must have a runtime default`)
     assert.equal(Object.hasOwn(configExample, field), true, `${field} must have a safe example value`)
   }
+  assert.doesNotMatch(configSource, /^  turnConfirm:/m)
+  assert.equal(Object.hasOwn(configExample, 'turnConfirm'), false)
 
   for (const [field, schema] of fields) {
     assert.equal(
@@ -565,4 +569,18 @@ test('tool video limit matches the memory-safe runtime hard limit', async () => 
   const example = JSON.parse(await readSource('config/config.example.json')) as Record<string, unknown>
   assert.equal(example.toolVideoMaxMB, 8)
   assert.match(await readSource('utils/config.js'), /toolVideoMaxMB:\s*8/)
+})
+
+test('Guoba exposes exactly one pending indicator field with lifecycle semantics', () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const fields = schemas.filter(schema => schema.field === 'turnConfirm')
+  assert.equal(fields.length, 1)
+  assert.equal(fields[0]?.component, 'Switch')
+  assert.equal(fields[0]?.label, '显示正在思考提示')
+  assert.equal(
+    fields[0]?.bottomHelpMessage,
+    '普通聊天开始后显示一次提示，并在首条进度、审批暂停、终态或最多 8 秒后撤回；主动群聊不显示。'
+  )
 })

@@ -24,11 +24,14 @@ import { runServer, stopServer } from '../server/index.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 import { selectImportableConfig } from '../dist/runtime/config-persistence.js'
 import { migrateLegacyCrossChannelPolicies } from '../dist/runtime/tools/cross-channel-policy.js'
+import { createPendingIndicatorConfigPort } from '../dist/runtime/presentation/pending-indicator-config.js'
 import {
   providerModeMigrationEvent,
   resolveProviderMode,
   resolveProviderModeForRuntime
 } from '../dist/runtime/provider-mode-policy.js'
+
+const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
 
 export class ChatgptManagement extends plugin {
   constructor (e) {
@@ -549,14 +552,14 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async turnOnConfirm (e) {
-    await redis.set('CHATGPT:CONFIRM', 'on')
-    await this.reply('已开启消息确认', true)
+    await pendingIndicatorConfig.setEnabled(true)
+    await this.reply('已开启显示正在思考提示', true)
     return false
   }
 
   async turnOffConfirm (e) {
-    await redis.set('CHATGPT:CONFIRM', 'off')
-    await this.reply('已关闭消息确认', true)
+    await pendingIndicatorConfig.setEnabled(false)
+    await this.reply('已关闭显示正在思考提示', true)
     return false
   }
 
@@ -859,9 +862,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
       return true
     }
     let redisConfig = {}
-    if (await redis.exists('CHATGPT:CONFIRM') != 0) {
-      redisConfig.turnConfirm = await redis.get('CHATGPT:CONFIRM') === 'on'
-    }
+    redisConfig.turnConfirm = await pendingIndicatorConfig.getEnabled()
     if (await redis.exists('CHATGPT:USE') != 0) {
       redisConfig.useMode = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
     }
@@ -919,10 +920,10 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
             changeConfig.push({
               item: 'turnConfirm',
               value: redisConfig.turnConfirm ? 'on' : 'off',
-              old: await redis.get('CHATGPT:CONFIRM'),
+              old: (await pendingIndicatorConfig.getEnabled()) ? 'on' : 'off',
               type: 'redis'
             })
-            await redis.set('CHATGPT:CONFIRM', redisConfig.turnConfirm ? 'on' : 'off')
+            await pendingIndicatorConfig.setEnabled(redisConfig.turnConfirm === true)
           }
           if (redisConfig.useMode != null) {
             const importedMode = resolveProviderMode(redisConfig.useMode)
