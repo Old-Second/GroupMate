@@ -19,6 +19,18 @@ const INITIAL_COUNTERS = Object.freeze({
     correctionTurns: 0,
     usedActiveRuntimeMs: 0
 });
+export function boundedMonotonicDurationMs(startedAt, finishedAt, maximumMs = Number.MAX_SAFE_INTEGER) {
+    if (!Number.isSafeInteger(maximumMs) || maximumMs < 0) {
+        throw new TypeError('observation duration limit must be a non-negative safe integer');
+    }
+    if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) ||
+        finishedAt <= startedAt)
+        return 0;
+    const duration = Math.ceil(finishedAt - startedAt);
+    if (!Number.isSafeInteger(duration))
+        return maximumMs;
+    return Math.min(duration, maximumMs);
+}
 function assertNonNegativeInteger(value, field) {
     if (!Number.isSafeInteger(value) || value < 0) {
         throw new TypeError(`${field} must be a non-negative integer`);

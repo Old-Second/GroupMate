@@ -20,7 +20,12 @@ import { parseProviderTurnState } from './provider-state.js'
 import { parseApprovalInterruption, type ApprovalInterruption } from './interruption.js'
 import type { RunBudgetCounters, RunBudgetLimits } from './run-budget.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
-import { assertRunTransition, parseRunStatus, type RunStatus } from './run-state.js'
+import {
+  assertRunTransition,
+  isTerminalRunStatus,
+  parseRunStatus,
+  type RunStatus
+} from './run-state.js'
 import type { PreparedToolBatch } from './tool-scheduler.js'
 import type { ToolExecutionLedger } from './tool-ledger.js'
 import type { ToolSnapshotManifestEntry } from '../tools/tool-registry.js'
@@ -553,6 +558,10 @@ function validateCheckpointV2 (parsed: RunCheckpointV2): void {
   parseRunObservationCounters(parsed.observationCounters)
   validateObservationState(parsed.providerDispatch, 'provider dispatch observation')
   validateObservationState(parsed.engineActivity, 'engine activity observation')
+  if (isTerminalRunStatus(parsed.status) &&
+    (parsed.providerDispatch.state !== 'idle' || parsed.engineActivity.state !== 'idle')) {
+    throw new TypeError('terminal run checkpoint contains a reservation')
+  }
   const observationPolicy = parseFrozenObservationPolicy(parsed.observationPolicy)
   const expectedObservationPolicy = createFrozenObservationPolicy({
     levelAtStart: observationPolicy.levelAtStart,

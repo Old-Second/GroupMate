@@ -8,7 +8,7 @@ import { parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from './provider-state.js';
 import { parseApprovalInterruption } from './interruption.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
-import { assertRunTransition, parseRunStatus } from './run-state.js';
+import { assertRunTransition, isTerminalRunStatus, parseRunStatus } from './run-state.js';
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../session/conversation-scope.js';
 import { parseSerializablePreparedCapability } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
@@ -385,6 +385,10 @@ function validateCheckpointV2(parsed) {
     parseRunObservationCounters(parsed.observationCounters);
     validateObservationState(parsed.providerDispatch, 'provider dispatch observation');
     validateObservationState(parsed.engineActivity, 'engine activity observation');
+    if (isTerminalRunStatus(parsed.status) &&
+        (parsed.providerDispatch.state !== 'idle' || parsed.engineActivity.state !== 'idle')) {
+        throw new TypeError('terminal run checkpoint contains a reservation');
+    }
     const observationPolicy = parseFrozenObservationPolicy(parsed.observationPolicy);
     const expectedObservationPolicy = createFrozenObservationPolicy({
         levelAtStart: observationPolicy.levelAtStart,

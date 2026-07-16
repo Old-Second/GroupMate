@@ -196,6 +196,15 @@ export function completeToolExecutionLedger (
   return freezeLedger(ledger.step, calls)
 }
 
+export function countScheduledToolAttempts (
+  scheduled: readonly ScheduledToolResult[]
+): number {
+  return scheduled.reduce(
+    (total, item) => total + item.attemptObservations.length,
+    0
+  )
+}
+
 export function resolveToolApproval (
   ledger: ToolExecutionLedger,
   callId: string,

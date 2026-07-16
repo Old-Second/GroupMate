@@ -6,13 +6,14 @@ import { canonicalSessionKey } from '../session/conversation-scope.js';
 import { completedPreparedCall } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
 import { decideApprovalInterruption, displayApprovalInterruption, isApprovalActorEligible, parseApprovalInterruption } from './interruption.js';
+import { boundedMonotonicDurationMs } from './run-budget.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
 import { isTerminalRunStatus } from './run-state.js';
 import { RunReferenceConflictError, RunStoreConflictError } from './run-store.js';
-import { applyToolPreflight, cancelToolExecutionLedger, completeToolExecutionLedger, createToolExecutionLedger, failRecoveredToolExecutionLedger, failToolExecutionLedger, resetToolExecutionLedgerForRecovery, resolveToolApproval, toolLedgerHasIndeterminate, toolLedgerHasUnresolvedNonRead, toolLedgerHasVisibleOutput, toolLedgerModelMessages, toolLedgerRequiresToolDisabledFinalResponse } from './tool-ledger.js';
+import { applyToolPreflight, cancelToolExecutionLedger, countScheduledToolAttempts, completeToolExecutionLedger, createToolExecutionLedger, failRecoveredToolExecutionLedger, failToolExecutionLedger, resetToolExecutionLedgerForRecovery, resolveToolApproval, toolLedgerHasIndeterminate, toolLedgerHasUnresolvedNonRead, toolLedgerHasVisibleOutput, toolLedgerModelMessages, toolLedgerRequiresToolDisabledFinalResponse } from './tool-ledger.js';
 class ModelAttemptFailure extends Error {
     agentError;
     checkpoint;
@@ -58,24 +59,43 @@ function mergedProviderUsage(previous, current) {
     const total = previous + current;
     return Number.isSafeInteger(total) ? total : 'unavailable';
 }
-function synchronizedObservationCounters(current, budget, ledgers, interruption, approvalHistory) {
+function synchronizedObservationCounters(current, budget, ledgers, interruption, approvalHistory, completedModelTurns) {
     const approvalIds = new Set(approvalHistory.map(value => value.approvalId));
     if (interruption !== null)
         approvalIds.add(interruption.approvalId);
     const calls = ledgers.flatMap(ledger => ledger.calls);
+    const uniqueCallIds = new Set(calls.map(call => call.callId));
     return Object.freeze({
         ...current,
-        modelTurns: knownObservation(current.modelTurns, budget.modelTurns),
-        providerRetries: knownObservation(current.providerRetries, budget.providerRetries),
-        recoveryAttempts: knownObservation(current.recoveryAttempts, budget.recoveryAttempts),
-        correctionTurns: knownObservation(current.correctionTurns, budget.correctionTurns),
-        toolCalls: knownObservation(current.toolCalls, budget.toolCalls),
+        modelTurns: incrementObservation(current.modelTurns, completedModelTurns),
+        toolCalls: knownObservation(current.toolCalls, uniqueCallIds.size),
         approvalRequests: knownObservation(current.approvalRequests, approvalIds.size),
         toolDenied: knownObservation(current.toolDenied, calls.filter(call => call.status === 'denied' || call.status === 'rejected').length),
         toolExpired: knownObservation(current.toolExpired, calls.filter(call => call.status === 'expired').length),
         toolIndeterminate: knownObservation(current.toolIndeterminate, calls.filter(call => call.status === 'indeterminate').length),
         estimatedTokens: knownObservation(current.estimatedTokens, budget.estimatedTokens),
         providerActiveDurationMs: knownObservation(current.providerActiveDurationMs, budget.usedActiveRuntimeMs)
+    });
+}
+function unavailableProviderObservations(current) {
+    return Object.freeze({
+        ...current,
+        providerAttempts: 'unavailable',
+        providerRetries: 'unavailable',
+        recoveryAttempts: 'unavailable',
+        correctionTurns: 'unavailable',
+        providerInputTokens: 'unavailable',
+        providerOutputTokens: 'unavailable',
+        providerTotalTokens: 'unavailable',
+        providerActiveDurationMs: 'unavailable'
+    });
+}
+function unavailableEngineObservations(current) {
+    return Object.freeze({
+        ...current,
+        modelTurns: 'unavailable',
+        toolAttempts: 'unavailable',
+        engineActiveDurationMs: 'unavailable'
     });
 }
 function internalError(cause) {
@@ -277,6 +297,7 @@ export class RunEngine {
     #store;
     #budget;
     #now;
+    #monotonicNow;
     #generateId;
     #createRunRef;
     #createRequestRef;
@@ -284,7 +305,7 @@ export class RunEngine {
     #runtimeBindings = new Map();
     #controllers = new Map();
     #startedToolCalls = new Map();
-    #toolAttemptCounts = new Map();
+    #engineActivityStarts = new Map();
     constructor(options) {
         this.#adapter = options.adapter;
         this.#profile = options.profile;
@@ -292,6 +313,7 @@ export class RunEngine {
         this.#store = options.store;
         this.#budget = options.budget;
         this.#now = options.now ?? (() => new Date());
+        this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
         this.#generateId = options.generateId ?? (() => crypto.randomUUID());
         this.#createRunRef = options.createRunRef ?? createRunRef;
         this.#createRequestRef = options.createRequestRef ?? createRequestRef;
@@ -352,7 +374,7 @@ export class RunEngine {
     async decideApproval(input, runtime, options = {}) {
         if (runtime !== undefined)
             this.#runtimeBindings.set(input.runId, runtime);
-        const checkpoint = await this.loadCheckpoint(input.runId);
+        let checkpoint = await this.loadCheckpoint(input.runId);
         if (checkpoint === null || checkpoint.status !== 'waiting_approval' ||
             checkpoint.interruption === null)
             return null;
@@ -413,6 +435,9 @@ export class RunEngine {
         let resolvedLedger = ledger;
         let preparationContext;
         try {
+            checkpoint = await this.#beginEngineActivity(checkpoint);
+            if (isTerminalRunStatus(checkpoint.status))
+                return terminalResult(checkpoint);
             if (kind === 'approved') {
                 let prepared;
                 try {
@@ -489,19 +514,23 @@ export class RunEngine {
                 interruption: nextInterruption,
                 approvalHistory: history,
                 deadlineAt
-            }, resolutionEvents);
+            }, resolutionEvents, true);
             let stored;
             try {
                 stored = await this.#store.compareAndSet(checkpoint, next);
             }
             catch (error) {
-                if (error instanceof RunStoreConflictError)
+                if (error instanceof RunStoreConflictError) {
+                    this.#engineActivityStarts.delete(input.runId);
                     return null;
+                }
                 throw error;
             }
             this.#notifyNewEvents(checkpoint, stored);
-            if (stored.status === 'waiting_approval')
+            if (stored.status === 'waiting_approval') {
+                this.#engineActivityStarts.delete(input.runId);
                 return terminalResult(stored);
+            }
             const timer = this.#deadlineTimer(stored, controller);
             try {
                 return await this.#drive(stored, controller);
@@ -590,6 +619,9 @@ export class RunEngine {
             if (this.#deadlineExpired(stored)) {
                 return await this.cancel(input.runId, 'deadline_exceeded');
             }
+            stored = await this.#beginEngineActivity(stored);
+            if (isTerminalRunStatus(stored.status))
+                return terminalResult(stored);
             return await this.#drive(stored, controller);
         }
         finally {
@@ -634,7 +666,11 @@ export class RunEngine {
                 }))
             });
         }
-        if (isTerminalRunStatus(checkpoint.status) || checkpoint.status === 'waiting_approval') {
+        if (isTerminalRunStatus(checkpoint.status)) {
+            return terminalResult(checkpoint);
+        }
+        if (checkpoint.status === 'waiting_approval') {
+            checkpoint = await this.#recoverObservationReservations(checkpoint);
             return terminalResult(checkpoint);
         }
         const controller = this.#controllers.get(runId) ?? new AbortController();
@@ -642,7 +678,9 @@ export class RunEngine {
         const detach = this.#linkExternalSignal(options.signal, controller);
         const timer = this.#deadlineTimer(checkpoint, controller);
         try {
-            let resumable = checkpoint;
+            let resumable = await this.#beginEngineActivity(checkpoint);
+            if (isTerminalRunStatus(resumable.status))
+                return terminalResult(resumable);
             try {
                 this.#assertRecoveredCompatibility(resumable);
                 if (resumable.status === 'executing_tools') {
@@ -688,17 +726,9 @@ export class RunEngine {
                 : ledger));
             const next = this.#next(checkpoint, 'cancelled', {
                 toolLedgers: Object.freeze(ledgers),
-                observationCounters: Object.freeze({
-                    ...checkpoint.observationCounters,
-                    toolAttempts: incrementObservation(checkpoint.observationCounters.toolAttempts, checkpoint.status === 'executing_tools'
-                        ? this.#toolAttemptCounts.get(runId) ?? 0
-                        : 0)
-                }),
                 preparedBatch: null,
                 interruption: null,
                 modelTurn: null,
-                providerDispatch: Object.freeze({ state: 'idle' }),
-                engineActivity: Object.freeze({ state: 'idle' }),
                 cancellationReason
             }, [{ type: 'run.cancelled', payload: { reason: cancellationReason } }]);
             try {
@@ -717,6 +747,35 @@ export class RunEngine {
             runRef: 'unavailable',
             error: serializeAgentError(checkpointConflict())
         });
+    }
+    async #beginEngineActivity(checkpoint) {
+        let current = await this.#recoverObservationReservations(checkpoint);
+        if (isTerminalRunStatus(current.status))
+            return current;
+        current = await this.#commit(current, current.status, {
+            engineActivity: Object.freeze({ state: 'reserved' })
+        }, [], false);
+        if (!isTerminalRunStatus(current.status)) {
+            this.#engineActivityStarts.set(current.runId, this.#safeMonotonicNow());
+        }
+        return current;
+    }
+    async #recoverObservationReservations(checkpoint) {
+        if (checkpoint.providerDispatch.state === 'idle' &&
+            checkpoint.engineActivity.state === 'idle')
+            return checkpoint;
+        let observationCounters = checkpoint.observationCounters;
+        if (checkpoint.providerDispatch.state === 'reserved') {
+            observationCounters = unavailableProviderObservations(observationCounters);
+        }
+        if (checkpoint.engineActivity.state === 'reserved') {
+            observationCounters = unavailableEngineObservations(observationCounters);
+        }
+        return await this.#commit(checkpoint, checkpoint.status, {
+            observationCounters,
+            providerDispatch: Object.freeze({ state: 'idle' }),
+            engineActivity: Object.freeze({ state: 'idle' })
+        }, [], false);
     }
     #assertRecoveredCompatibility(checkpoint) {
         if (checkpoint.profileId !== this.#profile.id ||
@@ -938,6 +997,9 @@ export class RunEngine {
         const observationCounters = Object.freeze({
             ...checkpoint.observationCounters,
             providerAttempts: incrementObservation(checkpoint.observationCounters.providerAttempts),
+            providerRetries: knownObservation(checkpoint.observationCounters.providerRetries, checkpoint.budgetCounters.providerRetries),
+            recoveryAttempts: knownObservation(checkpoint.observationCounters.recoveryAttempts, checkpoint.budgetCounters.recoveryAttempts),
+            correctionTurns: knownObservation(checkpoint.observationCounters.correctionTurns, checkpoint.budgetCounters.correctionTurns),
             providerInputTokens: 'unavailable',
             providerOutputTokens: 'unavailable',
             providerTotalTokens: 'unavailable'
@@ -953,7 +1015,8 @@ export class RunEngine {
             ...checkpoint.observationCounters,
             providerInputTokens: mergedProviderUsage(previousUsage.providerInputTokens, usage?.inputTokens),
             providerOutputTokens: mergedProviderUsage(previousUsage.providerOutputTokens, usage?.outputTokens),
-            providerTotalTokens: mergedProviderUsage(previousUsage.providerTotalTokens, usage?.totalTokens)
+            providerTotalTokens: mergedProviderUsage(previousUsage.providerTotalTokens, usage?.totalTokens),
+            providerActiveDurationMs: knownObservation(checkpoint.observationCounters.providerActiveDurationMs, counters.usedActiveRuntimeMs)
         });
         return await this.#commit(checkpoint, checkpoint.status, {
             budgetCounters: counters,
@@ -990,7 +1053,7 @@ export class RunEngine {
                 if (isTerminalRunStatus(current.status)) {
                     return Object.freeze({ terminal: true, checkpoint: current });
                 }
-                const startedAt = performance.now();
+                const startedAt = this.#safeMonotonicNow();
                 let turn;
                 try {
                     turn = await this.#providerCall(request, signal, timeoutMs);
@@ -998,7 +1061,7 @@ export class RunEngine {
                 catch (error) {
                     if (isAbortError(error) || signal.aborted)
                         throw new RunAbortedError();
-                    const activeRuntimeMs = Math.max(0, Math.ceil(performance.now() - startedAt));
+                    const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
                     counters = this.#budget.recordUsage(counters, { activeRuntimeMs });
                     current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage);
                     if (isTerminalRunStatus(current.status)) {
@@ -1044,7 +1107,7 @@ export class RunEngine {
                     }
                     throw internalError(error);
                 }
-                const activeRuntimeMs = Math.max(0, Math.ceil(performance.now() - startedAt));
+                const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
                 counters = this.#budget.recordUsage(counters, {
                     activeRuntimeMs,
                     providerReportedTokens: turn.usage?.totalTokens ?? 0
@@ -1297,7 +1360,6 @@ export class RunEngine {
         const runtime = this.#runtime(checkpoint.runId);
         this.#assertSnapshot(checkpoint, runtime.snapshot);
         this.#startedToolCalls.set(checkpoint.runId, new Set());
-        this.#toolAttemptCounts.set(checkpoint.runId, 0);
         const execution = await this.#raceAbort(this.#scheduler.execute(batch, {
             snapshot: runtime.snapshot,
             contextFor: async (capability) => {
@@ -1336,7 +1398,7 @@ export class RunEngine {
             estimatedInputTokens,
             observationCounters: Object.freeze({
                 ...checkpoint.observationCounters,
-                toolAttempts: incrementObservation(checkpoint.observationCounters.toolAttempts, this.#toolAttemptCounts.get(checkpoint.runId) ?? 0)
+                toolAttempts: incrementObservation(checkpoint.observationCounters.toolAttempts, countScheduledToolAttempts(execution.results))
             }),
             toolLedgers: this.#replaceLastLedger(checkpoint, completedLedger),
             preparedBatch: null,
@@ -1463,15 +1525,20 @@ export class RunEngine {
                 signal.removeEventListener('abort', onAbort);
         }
     }
-    async #commit(checkpoint, status, changes, drafts) {
-        const next = this.#next(checkpoint, status, changes, drafts);
+    async #commit(checkpoint, status, changes, drafts, closeActivityBoundary = true) {
+        const next = this.#next(checkpoint, status, changes, drafts, closeActivityBoundary);
+        const closesActivity = closeActivityBoundary &&
+            (isTerminalRunStatus(status) || status === 'waiting_approval');
         try {
             const stored = await this.#store.compareAndSet(checkpoint, next);
+            if (closesActivity)
+                this.#engineActivityStarts.delete(checkpoint.runId);
             this.#notifyNewEvents(checkpoint, stored);
             return stored;
         }
         catch (error) {
             if (error instanceof RunStoreConflictError) {
+                this.#engineActivityStarts.delete(checkpoint.runId);
                 const latest = await this.loadCheckpoint(checkpoint.runId);
                 if (latest !== null && isTerminalRunStatus(latest.status))
                     return latest;
@@ -1480,7 +1547,8 @@ export class RunEngine {
             throw error;
         }
     }
-    #next(checkpoint, status, changes, drafts) {
+    #next(checkpoint, status, changes, drafts, activityBoundary = 'degrade') {
+        const boundedChanges = this.#boundaryObservationChanges(checkpoint, status, changes, activityBoundary);
         const occurredAt = this.#timestamp();
         const events = drafts.map((draft, offset) => createRunEvent({
             eventId: this.#generateId(),
@@ -1491,17 +1559,50 @@ export class RunEngine {
             type: draft.type,
             payload: draft.payload ?? EMPTY_PAYLOAD
         }));
-        const budgetCounters = changes.budgetCounters ?? checkpoint.budgetCounters;
-        const toolLedgers = changes.toolLedgers ?? checkpoint.toolLedgers;
-        const interruption = changes.interruption === undefined
+        const budgetCounters = boundedChanges.budgetCounters ?? checkpoint.budgetCounters;
+        const toolLedgers = boundedChanges.toolLedgers ?? checkpoint.toolLedgers;
+        const interruption = boundedChanges.interruption === undefined
             ? checkpoint.interruption
-            : changes.interruption;
-        const approvalHistory = changes.approvalHistory ?? checkpoint.approvalHistory;
-        const observationCounters = synchronizedObservationCounters(changes.observationCounters ?? checkpoint.observationCounters, budgetCounters, toolLedgers, interruption, approvalHistory);
+            : boundedChanges.interruption;
+        const approvalHistory = boundedChanges.approvalHistory ?? checkpoint.approvalHistory;
+        const observationCounters = synchronizedObservationCounters(boundedChanges.observationCounters ?? checkpoint.observationCounters, budgetCounters, toolLedgers, interruption, approvalHistory, drafts.filter(draft => draft.type === 'model.completed').length);
         return nextRunCheckpoint(checkpoint, status, {
-            ...changes,
+            ...boundedChanges,
             observationCounters
         }, events, occurredAt);
+    }
+    #boundaryObservationChanges(checkpoint, status, changes, activityBoundary) {
+        if (activityBoundary === false)
+            return changes;
+        if (!isTerminalRunStatus(status) && status !== 'waiting_approval')
+            return changes;
+        let observationCounters = changes.observationCounters ??
+            checkpoint.observationCounters;
+        const providerDispatch = changes.providerDispatch ?? checkpoint.providerDispatch;
+        const engineActivity = changes.engineActivity ?? checkpoint.engineActivity;
+        let exactEngineSpan = activityBoundary === true;
+        if (providerDispatch.state === 'reserved') {
+            observationCounters = unavailableProviderObservations(observationCounters);
+            exactEngineSpan = false;
+        }
+        if (engineActivity.state === 'reserved') {
+            const startedAt = this.#engineActivityStarts.get(checkpoint.runId);
+            if (exactEngineSpan && startedAt !== undefined) {
+                observationCounters = Object.freeze({
+                    ...observationCounters,
+                    engineActiveDurationMs: incrementObservation(observationCounters.engineActiveDurationMs, boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow()))
+                });
+            }
+            else {
+                observationCounters = unavailableEngineObservations(observationCounters);
+            }
+        }
+        return Object.freeze({
+            ...changes,
+            observationCounters,
+            providerDispatch: Object.freeze({ state: 'idle' }),
+            engineActivity: Object.freeze({ state: 'idle' })
+        });
     }
     async #fail(checkpoint, error, prefixEvents = [], changes = {}, detailOverride) {
         if (isTerminalRunStatus(checkpoint.status))
@@ -1518,8 +1619,6 @@ export class RunEngine {
             modelTurn: null,
             preparedBatch: null,
             interruption: null,
-            providerDispatch: Object.freeze({ state: 'idle' }),
-            engineActivity: Object.freeze({ state: 'idle' }),
             error: serialized
         }, [...prefixEvents, {
                 type: 'run.failed',
@@ -1741,7 +1840,6 @@ export class RunEngine {
         const started = this.#startedToolCalls.get(runId) ?? new Set();
         started.add(callId);
         this.#startedToolCalls.set(runId, started);
-        this.#toolAttemptCounts.set(runId, (this.#toolAttemptCounts.get(runId) ?? 0) + 1);
     }
     #assertSnapshot(checkpoint, snapshot) {
         if (snapshot.id !== checkpoint.toolSnapshot.id ||
@@ -1768,6 +1866,14 @@ export class RunEngine {
     }
     #timestamp() {
         return this.#now().toISOString();
+    }
+    #safeMonotonicNow() {
+        try {
+            return this.#monotonicNow();
+        }
+        catch {
+            return Number.NaN;
+        }
     }
     #deadlineExpired(checkpoint) {
         return this.#now().getTime() >= new Date(checkpoint.deadlineAt).getTime();
@@ -1802,7 +1908,7 @@ export class RunEngine {
     #cleanupRun(runId, controller) {
         this.#runtimeBindings.delete(runId);
         this.#startedToolCalls.delete(runId);
-        this.#toolAttemptCounts.delete(runId);
+        this.#engineActivityStarts.delete(runId);
         if (this.#controllers.get(runId) === controller) {
             this.#controllers.delete(runId);
         }

@@ -13,19 +13,31 @@ import {
   type RunCheckpoint,
   type RunCheckpointV1
 } from '../../src/agent/run/run-checkpoint.js'
-import { RunEngine, type RunRuntimeBinding } from '../../src/agent/run/run-engine.js'
+import {
+  RunEngine,
+  type RunRuntimeBinding,
+  type StartRunInput
+} from '../../src/agent/run/run-engine.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
+import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
 import { RedisRunStore, redisRunKeys } from '../../src/agent/run/redis-run-store.js'
-import { RunReferenceConflictError } from '../../src/agent/run/run-store.js'
+import {
+  RunReferenceConflictError,
+  type RunStore
+} from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import { applyToolPreflight, createToolExecutionLedger } from '../../src/agent/run/tool-ledger.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
 import type { ToolExecutionContext, ToolPreparationContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
-import type { SerializablePreparedCapability } from '../../src/agent/tools/prepared-capability.js'
+import type {
+  PreparedToolCall,
+  SerializablePreparedCapability
+} from '../../src/agent/tools/prepared-capability.js'
 import type { ToolSnapshot } from '../../src/agent/tools/tool-registry.js'
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
 import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
+import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
 
 const timestamp = '2026-07-14T00:00:00.000Z'
 const deadlineAt = '2026-07-14T00:04:00.000Z'
@@ -91,10 +103,11 @@ function success (text: string): ToolResult {
 }
 
 function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
+  const runRef = createHash('sha256').update(`run:${runId}`).digest('hex').slice(0, 32)
   return createInitialRunCheckpoint({
     profileId: 'standard', profileVersion: 1, runId,
     sessionId: 'session-1', sessionAddress: address,
-    runRef: createHash('sha256').update(`run:${runId}`).digest('hex').slice(0, 32),
+    runRef,
     requestRef: createHash('sha256').update(`request:${runId}`).digest('hex').slice(0, 32),
     requestKind: 'ordinary_chat',
     presentationRoute: Object.freeze({
@@ -108,8 +121,8 @@ function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
       actorId: 'actor-private-value',
       requestMessageId: 'message-current'
     }),
-    observationPolicy: Object.freeze({
-      schemaVersion: 1, levelAtStart: 'basic', sampledSuccess: false
+    observationPolicy: createFrozenObservationPolicy({
+      levelAtStart: 'basic', runRef
     }),
     model: Object.freeze({
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
@@ -229,7 +242,11 @@ class ScriptedAdapter implements ModelAdapter {
 class CountingRuntime implements ToolRuntime {
   preparations = 0
   executions = 0
-  async prepare (call: ToolCall, _context: ToolPreparationContext, _snapshot: ToolSnapshot) {
+  async prepare (
+    call: ToolCall,
+    _context: ToolPreparationContext,
+    _snapshot: ToolSnapshot
+  ): Promise<PreparedToolCall> {
     this.preparations += 1
     const capability: SerializablePreparedCapability = Object.freeze({
       schemaVersion: 1, callId: call.callId, toolName: 'fixture', toolVersion: 1,
@@ -244,6 +261,34 @@ class CountingRuntime implements ToolRuntime {
   async executePrepared (): Promise<ToolResult> {
     this.executions += 1
     return success('recovered')
+  }
+}
+
+class ApprovalRuntime extends CountingRuntime {
+  override async prepare (
+    call: ToolCall,
+    _context: ToolPreparationContext,
+    _snapshot: ToolSnapshot
+  ): Promise<PreparedToolCall> {
+    this.preparations += 1
+    const capability: SerializablePreparedCapability = Object.freeze({
+      schemaVersion: 1,
+      callId: call.callId,
+      toolName: 'fixture',
+      toolVersion: 1,
+      snapshotId: call.snapshotId,
+      canonicalArguments: Object.freeze({}),
+      argumentHash: 'hash-call-approval',
+      target: Object.freeze({ kind: 'none' }),
+      resourceKeys: Object.freeze(['fixture:000000000000000000000000']),
+      executionClass: 'read_only',
+      retrySafe: true
+    })
+    return Object.freeze({
+      kind: 'approval_required' as const,
+      capability,
+      summaryCode: 'fixture_approval'
+    })
   }
 }
 
@@ -263,10 +308,56 @@ function textTurn (text: string): ModelTurn {
   return Object.freeze({ text, toolCalls: Object.freeze([]), finishReason: 'stop' })
 }
 
-async function persistPath (store: RedisRunStore, path: readonly RunCheckpoint[]): Promise<void> {
+function approvalTurn (): ModelTurn {
+  return Object.freeze({
+    text: '',
+    toolCalls: Object.freeze([Object.freeze({
+      index: 0,
+      callId: 'call-approval',
+      name: 'fixture',
+      argumentsText: '{}',
+      arguments: Object.freeze({})
+    })]),
+    finishReason: 'tool_calls'
+  })
+}
+
+function startInput (
+  source: RunCheckpoint,
+  runtime: RunRuntimeBinding
+): StartRunInput {
+  if (source.presentationRoute === null ||
+    source.requestKind !== 'ordinary_chat') {
+    throw new TypeError('start fixture identity is invalid')
+  }
+  return Object.freeze({
+    runId: source.runId,
+    runRef: source.runRef,
+    requestRef: source.requestRef,
+    requestKind: source.requestKind,
+    presentationRoute: source.presentationRoute,
+    observationPolicy: source.observationPolicy,
+    sessionId: source.sessionId,
+    sessionAddress: source.sessionAddress,
+    deadlineAt: source.deadlineAt,
+    model: source.model,
+    runtime
+  })
+}
+
+async function persistPath (store: RunStore, path: readonly RunCheckpoint[]): Promise<void> {
   await store.create(path[0])
   for (let index = 1; index < path.length; index += 1) {
     await store.compareAndSet(path[index - 1], path[index])
+  }
+}
+
+function sequenceClock (...values: number[]): () => number {
+  const remaining = [...values]
+  return () => {
+    const value = remaining.shift()
+    if (value === undefined) throw new Error('monotonic clock script exhausted')
+    return value
   }
 }
 
@@ -460,6 +551,249 @@ test('RunEngine re-prepares a recovered read-only batch before executing it', as
   assert.equal(toolRuntime.preparations, 1)
   assert.equal(toolRuntime.executions, 1)
   assert.equal(adapter.calls, 1)
+})
+
+test('RunEngine degrades every ambiguous dispatch and activity counter after reserved recovery', async () => {
+  for (const [name, priorDuration] of [
+    ['dispatch-before-wire', 0],
+    ['dispatch-after-wire', 4]
+  ] as const) {
+    const store = new InMemoryRunStore()
+    const source = initial(`run-${name}`)
+    const path = callingModelPath(source)
+    const calling = path.at(-1)
+    if (calling === undefined) throw new TypeError('calling checkpoint is missing')
+    const crashed = nextRunCheckpoint(calling, 'calling_model', {
+      observationCounters: Object.freeze({
+        ...calling.observationCounters,
+        providerAttempts: 1,
+        modelTurns: 0,
+        toolAttempts: 0,
+        providerRetries: 0,
+        recoveryAttempts: 0,
+        correctionTurns: 0,
+        providerInputTokens: 'unavailable',
+        providerOutputTokens: 'unavailable',
+        providerTotalTokens: 'unavailable',
+        providerActiveDurationMs: priorDuration,
+        engineActiveDurationMs: 7
+      }),
+      providerDispatch: Object.freeze({ state: 'reserved' }),
+      engineActivity: Object.freeze({ state: 'reserved' })
+    }, [], timestamp)
+    await persistPath(store, [...path, crashed])
+    const adapter = new ScriptedAdapter(Object.freeze({
+      ...textTurn('恢复后完成'),
+      usage: Object.freeze({ inputTokens: 5, outputTokens: 2, totalTokens: 7 })
+    }))
+    const engine = new RunEngine({
+      adapter,
+      profile: standardOpenAIProfile,
+      scheduler: new ToolScheduler({ runtime: new CountingRuntime() }),
+      store,
+      budget,
+      now: () => new Date(timestamp),
+      monotonicNow: sequenceClock(0, 1, 2, 5),
+      generateId: () => 'generated-id'
+    })
+
+    const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+    assert.equal(result.kind, 'completed')
+    assert.equal(adapter.calls, 1)
+    const terminal = await store.load(source.runId)
+    assert.deepEqual(terminal?.schemaVersion === 2 ? {
+      providerAttempts: terminal.observationCounters.providerAttempts,
+      providerRetries: terminal.observationCounters.providerRetries,
+      recoveryAttempts: terminal.observationCounters.recoveryAttempts,
+      correctionTurns: terminal.observationCounters.correctionTurns,
+      providerInputTokens: terminal.observationCounters.providerInputTokens,
+      providerOutputTokens: terminal.observationCounters.providerOutputTokens,
+      providerTotalTokens: terminal.observationCounters.providerTotalTokens,
+      providerActiveDurationMs: terminal.observationCounters.providerActiveDurationMs,
+      modelTurns: terminal.observationCounters.modelTurns,
+      toolAttempts: terminal.observationCounters.toolAttempts,
+      engineActiveDurationMs: terminal.observationCounters.engineActiveDurationMs,
+      toolCalls: terminal.observationCounters.toolCalls,
+      approvalRequests: terminal.observationCounters.approvalRequests,
+      providerDispatch: terminal.providerDispatch.state,
+      engineActivity: terminal.engineActivity.state
+    } : null, {
+      providerAttempts: 'unavailable',
+      providerRetries: 'unavailable',
+      recoveryAttempts: 'unavailable',
+      correctionTurns: 'unavailable',
+      providerInputTokens: 'unavailable',
+      providerOutputTokens: 'unavailable',
+      providerTotalTokens: 'unavailable',
+      providerActiveDurationMs: 'unavailable',
+      modelTurns: 'unavailable',
+      toolAttempts: 'unavailable',
+      engineActiveDurationMs: 'unavailable',
+      toolCalls: 0,
+      approvalRequests: 0,
+      providerDispatch: 'idle',
+      engineActivity: 'idle'
+    })
+  }
+})
+
+test('RunEngine engine-reserved recovery preserves independently proven Provider aggregates', async () => {
+  const store = new InMemoryRunStore()
+  const source = initial('run-engine-reserved')
+  const path = executingPath(source, 'read_only')
+  const executing = path.at(-1)
+  if (executing === undefined) throw new TypeError('executing checkpoint is missing')
+  const crashed = nextRunCheckpoint(executing, 'executing_tools', {
+    budgetCounters: Object.freeze({
+      ...executing.budgetCounters,
+      usedActiveRuntimeMs: 4
+    }),
+    observationCounters: Object.freeze({
+      ...executing.observationCounters,
+      providerAttempts: 1,
+      modelTurns: 1,
+      toolAttempts: 0,
+      toolCalls: 1,
+      providerInputTokens: 7,
+      providerOutputTokens: 3,
+      providerTotalTokens: 10,
+      providerActiveDurationMs: 4,
+      engineActiveDurationMs: 13
+    }),
+    providerDispatch: Object.freeze({ state: 'idle' }),
+    engineActivity: Object.freeze({ state: 'reserved' })
+  }, [], timestamp)
+  await persistPath(store, [...path, crashed])
+  const adapter = new ScriptedAdapter(Object.freeze({
+    ...textTurn('恢复完成'),
+    usage: Object.freeze({ inputTokens: 5, outputTokens: 2, totalTokens: 7 })
+  }))
+  const engine = new RunEngine({
+    adapter,
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: new CountingRuntime() }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    monotonicNow: sequenceClock(0, 1, 2, 5),
+    generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'completed')
+  const terminal = await store.load(source.runId)
+  assert.deepEqual(terminal?.schemaVersion === 2 ? {
+    providerAttempts: terminal.observationCounters.providerAttempts,
+    providerInputTokens: terminal.observationCounters.providerInputTokens,
+    providerOutputTokens: terminal.observationCounters.providerOutputTokens,
+    providerTotalTokens: terminal.observationCounters.providerTotalTokens,
+    providerActiveDurationMs: terminal.observationCounters.providerActiveDurationMs,
+    modelTurns: terminal.observationCounters.modelTurns,
+    toolAttempts: terminal.observationCounters.toolAttempts,
+    engineActiveDurationMs: terminal.observationCounters.engineActiveDurationMs,
+    providerDispatch: terminal.providerDispatch.state,
+    engineActivity: terminal.engineActivity.state
+  } : null, {
+    providerAttempts: 2,
+    providerInputTokens: 12,
+    providerOutputTokens: 5,
+    providerTotalTokens: 17,
+    providerActiveDurationMs: 5,
+    modelTurns: 'unavailable',
+    toolAttempts: 'unavailable',
+    engineActiveDurationMs: 'unavailable',
+    providerDispatch: 'idle',
+    engineActivity: 'idle'
+  })
+})
+
+test('RunEngine clears a crashed waiting-approval activity reservation without starting new work', async () => {
+  const store = new InMemoryRunStore()
+  const source = initial('run-waiting-reserved')
+  const toolSnapshot = snapshot()
+  const setupRuntime = new ApprovalRuntime()
+  let generated = 0
+  const setupEngine = new RunEngine({
+    adapter: new ScriptedAdapter(approvalTurn()),
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: setupRuntime }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    monotonicNow: sequenceClock(0, 1, 2, 3),
+    generateId: () => `generated-${++generated}`
+  })
+
+  const paused = await setupEngine.start(
+    startInput(source, runtimeBinding(toolSnapshot))
+  )
+  assert.equal(paused.kind, 'paused')
+  const waiting = await store.load(source.runId)
+  if (waiting?.schemaVersion !== 2 || waiting.status !== 'waiting_approval') {
+    throw new TypeError('waiting approval fixture is missing')
+  }
+  assert.equal(waiting.engineActivity.state, 'idle')
+  const crashed = nextRunCheckpoint(waiting, 'waiting_approval', {
+    engineActivity: Object.freeze({ state: 'reserved' })
+  }, [], timestamp)
+  await store.compareAndSet(waiting, crashed)
+
+  const adapter = new ScriptedAdapter(textTurn('不应调用'))
+  const recoveryRuntime = new CountingRuntime()
+  let recoveryClockCalls = 0
+  const recoveryEngine = new RunEngine({
+    adapter,
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: recoveryRuntime }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    monotonicNow: () => {
+      recoveryClockCalls += 1
+      return 10
+    },
+    generateId: () => 'recovery-generated-id'
+  })
+
+  const recoveredResult = await recoveryEngine.resume(source.runId)
+  const recovered = await store.load(source.runId)
+  assert.deepEqual(recovered?.schemaVersion === 2 ? {
+    resultKind: recoveredResult.kind,
+    revision: recovered.revision,
+    providerDispatch: recovered.providerDispatch.state,
+    engineActivity: recovered.engineActivity.state,
+    counters: recovered.observationCounters
+  } : null, {
+    resultKind: 'paused',
+    revision: crashed.revision + 1,
+    providerDispatch: 'idle',
+    engineActivity: 'idle',
+    counters: Object.freeze({
+      ...crashed.observationCounters,
+      modelTurns: 'unavailable',
+      toolAttempts: 'unavailable',
+      engineActiveDurationMs: 'unavailable'
+    })
+  })
+
+  if (recovered?.schemaVersion !== 2) {
+    throw new TypeError('recovered waiting checkpoint is missing')
+  }
+  const idleRevision = recovered.revision
+  const idleResult = await recoveryEngine.resume(source.runId)
+  const stillIdle = await store.load(source.runId)
+  assert.equal(idleResult.kind, 'paused')
+  assert.equal(stillIdle?.revision, idleRevision)
+  assert.equal(
+    stillIdle?.schemaVersion === 2 ? stillIdle.engineActivity.state : null,
+    'idle'
+  )
+  assert.equal(recoveryClockCalls, 0)
+  assert.equal(adapter.calls, 0)
+  assert.equal(recoveryRuntime.preparations, 0)
+  assert.equal(recoveryRuntime.executions, 0)
 })
 
 test('RunAdmission enforces global two, per-session one and a FIFO queue of three', async () => {

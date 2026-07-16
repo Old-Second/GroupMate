@@ -76,6 +76,21 @@ const INITIAL_COUNTERS: RunBudgetCounters = Object.freeze({
   usedActiveRuntimeMs: 0
 })
 
+export function boundedMonotonicDurationMs (
+  startedAt: number,
+  finishedAt: number,
+  maximumMs = Number.MAX_SAFE_INTEGER
+): number {
+  if (!Number.isSafeInteger(maximumMs) || maximumMs < 0) {
+    throw new TypeError('observation duration limit must be a non-negative safe integer')
+  }
+  if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) ||
+    finishedAt <= startedAt) return 0
+  const duration = Math.ceil(finishedAt - startedAt)
+  if (!Number.isSafeInteger(duration)) return maximumMs
+  return Math.min(duration, maximumMs)
+}
+
 function assertNonNegativeInteger (value: number, field: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${field} must be a non-negative integer`)

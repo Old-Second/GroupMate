@@ -3,7 +3,10 @@ import { test } from 'node:test'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
 import { parseRunAdvanceResult } from '../../src/agent/contracts/result.js'
 import { parseProviderTurnState } from '../../src/agent/run/provider-state.js'
-import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import {
+  boundedMonotonicDurationMs,
+  createDefaultRunBudget
+} from '../../src/agent/run/run-budget.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 import { assertRunTransition } from '../../src/agent/run/run-state.js'
@@ -157,6 +160,23 @@ test('accounts active runtime and progress before crossing their limits', () => 
     () => budget.recordUsage(used, { progressEvents: 1 }),
     isRunBudgetExceeded
   )
+})
+
+test('bounds monotonic observations without changing Provider-only active budget meaning', () => {
+  assert.equal(boundedMonotonicDurationMs(10.2, 13.7, 100), 4)
+  assert.equal(boundedMonotonicDurationMs(10, 9, 100), 0)
+  assert.equal(boundedMonotonicDurationMs(10, 5_010, 1_000), 1_000)
+  assert.equal(boundedMonotonicDurationMs(Number.NaN, 5, 100), 0)
+
+  const budget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 4_096
+  })
+  const counters = budget.recordUsage(budget.initialCounters, {
+    activeRuntimeMs: 7
+  })
+  assert.equal(counters.usedActiveRuntimeMs, 7)
+  assert.equal(budget.remainingActiveMs(counters), 239_993)
 })
 
 test('rejects illegal and terminal run transitions', () => {

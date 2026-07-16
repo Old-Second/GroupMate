@@ -5,7 +5,10 @@ import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
-import { nextRunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
+import {
+  nextRunCheckpoint,
+  type RunCheckpoint
+} from '../../src/agent/run/run-checkpoint.js'
 import { RunEngine, type StartRunInput } from '../../src/agent/run/run-engine.js'
 import {
   RunStoreConflictError,
@@ -72,6 +75,13 @@ function failed (text = '工具执行失败。'): ToolResult {
   return Object.freeze({
     status: 'failed', effect: 'none', errorCode: 'tool_execution_failed',
     userMessage: text, retryable: false
+  })
+}
+
+function retryableFailure (): ToolResult {
+  return Object.freeze({
+    status: 'failed', effect: 'none', errorCode: 'upstream_unavailable',
+    userMessage: '上游暂时不可用。', retryable: true
   })
 }
 
@@ -143,6 +153,31 @@ function deferred<T> (): Deferred<T> {
   })
 }
 
+function sequenceClock (...values: number[]): () => number {
+  const remaining = [...values]
+  return () => {
+    const value = remaining.shift()
+    if (value === undefined) throw new Error('monotonic clock script exhausted')
+    return value
+  }
+}
+
+class ActivityOrderStore extends InMemoryRunStore {
+  readonly order: string[] = []
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    const stored = await super.compareAndSet(expected, next)
+    if (expected.engineActivity.state === 'idle' &&
+      next.engineActivity.state === 'reserved') {
+      this.order.push('engine_reserved')
+    }
+    return stored
+  }
+}
+
 function definition (name: string, executionClass: ToolDefinition['executionClass'] = 'read_only'): ToolDefinition {
   return Object.freeze({
     name, version: 1, aliases: Object.freeze([]), description: `${name} fixture`,
@@ -168,6 +203,8 @@ class ScriptedToolRuntime implements ToolRuntime {
   readonly outcomes = new Map<string, ToolResult>()
   readonly delays = new Map<string, number>()
   readonly deferredOutcomes = new Map<string, Deferred<ToolResult>>()
+  readonly scriptedOutcomes = new Map<string, Array<ToolResult | Error>>()
+  readonly approvalCalls = new Set<string>()
   readonly startedCalls: string[] = []
   onStarted?: (callId: string) => void
 
@@ -196,7 +233,9 @@ class ScriptedToolRuntime implements ToolRuntime {
       executionClass,
       retrySafe: executionClass === 'read_only'
     })
-    return Object.freeze({ kind: 'ready', capability })
+    return this.approvalCalls.has(call.callId)
+      ? Object.freeze({ kind: 'approval_required', capability, summaryCode: 'fixture_approval' })
+      : Object.freeze({ kind: 'ready', capability })
   }
 
   async executePrepared (
@@ -208,6 +247,10 @@ class ScriptedToolRuntime implements ToolRuntime {
     this.executions += 1
     this.startedCalls.push(prepared.callId)
     this.onStarted?.(prepared.callId)
+    const scripted = this.scriptedOutcomes.get(prepared.callId)
+    const scriptedItem = scripted?.shift()
+    if (scriptedItem instanceof Error) throw scriptedItem
+    if (scriptedItem !== undefined) return scriptedItem
     const pending = this.deferredOutcomes.get(prepared.callId)
     if (pending !== undefined) return await pending.promise
     const delay = this.delays.get(prepared.callId) ?? 0
@@ -246,6 +289,8 @@ interface HarnessOptions {
   readonly contextFor?: StartRunInput['runtime']['contextFor']
   readonly now?: () => Date
   readonly store?: RunStore
+  readonly monotonicNow?: () => number
+  readonly toolMonotonicNow?: () => number
 }
 
 function harness (
@@ -260,10 +305,18 @@ function harness (
   const engine = new RunEngine({
     adapter,
     profile: options.profile ?? standardOpenAIProfile,
-    scheduler: new ToolScheduler({ runtime: tools }),
+    scheduler: new ToolScheduler({
+      runtime: tools,
+      ...(options.toolMonotonicNow === undefined
+        ? {}
+        : { monotonicNow: options.toolMonotonicNow })
+    }),
     store,
     budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
     now: options.now ?? (() => new Date(timestamp)),
+    ...(options.monotonicNow === undefined
+      ? {}
+      : { monotonicNow: options.monotonicNow }),
     generateId: () => `generated-${++id}`,
     observer: event => { events.push(event.type) }
   })
@@ -370,7 +423,12 @@ function outputText (result: Awaited<ReturnType<RunEngine['start']>>): string | 
 }
 
 test('RunEngine completes one valid pure-text turn and emits ordered events', async () => {
-  const fixture = harness([modelText('完成')])
+  const fixture = harness([Object.freeze({
+    ...modelText('完成'),
+    usage: Object.freeze({ inputTokens: 7, outputTokens: 3, totalTokens: 10 })
+  })], {
+    monotonicNow: sequenceClock(0, 5, 9, 20)
+  })
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(result.kind, 'completed')
@@ -383,6 +441,67 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
   const checkpoint = await fixture.store.load('run-1')
   assert.equal(checkpoint?.status, 'completed')
   assert.equal(checkpoint?.budgetCounters.modelTurns, 1)
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    providerRetries: checkpoint.observationCounters.providerRetries,
+    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
+    correctionTurns: checkpoint.observationCounters.correctionTurns,
+    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
+    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
+    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
+    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
+  } : null, {
+    providerAttempts: 1,
+    modelTurns: 1,
+    toolAttempts: 0,
+    providerRetries: 0,
+    recoveryAttempts: 0,
+    correctionTurns: 0,
+    providerInputTokens: 7,
+    providerOutputTokens: 3,
+    providerTotalTokens: 10,
+    providerActiveDurationMs: 4,
+    engineActiveDurationMs: 20
+  })
+})
+
+test('RunEngine records the monotonic activity start only after reservation CAS', async () => {
+  const store = new ActivityOrderStore()
+  let tick = 0
+  const fixture = harness([modelText('完成')], {
+    store,
+    monotonicNow: () => {
+      store.order.push('clock')
+      tick += 1
+      return tick
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  assert.deepEqual(store.order.slice(0, 2), ['engine_reserved', 'clock'])
+})
+
+test('RunEngine keeps actual Provider wire time above one attempt timeout in the Phase 5 budget', async () => {
+  const fixture = harness([modelText('完成')], {
+    monotonicNow: sequenceClock(0, 10, 130_010, 130_020)
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  const checkpoint = await fixture.store.load('run-1')
+  assert.equal(checkpoint?.budgetCounters.usedActiveRuntimeMs, 130_000)
+  assert.equal(
+    checkpoint?.schemaVersion === 2
+      ? checkpoint.observationCounters.providerActiveDurationMs
+      : null,
+    130_000
+  )
 })
 
 test('RunEngine persists Provider dispatch reservation before wire and trusted usage after success', async () => {
@@ -538,6 +657,36 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   const corrected = await empty.engine.start(empty.input)
   assert.equal(outputText(corrected), '纠正后的回答')
   assert.equal(empty.adapter.requests[1]?.toolMode, 'disabled')
+  const correctedCheckpoint = await empty.store.load('run-1')
+  assert.deepEqual(correctedCheckpoint?.schemaVersion === 2 ? {
+    providerAttempts: correctedCheckpoint.observationCounters.providerAttempts,
+    modelTurns: correctedCheckpoint.observationCounters.modelTurns,
+    correctionTurns: correctedCheckpoint.observationCounters.correctionTurns
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 2,
+    correctionTurns: 1
+  })
+
+  const correctionFailure = harness([
+    modelText(''),
+    new ModelProviderError({
+      code: 'provider_unavailable', stage: 'model.response', retryable: false,
+      userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+    })
+  ])
+  const correctionFailed = await correctionFailure.engine.start(correctionFailure.input)
+  assert.equal(correctionFailed.kind, 'failed')
+  const correctionFailedCheckpoint = await correctionFailure.store.load('run-1')
+  assert.deepEqual(correctionFailedCheckpoint?.schemaVersion === 2 ? {
+    providerAttempts: correctionFailedCheckpoint.observationCounters.providerAttempts,
+    modelTurns: correctionFailedCheckpoint.observationCounters.modelTurns,
+    correctionTurns: correctionFailedCheckpoint.observationCounters.correctionTurns
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 1,
+    correctionTurns: 1
+  })
 
   const refusalTurn: ModelTurn = Object.freeze({
     text: '', refusal: 'policy refusal', toolCalls: Object.freeze([]),
@@ -588,6 +737,20 @@ test('RunEngine returns one ordered terminal result for unknown, failed and deni
   ])
   const ledger = (await fixture.store.load('run-1'))?.toolLedgers[0]
   assert.deepEqual(ledger?.calls.map(call => call.status), ['denied', 'failed', 'denied'])
+  const checkpoint = await fixture.store.load('run-1')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    toolCalls: checkpoint.observationCounters.toolCalls,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    toolDenied: checkpoint.observationCounters.toolDenied,
+    toolExpired: checkpoint.observationCounters.toolExpired,
+    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate
+  } : null, {
+    toolCalls: 3,
+    toolAttempts: 2,
+    toolDenied: 2,
+    toolExpired: 0,
+    toolIndeterminate: 0
+  })
 })
 
 test('RunEngine completes visible tool output without asking the Provider for another reply', async () => {
@@ -614,6 +777,121 @@ test('RunEngine completes visible tool output without asking the Provider for an
     toolAttempts: checkpoint.observationCounters.toolAttempts,
     toolCalls: checkpoint.observationCounters.toolCalls
   }, { providerAttempts: 1, toolAttempts: 1, toolCalls: 1 })
+})
+
+test('RunEngine counts actual scheduler attempts instead of inferring from the final tool result', async () => {
+  const fixture = harness([
+    modelTools([toolCall(0, 'call-retry', 'normalRead')]),
+    modelText('重试后完成')
+  ], {
+    monotonicNow: sequenceClock(0, 1, 3, 8, 11, 20),
+    toolMonotonicNow: sequenceClock(0, 2, 3, 7)
+  })
+  fixture.tools.scriptedOutcomes.set('call-retry', [
+    retryableFailure(),
+    success('second attempt')
+  ])
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '重试后完成')
+  const checkpoint = await fixture.store.load('run-1')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    toolCalls: checkpoint.observationCounters.toolCalls,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 2,
+    toolCalls: 1,
+    toolAttempts: 2,
+    engineActiveDurationMs: 20
+  })
+})
+
+test('RunEngine preserves exact counters and cumulative engine time across approval pause and resume', async () => {
+  const fixture = harness([
+    modelTools([toolCall(0, 'call-approved', 'sideEffect')]),
+    modelText('审批后完成')
+  ], {
+    monotonicNow: sequenceClock(0, 1, 2, 10, 20, 21, 23, 30),
+    toolMonotonicNow: sequenceClock(0, 4)
+  })
+  fixture.tools.approvalCalls.add('call-approved')
+
+  const paused = await fixture.engine.start(fixture.input)
+  assert.equal(paused.kind, 'paused')
+  if (paused.kind !== 'paused') throw new TypeError('approval fixture did not pause')
+  const displayed = await fixture.engine.displayApproval({
+    runId: paused.runId,
+    approvalId: paused.interruption.approvalId,
+    messageId: 'approval-message-private-id',
+    displayedAt: timestamp,
+    ttlSeconds: 60
+  })
+  assert.notEqual(displayed, null)
+
+  const result = await fixture.engine.decideApproval({
+    runId: paused.runId,
+    approvalId: paused.interruption.approvalId,
+    kind: 'approved',
+    decidedAt: timestamp,
+    sessionAddress: fixture.input.sessionAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'bot_master' })
+  })
+
+  assert.equal(result?.kind, 'completed')
+  assert.equal(result === null ? null : outputText(result), '审批后完成')
+  const checkpoint = await fixture.store.load('run-1')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    toolCalls: checkpoint.observationCounters.toolCalls,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    approvalRequests: checkpoint.observationCounters.approvalRequests,
+    toolDenied: checkpoint.observationCounters.toolDenied,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 2,
+    toolCalls: 1,
+    toolAttempts: 1,
+    approvalRequests: 1,
+    toolDenied: 0,
+    engineActiveDurationMs: 20
+  })
+})
+
+test('RunEngine engine duration is the invocation wall span, not parallel attempt durations summed', async () => {
+  const fixture = harness([
+    modelTools([
+      toolCall(0, 'call-parallel-0', 'fastRead'),
+      toolCall(1, 'call-parallel-1', 'slowRead')
+    ]),
+    modelText('并行完成')
+  ], {
+    monotonicNow: sequenceClock(0, 1, 2, 5, 6, 20),
+    toolMonotonicNow: sequenceClock(0, 1, 100, 101)
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  const checkpoint = await fixture.store.load('run-1')
+  assert.equal(
+    checkpoint?.schemaVersion === 2
+      ? checkpoint.observationCounters.engineActiveDurationMs
+      : null,
+    20
+  )
+  assert.equal(
+    checkpoint?.schemaVersion === 2
+      ? checkpoint.observationCounters.toolAttempts
+      : null,
+    2
+  )
 })
 
 test('RunEngine rejects a whole over-budget batch before preparing any capability and corrects once', async () => {
@@ -658,6 +936,17 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     providerAttempts: 2,
     providerUsage: 'unavailable'
   })
+  assert.deepEqual(retried?.schemaVersion === 2 ? {
+    modelTurns: retried.observationCounters.modelTurns,
+    providerRetries: retried.observationCounters.providerRetries,
+    recoveryAttempts: retried.observationCounters.recoveryAttempts,
+    correctionTurns: retried.observationCounters.correctionTurns
+  } : null, {
+    modelTurns: 1,
+    providerRetries: 1,
+    recoveryAttempts: 0,
+    correctionTurns: 0
+  })
 
   const legacyContext = new ModelProviderError({
     code: 'provider_invalid_request', stage: 'model.response', retryable: false,
@@ -684,6 +973,19 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     recovery: checkpoint?.budgetCounters.recoveryAttempts,
     correction: checkpoint?.budgetCounters.correctionTurns
   }, { provider: 0, recovery: 1, correction: 0 })
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    providerRetries: checkpoint.observationCounters.providerRetries,
+    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
+    correctionTurns: checkpoint.observationCounters.correctionTurns
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 1,
+    providerRetries: 0,
+    recoveryAttempts: 1,
+    correctionTurns: 0
+  })
 })
 
 test('RunEngine preserves the allowed retry count and the final provider error after exhaustion', async () => {
@@ -691,7 +993,9 @@ test('RunEngine preserves the allowed retry count and the final provider error a
     code: 'provider_unavailable', stage: 'model.response', retryable: true,
     userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
   })
-  const fixture = harness([unavailable(), unavailable()])
+  const fixture = harness([unavailable(), unavailable()], {
+    monotonicNow: sequenceClock(0, 1, 3, 5, 8, 10)
+  })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -699,6 +1003,26 @@ test('RunEngine preserves the allowed retry count and the final provider error a
   assert.equal(result.kind === 'failed' && result.error.code, 'provider_unavailable')
   assert.equal(fixture.adapter.requests.length, 2)
   assert.equal((await fixture.store.load('run-1'))?.budgetCounters.providerRetries, 1)
+  const checkpoint = await fixture.store.load('run-1')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    providerRetries: checkpoint.observationCounters.providerRetries,
+    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
+    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
+    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
+    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
+  } : null, {
+    providerAttempts: 2,
+    modelTurns: 0,
+    providerRetries: 1,
+    providerInputTokens: 'unavailable',
+    providerOutputTokens: 'unavailable',
+    providerTotalTokens: 'unavailable',
+    providerActiveDurationMs: 5,
+    engineActiveDurationMs: 10
+  })
 })
 
 test('RunEngine never applies legacy context recovery after a tool has been prepared', async () => {
@@ -782,6 +1106,35 @@ test('RunEngine cancellation wins over a late Provider result and suppresses ter
   await new Promise(resolve => setImmediate(resolve))
   const checkpoint = await fixture.store.load('run-1')
   assert.equal(checkpoint?.status, 'cancelled')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    providerRetries: checkpoint.observationCounters.providerRetries,
+    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
+    correctionTurns: checkpoint.observationCounters.correctionTurns,
+    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
+    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
+    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
+    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs,
+    providerDispatch: checkpoint.providerDispatch.state,
+    engineActivity: checkpoint.engineActivity.state
+  } : null, {
+    providerAttempts: 'unavailable',
+    providerRetries: 'unavailable',
+    recoveryAttempts: 'unavailable',
+    correctionTurns: 'unavailable',
+    providerInputTokens: 'unavailable',
+    providerOutputTokens: 'unavailable',
+    providerTotalTokens: 'unavailable',
+    providerActiveDurationMs: 'unavailable',
+    modelTurns: 'unavailable',
+    toolAttempts: 'unavailable',
+    engineActiveDurationMs: 'unavailable',
+    providerDispatch: 'idle',
+    engineActivity: 'idle'
+  })
   assert.equal(fixture.events.includes('run.completed'), false)
   assert.equal(fixture.events.filter(type => type === 'run.cancelled').length, 1)
 })
@@ -804,8 +1157,19 @@ test('RunEngine marks an in-flight side effect indeterminate when cancellation w
   assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, 'indeterminate')
   assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
     toolAttempts: checkpoint.observationCounters.toolAttempts,
-    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate
-  } : null, { toolAttempts: 1, toolIndeterminate: 1 })
+    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate,
+    modelTurns: checkpoint.observationCounters.modelTurns,
+    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs,
+    providerDispatch: checkpoint.providerDispatch.state,
+    engineActivity: checkpoint.engineActivity.state
+  } : null, {
+    toolAttempts: 'unavailable',
+    toolIndeterminate: 1,
+    modelTurns: 'unavailable',
+    engineActiveDurationMs: 'unavailable',
+    providerDispatch: 'idle',
+    engineActivity: 'idle'
+  })
 
   toolResult.resolve(success('迟到副作用'))
   await new Promise(resolve => setImmediate(resolve))
@@ -834,6 +1198,13 @@ test('RunEngine does not call an unstarted side effect indeterminate on cancella
   assert.equal(
     (await fixture.store.load('run-1'))?.toolLedgers[0]?.calls[0]?.status,
     'cancelled'
+  )
+  const cancelledCheckpoint = await fixture.store.load('run-1')
+  assert.equal(
+    cancelledCheckpoint?.schemaVersion === 2
+      ? cancelledCheckpoint.observationCounters.toolAttempts
+      : null,
+    'unavailable'
   )
   freshContext.resolve(execution())
   await new Promise(resolve => setImmediate(resolve))

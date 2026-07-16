@@ -1,4 +1,7 @@
+import { performance } from 'node:perf_hooks';
 import { parseToolResult } from '../tools/tool-result.js';
+import { boundedMonotonicDurationMs } from './run-budget.js';
+const MAX_TOOL_TIMEOUT_MS = 30_000;
 class Semaphore {
     #limit;
     #active = 0;
@@ -73,21 +76,48 @@ function conflicts(keys, capability) {
 function frozenBatch(calls) {
     return Object.freeze({ schemaVersion: 1, calls: Object.freeze([...calls]) });
 }
-function scheduled(capability, result) {
+function scheduled(capability, result, attemptObservations) {
     return Object.freeze({
         callId: capability.callId,
         toolName: capability.toolName,
-        result: parseToolResult(result)
+        result: parseToolResult(result),
+        attemptObservations
     });
+}
+function attemptObservation(result, ordinal, durationMs) {
+    const projected = result.status === 'success'
+        ? { outcome: 'succeeded', resultCode: null }
+        : result.status === 'denied'
+            ? { outcome: 'denied', resultCode: result.reasonCode }
+            : result.status === 'failed'
+                ? { outcome: 'failed', resultCode: result.errorCode }
+                : {
+                    outcome: 'indeterminate',
+                    resultCode: 'tool_outcome_unknown'
+                };
+    return Object.freeze({
+        schemaVersion: 1,
+        ordinal,
+        outcome: projected.outcome,
+        durationMs,
+        resultCode: projected.resultCode
+    });
+}
+function frozenAttemptObservations(observations) {
+    if (observations.length > 2)
+        throw new TypeError('tool attempt observations are invalid');
+    return Object.freeze([...observations]);
 }
 export class ToolScheduler {
     #runtime;
     #maxPerRunConcurrency;
     #global;
+    #monotonicNow;
     constructor(options) {
         this.#runtime = options.runtime;
         this.#maxPerRunConcurrency = options.maxPerRunConcurrency ?? 2;
         this.#global = new Semaphore(options.maxGlobalConcurrency ?? 2);
+        this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
         if (!Number.isSafeInteger(this.#maxPerRunConcurrency) ||
             this.#maxPerRunConcurrency < 1 || this.#maxPerRunConcurrency > 2) {
             throw new TypeError('tool concurrency limit is invalid');
@@ -120,25 +150,32 @@ export class ToolScheduler {
         let group = [];
         let groupKeys = new Set();
         const run = async (capability) => {
-            const releaseRun = await perRun.acquire(context.signal);
+            const observations = [];
+            let releaseRun;
             let releaseGlobal;
             try {
+                releaseRun = await perRun.acquire(context.signal);
                 releaseGlobal = await this.#global.acquire(context.signal);
-                let result = await this.#attempt(capability, context);
-                if (parallelEligible(capability) && result.status === 'failed' && result.retryable &&
+                let attempt = await this.#attempt(capability, context, 1);
+                if (attempt.observation !== null)
+                    observations.push(attempt.observation);
+                if (parallelEligible(capability) && attempt.result.status === 'failed' &&
+                    attempt.result.retryable &&
                     !context.signal.aborted) {
-                    result = await this.#attempt(capability, context);
+                    attempt = await this.#attempt(capability, context, 2);
+                    if (attempt.observation !== null)
+                        observations.push(attempt.observation);
                 }
-                return scheduled(capability, result);
+                return scheduled(capability, attempt.result, frozenAttemptObservations(observations));
             }
             catch {
                 return scheduled(capability, capability.executionClass === 'read_only'
                     ? failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed')
-                    : indeterminateResult());
+                    : indeterminateResult(), frozenAttemptObservations(observations));
             }
             finally {
                 releaseGlobal?.();
-                releaseRun();
+                releaseRun?.();
             }
         };
         const flush = async () => {
@@ -156,7 +193,10 @@ export class ToolScheduler {
             const item = batch.calls[index];
             if (item.kind === 'completed') {
                 results[index] = Object.freeze({
-                    callId: item.callId, toolName: item.toolName, result: parseToolResult(item.result)
+                    callId: item.callId,
+                    toolName: item.toolName,
+                    result: parseToolResult(item.result),
+                    attemptObservations: frozenAttemptObservations([])
                 });
                 continue;
             }
@@ -178,18 +218,52 @@ export class ToolScheduler {
         }
         return Object.freeze({ results: Object.freeze(results) });
     }
-    async #attempt(capability, context) {
-        if (context.signal.aborted)
-            return failedResult('tool_cancelled');
+    async #attempt(capability, context, ordinal) {
+        if (context.signal.aborted) {
+            return Object.freeze({ result: failedResult('tool_cancelled'), observation: null });
+        }
         let fresh;
         try {
             fresh = await context.contextFor(capability);
         }
         catch {
-            return failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed');
+            return Object.freeze({
+                result: failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed'),
+                observation: null
+            });
         }
-        if (context.signal.aborted)
-            return failedResult('tool_cancelled');
-        return await this.#runtime.executePrepared(capability, fresh, context.snapshot, context.signal);
+        if (context.signal.aborted) {
+            return Object.freeze({ result: failedResult('tool_cancelled'), observation: null });
+        }
+        let timeoutMs;
+        try {
+            timeoutMs = context.snapshot.resolve(capability.toolName).definition.timeoutMs;
+        }
+        catch {
+            timeoutMs = MAX_TOOL_TIMEOUT_MS;
+        }
+        const startedAt = this.#safeMonotonicNow();
+        let result;
+        try {
+            result = parseToolResult(await this.#runtime.executePrepared(capability, fresh, context.snapshot, context.signal));
+        }
+        catch {
+            result = capability.executionClass === 'read_only'
+                ? failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed')
+                : indeterminateResult();
+        }
+        const durationMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow(), timeoutMs);
+        return Object.freeze({
+            result,
+            observation: attemptObservation(result, ordinal, durationMs)
+        });
+    }
+    #safeMonotonicNow() {
+        try {
+            return this.#monotonicNow();
+        }
+        catch {
+            return Number.NaN;
+        }
     }
 }

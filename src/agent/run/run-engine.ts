@@ -42,7 +42,11 @@ import {
   type ApprovalDecision,
   type ApprovalInterruption
 } from './interruption.js'
-import type { RunBudget, RunBudgetCounters } from './run-budget.js'
+import {
+  boundedMonotonicDurationMs,
+  type RunBudget,
+  type RunBudgetCounters
+} from './run-budget.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
@@ -69,6 +73,7 @@ import {
 import {
   applyToolPreflight,
   cancelToolExecutionLedger,
+  countScheduledToolAttempts,
   completeToolExecutionLedger,
   createToolExecutionLedger,
   failRecoveredToolExecutionLedger,
@@ -162,6 +167,7 @@ export interface RunEngineOptions {
   readonly store: RunStore
   readonly budget: RunBudget
   readonly now?: () => Date
+  readonly monotonicNow?: () => number
   readonly generateId?: () => string
   readonly createRunRef?: () => string
   readonly createRequestRef?: () => string
@@ -255,27 +261,17 @@ function synchronizedObservationCounters (
   budget: RunBudgetCounters,
   ledgers: readonly ToolExecutionLedger[],
   interruption: ApprovalInterruption | null,
-  approvalHistory: readonly ApprovalInterruption[]
+  approvalHistory: readonly ApprovalInterruption[],
+  completedModelTurns: number
 ): RunObservationCountersV1 {
   const approvalIds = new Set(approvalHistory.map(value => value.approvalId))
   if (interruption !== null) approvalIds.add(interruption.approvalId)
   const calls = ledgers.flatMap(ledger => ledger.calls)
+  const uniqueCallIds = new Set(calls.map(call => call.callId))
   return Object.freeze({
     ...current,
-    modelTurns: knownObservation(current.modelTurns, budget.modelTurns),
-    providerRetries: knownObservation(
-      current.providerRetries,
-      budget.providerRetries
-    ),
-    recoveryAttempts: knownObservation(
-      current.recoveryAttempts,
-      budget.recoveryAttempts
-    ),
-    correctionTurns: knownObservation(
-      current.correctionTurns,
-      budget.correctionTurns
-    ),
-    toolCalls: knownObservation(current.toolCalls, budget.toolCalls),
+    modelTurns: incrementObservation(current.modelTurns, completedModelTurns),
+    toolCalls: knownObservation(current.toolCalls, uniqueCallIds.size),
     approvalRequests: knownObservation(
       current.approvalRequests,
       approvalIds.size
@@ -300,6 +296,33 @@ function synchronizedObservationCounters (
       current.providerActiveDurationMs,
       budget.usedActiveRuntimeMs
     )
+  })
+}
+
+function unavailableProviderObservations (
+  current: RunObservationCountersV1
+): RunObservationCountersV1 {
+  return Object.freeze({
+    ...current,
+    providerAttempts: 'unavailable',
+    providerRetries: 'unavailable',
+    recoveryAttempts: 'unavailable',
+    correctionTurns: 'unavailable',
+    providerInputTokens: 'unavailable',
+    providerOutputTokens: 'unavailable',
+    providerTotalTokens: 'unavailable',
+    providerActiveDurationMs: 'unavailable'
+  })
+}
+
+function unavailableEngineObservations (
+  current: RunObservationCountersV1
+): RunObservationCountersV1 {
+  return Object.freeze({
+    ...current,
+    modelTurns: 'unavailable',
+    toolAttempts: 'unavailable',
+    engineActiveDurationMs: 'unavailable'
   })
 }
 
@@ -517,6 +540,7 @@ export class RunEngine {
   readonly #store: RunStore
   readonly #budget: RunBudget
   readonly #now: () => Date
+  readonly #monotonicNow: () => number
   readonly #generateId: () => string
   readonly #createRunRef: () => string
   readonly #createRequestRef: () => string
@@ -524,7 +548,7 @@ export class RunEngine {
   readonly #runtimeBindings = new Map<string, RunRuntimeBinding>()
   readonly #controllers = new Map<string, AbortController>()
   readonly #startedToolCalls = new Map<string, Set<string>>()
-  readonly #toolAttemptCounts = new Map<string, number>()
+  readonly #engineActivityStarts = new Map<string, number>()
 
   constructor (options: RunEngineOptions) {
     this.#adapter = options.adapter
@@ -533,6 +557,7 @@ export class RunEngine {
     this.#store = options.store
     this.#budget = options.budget
     this.#now = options.now ?? (() => new Date())
+    this.#monotonicNow = options.monotonicNow ?? (() => performance.now())
     this.#generateId = options.generateId ?? (() => crypto.randomUUID())
     this.#createRunRef = options.createRunRef ?? createRunRef
     this.#createRequestRef = options.createRequestRef ?? createRequestRef
@@ -599,7 +624,7 @@ export class RunEngine {
     options: RunControlOptions = {}
   ): Promise<RunAdvanceResult | null> {
     if (runtime !== undefined) this.#runtimeBindings.set(input.runId, runtime)
-    const checkpoint = await this.loadCheckpoint(input.runId)
+    let checkpoint = await this.loadCheckpoint(input.runId)
     if (checkpoint === null || checkpoint.status !== 'waiting_approval' ||
       checkpoint.interruption === null) return null
     const interruption = checkpoint.interruption
@@ -659,6 +684,8 @@ export class RunEngine {
     let resolvedLedger = ledger
     let preparationContext: ToolPreparationContext | undefined
     try {
+      checkpoint = await this.#beginEngineActivity(checkpoint)
+      if (isTerminalRunStatus(checkpoint.status)) return terminalResult(checkpoint)
       if (kind === 'approved') {
         let prepared: {
           readonly capability: SerializablePreparedCapability
@@ -776,17 +803,24 @@ export class RunEngine {
           approvalHistory: history,
           deadlineAt
         },
-        resolutionEvents
+        resolutionEvents,
+        true
       )
       let stored: RunCheckpoint
       try {
         stored = await this.#store.compareAndSet(checkpoint, next)
       } catch (error) {
-        if (error instanceof RunStoreConflictError) return null
+        if (error instanceof RunStoreConflictError) {
+          this.#engineActivityStarts.delete(input.runId)
+          return null
+        }
         throw error
       }
       this.#notifyNewEvents(checkpoint, stored)
-      if (stored.status === 'waiting_approval') return terminalResult(stored)
+      if (stored.status === 'waiting_approval') {
+        this.#engineActivityStarts.delete(input.runId)
+        return terminalResult(stored)
+      }
       const timer = this.#deadlineTimer(stored, controller)
       try {
         return await this.#drive(stored, controller)
@@ -875,6 +909,8 @@ export class RunEngine {
       if (this.#deadlineExpired(stored)) {
         return await this.cancel(input.runId, 'deadline_exceeded')
       }
+      stored = await this.#beginEngineActivity(stored)
+      if (isTerminalRunStatus(stored.status)) return terminalResult(stored)
       return await this.#drive(stored, controller)
     } finally {
       detach()
@@ -919,7 +955,11 @@ export class RunEngine {
         }))
       })
     }
-    if (isTerminalRunStatus(checkpoint.status) || checkpoint.status === 'waiting_approval') {
+    if (isTerminalRunStatus(checkpoint.status)) {
+      return terminalResult(checkpoint)
+    }
+    if (checkpoint.status === 'waiting_approval') {
+      checkpoint = await this.#recoverObservationReservations(checkpoint)
       return terminalResult(checkpoint)
     }
     const controller = this.#controllers.get(runId) ?? new AbortController()
@@ -927,7 +967,8 @@ export class RunEngine {
     const detach = this.#linkExternalSignal(options.signal, controller)
     const timer = this.#deadlineTimer(checkpoint, controller)
     try {
-      let resumable = checkpoint
+      let resumable = await this.#beginEngineActivity(checkpoint)
+      if (isTerminalRunStatus(resumable.status)) return terminalResult(resumable)
       try {
         this.#assertRecoveredCompatibility(resumable)
         if (resumable.status === 'executing_tools') {
@@ -971,20 +1012,9 @@ export class RunEngine {
       ))
       const next = this.#next(checkpoint, 'cancelled', {
         toolLedgers: Object.freeze(ledgers),
-        observationCounters: Object.freeze({
-          ...checkpoint.observationCounters,
-          toolAttempts: incrementObservation(
-            checkpoint.observationCounters.toolAttempts,
-            checkpoint.status === 'executing_tools'
-              ? this.#toolAttemptCounts.get(runId) ?? 0
-              : 0
-          )
-        }),
         preparedBatch: null,
         interruption: null,
         modelTurn: null,
-        providerDispatch: Object.freeze({ state: 'idle' }),
-        engineActivity: Object.freeze({ state: 'idle' }),
         cancellationReason
       }, [{ type: 'run.cancelled', payload: { reason: cancellationReason } }])
       try {
@@ -1001,6 +1031,39 @@ export class RunEngine {
       runRef: 'unavailable',
       error: serializeAgentError(checkpointConflict())
     })
+  }
+
+  async #beginEngineActivity (
+    checkpoint: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    let current = await this.#recoverObservationReservations(checkpoint)
+    if (isTerminalRunStatus(current.status)) return current
+    current = await this.#commit(current, current.status, {
+      engineActivity: Object.freeze({ state: 'reserved' })
+    }, [], false)
+    if (!isTerminalRunStatus(current.status)) {
+      this.#engineActivityStarts.set(current.runId, this.#safeMonotonicNow())
+    }
+    return current
+  }
+
+  async #recoverObservationReservations (
+    checkpoint: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (checkpoint.providerDispatch.state === 'idle' &&
+      checkpoint.engineActivity.state === 'idle') return checkpoint
+    let observationCounters = checkpoint.observationCounters
+    if (checkpoint.providerDispatch.state === 'reserved') {
+      observationCounters = unavailableProviderObservations(observationCounters)
+    }
+    if (checkpoint.engineActivity.state === 'reserved') {
+      observationCounters = unavailableEngineObservations(observationCounters)
+    }
+    return await this.#commit(checkpoint, checkpoint.status, {
+      observationCounters,
+      providerDispatch: Object.freeze({ state: 'idle' }),
+      engineActivity: Object.freeze({ state: 'idle' })
+    }, [], false)
   }
 
   #assertRecoveredCompatibility (checkpoint: RunCheckpoint): void {
@@ -1264,6 +1327,18 @@ export class RunEngine {
       providerAttempts: incrementObservation(
         checkpoint.observationCounters.providerAttempts
       ),
+      providerRetries: knownObservation(
+        checkpoint.observationCounters.providerRetries,
+        checkpoint.budgetCounters.providerRetries
+      ),
+      recoveryAttempts: knownObservation(
+        checkpoint.observationCounters.recoveryAttempts,
+        checkpoint.budgetCounters.recoveryAttempts
+      ),
+      correctionTurns: knownObservation(
+        checkpoint.observationCounters.correctionTurns,
+        checkpoint.budgetCounters.correctionTurns
+      ),
       providerInputTokens: 'unavailable',
       providerOutputTokens: 'unavailable',
       providerTotalTokens: 'unavailable'
@@ -1297,6 +1372,10 @@ export class RunEngine {
       providerTotalTokens: mergedProviderUsage(
         previousUsage.providerTotalTokens,
         usage?.totalTokens
+      ),
+      providerActiveDurationMs: knownObservation(
+        checkpoint.observationCounters.providerActiveDurationMs,
+        counters.usedActiveRuntimeMs
       )
     })
     return await this.#commit(checkpoint, checkpoint.status, {
@@ -1341,13 +1420,16 @@ export class RunEngine {
         if (isTerminalRunStatus(current.status)) {
           return Object.freeze({ terminal: true, checkpoint: current })
         }
-        const startedAt = performance.now()
+        const startedAt = this.#safeMonotonicNow()
         let turn: ModelTurn
         try {
           turn = await this.#providerCall(request, signal, timeoutMs)
         } catch (error) {
           if (isAbortError(error) || signal.aborted) throw new RunAbortedError()
-          const activeRuntimeMs = Math.max(0, Math.ceil(performance.now() - startedAt))
+          const activeRuntimeMs = boundedMonotonicDurationMs(
+            startedAt,
+            this.#safeMonotonicNow()
+          )
           counters = this.#budget.recordUsage(counters, { activeRuntimeMs })
           current = await this.#completeProviderDispatch(
             current,
@@ -1400,7 +1482,10 @@ export class RunEngine {
           }
           throw internalError(error)
         }
-        const activeRuntimeMs = Math.max(0, Math.ceil(performance.now() - startedAt))
+        const activeRuntimeMs = boundedMonotonicDurationMs(
+          startedAt,
+          this.#safeMonotonicNow()
+        )
         counters = this.#budget.recordUsage(counters, {
           activeRuntimeMs,
           providerReportedTokens: turn.usage?.totalTokens ?? 0
@@ -1686,7 +1771,6 @@ export class RunEngine {
     const runtime = this.#runtime(checkpoint.runId)
     this.#assertSnapshot(checkpoint, runtime.snapshot)
     this.#startedToolCalls.set(checkpoint.runId, new Set<string>())
-    this.#toolAttemptCounts.set(checkpoint.runId, 0)
     const execution = await this.#raceAbort(this.#scheduler.execute(batch, {
       snapshot: runtime.snapshot,
       contextFor: async capability => {
@@ -1730,7 +1814,7 @@ export class RunEngine {
         ...checkpoint.observationCounters,
         toolAttempts: incrementObservation(
           checkpoint.observationCounters.toolAttempts,
-          this.#toolAttemptCounts.get(checkpoint.runId) ?? 0
+          countScheduledToolAttempts(execution.results)
         )
       }),
       toolLedgers: this.#replaceLastLedger(checkpoint, completedLedger),
@@ -1874,15 +1958,26 @@ export class RunEngine {
     checkpoint: RunCheckpoint,
     status: RunStatus,
     changes: RunCheckpointChanges,
-    drafts: readonly EventDraft[]
+    drafts: readonly EventDraft[],
+    closeActivityBoundary = true
   ): Promise<RunCheckpoint> {
-    const next = this.#next(checkpoint, status, changes, drafts)
+    const next = this.#next(
+      checkpoint,
+      status,
+      changes,
+      drafts,
+      closeActivityBoundary
+    )
+    const closesActivity = closeActivityBoundary &&
+      (isTerminalRunStatus(status) || status === 'waiting_approval')
     try {
       const stored = await this.#store.compareAndSet(checkpoint, next)
+      if (closesActivity) this.#engineActivityStarts.delete(checkpoint.runId)
       this.#notifyNewEvents(checkpoint, stored)
       return stored
     } catch (error) {
       if (error instanceof RunStoreConflictError) {
+        this.#engineActivityStarts.delete(checkpoint.runId)
         const latest = await this.loadCheckpoint(checkpoint.runId)
         if (latest !== null && isTerminalRunStatus(latest.status)) return latest
         throw checkpointConflict(error)
@@ -1895,8 +1990,15 @@ export class RunEngine {
     checkpoint: RunCheckpoint,
     status: RunStatus,
     changes: RunCheckpointChanges,
-    drafts: readonly EventDraft[]
+    drafts: readonly EventDraft[],
+    activityBoundary: boolean | 'degrade' = 'degrade'
   ): RunCheckpoint {
+    const boundedChanges = this.#boundaryObservationChanges(
+      checkpoint,
+      status,
+      changes,
+      activityBoundary
+    )
     const occurredAt = this.#timestamp()
     const events = drafts.map((draft, offset) => createRunEvent({
       eventId: this.#generateId(),
@@ -1907,23 +2009,66 @@ export class RunEngine {
       type: draft.type,
       payload: draft.payload ?? EMPTY_PAYLOAD
     }))
-    const budgetCounters = changes.budgetCounters ?? checkpoint.budgetCounters
-    const toolLedgers = changes.toolLedgers ?? checkpoint.toolLedgers
-    const interruption = changes.interruption === undefined
+    const budgetCounters = boundedChanges.budgetCounters ?? checkpoint.budgetCounters
+    const toolLedgers = boundedChanges.toolLedgers ?? checkpoint.toolLedgers
+    const interruption = boundedChanges.interruption === undefined
       ? checkpoint.interruption
-      : changes.interruption
-    const approvalHistory = changes.approvalHistory ?? checkpoint.approvalHistory
+      : boundedChanges.interruption
+    const approvalHistory = boundedChanges.approvalHistory ?? checkpoint.approvalHistory
     const observationCounters = synchronizedObservationCounters(
-      changes.observationCounters ?? checkpoint.observationCounters,
+      boundedChanges.observationCounters ?? checkpoint.observationCounters,
       budgetCounters,
       toolLedgers,
       interruption,
-      approvalHistory
+      approvalHistory,
+      drafts.filter(draft => draft.type === 'model.completed').length
     )
     return nextRunCheckpoint(checkpoint, status, {
-      ...changes,
+      ...boundedChanges,
       observationCounters
     }, events, occurredAt)
+  }
+
+  #boundaryObservationChanges (
+    checkpoint: RunCheckpoint,
+    status: RunStatus,
+    changes: RunCheckpointChanges,
+    activityBoundary: boolean | 'degrade'
+  ): RunCheckpointChanges {
+    if (activityBoundary === false) return changes
+    if (!isTerminalRunStatus(status) && status !== 'waiting_approval') return changes
+    let observationCounters = changes.observationCounters ??
+      checkpoint.observationCounters
+    const providerDispatch = changes.providerDispatch ?? checkpoint.providerDispatch
+    const engineActivity = changes.engineActivity ?? checkpoint.engineActivity
+    let exactEngineSpan = activityBoundary === true
+    if (providerDispatch.state === 'reserved') {
+      observationCounters = unavailableProviderObservations(observationCounters)
+      exactEngineSpan = false
+    }
+    if (engineActivity.state === 'reserved') {
+      const startedAt = this.#engineActivityStarts.get(checkpoint.runId)
+      if (exactEngineSpan && startedAt !== undefined) {
+        observationCounters = Object.freeze({
+          ...observationCounters,
+          engineActiveDurationMs: incrementObservation(
+            observationCounters.engineActiveDurationMs,
+            boundedMonotonicDurationMs(
+              startedAt,
+              this.#safeMonotonicNow()
+            )
+          )
+        })
+      } else {
+        observationCounters = unavailableEngineObservations(observationCounters)
+      }
+    }
+    return Object.freeze({
+      ...changes,
+      observationCounters,
+      providerDispatch: Object.freeze({ state: 'idle' }),
+      engineActivity: Object.freeze({ state: 'idle' })
+    })
   }
 
   async #fail (
@@ -1946,8 +2091,6 @@ export class RunEngine {
       modelTurn: null,
       preparedBatch: null,
       interruption: null,
-      providerDispatch: Object.freeze({ state: 'idle' }),
-      engineActivity: Object.freeze({ state: 'idle' }),
       error: serialized
     }, [...prefixEvents, {
       type: 'run.failed',
@@ -2229,10 +2372,6 @@ export class RunEngine {
     const started = this.#startedToolCalls.get(runId) ?? new Set<string>()
     started.add(callId)
     this.#startedToolCalls.set(runId, started)
-    this.#toolAttemptCounts.set(
-      runId,
-      (this.#toolAttemptCounts.get(runId) ?? 0) + 1
-    )
   }
 
   #assertSnapshot (checkpoint: RunCheckpoint, snapshot: ToolSnapshot): void {
@@ -2262,6 +2401,14 @@ export class RunEngine {
 
   #timestamp (): string {
     return this.#now().toISOString()
+  }
+
+  #safeMonotonicNow (): number {
+    try {
+      return this.#monotonicNow()
+    } catch {
+      return Number.NaN
+    }
   }
 
   #deadlineExpired (checkpoint: RunCheckpoint): boolean {
@@ -2309,7 +2456,7 @@ export class RunEngine {
   #cleanupRun (runId: string, controller: AbortController): void {
     this.#runtimeBindings.delete(runId)
     this.#startedToolCalls.delete(runId)
-    this.#toolAttemptCounts.delete(runId)
+    this.#engineActivityStarts.delete(runId)
     if (this.#controllers.get(runId) === controller) {
       this.#controllers.delete(runId)
     }

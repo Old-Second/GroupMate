@@ -129,6 +129,9 @@ export function completeToolExecutionLedger(ledger, scheduled) {
     });
     return freezeLedger(ledger.step, calls);
 }
+export function countScheduledToolAttempts(scheduled) {
+    return scheduled.reduce((total, item) => total + item.attemptObservations.length, 0);
+}
 export function resolveToolApproval(ledger, callId, resolution) {
     let matched = false;
     const calls = ledger.calls.map(call => {

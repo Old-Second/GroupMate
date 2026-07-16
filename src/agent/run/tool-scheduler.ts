@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks'
 import type { ToolCall } from '../tools/tool-call.js'
 import type { ToolExecutionContext, ToolPreparationContext } from '../tools/tool-context.js'
 import type {
@@ -5,8 +6,16 @@ import type {
   SerializablePreparedCapability
 } from '../tools/prepared-capability.js'
 import type { ToolSnapshot } from '../tools/tool-registry.js'
-import { parseToolResult, type ToolResult } from '../tools/tool-result.js'
+import {
+  parseToolResult,
+  type ToolDenyCode,
+  type ToolErrorCode,
+  type ToolResult
+} from '../tools/tool-result.js'
 import type { ToolRuntime } from '../tools/tool-runtime.js'
+import { boundedMonotonicDurationMs } from './run-budget.js'
+
+const MAX_TOOL_TIMEOUT_MS = 30_000
 
 export interface PreparedToolBatch {
   readonly schemaVersion: 1
@@ -39,7 +48,29 @@ export interface ScheduledToolResult {
   readonly callId: string
   readonly toolName: string
   readonly result: ToolResult
+  readonly attemptObservations: ToolAttemptObservationsV1
 }
+
+export type ToolAttemptOutcome =
+  | 'succeeded'
+  | 'failed'
+  | 'denied'
+  | 'indeterminate'
+
+export type ToolAttemptResultCode = ToolDenyCode | ToolErrorCode | null
+
+export interface ToolAttemptObservationV1 {
+  readonly schemaVersion: 1
+  readonly ordinal: 1 | 2
+  readonly outcome: ToolAttemptOutcome
+  readonly durationMs: number
+  readonly resultCode: ToolAttemptResultCode
+}
+
+export type ToolAttemptObservationsV1 =
+  | readonly []
+  | readonly [ToolAttemptObservationV1]
+  | readonly [ToolAttemptObservationV1, ToolAttemptObservationV1]
 
 export interface ToolBatchExecutionResult {
   readonly results: readonly ScheduledToolResult[]
@@ -49,6 +80,12 @@ export interface ToolSchedulerOptions {
   readonly runtime: ToolRuntime
   readonly maxPerRunConcurrency?: number
   readonly maxGlobalConcurrency?: number
+  readonly monotonicNow?: () => number
+}
+
+interface ToolAttemptExecution {
+  readonly result: ToolResult
+  readonly observation: ToolAttemptObservationV1 | null
 }
 
 interface Waiter {
@@ -142,24 +179,59 @@ function frozenBatch (calls: readonly PreparedToolCall[]): PreparedToolBatch {
 
 function scheduled (
   capability: SerializablePreparedCapability,
-  result: ToolResult
+  result: ToolResult,
+  attemptObservations: ToolAttemptObservationsV1
 ): ScheduledToolResult {
   return Object.freeze({
     callId: capability.callId,
     toolName: capability.toolName,
-    result: parseToolResult(result)
+    result: parseToolResult(result),
+    attemptObservations
   })
+}
+
+function attemptObservation (
+  result: ToolResult,
+  ordinal: 1 | 2,
+  durationMs: number
+): ToolAttemptObservationV1 {
+  const projected = result.status === 'success'
+    ? { outcome: 'succeeded' as const, resultCode: null }
+    : result.status === 'denied'
+      ? { outcome: 'denied' as const, resultCode: result.reasonCode }
+      : result.status === 'failed'
+        ? { outcome: 'failed' as const, resultCode: result.errorCode }
+        : {
+            outcome: 'indeterminate' as const,
+            resultCode: 'tool_outcome_unknown' as const
+          }
+  return Object.freeze({
+    schemaVersion: 1,
+    ordinal,
+    outcome: projected.outcome,
+    durationMs,
+    resultCode: projected.resultCode
+  })
+}
+
+function frozenAttemptObservations (
+  observations: readonly ToolAttemptObservationV1[]
+): ToolAttemptObservationsV1 {
+  if (observations.length > 2) throw new TypeError('tool attempt observations are invalid')
+  return Object.freeze([...observations]) as ToolAttemptObservationsV1
 }
 
 export class ToolScheduler {
   readonly #runtime: ToolRuntime
   readonly #maxPerRunConcurrency: number
   readonly #global: Semaphore
+  readonly #monotonicNow: () => number
 
   constructor (options: ToolSchedulerOptions) {
     this.#runtime = options.runtime
     this.#maxPerRunConcurrency = options.maxPerRunConcurrency ?? 2
     this.#global = new Semaphore(options.maxGlobalConcurrency ?? 2)
+    this.#monotonicNow = options.monotonicNow ?? (() => performance.now())
     if (!Number.isSafeInteger(this.#maxPerRunConcurrency) ||
       this.#maxPerRunConcurrency < 1 || this.#maxPerRunConcurrency > 2) {
       throw new TypeError('tool concurrency limit is invalid')
@@ -201,26 +273,36 @@ export class ToolScheduler {
     let groupKeys = new Set<string>()
 
     const run = async (capability: SerializablePreparedCapability): Promise<ScheduledToolResult> => {
-      const releaseRun = await perRun.acquire(context.signal)
+      const observations: ToolAttemptObservationV1[] = []
+      let releaseRun: (() => void) | undefined
       let releaseGlobal: (() => void) | undefined
       try {
+        releaseRun = await perRun.acquire(context.signal)
         releaseGlobal = await this.#global.acquire(context.signal)
-        let result = await this.#attempt(capability, context)
-        if (parallelEligible(capability) && result.status === 'failed' && result.retryable &&
+        let attempt = await this.#attempt(capability, context, 1)
+        if (attempt.observation !== null) observations.push(attempt.observation)
+        if (parallelEligible(capability) && attempt.result.status === 'failed' &&
+          attempt.result.retryable &&
           !context.signal.aborted) {
-          result = await this.#attempt(capability, context)
+          attempt = await this.#attempt(capability, context, 2)
+          if (attempt.observation !== null) observations.push(attempt.observation)
         }
-        return scheduled(capability, result)
+        return scheduled(
+          capability,
+          attempt.result,
+          frozenAttemptObservations(observations)
+        )
       } catch {
         return scheduled(
           capability,
           capability.executionClass === 'read_only'
             ? failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed')
-            : indeterminateResult()
+            : indeterminateResult(),
+          frozenAttemptObservations(observations)
         )
       } finally {
         releaseGlobal?.()
-        releaseRun()
+        releaseRun?.()
       }
     }
 
@@ -239,7 +321,10 @@ export class ToolScheduler {
       const item = batch.calls[index]
       if (item.kind === 'completed') {
         results[index] = Object.freeze({
-          callId: item.callId, toolName: item.toolName, result: parseToolResult(item.result)
+          callId: item.callId,
+          toolName: item.toolName,
+          result: parseToolResult(item.result),
+          attemptObservations: frozenAttemptObservations([])
         })
         continue
       }
@@ -262,18 +347,57 @@ export class ToolScheduler {
 
   async #attempt (
     capability: SerializablePreparedCapability,
-    context: ToolBatchExecutionContext
-  ): Promise<ToolResult> {
-    if (context.signal.aborted) return failedResult('tool_cancelled')
+    context: ToolBatchExecutionContext,
+    ordinal: 1 | 2
+  ): Promise<ToolAttemptExecution> {
+    if (context.signal.aborted) {
+      return Object.freeze({ result: failedResult('tool_cancelled'), observation: null })
+    }
     let fresh: ToolExecutionContext
     try {
       fresh = await context.contextFor(capability)
     } catch {
-      return failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed')
+      return Object.freeze({
+        result: failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed'),
+        observation: null
+      })
     }
-    if (context.signal.aborted) return failedResult('tool_cancelled')
-    return await this.#runtime.executePrepared(
-      capability, fresh, context.snapshot, context.signal
+    if (context.signal.aborted) {
+      return Object.freeze({ result: failedResult('tool_cancelled'), observation: null })
+    }
+    let timeoutMs: number
+    try {
+      timeoutMs = context.snapshot.resolve(capability.toolName).definition.timeoutMs
+    } catch {
+      timeoutMs = MAX_TOOL_TIMEOUT_MS
+    }
+    const startedAt = this.#safeMonotonicNow()
+    let result: ToolResult
+    try {
+      result = parseToolResult(await this.#runtime.executePrepared(
+        capability, fresh, context.snapshot, context.signal
+      ))
+    } catch {
+      result = capability.executionClass === 'read_only'
+        ? failedResult(context.signal.aborted ? 'tool_cancelled' : 'tool_execution_failed')
+        : indeterminateResult()
+    }
+    const durationMs = boundedMonotonicDurationMs(
+      startedAt,
+      this.#safeMonotonicNow(),
+      timeoutMs
     )
+    return Object.freeze({
+      result,
+      observation: attemptObservation(result, ordinal, durationMs)
+    })
+  }
+
+  #safeMonotonicNow (): number {
+    try {
+      return this.#monotonicNow()
+    } catch {
+      return Number.NaN
+    }
   }
 }
