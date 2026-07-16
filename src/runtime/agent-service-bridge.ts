@@ -472,7 +472,8 @@ function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
     kind: 'failed',
     runId,
     runRef: 'unavailable',
-    error: serializeAgentError(normalized)
+    error: serializeAgentError(normalized),
+    terminal: null
   })
 }
 

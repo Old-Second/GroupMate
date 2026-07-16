@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
+import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type {
   ModelAdapter,
   ModelRequest,
@@ -45,6 +46,13 @@ import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
 
 const createdAt = '2026-07-14T00:00:00.000Z'
+
+function terminalSnapshot (result: RunAdvanceResult | null | undefined) {
+  return result === null || result === undefined || result.kind === 'paused' ||
+    result.terminal === null
+    ? null
+    : result.terminal.snapshot
+}
 
 function interruption (
   profile: ApprovalInterruption['approverPolicy']['profile'] = 'safe'
@@ -524,14 +532,10 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
   assert.deepEqual(cancelCase.allocations(), {
     runRefAllocations: 1, requestRefAllocations: 1
   })
-  const cancelledCheckpoint = await cancelCase.fixture.store.load(paused.runId)
-  assert.equal(cancelledCheckpoint?.schemaVersion, 2)
-  assert.equal(
-    cancelledCheckpoint?.schemaVersion === 2
-      ? cancelledCheckpoint.observationCounters.approvalRequests
-      : null,
-    1
-  )
+  const cancelledSnapshot = terminalSnapshot(cancelled)
+  assert.equal(cancelledSnapshot?.status, 'cancelled')
+  assert.equal(cancelledSnapshot?.counters.approvalRequests, 1)
+  assert.equal(await cancelCase.fixture.store.load(paused.runId), null)
   assert.equal(cancelCase.fixture.adapter.requests.length, 0)
   assert.equal(cancelCase.fixture.toolRuntime.executions.length, 0)
 })
@@ -580,12 +584,8 @@ test('RunEngine resolves ordered approvals in one run without executing an undec
 
   assert.equal(completed?.kind, 'completed')
   assert.deepEqual(fixture.toolRuntime.executions, ['call-1', 'call-2'])
-  const checkpoint = await fixture.store.load('run-approval-1')
-  assert.equal(checkpoint?.approvalHistory.length, 2)
-  assert.deepEqual(
-    checkpoint?.approvalHistory.map(item => item.decision?.kind),
-    ['approved', 'approved']
-  )
+  assert.equal(terminalSnapshot(completed)?.counters.approvalRequests, 2)
+  assert.equal(await fixture.store.load('run-approval-1'), null)
   assert.equal(JSON.stringify(fixture.adapter.requests[1]?.messages).includes('approval-generated'), false)
 })
 
@@ -618,19 +618,19 @@ test('RunEngine turns rejection and expiry into exact terminal tool results with
     })
     assert.equal(result?.kind, 'completed')
     assert.equal(fixture.toolRuntime.executions.length, 0)
-    const checkpoint = await fixture.store.load('run-approval-1')
-    assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, branch)
-    assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-      approvalRequests: checkpoint.observationCounters.approvalRequests,
-      toolDenied: checkpoint.observationCounters.toolDenied,
-      toolExpired: checkpoint.observationCounters.toolExpired,
-      toolAttempts: checkpoint.observationCounters.toolAttempts
-    } : null, {
+    const snapshot = terminalSnapshot(result)
+    assert.deepEqual(snapshot === null ? null : {
+      approvalRequests: snapshot.counters.approvalRequests,
+      toolDenied: snapshot.counters.toolDenied,
+      toolExpired: snapshot.counters.toolExpired,
+      toolAttempts: snapshot.counters.toolAttempts
+    }, {
       approvalRequests: 1,
       toolDenied: branch === 'rejected' ? 1 : 0,
       toolExpired: branch === 'expired' ? 1 : 0,
       toolAttempts: 0
     })
+    assert.equal(await fixture.store.load('run-approval-1'), null)
     const toolMessage = fixture.adapter.requests[1]?.messages.find(message => message.role === 'tool')
     assert.match(toolMessage?.role === 'tool' ? toolMessage.content : '',
       branch === 'expired' ? /已过期/ : /已拒绝/)
@@ -670,9 +670,14 @@ test('RunEngine starts approval TTL at display time and excludes waiting from ru
     actor: Object.freeze({ userId: 'actor-1', role: 'group_owner' })
   })
   assert.equal(result?.kind, 'completed')
-  const completed = await fixture.store.load('run-approval-1')
-  assert.equal(completed?.deadlineAt, '2026-07-14T00:08:30.000Z')
-  assert.ok((completed?.budgetCounters.usedActiveRuntimeMs ?? 240_000) < 10_000)
+  const completed = terminalSnapshot(result)
+  assert.equal(completed?.finishedAt, '2026-07-14T00:04:30.000Z')
+  const providerActiveDurationMs = completed?.counters.providerActiveDurationMs
+  assert.equal(typeof providerActiveDurationMs, 'number')
+  if (typeof providerActiveDurationMs === 'number') {
+    assert.ok(providerActiveDurationMs < 10_000)
+  }
+  assert.equal(await fixture.store.load('run-approval-1'), null)
 })
 
 test('RunEngine safe requester can self-confirm while strict requires a known different approver', async () => {
@@ -800,7 +805,7 @@ test('RunEngine fails closed when authorization or a frozen tool changes after a
       entry.name
     )
     assert.equal(fixture.toolRuntime.executions.length, 0, entry.name)
-    const checkpoint = await fixture.store.load('run-approval-1')
-    assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, 'denied', entry.name)
+    assert.equal(terminalSnapshot(result)?.counters.toolDenied, 1, entry.name)
+    assert.equal(await fixture.store.load('run-approval-1'), null, entry.name)
   }
 })

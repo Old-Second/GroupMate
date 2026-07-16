@@ -1,25 +1,31 @@
-import { isTerminalRunStatus } from '../../src/agent/run/run-state.js'
-import type {
-  LoadedRunCheckpoint,
-  RunCheckpoint,
-  RunCheckpointV1,
-  RunCheckpointV2
+import type { AgentEvent } from '../../src/agent/contracts/event.js'
+import {
+  RunCheckpointCodec,
+  type LoadedRunCheckpoint,
+  type RunCheckpoint,
+  type RunCheckpointV1,
+  type RunCheckpointV2
 } from '../../src/agent/run/run-checkpoint.js'
+import type { RunTerminalSnapshotV2 } from '../../src/agent/run/run-observation.js'
+import { isTerminalRunStatus } from '../../src/agent/run/run-state.js'
 import {
   checkpointWithAppendedEvents,
-  createRunTombstone,
+  normalizeRunTombstone,
   parseRunTombstone,
-  RunStoreConflictError,
+  parseTerminalCommitReceipt,
   RunReferenceConflictError,
-  type RunTombstone,
-  type RunStore
+  RunStoreConflictError,
+  validateTerminalCommitInput,
+  type NormalizedRunTombstoneV1,
+  type RunStore,
+  type TerminalCommitReceiptV1
 } from '../../src/agent/run/run-store.js'
-import type { AgentEvent } from '../../src/agent/contracts/event.js'
 
 export class InMemoryRunStore implements RunStore {
   readonly #runs = new Map<string, LoadedRunCheckpoint>()
-  readonly #tombstones = new Map<string, RunTombstone>()
+  readonly #tombstones = new Map<string, string>()
   readonly #references = new Map<string, string>()
+  readonly #codec = new RunCheckpointCodec()
 
   seedLoadedCheckpoint (checkpoint: LoadedRunCheckpoint): void {
     if (this.#runs.has(checkpoint.runId)) throw new RunStoreConflictError()
@@ -74,15 +80,41 @@ export class InMemoryRunStore implements RunStore {
     if (current === undefined || current.schemaVersion !== 2 ||
       current.revision !== expected.revision ||
       next.runId !== expected.runId || next.revision !== expected.revision + 1 ||
-      next.runRef !== expected.runRef ||
-      isTerminalRunStatus(current.status)) {
+      next.runRef !== expected.runRef || isTerminalRunStatus(current.status) ||
+      isTerminalRunStatus(next.status)) {
       throw new RunStoreConflictError()
     }
     this.#runs.set(next.runId, next)
-    if (isTerminalRunStatus(next.status)) {
-      this.#tombstones.set(next.runId, createRunTombstone(next))
-    }
     return next
+  }
+
+  async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: RunTerminalSnapshotV2
+  ): Promise<TerminalCommitReceiptV1> {
+    const validated = validateTerminalCommitInput(expected, next, snapshot)
+    const current = this.#runs.get(expected.runId)
+    if (current === undefined || current.schemaVersion !== 2 ||
+      JSON.stringify(current) !== JSON.stringify(expected) ||
+      this.#tombstones.has(expected.runId)) {
+      throw new RunStoreConflictError()
+    }
+    const encoded = this.#codec.encode(expected)
+    const raw = JSON.stringify(validated.tombstone)
+    this.#runs.delete(expected.runId)
+    this.#tombstones.set(expected.runId, raw)
+    return parseTerminalCommitReceipt({
+      schemaVersion: 1,
+      observationId: validated.snapshot.observationId,
+      runRef: validated.snapshot.runRef,
+      revision: validated.snapshot.revision,
+      deletedKeyCount: 2,
+      createdKeyCount: 1,
+      checkpointBytesDeleted: Buffer.byteLength(encoded.checkpoint, 'utf8'),
+      eventBytesDeleted: Buffer.byteLength(encoded.events, 'utf8'),
+      tombstoneBytes: Buffer.byteLength(raw, 'utf8')
+    })
   }
 
   async appendEvents (
@@ -96,22 +128,21 @@ export class InMemoryRunStore implements RunStore {
     )
   }
 
-  async finish (
-    expected: RunCheckpoint,
-    summary: RunTombstone
-  ): Promise<RunTombstone> {
-    const parsed = parseRunTombstone(summary)
-    const current = this.#runs.get(expected.runId)
-    if (current === undefined || current.revision !== expected.revision ||
-      parsed.runId !== expected.runId || parsed.revision !== expected.revision + 1) {
-      throw new RunStoreConflictError()
-    }
-    this.#runs.delete(expected.runId)
-    this.#tombstones.set(parsed.runId, parsed)
-    return parsed
+  readRawTombstone (runId: string): string | null {
+    return this.#tombstones.get(runId) ?? null
   }
 
-  async loadTombstone (runId: string): Promise<RunTombstone | null> {
-    return this.#tombstones.get(runId) ?? null
+  seedRawTombstone (runId: string, raw: string): void {
+    this.#tombstones.set(runId, raw)
+  }
+
+  async loadTombstone (runId: string): Promise<NormalizedRunTombstoneV1 | null> {
+    const raw = this.#tombstones.get(runId)
+    if (raw === undefined) return null
+    const parsed = parseRunTombstone(JSON.parse(raw) as unknown)
+    if (parsed.schemaVersion === 1 && parsed.runId !== runId) {
+      throw new TypeError('run ID does not match its tombstone key')
+    }
+    return normalizeRunTombstone(parsed)
   }
 }

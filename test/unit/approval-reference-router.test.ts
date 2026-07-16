@@ -4,6 +4,10 @@ import type { SessionAddress } from '../../src/agent/contracts/identity.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type { ApprovalInterruption } from '../../src/agent/run/interruption.js'
 import {
+  createInitialRunObservationCounters,
+  terminalObservationId
+} from '../../src/agent/run/run-observation.js'
+import {
   RedisApprovalReferenceIndex,
   RunApprovalRouter,
   projectYunzaiApprovalReply,
@@ -22,6 +26,42 @@ const groupAddress: SessionAddress = Object.freeze({
   scope: Object.freeze({ kind: 'group', groupId: 'group-1' })
 })
 const now = '2026-07-14T00:00:10.000Z'
+const completedRunRef = '1'.repeat(32)
+
+function completedTerminal () {
+  const revision = 7
+  const observationId = terminalObservationId(completedRunRef, revision)
+  const counters = createInitialRunObservationCounters()
+  return Object.freeze({
+    snapshot: Object.freeze({
+      schemaVersion: 2 as const,
+      observationId,
+      runRef: completedRunRef,
+      revision,
+      status: 'completed' as const,
+      finishedAt: now,
+      completion: Object.freeze({
+        kind: 'already_visible' as const,
+        source: 'tool_output' as const
+      }),
+      errorCode: null,
+      cancellationReason: null,
+      counters,
+      engineDurationMs: counters.engineActiveDurationMs
+    }),
+    receipt: Object.freeze({
+      schemaVersion: 1 as const,
+      observationId,
+      runRef: completedRunRef,
+      revision,
+      deletedKeyCount: 2,
+      createdKeyCount: 1,
+      checkpointBytesDeleted: 100,
+      eventBytesDeleted: 20,
+      tombstoneBytes: 300
+    })
+  })
+}
 
 function pending (): ApprovalInterruption {
   return Object.freeze({
@@ -104,9 +144,10 @@ class FakeApprovalControl implements RunApprovalControl {
     return Object.freeze({
       kind: 'completed',
       runId: input.runId,
-      runRef: '1'.repeat(32),
+      runRef: completedRunRef,
       completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
-      output: null
+      output: null,
+      terminal: completedTerminal()
     })
   }
 }

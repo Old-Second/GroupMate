@@ -274,7 +274,8 @@ function failedEnvelope(runId, error) {
         kind: 'failed',
         runId,
         runRef: 'unavailable',
-        error: serializeAgentError(normalized)
+        error: serializeAgentError(normalized),
+        terminal: null
     });
 }
 function messageIdentifier(value) {

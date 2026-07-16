@@ -9,13 +9,14 @@ import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-pro
 import { RunAdmission } from '../../src/agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import { RunEngine } from '../../src/agent/run/run-engine.js'
-import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
 import {
   RunReferenceConflictError,
   type RunStore
 } from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
+import type { AgentSessionState } from '../../src/agent/session/agent-session-state.js'
 import { RedisAgentSessionStore } from '../../src/agent/session/redis-agent-session-store.js'
+import type { SessionStore } from '../../src/agent/session/session-store.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
 import type {
   ToolExecutionContext,
@@ -183,6 +184,9 @@ class ServiceAdapter implements ModelAdapter {
     }),
     Object.freeze({
       text: '临时任务完成。', finishReason: 'stop' as const, toolCalls: Object.freeze([])
+    }),
+    Object.freeze({
+      text: '终态已提交。', finishReason: 'stop' as const, toolCalls: Object.freeze([])
     })
   ]
 
@@ -263,8 +267,8 @@ class InjectedCollisionRunStore implements RunStore {
     await this.base.appendEvents(expected, events)
   )
 
-  finish: RunStore['finish'] = async (expected, summary) => (
-    await this.base.finish(expected, summary)
+  commitTerminal: RunStore['commitTerminal'] = async (expected, next, snapshot) => (
+    await this.base.commitTerminal(expected, next, snapshot)
   )
 
   loadTombstone: RunStore['loadTombstone'] = async runId => (
@@ -274,9 +278,23 @@ class InjectedCollisionRunStore implements RunStore {
 
 test('AgentService owns context, progress, run execution and terminal session writes', async () => {
   const redis = new FakeRedis(() => Date.parse(createdAt))
-  const sessions = new RedisAgentSessionStore({
+  const persistedSessions = new RedisAgentSessionStore({
     redis, now: () => new Date(createdAt), generateId: () => 'session-1'
   })
+  let rejectSessionSave = false
+  const sessions: SessionStore<AgentSessionState> = {
+    get: async (address, options) => await persistedSessions.get(address, options),
+    save: async (record, options) => {
+      if (rejectSessionSave) throw new Error('injected terminal session save failure')
+      await persistedSessions.save(record, options)
+    },
+    delete: async (address, options) => await persistedSessions.delete(address, options),
+    list: (query, options) => persistedSessions.list(query, options),
+    deleteAll: async (query, options) => await persistedSessions.deleteAll(query, options),
+    fork: async (source, target, startedBy, options) => (
+      await persistedSessions.fork(source, target, startedBy, options)
+    )
+  }
   const runStore = new InMemoryRunStore()
   const adapter = new ServiceAdapter()
   const toolRuntime = new ServiceToolRuntime()
@@ -355,6 +373,17 @@ test('AgentService owns context, progress, run execution and terminal session wr
   })
   assert.equal(aborted.kind, 'cancelled')
   assert.equal(aborted.kind === 'cancelled' ? aborted.reason : null, 'user_cancelled')
+
+  rejectSessionSave = true
+  const committedBeforeSessionFailure = await service.handle(
+    request('request-3', '保留已提交终态'),
+    { signal: new AbortController().signal }
+  )
+  assert.equal(committedBeforeSessionFailure.kind, 'completed')
+  assert.equal(committedBeforeSessionFailure.terminal.snapshot.status, 'completed')
+  assert.equal(committedBeforeSessionFailure.terminal.snapshot.runRef, committedBeforeSessionFailure.runRef)
+  assert.equal(committedBeforeSessionFailure.terminal.receipt.runRef, committedBeforeSessionFailure.runRef)
+  assert.equal(await runStore.load(committedBeforeSessionFailure.runId), null)
 
   let bridgeCreations = 0
   const firstBridge = getAgentServiceBridge(() => {
@@ -468,12 +497,14 @@ test('AgentService retries one runRef collision and fails the second with zero m
       assert.equal(result.kind, 'completed')
       assert.equal(result.runRef, runRefs[1])
       assert.equal(providerCalls, 1)
-      const stored = await runStore.base.load(result.runId)
-      assert.equal(stored?.schemaVersion, 2)
-      assert.equal(stored?.schemaVersion === 2 ? stored.runRef : null, runRefs[1])
-      assert.deepEqual(
-        stored?.schemaVersion === 2 ? stored.observationPolicy : null,
-        createFrozenObservationPolicy({ levelAtStart: 'basic', runRef: runRefs[1] })
+      assert.equal(await runStore.base.load(result.runId), null)
+      assert.equal(
+        result.kind === 'completed' ? result.terminal.snapshot.runRef : null,
+        runRefs[1]
+      )
+      assert.equal(
+        (await runStore.base.loadTombstone(result.runId))?.runRef,
+        runRefs[1]
       )
     } else {
       assert.equal(result.kind, 'failed')
@@ -652,7 +683,7 @@ test('AgentService cancellation releases a paused run before the next session tu
   const cancelledCount = await service.shutdown('process_shutdown')
   assert.equal(cancelledCount, 1)
   assert.equal(await service.shutdown('ignored_second_reason'), 1)
-  const shutdownCheckpoint = await runStore.load(pendingShutdown.runId)
+  const shutdownCheckpoint = await runStore.loadTombstone(pendingShutdown.runId)
   assert.equal(shutdownCheckpoint?.status, 'cancelled')
   assert.equal(shutdownCheckpoint?.cancellationReason, 'process_shutdown')
 

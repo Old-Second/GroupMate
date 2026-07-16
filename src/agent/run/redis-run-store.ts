@@ -15,13 +15,19 @@ import { RUN_RESOURCE_LIMITS } from './run-limits.js'
 import { isTerminalRunStatus } from './run-state.js'
 import {
   checkpointWithAppendedEvents,
-  createRunTombstone,
+  createRunTombstoneV2,
+  normalizeRunTombstone,
+  parseTerminalCommitReceipt,
   parseRunTombstone,
   RunReferenceConflictError,
   RunStoreConflictError,
+  validateTerminalCommitInput,
+  type NormalizedRunTombstoneV1,
   type RunStore,
-  type RunTombstone
+  type RunTombstoneV2,
+  type TerminalCommitReceiptV1
 } from './run-store.js'
+import type { RunTerminalSnapshotV2 } from './run-observation.js'
 import { RUN_REF_PATTERN } from './run-reference.js'
 
 export interface RedisRunClient {
@@ -165,41 +171,26 @@ if operation == 'cas' then
   local oldEvents = redis.call('GET', KEYS[2])
   local reference = redis.call('GET', KEYS[4])
   if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] or
-    reference ~= ARGV[10] then return 'conflict' end
-  local terminal = ARGV[7] == '1'
+    reference ~= ARGV[7] then return 'conflict' end
   local projected = {
-    bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents),
-    checkpoints = current.checkpoints - 1,
-    events = current.events - 1,
+    bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents) +
+      string.len(ARGV[4]) + string.len(ARGV[5]),
+    checkpoints = current.checkpoints,
+    events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes,
     references = current.references
   }
-  if terminal then
-    if redis.call('EXISTS', KEYS[3]) > 0 then return 'conflict' end
-    projected.bytes = projected.bytes + string.len(ARGV[8])
-    projected.tombstones = projected.tombstones + 1
-  else
-    projected.bytes = projected.bytes + string.len(ARGV[4]) + string.len(ARGV[5])
-    projected.checkpoints = projected.checkpoints + 1
-    projected.events = projected.events + 1
-  end
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
-  if terminal then
-    redis.call('DEL', KEYS[1], KEYS[2])
-    redis.call('SET', KEYS[3], ARGV[8], 'EX', tonumber(ARGV[9]))
-    redis.call('SET', KEYS[4], ARGV[10], 'EX', tonumber(ARGV[9]))
-  else
-    redis.call('SET', KEYS[1], ARGV[4], 'EX', tonumber(ARGV[6]))
-    redis.call('SET', KEYS[2], ARGV[5], 'EX', tonumber(ARGV[6]))
-    redis.call('SET', KEYS[4], ARGV[10], 'EX', tonumber(ARGV[6]))
-  end
+  redis.call('SET', KEYS[1], ARGV[4], 'EX', tonumber(ARGV[6]))
+  redis.call('SET', KEYS[2], ARGV[5], 'EX', tonumber(ARGV[6]))
+  redis.call('SET', KEYS[4], ARGV[7], 'EX', tonumber(ARGV[6]))
   save(projected)
   return 'ok'
 end
 
-if operation == 'finish' then
+if operation == 'commit_terminal' then
   local oldCheckpoint = redis.call('GET', KEYS[1])
   local oldEvents = redis.call('GET', KEYS[2])
   local reference = redis.call('GET', KEYS[4])
@@ -215,11 +206,18 @@ if operation == 'finish' then
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
-  redis.call('DEL', KEYS[1], KEYS[2])
+  local deleted = redis.call('DEL', KEYS[1], KEYS[2])
   redis.call('SET', KEYS[3], ARGV[4], 'EX', tonumber(ARGV[5]))
   redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[5]))
   save(projected)
-  return 'ok'
+  return {
+    'ok',
+    deleted,
+    1,
+    string.len(oldCheckpoint),
+    string.len(oldEvents),
+    string.len(ARGV[4])
+  }
 end
 
 if operation == 'admission_acquire' then
@@ -524,8 +522,11 @@ function requireMutationSuccess (result: unknown, operation: string): void {
   throw storageUnavailable(operation, new TypeError('unexpected Lua result'))
 }
 
-function encodeTombstone (value: RunTombstone): string {
+function encodeTombstone (value: RunTombstoneV2): string {
   const parsed = parseRunTombstone(value)
+  if (parsed.schemaVersion !== 2) {
+    throw checkpointInvalid('encode_tombstone', new TypeError('v2 tombstone is required'))
+  }
   const raw = JSON.stringify(parsed)
   if (Buffer.byteLength(raw, 'utf8') > RUN_RESOURCE_LIMITS.tombstoneBytes) {
     throw checkpointInvalid('encode_tombstone', new TypeError('tombstone byte limit exceeded'))
@@ -708,15 +709,14 @@ export class RedisRunStore implements RunStore {
   ): Promise<RunCheckpoint> {
     if (next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
       next.revision !== expected.revision + 1 || next.runRef !== expected.runRef ||
-      next.requestRef !== expected.requestRef || isTerminalRunStatus(expected.status)) {
+      next.requestRef !== expected.requestRef || isTerminalRunStatus(expected.status) ||
+      isTerminalRunStatus(next.status)) {
       throw new RunStoreConflictError()
     }
     const expectedEncoded = this.#encode(expected, 'compare_expected')
     const nextEncoded = this.#encode(next, 'compare_next')
     const keys = redisRunKeys(expected.runId)
     const referenceKey = redisRunReferenceKey(expected.runRef)
-    const terminal = isTerminalRunStatus(next.status)
-    const tombstone = terminal ? encodeTombstone(createRunTombstone(next)) : ''
     const activeTtlSeconds = next.status === 'waiting_approval'
       ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
       : this.#activeTtlSeconds
@@ -728,9 +728,6 @@ export class RedisRunStore implements RunStore {
       nextEncoded.checkpoint,
       nextEncoded.events,
       String(activeTtlSeconds),
-      terminal ? '1' : '0',
-      tombstone,
-      String(TOMBSTONE_TTL_SECONDS),
       expected.runId
     ])
     requireMutationSuccess(result, 'compare_and_set')
@@ -748,32 +745,53 @@ export class RedisRunStore implements RunStore {
     )
   }
 
-  async finish (
+  async commitTerminal (
     expected: RunCheckpoint,
-    summary: RunTombstone
-  ): Promise<RunTombstone> {
-    const parsed = parseRunTombstone(summary)
-    if (parsed.runId !== expected.runId || parsed.sessionId !== expected.sessionId ||
-      parsed.revision !== expected.revision + 1 || isTerminalRunStatus(expected.status)) {
-      throw new RunStoreConflictError()
-    }
-    const encoded = this.#encode(expected, 'finish_expected')
+    next: RunCheckpoint,
+    snapshot: RunTerminalSnapshotV2
+  ): Promise<TerminalCommitReceiptV1> {
+    const validated = validateTerminalCommitInput(expected, next, snapshot)
+    const encoded = this.#encode(expected, 'commit_terminal_expected')
+    const tombstone = encodeTombstone(createRunTombstoneV2(validated.snapshot))
     const keys = redisRunKeys(expected.runId)
     const referenceKey = redisRunReferenceKey(expected.runRef)
-    const result = await mutate(this.#client, 'finish', [
+    const result = await mutate(this.#client, 'commit_terminal', [
       keys.checkpoint, keys.events, keys.tombstone, referenceKey
     ], [
       encoded.checkpoint,
       encoded.events,
-      encodeTombstone(parsed),
+      tombstone,
       String(TOMBSTONE_TTL_SECONDS),
       expected.runId
     ])
-    requireMutationSuccess(result, 'finish')
-    return parsed
+    if (!Array.isArray(result) || result.length !== 6 || result[0] !== 'ok') {
+      requireMutationSuccess(result, 'commit_terminal')
+      throw storageUnavailable(
+        'commit_terminal',
+        new TypeError('unexpected terminal commit receipt')
+      )
+    }
+    const numbers = result.slice(1).map(value => Number(value))
+    if (numbers.some(value => !Number.isSafeInteger(value) || value < 0)) {
+      throw storageUnavailable(
+        'commit_terminal',
+        new TypeError('invalid terminal commit receipt')
+      )
+    }
+    return parseTerminalCommitReceipt({
+      schemaVersion: 1,
+      observationId: validated.snapshot.observationId,
+      runRef: validated.snapshot.runRef,
+      revision: validated.snapshot.revision,
+      deletedKeyCount: numbers[0],
+      createdKeyCount: numbers[1],
+      checkpointBytesDeleted: numbers[2],
+      eventBytesDeleted: numbers[3],
+      tombstoneBytes: numbers[4]
+    })
   }
 
-  async loadTombstone (runId: string): Promise<RunTombstone | null> {
+  async loadTombstone (runId: string): Promise<NormalizedRunTombstoneV1 | null> {
     const key = redisRunKeys(runId).tombstone
     let raw: string | null
     try {
@@ -787,8 +805,10 @@ export class RedisRunStore implements RunStore {
     }
     try {
       const decoded = parseRunTombstone(JSON.parse(raw) as unknown)
-      if (decoded.runId !== runId) throw new TypeError('run ID does not match its tombstone key')
-      return decoded
+      if (decoded.schemaVersion === 1 && decoded.runId !== runId) {
+        throw new TypeError('run ID does not match its tombstone key')
+      }
+      return normalizeRunTombstone(decoded)
     } catch (error) {
       throw checkpointInvalid('load_tombstone', error)
     }

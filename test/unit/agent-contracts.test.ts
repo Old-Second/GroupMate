@@ -13,6 +13,50 @@ import {
   parseAgentResult,
   parseRunAdvanceResult
 } from '../../src/agent/contracts/result.js'
+import {
+  createInitialRunObservationCounters,
+  terminalObservationId
+} from '../../src/agent/run/run-observation.js'
+
+const terminalRunRef = '22222222222222222222222222222222'
+const terminalRevision = 3
+
+function visibleTerminalFacts (runRef = terminalRunRef) {
+  const observationId = terminalObservationId(runRef, terminalRevision)
+  const counters = Object.freeze({
+    ...createInitialRunObservationCounters(),
+    engineActiveDurationMs: 0
+  })
+  return Object.freeze({
+    snapshot: Object.freeze({
+      schemaVersion: 2 as const,
+      observationId,
+      runRef,
+      revision: terminalRevision,
+      status: 'completed' as const,
+      finishedAt: '2026-07-13T00:00:00.000Z',
+      completion: Object.freeze({
+        kind: 'already_visible' as const,
+        source: 'tool_output' as const
+      }),
+      errorCode: null,
+      cancellationReason: null,
+      counters,
+      engineDurationMs: 0
+    }),
+    receipt: Object.freeze({
+      schemaVersion: 1 as const,
+      observationId,
+      runRef,
+      revision: terminalRevision,
+      deletedKeyCount: 2,
+      createdKeyCount: 1,
+      checkpointBytesDeleted: 100,
+      eventBytesDeleted: 20,
+      tombstoneBytes: 300
+    })
+  })
+}
 
 const userMessage = {
   id: 'message-1',
@@ -111,19 +155,19 @@ test('result parsers use one completion contract and freeze run references on ev
     output: userMessage
   }))
 
-  assert.deepEqual(parseRunAdvanceResult({
+  const completed = {
     kind: 'completed',
     runId: 'run-1',
-    runRef: '22222222222222222222222222222222',
+    runRef: terminalRunRef,
     completion: { kind: 'already_visible', source: 'tool_output' },
-    output: null
-  }), {
-    kind: 'completed',
-    runId: 'run-1',
-    runRef: '22222222222222222222222222222222',
-    completion: { kind: 'already_visible', source: 'tool_output' },
-    output: null
-  })
+    output: null,
+    terminal: visibleTerminalFacts()
+  } as const
+  assert.deepEqual(parseRunAdvanceResult(completed), completed)
+  assert.throws(() => parseRunAdvanceResult({
+    ...completed,
+    terminal: visibleTerminalFacts('3'.repeat(32))
+  }), /match/i)
   assert.deepEqual(parseRunAdvanceResult({
     kind: 'failed',
     runId: 'run-1',
@@ -133,7 +177,8 @@ test('result parsers use one completion contract and freeze run references on ev
       stage: 'fixture',
       retryable: false,
       userMessage: '失败。'
-    }))
+    })),
+    terminal: null
   }).runRef, 'unavailable')
 })
 

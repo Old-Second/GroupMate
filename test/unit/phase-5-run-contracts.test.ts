@@ -9,6 +9,10 @@ import {
 } from '../../src/agent/run/run-budget.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
+import {
+  createInitialRunObservationCounters,
+  terminalObservationId
+} from '../../src/agent/run/run-observation.js'
 import { assertRunTransition } from '../../src/agent/run/run-state.js'
 
 const timestamp = '2026-07-14T00:00:00.000Z'
@@ -55,6 +59,54 @@ const interruption = {
   },
   createdAt: timestamp
 } as const
+
+const terminalRunRef = '1'.repeat(32)
+const terminalRevision = 7
+const terminalObservation = terminalObservationId(terminalRunRef, terminalRevision)
+const terminalCounters = Object.freeze({
+  ...createInitialRunObservationCounters(),
+  providerAttempts: 1,
+  modelTurns: 1,
+  providerInputTokens: 3,
+  providerOutputTokens: 2,
+  providerTotalTokens: 5,
+  providerActiveDurationMs: 7,
+  engineActiveDurationMs: 11
+})
+
+function terminalFacts (
+  status: 'completed' | 'failed' | 'cancelled' = 'completed'
+) {
+  const snapshot = Object.freeze({
+    schemaVersion: 2 as const,
+    observationId: terminalObservation,
+    runRef: terminalRunRef,
+    revision: terminalRevision,
+    status,
+    finishedAt: timestamp,
+    completion: status === 'completed'
+      ? Object.freeze({ kind: 'reply_text' as const, lengthBucket: '1_40' as const })
+      : Object.freeze({ kind: 'none' as const }),
+    errorCode: status === 'failed' ? 'provider_protocol_error' as const : null,
+    cancellationReason: status === 'cancelled' ? 'user_cancelled' : null,
+    counters: terminalCounters,
+    engineDurationMs: terminalCounters.engineActiveDurationMs
+  })
+  return Object.freeze({
+    snapshot,
+    receipt: Object.freeze({
+      schemaVersion: 1 as const,
+      observationId: terminalObservation,
+      runRef: terminalRunRef,
+      revision: terminalRevision,
+      deletedKeyCount: 2,
+      createdKeyCount: 1,
+      checkpointBytesDeleted: 100,
+      eventBytesDeleted: 20,
+      tombstoneBytes: 300
+    })
+  })
+}
 
 test('freezes the confirmed balanced run budget', () => {
   const budget = createDefaultRunBudget({
@@ -275,17 +327,28 @@ test('parses every bounded run advance result branch', () => {
   const completed = parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
-    runRef: '1'.repeat(32),
+    runRef: terminalRunRef,
     completion: { kind: 'reply_text', text: '完成' },
     output: assistantMessage,
+    terminal: terminalFacts()
   })
   assert.equal(completed.kind, 'completed')
   assert.equal(parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
-    runRef: '1'.repeat(32),
+    runRef: terminalRunRef,
     completion: { kind: 'already_visible', source: 'tool_output' },
     output: null,
+    terminal: Object.freeze({
+      ...terminalFacts(),
+      snapshot: Object.freeze({
+        ...terminalFacts().snapshot,
+        completion: Object.freeze({
+          kind: 'already_visible' as const,
+          source: 'tool_output' as const
+        })
+      })
+    })
   }).kind, 'completed')
   assert.equal(parseRunAdvanceResult({
     kind: 'paused',
@@ -302,21 +365,24 @@ test('parses every bounded run advance result branch', () => {
       stage: 'model.decode',
       retryable: false,
       userMessage: '模型响应协议异常，请稍后重试。'
-    }))
+    })),
+    terminal: null
   }).kind, 'failed')
   assert.equal(parseRunAdvanceResult({
     kind: 'cancelled',
     runId: 'run-1',
     runRef: 'unavailable',
-    reason: 'caller_aborted'
+    reason: 'caller_aborted',
+    terminal: null
   }).kind, 'cancelled')
 
   assert.throws(() => parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
-    runRef: '1'.repeat(32),
+    runRef: terminalRunRef,
     completion: { kind: 'reply_text', text: '完成' },
     output: null,
+    terminal: terminalFacts()
   }), /completed run output/)
   assert.throws(() => parseRunAdvanceResult({
     kind: 'failed',
@@ -328,6 +394,118 @@ test('parses every bounded run advance result branch', () => {
       retryable: false,
       userMessage: 'safe',
       details: { nested: { secret: true } }
-    }
+    },
+    terminal: null
   }), /non-primitive/)
+})
+
+test('cross-validates terminal result kind, payload and exact receipt identity', () => {
+  const failedError = serializeAgentError(new AgentError({
+    code: 'provider_protocol_error',
+    stage: 'model.decode',
+    retryable: false,
+    userMessage: 'safe'
+  }))
+  const completed = {
+    kind: 'completed',
+    runId: 'run-1',
+    runRef: terminalRunRef,
+    completion: { kind: 'reply_text', text: '完成' },
+    output: assistantMessage,
+    terminal: terminalFacts()
+  } as const
+  const failed = {
+    kind: 'failed',
+    runId: 'run-1',
+    runRef: terminalRunRef,
+    error: failedError,
+    terminal: terminalFacts('failed')
+  } as const
+  const cancelled = {
+    kind: 'cancelled',
+    runId: 'run-1',
+    runRef: terminalRunRef,
+    reason: 'user_cancelled',
+    terminal: terminalFacts('cancelled')
+  } as const
+
+  assert.equal(parseRunAdvanceResult(completed).kind, 'completed')
+  assert.equal(parseRunAdvanceResult(failed).kind, 'failed')
+  assert.equal(parseRunAdvanceResult(cancelled).kind, 'cancelled')
+
+  for (const valid of [
+    { ...failed, runRef: 'unavailable', terminal: null },
+    { ...failed, terminal: null },
+    { ...cancelled, runRef: 'unavailable', terminal: null },
+    { ...cancelled, terminal: null }
+  ]) {
+    assert.doesNotThrow(() => parseRunAdvanceResult(valid))
+  }
+
+  const hostile = [
+    { ...completed, terminal: null },
+    { ...completed, terminal: terminalFacts('failed') },
+    { ...failed, terminal: terminalFacts() },
+    { ...cancelled, terminal: terminalFacts('failed') },
+    { ...completed, runRef: '2'.repeat(32) },
+    {
+      ...completed,
+      terminal: {
+        ...completed.terminal,
+        receipt: { ...completed.terminal.receipt, runRef: '2'.repeat(32) }
+      }
+    },
+    {
+      ...completed,
+      terminal: {
+        ...completed.terminal,
+        receipt: { ...completed.terminal.receipt, revision: terminalRevision + 1 }
+      }
+    },
+    {
+      ...completed,
+      terminal: {
+        ...completed.terminal,
+        receipt: { ...completed.terminal.receipt, observationId: 'f'.repeat(64) }
+      }
+    },
+    { ...completed, extra: true },
+    { ...completed, terminal: { ...completed.terminal, extra: true } },
+    {
+      ...completed,
+      terminal: {
+        ...completed.terminal,
+        snapshot: { ...completed.terminal.snapshot, extra: true }
+      }
+    },
+    {
+      ...completed,
+      terminal: {
+        ...completed.terminal,
+        receipt: { ...completed.terminal.receipt, extra: true }
+      }
+    }
+  ]
+  for (const value of hostile) {
+    assert.throws(() => parseRunAdvanceResult(value), TypeError)
+  }
+
+  assert.throws(() => parseRunAdvanceResult({
+    ...completed,
+    completion: { kind: 'already_visible', source: 'tool_output' },
+    output: null
+  }), /completion|terminal/i)
+  assert.throws(() => parseRunAdvanceResult({
+    ...failed,
+    error: serializeAgentError(new AgentError({
+      code: 'provider_unavailable',
+      stage: 'model.decode',
+      retryable: false,
+      userMessage: 'safe'
+    }))
+  }), /error|terminal/i)
+  assert.throws(() => parseRunAdvanceResult({
+    ...cancelled,
+    reason: 'deadline_exceeded'
+  }), /reason|terminal/i)
 })

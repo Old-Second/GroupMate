@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
@@ -10,6 +11,7 @@ import {
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
 import { RunEngine, type StartRunInput } from '../../src/agent/run/run-engine.js'
+import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
 import {
   RunStoreConflictError,
   type RunStore
@@ -397,7 +399,11 @@ class TerminalRaceRunStore implements RunStore {
         engineActivity: Object.freeze({ state: 'idle' }),
         cancellationReason: 'concurrent_terminal'
       }, [], timestamp)
-      await this.base.compareAndSet(expected, terminal)
+      await this.base.commitTerminal(
+        expected,
+        terminal,
+        createRunTerminalSnapshot(terminal)
+      )
       throw new RunStoreConflictError()
     }
     return await this.base.compareAndSet(expected, next)
@@ -407,8 +413,8 @@ class TerminalRaceRunStore implements RunStore {
     await this.base.appendEvents(expected, events)
   )
 
-  finish: RunStore['finish'] = async (expected, summary) => (
-    await this.base.finish(expected, summary)
+  commitTerminal: RunStore['commitTerminal'] = async (expected, next, snapshot) => (
+    await this.base.commitTerminal(expected, next, snapshot)
   )
 
   loadTombstone: RunStore['loadTombstone'] = async runId => (
@@ -420,6 +426,12 @@ function outputText (result: Awaited<ReturnType<RunEngine['start']>>): string | 
   if (result.kind !== 'completed' || result.output === null) return null
   const part = result.output.parts[0]
   return part?.type === 'text' ? part.text : null
+}
+
+function terminalSnapshot (result: RunAdvanceResult) {
+  return result.kind === 'paused' || result.terminal === null
+    ? null
+    : result.terminal.snapshot
 }
 
 test('RunEngine completes one valid pure-text turn and emits ordered events', async () => {
@@ -438,22 +450,22 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
     'run.created', 'run.started', 'context.prepared', 'model.started',
     'model.completed', 'run.completed'
   ])
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.status, 'completed')
-  assert.equal(checkpoint?.budgetCounters.modelTurns, 1)
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    providerRetries: checkpoint.observationCounters.providerRetries,
-    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
-    correctionTurns: checkpoint.observationCounters.correctionTurns,
-    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
-    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
-    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
-    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
-  } : null, {
+  assert.equal(await fixture.store.load('run-1'), null)
+  const snapshot = terminalSnapshot(result)
+  assert.equal(snapshot?.status, 'completed')
+  assert.deepEqual(snapshot === null ? null : {
+    providerAttempts: snapshot.counters.providerAttempts,
+    modelTurns: snapshot.counters.modelTurns,
+    toolAttempts: snapshot.counters.toolAttempts,
+    providerRetries: snapshot.counters.providerRetries,
+    recoveryAttempts: snapshot.counters.recoveryAttempts,
+    correctionTurns: snapshot.counters.correctionTurns,
+    providerInputTokens: snapshot.counters.providerInputTokens,
+    providerOutputTokens: snapshot.counters.providerOutputTokens,
+    providerTotalTokens: snapshot.counters.providerTotalTokens,
+    providerActiveDurationMs: snapshot.counters.providerActiveDurationMs,
+    engineActiveDurationMs: snapshot.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 1,
     modelTurns: 1,
     toolAttempts: 0,
@@ -494,14 +506,8 @@ test('RunEngine keeps actual Provider wire time above one attempt timeout in the
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(result.kind, 'completed')
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.budgetCounters.usedActiveRuntimeMs, 130_000)
-  assert.equal(
-    checkpoint?.schemaVersion === 2
-      ? checkpoint.observationCounters.providerActiveDurationMs
-      : null,
-    130_000
-  )
+  assert.equal(terminalSnapshot(result)?.counters.providerActiveDurationMs, 130_000)
+  assert.equal(await fixture.store.load('run-1'), null)
 })
 
 test('RunEngine persists Provider dispatch reservation before wire and trusted usage after success', async () => {
@@ -528,16 +534,15 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(result.kind, 'completed')
-  const completed = await fixture.store.load('run-1')
-  assert.equal(completed?.schemaVersion, 2)
-  if (completed?.schemaVersion !== 2) throw new TypeError('completed checkpoint is missing')
-  assert.deepEqual(completed.providerDispatch, { state: 'idle' })
+  const completed = terminalSnapshot(result)
+  assert.notEqual(completed, null)
+  if (completed === null) throw new TypeError('terminal snapshot is missing')
   assert.deepEqual({
-    attempts: completed.observationCounters.providerAttempts,
-    modelTurns: completed.observationCounters.modelTurns,
-    input: completed.observationCounters.providerInputTokens,
-    output: completed.observationCounters.providerOutputTokens,
-    total: completed.observationCounters.providerTotalTokens
+    attempts: completed.counters.providerAttempts,
+    modelTurns: completed.counters.modelTurns,
+    input: completed.counters.providerInputTokens,
+    output: completed.counters.providerOutputTokens,
+    total: completed.counters.providerTotalTokens
   }, {
     attempts: 1, modelTurns: 1, input: 7, output: 3, total: 10
   })
@@ -554,7 +559,8 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
     kind: 'cancelled',
     runId: 'run-1',
     runRef: '1'.repeat(32),
-    reason: 'concurrent_terminal'
+    reason: 'other',
+    terminal: null
   })
   assert.equal(fixture.adapter.requests.length, 0)
   assert.equal(fixture.tools.preparations, 0)
@@ -584,7 +590,8 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
     kind: 'cancelled',
     runId: 'run-1',
     runRef: '1'.repeat(32),
-    reason: 'concurrent_terminal'
+    reason: 'other',
+    terminal: null
   })
   assert.equal(fixture.adapter.requests.length, 1)
   assert.equal(modelEvaluationReads, 0)
@@ -626,8 +633,11 @@ test('RunEngine never exposes companion text from a turn that still contains too
   assert.equal(outputText(result), '查询完成')
   assert.equal(JSON.stringify(result).includes('我先查一下'), false)
   assert.equal(JSON.stringify(fixture.events).includes('我先查一下'), false)
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(JSON.stringify(checkpoint).includes('我先查一下'), true)
+  assert.equal(await fixture.store.load('run-1'), null)
+  assert.equal(
+    JSON.stringify(await fixture.store.loadTombstone('run-1')).includes('我先查一下'),
+    false
+  )
 })
 
 test('RunEngine uses at most five normal turns and one tools-disabled correction', async () => {
@@ -647,9 +657,9 @@ test('RunEngine uses at most five normal turns and one tools-disabled correction
   assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode), [
     'auto', 'auto', 'auto', 'auto', 'auto', 'disabled'
   ])
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.budgetCounters.modelTurns, 6)
-  assert.equal(checkpoint?.budgetCounters.correctionTurns, 1)
+  const snapshot = terminalSnapshot(result)
+  assert.equal(snapshot?.counters.modelTurns, 6)
+  assert.equal(snapshot?.counters.correctionTurns, 1)
 })
 
 test('RunEngine corrects one empty response but keeps refusal distinct', async () => {
@@ -657,12 +667,12 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   const corrected = await empty.engine.start(empty.input)
   assert.equal(outputText(corrected), '纠正后的回答')
   assert.equal(empty.adapter.requests[1]?.toolMode, 'disabled')
-  const correctedCheckpoint = await empty.store.load('run-1')
-  assert.deepEqual(correctedCheckpoint?.schemaVersion === 2 ? {
-    providerAttempts: correctedCheckpoint.observationCounters.providerAttempts,
-    modelTurns: correctedCheckpoint.observationCounters.modelTurns,
-    correctionTurns: correctedCheckpoint.observationCounters.correctionTurns
-  } : null, {
+  const correctedSnapshot = terminalSnapshot(corrected)
+  assert.deepEqual(correctedSnapshot === null ? null : {
+    providerAttempts: correctedSnapshot.counters.providerAttempts,
+    modelTurns: correctedSnapshot.counters.modelTurns,
+    correctionTurns: correctedSnapshot.counters.correctionTurns
+  }, {
     providerAttempts: 2,
     modelTurns: 2,
     correctionTurns: 1
@@ -677,12 +687,12 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   ])
   const correctionFailed = await correctionFailure.engine.start(correctionFailure.input)
   assert.equal(correctionFailed.kind, 'failed')
-  const correctionFailedCheckpoint = await correctionFailure.store.load('run-1')
-  assert.deepEqual(correctionFailedCheckpoint?.schemaVersion === 2 ? {
-    providerAttempts: correctionFailedCheckpoint.observationCounters.providerAttempts,
-    modelTurns: correctionFailedCheckpoint.observationCounters.modelTurns,
-    correctionTurns: correctionFailedCheckpoint.observationCounters.correctionTurns
-  } : null, {
+  const correctionFailedSnapshot = terminalSnapshot(correctionFailed)
+  assert.deepEqual(correctionFailedSnapshot === null ? null : {
+    providerAttempts: correctionFailedSnapshot.counters.providerAttempts,
+    modelTurns: correctionFailedSnapshot.counters.modelTurns,
+    correctionTurns: correctionFailedSnapshot.counters.correctionTurns
+  }, {
     providerAttempts: 2,
     modelTurns: 1,
     correctionTurns: 1
@@ -712,7 +722,8 @@ test('RunEngine rejects duplicate or malformed call IDs before ledger preparatio
     assert.equal(result.kind, 'failed')
     assert.equal(result.kind === 'failed' && result.error.code, 'provider_protocol_error')
     assert.equal(fixture.tools.preparations, 0)
-    assert.deepEqual((await fixture.store.load('run-1'))?.toolLedgers, [])
+    assert.equal(terminalSnapshot(result)?.counters.toolCalls, 0)
+    assert.equal(terminalSnapshot(result)?.counters.toolAttempts, 0)
   }
 })
 
@@ -735,16 +746,14 @@ test('RunEngine returns one ordered terminal result for unknown, failed and deni
   assert.deepEqual(toolMessages.map(message => message.role === 'tool' && message.toolCallId), [
     'call-unknown', 'call-failed', 'call-denied'
   ])
-  const ledger = (await fixture.store.load('run-1'))?.toolLedgers[0]
-  assert.deepEqual(ledger?.calls.map(call => call.status), ['denied', 'failed', 'denied'])
-  const checkpoint = await fixture.store.load('run-1')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    toolCalls: checkpoint.observationCounters.toolCalls,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    toolDenied: checkpoint.observationCounters.toolDenied,
-    toolExpired: checkpoint.observationCounters.toolExpired,
-    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate
-  } : null, {
+  const snapshot = terminalSnapshot(result)
+  assert.deepEqual(snapshot === null ? null : {
+    toolCalls: snapshot.counters.toolCalls,
+    toolAttempts: snapshot.counters.toolAttempts,
+    toolDenied: snapshot.counters.toolDenied,
+    toolExpired: snapshot.counters.toolExpired,
+    toolIndeterminate: snapshot.counters.toolIndeterminate
+  }, {
     toolCalls: 3,
     toolAttempts: 2,
     toolDenied: 2,
@@ -761,21 +770,22 @@ test('RunEngine completes visible tool output without asking the Provider for an
 
   const result = await fixture.engine.start(fixture.input)
 
-  assert.deepEqual(result, {
-    kind: 'completed',
-    runId: 'run-1',
-    runRef: '1'.repeat(32),
-    completion: { kind: 'already_visible', source: 'tool_output' },
-    output: null
-  })
+  assert.equal(result.kind, 'completed')
+  assert.equal(result.runId, 'run-1')
+  assert.equal(result.runRef, '1'.repeat(32))
+  assert.deepEqual(
+    result.kind === 'completed' ? result.completion : null,
+    { kind: 'already_visible', source: 'tool_output' }
+  )
+  assert.equal(result.kind === 'completed' ? result.output : undefined, null)
   assert.equal(fixture.adapter.requests.length, 1)
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.schemaVersion, 2)
-  if (checkpoint?.schemaVersion !== 2) throw new TypeError('completed checkpoint is missing')
+  const checkpoint = terminalSnapshot(result)
+  assert.notEqual(checkpoint, null)
+  if (checkpoint === null) throw new TypeError('terminal snapshot is missing')
   assert.deepEqual({
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    toolCalls: checkpoint.observationCounters.toolCalls
+    providerAttempts: checkpoint.counters.providerAttempts,
+    toolAttempts: checkpoint.counters.toolAttempts,
+    toolCalls: checkpoint.counters.toolCalls
   }, { providerAttempts: 1, toolAttempts: 1, toolCalls: 1 })
 })
 
@@ -795,14 +805,14 @@ test('RunEngine counts actual scheduler attempts instead of inferring from the f
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(outputText(result), '重试后完成')
-  const checkpoint = await fixture.store.load('run-1')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    toolCalls: checkpoint.observationCounters.toolCalls,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
-  } : null, {
+  const checkpoint = terminalSnapshot(result)
+  assert.deepEqual(checkpoint === null ? null : {
+    providerAttempts: checkpoint.counters.providerAttempts,
+    modelTurns: checkpoint.counters.modelTurns,
+    toolCalls: checkpoint.counters.toolCalls,
+    toolAttempts: checkpoint.counters.toolAttempts,
+    engineActiveDurationMs: checkpoint.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 2,
     modelTurns: 2,
     toolCalls: 1,
@@ -844,16 +854,16 @@ test('RunEngine preserves exact counters and cumulative engine time across appro
 
   assert.equal(result?.kind, 'completed')
   assert.equal(result === null ? null : outputText(result), '审批后完成')
-  const checkpoint = await fixture.store.load('run-1')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    toolCalls: checkpoint.observationCounters.toolCalls,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    approvalRequests: checkpoint.observationCounters.approvalRequests,
-    toolDenied: checkpoint.observationCounters.toolDenied,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
-  } : null, {
+  const checkpoint = result === null ? null : terminalSnapshot(result)
+  assert.deepEqual(checkpoint === null ? null : {
+    providerAttempts: checkpoint.counters.providerAttempts,
+    modelTurns: checkpoint.counters.modelTurns,
+    toolCalls: checkpoint.counters.toolCalls,
+    toolAttempts: checkpoint.counters.toolAttempts,
+    approvalRequests: checkpoint.counters.approvalRequests,
+    toolDenied: checkpoint.counters.toolDenied,
+    engineActiveDurationMs: checkpoint.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 2,
     modelTurns: 2,
     toolCalls: 1,
@@ -879,17 +889,13 @@ test('RunEngine engine duration is the invocation wall span, not parallel attemp
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(result.kind, 'completed')
-  const checkpoint = await fixture.store.load('run-1')
+  const checkpoint = terminalSnapshot(result)
   assert.equal(
-    checkpoint?.schemaVersion === 2
-      ? checkpoint.observationCounters.engineActiveDurationMs
-      : null,
+    checkpoint?.counters.engineActiveDurationMs ?? null,
     20
   )
   assert.equal(
-    checkpoint?.schemaVersion === 2
-      ? checkpoint.observationCounters.toolAttempts
-      : null,
+    checkpoint?.counters.toolAttempts ?? null,
     2
   )
 })
@@ -906,9 +912,9 @@ test('RunEngine rejects a whole over-budget batch before preparing any capabilit
   assert.equal(fixture.tools.preparations, 0)
   assert.equal(fixture.tools.executions, 0)
   assert.equal(fixture.adapter.requests[1]?.toolMode, 'disabled')
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.budgetCounters.toolCalls, 0)
-  assert.equal(checkpoint?.toolLedgers[0]?.calls.every(call => call.status === 'failed'), true)
+  const checkpoint = terminalSnapshot(result)
+  assert.equal(checkpoint?.counters.toolCalls, 9)
+  assert.equal(checkpoint?.counters.toolAttempts, 0)
 })
 
 test('RunEngine keeps provider retry, context recovery and correction counters separate', async () => {
@@ -917,18 +923,15 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
   })
   const retry = harness([retryable, modelText('重试成功')])
-  assert.equal(outputText(await retry.engine.start(retry.input)), '重试成功')
-  const retried = await retry.store.load('run-1')
+  const retryResult = await retry.engine.start(retry.input)
+  assert.equal(outputText(retryResult), '重试成功')
+  const retried = terminalSnapshot(retryResult)
   assert.deepEqual({
-    provider: retried?.budgetCounters.providerRetries,
-    recovery: retried?.budgetCounters.recoveryAttempts,
-    correction: retried?.budgetCounters.correctionTurns,
-    providerAttempts: retried?.schemaVersion === 2
-      ? retried.observationCounters.providerAttempts
-      : null,
-    providerUsage: retried?.schemaVersion === 2
-      ? retried.observationCounters.providerTotalTokens
-      : null
+    provider: retried?.counters.providerRetries,
+    recovery: retried?.counters.recoveryAttempts,
+    correction: retried?.counters.correctionTurns,
+    providerAttempts: retried?.counters.providerAttempts ?? null,
+    providerUsage: retried?.counters.providerTotalTokens ?? null
   }, {
     provider: 1,
     recovery: 0,
@@ -936,12 +939,12 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     providerAttempts: 2,
     providerUsage: 'unavailable'
   })
-  assert.deepEqual(retried?.schemaVersion === 2 ? {
-    modelTurns: retried.observationCounters.modelTurns,
-    providerRetries: retried.observationCounters.providerRetries,
-    recoveryAttempts: retried.observationCounters.recoveryAttempts,
-    correctionTurns: retried.observationCounters.correctionTurns
-  } : null, {
+  assert.deepEqual(retried === null ? null : {
+    modelTurns: retried.counters.modelTurns,
+    providerRetries: retried.counters.providerRetries,
+    recoveryAttempts: retried.counters.recoveryAttempts,
+    correctionTurns: retried.counters.correctionTurns
+  }, {
     modelTurns: 1,
     providerRetries: 1,
     recoveryAttempts: 0,
@@ -965,21 +968,22 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
       })
     }
   })
-  assert.equal(outputText(await recovered.engine.start(recovered.input)), '恢复成功')
-  const checkpoint = await recovered.store.load('run-1')
+  const recoveredResult = await recovered.engine.start(recovered.input)
+  assert.equal(outputText(recoveredResult), '恢复成功')
+  const checkpoint = terminalSnapshot(recoveredResult)
   assert.equal(recoveries, 1)
   assert.deepEqual({
-    provider: checkpoint?.budgetCounters.providerRetries,
-    recovery: checkpoint?.budgetCounters.recoveryAttempts,
-    correction: checkpoint?.budgetCounters.correctionTurns
+    provider: checkpoint?.counters.providerRetries,
+    recovery: checkpoint?.counters.recoveryAttempts,
+    correction: checkpoint?.counters.correctionTurns
   }, { provider: 0, recovery: 1, correction: 0 })
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    providerRetries: checkpoint.observationCounters.providerRetries,
-    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
-    correctionTurns: checkpoint.observationCounters.correctionTurns
-  } : null, {
+  assert.deepEqual(checkpoint === null ? null : {
+    providerAttempts: checkpoint.counters.providerAttempts,
+    modelTurns: checkpoint.counters.modelTurns,
+    providerRetries: checkpoint.counters.providerRetries,
+    recoveryAttempts: checkpoint.counters.recoveryAttempts,
+    correctionTurns: checkpoint.counters.correctionTurns
+  }, {
     providerAttempts: 2,
     modelTurns: 1,
     providerRetries: 0,
@@ -1002,18 +1006,18 @@ test('RunEngine preserves the allowed retry count and the final provider error a
   assert.equal(result.kind, 'failed')
   assert.equal(result.kind === 'failed' && result.error.code, 'provider_unavailable')
   assert.equal(fixture.adapter.requests.length, 2)
-  assert.equal((await fixture.store.load('run-1'))?.budgetCounters.providerRetries, 1)
-  const checkpoint = await fixture.store.load('run-1')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    providerRetries: checkpoint.observationCounters.providerRetries,
-    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
-    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
-    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
-    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs
-  } : null, {
+  const checkpoint = terminalSnapshot(result)
+  assert.equal(checkpoint?.counters.providerRetries, 1)
+  assert.deepEqual(checkpoint === null ? null : {
+    providerAttempts: checkpoint.counters.providerAttempts,
+    modelTurns: checkpoint.counters.modelTurns,
+    providerRetries: checkpoint.counters.providerRetries,
+    providerInputTokens: checkpoint.counters.providerInputTokens,
+    providerOutputTokens: checkpoint.counters.providerOutputTokens,
+    providerTotalTokens: checkpoint.counters.providerTotalTokens,
+    providerActiveDurationMs: checkpoint.counters.providerActiveDurationMs,
+    engineActiveDurationMs: checkpoint.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 2,
     modelTurns: 0,
     providerRetries: 1,
@@ -1049,7 +1053,7 @@ test('RunEngine never applies legacy context recovery after a tool has been prep
   assert.equal(result.kind, 'failed')
   assert.equal(result.kind === 'failed' && result.error.code, 'provider_invalid_request')
   assert.equal(recoveries, 0)
-  assert.equal((await fixture.store.load('run-1'))?.budgetCounters.recoveryAttempts, 0)
+  assert.equal(terminalSnapshot(result)?.counters.recoveryAttempts, 0)
 })
 
 test('RunEngine cancels an expired deadline before any Provider call', async () => {
@@ -1059,12 +1063,11 @@ test('RunEngine cancels an expired deadline before any Provider call', async () 
 
   const result = await fixture.engine.start(fixture.input)
 
-  assert.deepEqual(result, {
-    kind: 'cancelled',
-    runId: 'run-1',
-    runRef: '1'.repeat(32),
-    reason: 'deadline_exceeded'
-  })
+  assert.equal(result.kind, 'cancelled')
+  assert.equal(result.runId, 'run-1')
+  assert.equal(result.runRef, '1'.repeat(32))
+  assert.equal(result.kind === 'cancelled' ? result.reason : null, 'deadline_exceeded')
+  assert.equal(terminalSnapshot(result)?.status, 'cancelled')
   assert.equal(fixture.adapter.requests.length, 0)
 })
 
@@ -1100,27 +1103,29 @@ test('RunEngine cancellation wins over a late Provider result and suppresses ter
   const cancelled = await fixture.engine.cancel('run-1', 'user_cancelled')
   const result = await running
   assert.equal(cancelled.kind, 'cancelled')
-  assert.deepEqual(result, cancelled)
+  assert.equal(result.kind, 'cancelled')
+  assert.equal(result.kind === 'cancelled' ? result.reason : null, 'user_cancelled')
+  assert.equal(result.runRef, '1'.repeat(32))
+  assert.equal(result.kind === 'cancelled' ? result.terminal : undefined, null)
+  assert.notEqual(terminalSnapshot(cancelled), null)
 
   pendingTurn.resolve(modelText('迟到结果'))
   await new Promise(resolve => setImmediate(resolve))
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.status, 'cancelled')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    providerAttempts: checkpoint.observationCounters.providerAttempts,
-    providerRetries: checkpoint.observationCounters.providerRetries,
-    recoveryAttempts: checkpoint.observationCounters.recoveryAttempts,
-    correctionTurns: checkpoint.observationCounters.correctionTurns,
-    providerInputTokens: checkpoint.observationCounters.providerInputTokens,
-    providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
-    providerTotalTokens: checkpoint.observationCounters.providerTotalTokens,
-    providerActiveDurationMs: checkpoint.observationCounters.providerActiveDurationMs,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs,
-    providerDispatch: checkpoint.providerDispatch.state,
-    engineActivity: checkpoint.engineActivity.state
-  } : null, {
+  assert.equal(await fixture.store.load('run-1'), null)
+  const checkpoint = terminalSnapshot(cancelled)
+  assert.deepEqual(checkpoint === null ? null : {
+    providerAttempts: checkpoint.counters.providerAttempts,
+    providerRetries: checkpoint.counters.providerRetries,
+    recoveryAttempts: checkpoint.counters.recoveryAttempts,
+    correctionTurns: checkpoint.counters.correctionTurns,
+    providerInputTokens: checkpoint.counters.providerInputTokens,
+    providerOutputTokens: checkpoint.counters.providerOutputTokens,
+    providerTotalTokens: checkpoint.counters.providerTotalTokens,
+    providerActiveDurationMs: checkpoint.counters.providerActiveDurationMs,
+    modelTurns: checkpoint.counters.modelTurns,
+    toolAttempts: checkpoint.counters.toolAttempts,
+    engineActiveDurationMs: checkpoint.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 'unavailable',
     providerRetries: 'unavailable',
     recoveryAttempts: 'unavailable',
@@ -1131,9 +1136,7 @@ test('RunEngine cancellation wins over a late Provider result and suppresses ter
     providerActiveDurationMs: 'unavailable',
     modelTurns: 'unavailable',
     toolAttempts: 'unavailable',
-    engineActiveDurationMs: 'unavailable',
-    providerDispatch: 'idle',
-    engineActivity: 'idle'
+    engineActiveDurationMs: 'unavailable'
   })
   assert.equal(fixture.events.includes('run.completed'), false)
   assert.equal(fixture.events.filter(type => type === 'run.cancelled').length, 1)
@@ -1150,30 +1153,25 @@ test('RunEngine marks an in-flight side effect indeterminate when cancellation w
   const running = fixture.engine.start(fixture.input)
   await started.promise
 
-  await fixture.engine.cancel('run-1', 'user_cancelled')
+  const cancelled = await fixture.engine.cancel('run-1', 'user_cancelled')
   const result = await running
   assert.equal(result.kind, 'cancelled')
-  const checkpoint = await fixture.store.load('run-1')
-  assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, 'indeterminate')
-  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
-    toolAttempts: checkpoint.observationCounters.toolAttempts,
-    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate,
-    modelTurns: checkpoint.observationCounters.modelTurns,
-    engineActiveDurationMs: checkpoint.observationCounters.engineActiveDurationMs,
-    providerDispatch: checkpoint.providerDispatch.state,
-    engineActivity: checkpoint.engineActivity.state
-  } : null, {
+  const checkpoint = terminalSnapshot(cancelled)
+  assert.deepEqual(checkpoint === null ? null : {
+    toolAttempts: checkpoint.counters.toolAttempts,
+    toolIndeterminate: checkpoint.counters.toolIndeterminate,
+    modelTurns: checkpoint.counters.modelTurns,
+    engineActiveDurationMs: checkpoint.counters.engineActiveDurationMs
+  }, {
     toolAttempts: 'unavailable',
     toolIndeterminate: 1,
     modelTurns: 'unavailable',
-    engineActiveDurationMs: 'unavailable',
-    providerDispatch: 'idle',
-    engineActivity: 'idle'
+    engineActiveDurationMs: 'unavailable'
   })
 
   toolResult.resolve(success('迟到副作用'))
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal((await fixture.store.load('run-1'))?.status, 'cancelled')
+  assert.equal(await fixture.store.load('run-1'), null)
 })
 
 test('RunEngine does not call an unstarted side effect indeterminate on cancellation', async () => {
@@ -1190,20 +1188,14 @@ test('RunEngine does not call an unstarted side effect indeterminate on cancella
   const running = fixture.engine.start(fixture.input)
   await contextEntered.promise
 
-  await fixture.engine.cancel('run-1', 'user_cancelled')
+  const cancelled = await fixture.engine.cancel('run-1', 'user_cancelled')
   const result = await running
 
   assert.equal(result.kind, 'cancelled')
   assert.equal(fixture.tools.executions, 0)
+  const cancelledCheckpoint = terminalSnapshot(cancelled)
   assert.equal(
-    (await fixture.store.load('run-1'))?.toolLedgers[0]?.calls[0]?.status,
-    'cancelled'
-  )
-  const cancelledCheckpoint = await fixture.store.load('run-1')
-  assert.equal(
-    cancelledCheckpoint?.schemaVersion === 2
-      ? cancelledCheckpoint.observationCounters.toolAttempts
-      : null,
+    cancelledCheckpoint?.counters.toolAttempts ?? null,
     'unavailable'
   )
   freshContext.resolve(execution())

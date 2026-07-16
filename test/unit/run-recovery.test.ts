@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
+import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import { ModelProviderError, type ModelAdapter, type ModelRequest, type ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { RunAdmission } from '../../src/agent/run/run-admission.js'
@@ -53,6 +54,12 @@ const facts: ToolRuntimeFacts = Object.freeze({
   botGroupRole: 'owner', actorGroupRole: 'owner', targetRole: 'member',
   targetIsBotMaster: false, targetExists: true
 })
+
+function terminalSnapshot (result: RunAdvanceResult) {
+  return result.kind === 'paused' || result.terminal === null
+    ? null
+    : result.terminal.snapshot
+}
 const preparation: ToolPreparationContext = Object.freeze({
   runId: 'run-1', profile: 'compatible', facts,
   intent: Object.freeze({
@@ -601,24 +608,22 @@ test('RunEngine degrades every ambiguous dispatch and activity counter after res
 
     assert.equal(result.kind, 'completed')
     assert.equal(adapter.calls, 1)
-    const terminal = await store.load(source.runId)
-    assert.deepEqual(terminal?.schemaVersion === 2 ? {
-      providerAttempts: terminal.observationCounters.providerAttempts,
-      providerRetries: terminal.observationCounters.providerRetries,
-      recoveryAttempts: terminal.observationCounters.recoveryAttempts,
-      correctionTurns: terminal.observationCounters.correctionTurns,
-      providerInputTokens: terminal.observationCounters.providerInputTokens,
-      providerOutputTokens: terminal.observationCounters.providerOutputTokens,
-      providerTotalTokens: terminal.observationCounters.providerTotalTokens,
-      providerActiveDurationMs: terminal.observationCounters.providerActiveDurationMs,
-      modelTurns: terminal.observationCounters.modelTurns,
-      toolAttempts: terminal.observationCounters.toolAttempts,
-      engineActiveDurationMs: terminal.observationCounters.engineActiveDurationMs,
-      toolCalls: terminal.observationCounters.toolCalls,
-      approvalRequests: terminal.observationCounters.approvalRequests,
-      providerDispatch: terminal.providerDispatch.state,
-      engineActivity: terminal.engineActivity.state
-    } : null, {
+    const terminal = terminalSnapshot(result)
+    assert.deepEqual(terminal === null ? null : {
+      providerAttempts: terminal.counters.providerAttempts,
+      providerRetries: terminal.counters.providerRetries,
+      recoveryAttempts: terminal.counters.recoveryAttempts,
+      correctionTurns: terminal.counters.correctionTurns,
+      providerInputTokens: terminal.counters.providerInputTokens,
+      providerOutputTokens: terminal.counters.providerOutputTokens,
+      providerTotalTokens: terminal.counters.providerTotalTokens,
+      providerActiveDurationMs: terminal.counters.providerActiveDurationMs,
+      modelTurns: terminal.counters.modelTurns,
+      toolAttempts: terminal.counters.toolAttempts,
+      engineActiveDurationMs: terminal.counters.engineActiveDurationMs,
+      toolCalls: terminal.counters.toolCalls,
+      approvalRequests: terminal.counters.approvalRequests
+    }, {
       providerAttempts: 'unavailable',
       providerRetries: 'unavailable',
       recoveryAttempts: 'unavailable',
@@ -631,9 +636,7 @@ test('RunEngine degrades every ambiguous dispatch and activity counter after res
       toolAttempts: 'unavailable',
       engineActiveDurationMs: 'unavailable',
       toolCalls: 0,
-      approvalRequests: 0,
-      providerDispatch: 'idle',
-      engineActivity: 'idle'
+      approvalRequests: 0
     })
   }
 })
@@ -683,19 +686,17 @@ test('RunEngine engine-reserved recovery preserves independently proven Provider
   const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
 
   assert.equal(result.kind, 'completed')
-  const terminal = await store.load(source.runId)
-  assert.deepEqual(terminal?.schemaVersion === 2 ? {
-    providerAttempts: terminal.observationCounters.providerAttempts,
-    providerInputTokens: terminal.observationCounters.providerInputTokens,
-    providerOutputTokens: terminal.observationCounters.providerOutputTokens,
-    providerTotalTokens: terminal.observationCounters.providerTotalTokens,
-    providerActiveDurationMs: terminal.observationCounters.providerActiveDurationMs,
-    modelTurns: terminal.observationCounters.modelTurns,
-    toolAttempts: terminal.observationCounters.toolAttempts,
-    engineActiveDurationMs: terminal.observationCounters.engineActiveDurationMs,
-    providerDispatch: terminal.providerDispatch.state,
-    engineActivity: terminal.engineActivity.state
-  } : null, {
+  const terminal = terminalSnapshot(result)
+  assert.deepEqual(terminal === null ? null : {
+    providerAttempts: terminal.counters.providerAttempts,
+    providerInputTokens: terminal.counters.providerInputTokens,
+    providerOutputTokens: terminal.counters.providerOutputTokens,
+    providerTotalTokens: terminal.counters.providerTotalTokens,
+    providerActiveDurationMs: terminal.counters.providerActiveDurationMs,
+    modelTurns: terminal.counters.modelTurns,
+    toolAttempts: terminal.counters.toolAttempts,
+    engineActiveDurationMs: terminal.counters.engineActiveDurationMs
+  }, {
     providerAttempts: 2,
     providerInputTokens: 12,
     providerOutputTokens: 5,
@@ -703,9 +704,7 @@ test('RunEngine engine-reserved recovery preserves independently proven Provider
     providerActiveDurationMs: 5,
     modelTurns: 'unavailable',
     toolAttempts: 'unavailable',
-    engineActiveDurationMs: 'unavailable',
-    providerDispatch: 'idle',
-    engineActivity: 'idle'
+    engineActiveDurationMs: 'unavailable'
   })
 })
 
@@ -906,5 +905,5 @@ test('RunEngine keeps a final retryable provider error typed after restart', asy
   assert.equal(result.kind, 'failed')
   assert.equal(result.kind === 'failed' && result.error.code, 'provider_unavailable')
   assert.equal(adapter.calls, 2)
-  assert.equal((await store.loadTombstone(source.runId))?.providerRetries, 1)
+  assert.equal((await store.loadTombstone(source.runId))?.counters.providerRetries, 1)
 })

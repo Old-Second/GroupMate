@@ -13,11 +13,11 @@ import {
 } from '../../src/agent/run/run-checkpoint.js'
 import { upgradeRunCheckpointV1 } from '../../src/agent/run/run-checkpoint-migration.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
-import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
 import {
-  createRunTombstone,
-  RunReferenceConflictError
-} from '../../src/agent/run/run-store.js'
+  createFrozenObservationPolicy,
+  createRunTerminalSnapshot
+} from '../../src/agent/run/run-observation.js'
+import { RunReferenceConflictError } from '../../src/agent/run/run-store.js'
 import {
   RedisRunStore,
   RUN_STORE_LUA_MARKER,
@@ -226,7 +226,21 @@ test('RedisRunStore atomically replaces terminal state with one bounded 24-hour 
     cancellationReason: 'user_cancelled'
   }, [event(created.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
 
-  assert.deepEqual(await store.compareAndSet(created, cancelled), cancelled)
+  const snapshot = createRunTerminalSnapshot(cancelled)
+  const receipt = await store.commitTerminal(created, cancelled, snapshot)
+  assert.deepEqual({
+    observationId: receipt.observationId,
+    runRef: receipt.runRef,
+    revision: receipt.revision,
+    deletedKeyCount: receipt.deletedKeyCount,
+    createdKeyCount: receipt.createdKeyCount
+  }, {
+    observationId: snapshot.observationId,
+    runRef: snapshot.runRef,
+    revision: snapshot.revision,
+    deletedKeyCount: 2,
+    createdKeyCount: 1
+  })
   assert.equal(await store.load(created.runId), null)
   const tombstone = await store.loadTombstone(created.runId)
   assert.equal(tombstone?.status, 'cancelled')
@@ -239,7 +253,7 @@ test('RedisRunStore atomically replaces terminal state with one bounded 24-hour 
   assert.equal(await redis.ttl(redisRunReferenceKey(created.runRef)), 86_400)
 })
 
-test('RedisRunStore appends immutable events and supports the explicit finish port', async () => {
+test('RedisRunStore appends immutable events and uses the only terminal commit port', async () => {
   let nowMs = Date.parse(timestamp)
   const redis = new FakeRedis(() => nowMs)
   const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
@@ -256,10 +270,11 @@ test('RedisRunStore appends immutable events and supports the explicit finish po
     cancellationReason: 'user_cancelled'
   }, [event(created.runId, 2, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
   nowMs += 10_000
-  const tombstone = await store.finish(appended, createRunTombstone(cancelled))
-  assert.equal(tombstone.status, 'cancelled')
+  const snapshot = createRunTerminalSnapshot(cancelled)
+  const receipt = await store.commitTerminal(appended, cancelled, snapshot)
+  assert.equal(receipt.observationId, snapshot.observationId)
   assert.equal(await store.load(created.runId), null)
-  assert.deepEqual(await store.loadTombstone(created.runId), tombstone)
+  assert.equal((await store.loadTombstone(created.runId))?.status, 'cancelled')
   assert.equal(await redis.ttl(redisRunReferenceKey(created.runRef)), 86_400)
 })
 

@@ -12,7 +12,10 @@ import type {
   PresentationRouteV1,
   TrustedRequestKind
 } from '../contracts/interaction.js'
-import type { RunAdvanceResult } from '../contracts/result.js'
+import type {
+  RunAdvanceResult,
+  TerminalFactsV1
+} from '../contracts/result.js'
 import type {
   ModelAdapter,
   ModelMessage,
@@ -57,10 +60,11 @@ import {
   type RunModelConfig
 } from './run-checkpoint.js'
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js'
-import type {
-  FrozenObservationPolicyV1,
-  ObservationCount,
-  RunObservationCountersV1
+import {
+  createRunTerminalSnapshot,
+  type FrozenObservationPolicyV1,
+  type ObservationCount,
+  type RunObservationCountersV1
 } from './run-observation.js'
 import { createRequestRef, createRunRef } from './run-reference.js'
 import { createRunEvent } from './run-events.js'
@@ -68,6 +72,7 @@ import { isTerminalRunStatus, type RunStatus } from './run-state.js'
 import {
   RunReferenceConflictError,
   RunStoreConflictError,
+  type NormalizedRunTombstoneV1,
   type RunStore
 } from './run-store.js'
 import {
@@ -346,6 +351,47 @@ function checkpointConflict (cause?: unknown): AgentError {
   })
 }
 
+class ConcurrentTerminalError extends Error {
+  readonly tombstone: NormalizedRunTombstoneV1
+
+  constructor (tombstone: NormalizedRunTombstoneV1) {
+    super('run reached a concurrent terminal state')
+    this.name = 'ConcurrentTerminalError'
+    this.tombstone = tombstone
+  }
+}
+
+function observedTerminalResult (
+  runId: string,
+  tombstone: NormalizedRunTombstoneV1
+): RunAdvanceResult {
+  if (tombstone.status === 'cancelled') {
+    return Object.freeze({
+      kind: 'cancelled',
+      runId,
+      runRef: tombstone.runRef,
+      reason: tombstone.cancellationReason ?? 'other',
+      terminal: null
+    })
+  }
+  return Object.freeze({
+    kind: 'failed',
+    runId,
+    runRef: tombstone.runRef,
+    error: serializeAgentError(new AgentError({
+      code: tombstone.status === 'failed'
+        ? tombstone.errorCode ?? 'checkpoint_conflict'
+        : 'checkpoint_conflict',
+      stage: 'run.concurrent_terminal',
+      retryable: false,
+      userMessage: tombstone.status === 'failed'
+        ? '任务执行失败，请重新发起。'
+        : '任务已由另一个执行器完成。'
+    })),
+    terminal: null
+  })
+}
+
 function toolOutcomeUnknown (): AgentError {
   return new AgentError({
     code: 'tool_outcome_unknown',
@@ -372,17 +418,24 @@ function estimatedTokensFor (value: unknown): number {
   return Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(value), 'utf8') / 4))
 }
 
-function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
+function terminalResult (
+  checkpoint: RunCheckpoint,
+  terminal: TerminalFactsV1 | null
+): RunAdvanceResult {
   if (checkpoint.status === 'completed') {
     if (checkpoint.completion === null) {
       throw new TypeError('completed checkpoint disposition is missing')
+    }
+    if (terminal === null) {
+      throw new TypeError('completed checkpoint terminal facts are missing')
     }
     return Object.freeze({
       kind: 'completed',
       runId: checkpoint.runId,
       runRef: checkpoint.runRef,
       completion: checkpoint.completion,
-      output: checkpoint.output
+      output: checkpoint.output,
+      terminal
     })
   }
   if (checkpoint.status === 'failed' && checkpoint.error !== null) {
@@ -390,7 +443,8 @@ function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
       kind: 'failed',
       runId: checkpoint.runId,
       runRef: checkpoint.runRef,
-      error: checkpoint.error
+      error: checkpoint.error,
+      terminal
     })
   }
   if (checkpoint.status === 'cancelled' && checkpoint.cancellationReason !== null) {
@@ -398,7 +452,8 @@ function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
       kind: 'cancelled',
       runId: checkpoint.runId,
       runRef: checkpoint.runRef,
-      reason: checkpoint.cancellationReason
+      reason: checkpoint.cancellationReason,
+      terminal
     })
   }
   if (checkpoint.status === 'waiting_approval' && checkpoint.interruption !== null) {
@@ -549,6 +604,7 @@ export class RunEngine {
   readonly #controllers = new Map<string, AbortController>()
   readonly #startedToolCalls = new Map<string, Set<string>>()
   readonly #engineActivityStarts = new Map<string, number>()
+  readonly #terminalFacts = new WeakMap<RunCheckpoint, TerminalFactsV1>()
 
   constructor (options: RunEngineOptions) {
     this.#adapter = options.adapter
@@ -562,6 +618,10 @@ export class RunEngine {
     this.#createRunRef = options.createRunRef ?? createRunRef
     this.#createRequestRef = options.createRequestRef ?? createRequestRef
     this.#observer = options.observer
+  }
+
+  #terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
+    return terminalResult(checkpoint, this.#terminalFacts.get(checkpoint) ?? null)
   }
 
   async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
@@ -685,7 +745,7 @@ export class RunEngine {
     let preparationContext: ToolPreparationContext | undefined
     try {
       checkpoint = await this.#beginEngineActivity(checkpoint)
-      if (isTerminalRunStatus(checkpoint.status)) return terminalResult(checkpoint)
+      if (isTerminalRunStatus(checkpoint.status)) return this.#terminalResult(checkpoint)
       if (kind === 'approved') {
         let prepared: {
           readonly capability: SerializablePreparedCapability
@@ -819,7 +879,7 @@ export class RunEngine {
       this.#notifyNewEvents(checkpoint, stored)
       if (stored.status === 'waiting_approval') {
         this.#engineActivityStarts.delete(input.runId)
-        return terminalResult(stored)
+        return this.#terminalResult(stored)
       }
       const timer = this.#deadlineTimer(stored, controller)
       try {
@@ -831,6 +891,11 @@ export class RunEngine {
           this.#cleanupRun(input.runId, controller)
         }
       }
+    } catch (error) {
+      if (error instanceof ConcurrentTerminalError) {
+        return observedTerminalResult(input.runId, error.tombstone)
+      }
+      throw error
     } finally {
       detach()
     }
@@ -896,7 +961,8 @@ export class RunEngine {
         kind: 'failed',
         runId: input.runId,
         runRef: input.runRef,
-        error: serializeAgentError(asAgentError(error))
+        error: serializeAgentError(asAgentError(error)),
+        terminal: null
       })
     }
     this.#notify(event)
@@ -910,8 +976,13 @@ export class RunEngine {
         return await this.cancel(input.runId, 'deadline_exceeded')
       }
       stored = await this.#beginEngineActivity(stored)
-      if (isTerminalRunStatus(stored.status)) return terminalResult(stored)
+      if (isTerminalRunStatus(stored.status)) return this.#terminalResult(stored)
       return await this.#drive(stored, controller)
+    } catch (error) {
+      if (error instanceof ConcurrentTerminalError) {
+        return observedTerminalResult(input.runId, error.tombstone)
+      }
+      throw error
     } finally {
       detach()
       if (timer !== undefined) clearTimeout(timer)
@@ -938,7 +1009,8 @@ export class RunEngine {
         kind: 'failed',
         runId,
         runRef: 'unavailable',
-        error: serializeAgentError(asAgentError(error))
+        error: serializeAgentError(asAgentError(error)),
+        terminal: null
       })
     }
     if (checkpoint === null) {
@@ -952,15 +1024,23 @@ export class RunEngine {
           stage: 'run.resume',
           retryable: false,
           userMessage: '任务状态不存在或已失效。'
-        }))
+        })),
+        terminal: null
       })
     }
     if (isTerminalRunStatus(checkpoint.status)) {
-      return terminalResult(checkpoint)
+      return this.#terminalResult(checkpoint)
     }
     if (checkpoint.status === 'waiting_approval') {
-      checkpoint = await this.#recoverObservationReservations(checkpoint)
-      return terminalResult(checkpoint)
+      try {
+        checkpoint = await this.#recoverObservationReservations(checkpoint)
+        return this.#terminalResult(checkpoint)
+      } catch (error) {
+        if (error instanceof ConcurrentTerminalError) {
+          return observedTerminalResult(runId, error.tombstone)
+        }
+        throw error
+      }
     }
     const controller = this.#controllers.get(runId) ?? new AbortController()
     this.#controllers.set(runId, controller)
@@ -968,18 +1048,23 @@ export class RunEngine {
     const timer = this.#deadlineTimer(checkpoint, controller)
     try {
       let resumable = await this.#beginEngineActivity(checkpoint)
-      if (isTerminalRunStatus(resumable.status)) return terminalResult(resumable)
+      if (isTerminalRunStatus(resumable.status)) return this.#terminalResult(resumable)
       try {
         this.#assertRecoveredCompatibility(resumable)
         if (resumable.status === 'executing_tools') {
           resumable = await this.#recoverExecutingTools(resumable)
-          if (isTerminalRunStatus(resumable.status)) return terminalResult(resumable)
+          if (isTerminalRunStatus(resumable.status)) return this.#terminalResult(resumable)
         }
       } catch (error) {
         const failed = await this.#fail(resumable, asAgentError(error))
-        return terminalResult(failed)
+        return this.#terminalResult(failed)
       }
       return await this.#drive(resumable, controller)
+    } catch (error) {
+      if (error instanceof ConcurrentTerminalError) {
+        return observedTerminalResult(runId, error.tombstone)
+      }
+      throw error
     } finally {
       detach()
       if (timer !== undefined) clearTimeout(timer)
@@ -996,40 +1081,47 @@ export class RunEngine {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const checkpoint = await this.loadCheckpoint(runId)
       if (checkpoint === null) {
+        const tombstone = await this.#store.loadTombstone(runId).catch(() => null)
+        if (tombstone !== null) return observedTerminalResult(runId, tombstone)
         return Object.freeze({
           kind: 'cancelled',
           runId,
           runRef: 'unavailable',
-          reason: cancellationReason
+          reason: cancellationReason,
+          terminal: null
         })
       }
-      if (isTerminalRunStatus(checkpoint.status)) return terminalResult(checkpoint)
+      if (isTerminalRunStatus(checkpoint.status)) return this.#terminalResult(checkpoint)
       const started = this.#startedToolCalls.get(runId) ?? new Set<string>()
       const ledgers = checkpoint.toolLedgers.map((ledger, index, all) => (
         index === all.length - 1
           ? cancelToolExecutionLedger(ledger, started)
           : ledger
       ))
-      const next = this.#next(checkpoint, 'cancelled', {
-        toolLedgers: Object.freeze(ledgers),
-        preparedBatch: null,
-        interruption: null,
-        modelTurn: null,
-        cancellationReason
-      }, [{ type: 'run.cancelled', payload: { reason: cancellationReason } }])
       try {
-        const stored = await this.#store.compareAndSet(checkpoint, next)
-        this.#notifyNewEvents(checkpoint, stored)
-        return terminalResult(stored)
+        const stored = await this.#commit(checkpoint, 'cancelled', {
+          toolLedgers: Object.freeze(ledgers),
+          preparedBatch: null,
+          interruption: null,
+          modelTurn: null,
+          cancellationReason
+        }, [{ type: 'run.cancelled', payload: { reason: cancellationReason } }], 'degrade')
+        return this.#terminalResult(stored)
       } catch (error) {
-        if (!(error instanceof RunStoreConflictError)) throw error
+        if (error instanceof ConcurrentTerminalError) {
+          return observedTerminalResult(runId, error.tombstone)
+        }
+        if (!(error instanceof AgentError && error.code === 'checkpoint_conflict')) {
+          throw error
+        }
       }
     }
     return Object.freeze({
       kind: 'failed',
       runId,
       runRef: 'unavailable',
-      error: serializeAgentError(checkpointConflict())
+      error: serializeAgentError(checkpointConflict()),
+      terminal: null
     })
   }
 
@@ -1157,7 +1249,7 @@ export class RunEngine {
   ): Promise<RunAdvanceResult> {
     let checkpoint = initial
     while (!isTerminalRunStatus(checkpoint.status)) {
-      if (checkpoint.status === 'waiting_approval') return terminalResult(checkpoint)
+      if (checkpoint.status === 'waiting_approval') return this.#terminalResult(checkpoint)
       if (controller.signal.aborted) {
         return await this.cancel(
           checkpoint.runId,
@@ -1170,6 +1262,9 @@ export class RunEngine {
       try {
         checkpoint = await this.#advance(checkpoint, controller.signal)
       } catch (error) {
+        if (error instanceof ConcurrentTerminalError) {
+          return observedTerminalResult(checkpoint.runId, error.tombstone)
+        }
         if (isAbortError(error) || controller.signal.aborted) {
           return await this.cancel(
             checkpoint.runId,
@@ -1179,7 +1274,7 @@ export class RunEngine {
         checkpoint = await this.#fail(checkpoint, asAgentError(error))
       }
     }
-    return terminalResult(checkpoint)
+    return this.#terminalResult(checkpoint)
   }
 
   async #advance (
@@ -1959,7 +2054,7 @@ export class RunEngine {
     status: RunStatus,
     changes: RunCheckpointChanges,
     drafts: readonly EventDraft[],
-    closeActivityBoundary = true
+    closeActivityBoundary: boolean | 'degrade' = true
   ): Promise<RunCheckpoint> {
     const next = this.#next(
       checkpoint,
@@ -1968,18 +2063,28 @@ export class RunEngine {
       drafts,
       closeActivityBoundary
     )
-    const closesActivity = closeActivityBoundary &&
+    const closesActivity = closeActivityBoundary !== false &&
       (isTerminalRunStatus(status) || status === 'waiting_approval')
     try {
-      const stored = await this.#store.compareAndSet(checkpoint, next)
+      let stored: RunCheckpoint
+      if (isTerminalRunStatus(next.status)) {
+        const snapshot = createRunTerminalSnapshot(next)
+        const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot)
+        const terminal = Object.freeze({ snapshot, receipt })
+        this.#terminalFacts.set(next, terminal)
+        stored = next
+      } else {
+        stored = await this.#store.compareAndSet(checkpoint, next)
+      }
       if (closesActivity) this.#engineActivityStarts.delete(checkpoint.runId)
       this.#notifyNewEvents(checkpoint, stored)
       return stored
     } catch (error) {
       if (error instanceof RunStoreConflictError) {
         this.#engineActivityStarts.delete(checkpoint.runId)
-        const latest = await this.loadCheckpoint(checkpoint.runId)
-        if (latest !== null && isTerminalRunStatus(latest.status)) return latest
+        const tombstone = await this.#store.loadTombstone(checkpoint.runId)
+          .catch(() => null)
+        if (tombstone !== null) throw new ConcurrentTerminalError(tombstone)
         throw checkpointConflict(error)
       }
       throw error

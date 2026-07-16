@@ -165,42 +165,26 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const oldEvents = this.entryValue(eventKey)
       const reference = this.entryValue(referenceKey)
       if (oldCheckpoint !== args[1] || oldEvents !== args[2] ||
-        reference !== args[9]) return 'conflict'
-      const terminal = args[6] === '1'
+        reference !== args[6]) return 'conflict'
       const projected = {
-        bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents),
-        checkpoints: usage.checkpoints - 1,
-        events: usage.events - 1,
+        bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents) +
+          this.bytes(args[3]) + this.bytes(args[4]),
+        checkpoints: usage.checkpoints,
+        events: usage.events,
         tombstones: usage.tombstones,
         indexes: usage.indexes,
         references: usage.references
       }
-      if (terminal) {
-        if (tombstoneKey === undefined || this.entries.has(tombstoneKey)) return 'conflict'
-        projected.bytes += this.bytes(args[7])
-        projected.tombstones += 1
-      } else {
-        projected.bytes += this.bytes(args[3]) + this.bytes(args[4])
-        projected.checkpoints += 1
-        projected.events += 1
-      }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
-      if (terminal) {
-        this.entries.delete(checkpointKey)
-        this.entries.delete(eventKey)
-        this.setDirect(tombstoneKey, args[7], Number(args[8]))
-        this.setDirect(referenceKey, args[9], Number(args[8]))
-      } else {
-        this.setDirect(checkpointKey, args[3], Number(args[5]))
-        this.setDirect(eventKey, args[4], Number(args[5]))
-        this.setDirect(referenceKey, args[9], Number(args[5]))
-      }
+      this.setDirect(checkpointKey, args[3], Number(args[5]))
+      this.setDirect(eventKey, args[4], Number(args[5]))
+      this.setDirect(referenceKey, args[6], Number(args[5]))
       this.saveRunNamespaceUsage(metadataKey, projected)
       return 'ok'
     }
 
-    if (operation === 'finish') {
+    if (operation === 'commit_terminal') {
       const oldCheckpoint = this.entryValue(checkpointKey)
       const oldEvents = this.entryValue(eventKey)
       const reference = this.entryValue(referenceKey)
@@ -217,12 +201,20 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
-      this.entries.delete(checkpointKey)
-      this.entries.delete(eventKey)
+      let deleted = 0
+      if (checkpointKey !== undefined && this.entries.delete(checkpointKey)) deleted += 1
+      if (eventKey !== undefined && this.entries.delete(eventKey)) deleted += 1
       this.setDirect(tombstoneKey, args[3], Number(args[4]))
       this.setDirect(referenceKey, args[5], Number(args[4]))
       this.saveRunNamespaceUsage(metadataKey, projected)
-      return 'ok'
+      return [
+        'ok',
+        deleted,
+        1,
+        this.bytes(oldCheckpoint),
+        this.bytes(oldEvents),
+        this.bytes(args[3])
+      ]
     }
 
     if (operation === 'admission_acquire') {

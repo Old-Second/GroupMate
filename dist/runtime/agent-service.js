@@ -24,7 +24,8 @@ function failedEnvelope(runId, error, runRef = 'unavailable') {
         kind: 'failed',
         runId,
         runRef,
-        error: serializeAgentError(asAgentError(error))
+        error: serializeAgentError(asAgentError(error)),
+        terminal: null
     });
 }
 function cancellationReason(value, fallback = 'user_cancelled') {
@@ -60,7 +61,8 @@ function cancelledEnvelope(runId, reason = 'user_cancelled', runRef = 'unavailab
         kind: 'cancelled',
         runId,
         runRef,
-        reason: cancellationReason(reason)
+        reason: cancellationReason(reason),
+        terminal: null
     });
 }
 function linkedAbortSignal(callerSignal, lifecycleSignal) {
@@ -678,22 +680,26 @@ export class AgentService {
         await this.#progressPresenter.drain(pending.runId);
         if (result.kind === 'paused')
             return result;
-        let envelope = terminalEnvelope(result);
+        const envelope = terminalEnvelope(result);
         try {
-            if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
-                result.kind === 'completed') {
-                const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString());
-                await this.#sessions.save(next, {
-                    signal: undefined,
-                    ...(pending.request.sessionTtlSeconds === undefined
-                        ? {}
-                        : { ttlSeconds: pending.request.sessionTtlSeconds })
-                });
+            try {
+                if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
+                    result.kind === 'completed') {
+                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString());
+                    await this.#sessions.save(next, {
+                        signal: undefined,
+                        ...(pending.request.sessionTtlSeconds === undefined
+                            ? {}
+                            : { ttlSeconds: pending.request.sessionTtlSeconds })
+                    });
+                }
+            }
+            catch {
+                // The terminal store commit is authoritative. A secondary session
+                // projection must not rewrite or discard its snapshot and receipt.
+                this.#reportObserverFailure();
             }
             this.#recordRun(result);
-        }
-        catch (error) {
-            envelope = failedEnvelope(pending.runId, error, pending.request?.runRef ?? 'unavailable');
         }
         finally {
             this.#pending.delete(pending.runId);
@@ -715,19 +721,23 @@ export class AgentService {
             return;
         void this.#runStore.load(result.runId).then(checkpoint => {
             const counters = checkpoint?.budgetCounters;
+            const observed = result.kind === 'paused'
+                ? undefined
+                : result.terminal?.snapshot.counters;
             try {
                 this.#onRunLog?.(createAgentRunLog({
                     runId: result.runId,
                     fromStatus: 'active',
                     toStatus: result.kind,
-                    modelTurns: counters?.modelTurns,
-                    toolCalls: counters?.toolCalls,
-                    usedActiveRuntimeMs: counters?.usedActiveRuntimeMs,
-                    providerAttempts: counters === undefined
+                    modelTurns: observed?.modelTurns ?? counters?.modelTurns,
+                    toolCalls: observed?.toolCalls ?? counters?.toolCalls,
+                    usedActiveRuntimeMs: observed?.providerActiveDurationMs ??
+                        counters?.usedActiveRuntimeMs,
+                    providerAttempts: observed?.providerAttempts ?? (counters === undefined
                         ? undefined
-                        : counters.modelTurns + counters.providerRetries,
-                    recoveryAttempts: counters?.recoveryAttempts,
-                    correctionAttempts: counters?.correctionTurns,
+                        : counters.modelTurns + counters.providerRetries),
+                    recoveryAttempts: observed?.recoveryAttempts ?? counters?.recoveryAttempts,
+                    correctionAttempts: observed?.correctionTurns ?? counters?.correctionTurns,
                     errorCode: result.kind === 'failed' ? result.error.code : undefined
                 }));
             }
