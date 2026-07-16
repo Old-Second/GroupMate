@@ -1,5 +1,5 @@
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
-import { cancelledResult, executionFailure, indeterminateResult, visibleDefinition, visibleResult } from './visible-tool-support.js';
+import { cancelledResult, executionFailure, indeterminateResult, sessionAddressForTarget, visibleDefinition, visibleResult } from './visible-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { count: { type: 'integer' } },
     required: ['count'], additionalProperties: false
@@ -13,8 +13,16 @@ export function createSendDiceTool(services) {
                 ? Math.min(Math.max(Math.trunc(input.count), 1), 5) : 1;
             let sent = 0;
             try {
+                const target = sessionAddressForTarget(context.facts.botId, context.target);
+                if (target === null)
+                    return executionFailure('骰子发送失败。');
                 for (let index = 0; index < count; index += 1) {
-                    await services.qq.sendDice(context.target, context.signal);
+                    const delivery = await services.qq.sendDice(target, context.signal);
+                    if (delivery.kind === 'outcome_unknown')
+                        return indeterminateResult();
+                    if (delivery.kind === 'failed_definite') {
+                        return sent > 0 ? indeterminateResult() : executionFailure('骰子发送失败。');
+                    }
                     sent += 1;
                 }
                 return visibleResult(`已投掷 ${count} 枚骰子。`);

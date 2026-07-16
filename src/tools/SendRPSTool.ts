@@ -2,7 +2,7 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, visibleDefinition, visibleResult,
+  cancelledResult, executionFailure, sessionAddressForTarget, visibleDefinition, visibleDeliveryResult,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -20,8 +20,10 @@ export function createSendRPSTool (services: VisibleToolServices): ToolDefinitio
         return invalidArguments('石头剪刀布参数无效。')
       }
       try {
-        await services.qq.sendRps(context.target, input.value, context.signal)
-        return visibleResult('石头剪刀布已发送。')
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('石头剪刀布发送失败。')
+        const delivery = await services.qq.sendRps(target, input.value, context.signal)
+        return visibleDeliveryResult(delivery, '石头剪刀布已发送。', '石头剪刀布发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('石头剪刀布发送失败。')
       }

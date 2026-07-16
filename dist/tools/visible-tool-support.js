@@ -3,6 +3,21 @@ export function currentChannelTarget(facts) {
         ? Object.freeze({ kind: 'group', groupId: facts.channel.groupId })
         : Object.freeze({ kind: 'private', userId: facts.channel.userId });
 }
+export function sessionAddressForTarget(botId, target) {
+    if (target.kind === 'group') {
+        return Object.freeze({
+            botId,
+            scope: Object.freeze({ kind: 'group', groupId: target.groupId })
+        });
+    }
+    if (target.kind === 'private') {
+        return Object.freeze({
+            botId,
+            scope: Object.freeze({ kind: 'private', userId: target.userId })
+        });
+    }
+    return null;
+}
 export function visibleResult(message) {
     return Object.freeze({
         status: 'success', effect: 'visible',
@@ -41,6 +56,13 @@ export function indeterminateResult() {
         status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
         userMessage: '部分操作可能已完成，结果暂时无法确认。', retryable: false
     });
+}
+export function visibleDeliveryResult(delivery, successMessage, failureMessage = '工具执行失败。') {
+    if (delivery.kind === 'sent')
+        return visibleResult(successMessage);
+    if (delivery.kind === 'outcome_unknown')
+        return indeterminateResult();
+    return executionFailure(failureMessage);
 }
 export function visibleDefinition(input) {
     return Object.freeze({

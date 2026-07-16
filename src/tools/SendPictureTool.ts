@@ -2,7 +2,8 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, indeterminateResult, resourceFromBytes, visibleDefinition, visibleResult,
+  cancelledResult, executionFailure, indeterminateResult, resourceFromBytes,
+  sessionAddressForTarget, visibleDefinition, visibleResult,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -21,6 +22,8 @@ export function createSendPictureTool (services: VisibleToolServices): ToolDefin
       if (urls.length === 0) return invalidArguments('没有可发送的图片地址。')
       let sent = 0
       try {
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('图片发送失败。')
         for (const url of urls) {
           const fetched = await request(services.policyFetch, {
             url, policy: openImagePolicy, timeoutMs: 15_000, signal: context.signal
@@ -29,9 +32,13 @@ export function createSendPictureTool (services: VisibleToolServices): ToolDefin
           if (fetched.status < 200 || fetched.status >= 300) {
             return sent > 0 ? indeterminateResult() : executionFailure('图片暂时无法读取。')
           }
-          await services.qq.sendImage(
-            context.target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
+          const delivery = await services.qq.sendImage(
+            target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
           )
+          if (delivery.kind === 'outcome_unknown') return indeterminateResult()
+          if (delivery.kind === 'failed_definite') {
+            return sent > 0 ? indeterminateResult() : executionFailure('图片发送失败。')
+          }
           sent += 1
         }
         return visibleResult(`已发送 ${urls.length} 张图片。`)

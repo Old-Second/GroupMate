@@ -1,7 +1,8 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
-  cancelledResult, crossChannelDefinition, executionFailure,
+  cancelledResult, crossChannelDefinition, executionFailure, indeterminateResult,
+  sessionAddressForTarget,
   type VisibleToolServices
 } from './visible-tool-support.js'
 import { actorMaySendCrossChannel } from '../agent/tools/cross-channel-access.js'
@@ -50,7 +51,11 @@ export function createSendMessageTool (services: VisibleToolServices): ToolDefin
         return invalidArguments('跨会话消息参数无效。')
       }
       try {
-        await services.qq.sendText(context.target, text, context.signal)
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('消息发送失败。')
+        const delivery = await services.qq.sendText(target, text, context.signal)
+        if (delivery.kind === 'outcome_unknown') return indeterminateResult()
+        if (delivery.kind === 'failed_definite') return executionFailure('消息发送失败。')
         return {
           status: 'success', effect: 'background',
           content: [{ type: 'text', text: '消息已发送。' }], retryable: false

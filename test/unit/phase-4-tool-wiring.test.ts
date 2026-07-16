@@ -236,7 +236,12 @@ test('Yunzai approval keeps bot master authority for a group owner', async () =>
 test('Yunzai runtime freezes cross-channel policy per run', async () => {
   const mutableConfig = config({ enableToolPrivateSend: true })
   const sent: unknown[] = []
-  const receiver = { sendMsg: async (message: unknown) => { sent.push(message) } }
+  const receiver = {
+    sendMsg: async (message: unknown) => {
+      sent.push(message)
+      return true
+    }
+  }
   const event = {
     isGroup: false,
     user_id: 7,

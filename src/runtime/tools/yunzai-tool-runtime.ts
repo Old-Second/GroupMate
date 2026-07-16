@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { ToolAuditEvent, ToolAuditSink } from '../../agent/tools/audit.js'
+import type { SessionAddress } from '../../agent/contracts/identity.js'
 import type {
   ToolExecutionContext,
   ToolPreparationContext,
@@ -40,6 +41,13 @@ import type {
   VideoResolution,
   VisibleToolServices
 } from '../../tools/visible-tool-support.js'
+import { sessionAddressForTarget } from '../../tools/visible-tool-support.js'
+import {
+  createYunzaiOutboundPortFactory,
+  type OutboundPart,
+  type SafeTextAtom,
+  type YunzaiOutboundHostPort
+} from '../presentation/yunzai-outbound-port.js'
 
 type YunzaiValue = string | number
 type YunzaiRecord = Record<string, any>
@@ -380,9 +388,9 @@ function requireHostSuccess (value: unknown): void {
   if (value === false) throw new Error('host capability reported failure')
 }
 
-async function messageTarget (event: YunzaiRecord, target: ToolTarget): Promise<YunzaiRecord> {
-  if (target.kind === 'group') return await event.bot.pickGroup(hostIdentifier(target.groupId))
-  if (target.kind === 'private') return await event.bot.pickFriend(hostIdentifier(target.userId))
+async function messageTarget (event: YunzaiRecord, target: SessionAddress): Promise<YunzaiRecord> {
+  if (target.scope.kind === 'group') return await event.bot.pickGroup(hostIdentifier(target.scope.groupId))
+  if (target.scope.kind === 'private') return await event.bot.pickFriend(hostIdentifier(target.scope.userId))
   throw new TypeError('message target is invalid')
 }
 
@@ -403,21 +411,83 @@ function magicSegment (segment: YunzaiRecord, type: 'dice' | 'rps', value?: numb
   return { type, data: {} }
 }
 
-function qqCapabilities (event: YunzaiRecord, segment: YunzaiRecord): QqSendCapabilities {
-  const send = async (target: ToolTarget, message: unknown, signal: AbortSignal): Promise<void> => {
-    throwIfAborted(signal)
-    const receiver = await messageTarget(event, target)
-    requireHostSuccess(await receiver.sendMsg(message))
-    throwIfAborted(signal)
+function safeTextAtomValue (segment: YunzaiRecord, atom: SafeTextAtom): unknown {
+  if (atom.kind === 'text') return atom.text
+  if (atom.kind === 'at') {
+    const value = atom.target === 'all' ? 'all' : hostIdentifier(atom.target.userId)
+    return typeof segment.at === 'function' ? Reflect.apply(segment.at, segment, [value]) : { type: 'at', qq: value }
   }
+  if (atom.kind === 'face') {
+    return typeof segment.face === 'function'
+      ? Reflect.apply(segment.face, segment, [atom.faceId])
+      : { type: 'face', id: atom.faceId }
+  }
+  return typeof segment.markdown === 'function'
+    ? Reflect.apply(segment.markdown, segment, [atom.markdown])
+    : { type: 'markdown', data: { content: atom.markdown } }
+}
+
+function outboundMessage (segment: YunzaiRecord, part: OutboundPart): unknown {
+  if (part.media === 'text') {
+    const atoms = part.atoms.map(atom => safeTextAtomValue(segment, atom))
+    if (part.buttons !== undefined) atoms.push({ type: 'button', content: part.buttons })
+    return atoms.length === 1 ? atoms[0] : atoms
+  }
+  if (part.media === 'picture') return segment.image(resourceValue(part.resource))
+  if (part.media === 'voice') return segment.record(resourceValue(part.resource))
+  if (part.media === 'video') return segment.video(resourceValue(part.resource))
+  if (part.media === 'music') return segment.music(part.provider, part.id)
+  if (part.media === 'dice') return magicSegment(segment, 'dice')
+  if (part.media === 'rps') return magicSegment(segment, 'rps', part.value)
   return {
-    sendText: async (target, text, signal) => send(target, text, signal),
-    sendImage: async (target, resource, signal) => send(target, segment.image(resourceValue(resource)), signal),
-    sendAudio: async (target, resource, signal) => send(target, segment.record(resourceValue(resource)), signal),
-    sendVideo: async (target, resource, signal) => send(target, segment.video(resourceValue(resource)), signal),
-    sendMusic: async (target, music, signal) => send(target, segment.music(music.provider, music.id), signal),
-    sendDice: async (target, signal) => send(target, magicSegment(segment, 'dice'), signal),
-    sendRps: async (target, value, signal) => send(target, magicSegment(segment, 'rps', value), signal)
+    type: 'forward',
+    data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
+  }
+}
+
+function qqCapabilities (
+  event: YunzaiRecord,
+  segment: YunzaiRecord,
+  botId: string
+): QqSendCapabilities {
+  const outboundHost: YunzaiOutboundHostPort = Object.freeze({
+    async forTarget (target: SessionAddress) {
+      if (target.botId !== botId) return null
+      const receiver = await messageTarget(event, target)
+      const sendMethod = Reflect.get(receiver, 'sendMsg', receiver)
+      const recallMethod = Reflect.get(receiver, 'recallMsg', receiver)
+      if (typeof sendMethod !== 'function') return null
+      return Object.freeze({
+        dispatch: async (part: OutboundPart) => await Reflect.apply(
+          sendMethod,
+          receiver,
+          [outboundMessage(segment, part)]
+        ),
+        recall: async (messageId: string) => {
+          if (typeof recallMethod !== 'function') return false
+          return await Reflect.apply(recallMethod, receiver, [messageId])
+        }
+      })
+    }
+  })
+  const factory = createYunzaiOutboundPortFactory(outboundHost)
+  const deliver = async <P extends OutboundPart> (
+    target: SessionAddress,
+    part: P,
+    signal: AbortSignal
+  ) => await (await factory.forTarget(target)).deliver(part, 1, { signal })
+  return {
+    sendText: async (target, text, signal) => await deliver(target, {
+      media: 'text', atoms: Object.freeze([{ kind: 'text', text }])
+    }, signal),
+    sendImage: async (target, resource, signal) => await deliver(target, { media: 'picture', resource }, signal),
+    sendAudio: async (target, resource, signal) => await deliver(target, { media: 'voice', resource }, signal),
+    sendVideo: async (target, resource, signal) => await deliver(target, { media: 'video', resource }, signal),
+    sendMusic: async (target, music, signal) => await deliver(target, {
+      media: 'music', provider: music.provider, id: music.id
+    }, signal),
+    sendDice: async (target, signal) => await deliver(target, { media: 'dice' }, signal),
+    sendRps: async (target, value, signal) => await deliver(target, { media: 'rps', value }, signal)
   }
 }
 
@@ -785,7 +855,8 @@ async function currentMembers (
 function visibleServices (
   options: YunzaiToolRuntimeBridgeOptions,
   event: YunzaiRecord,
-  policyFetch: PolicyFetch
+  policyFetch: PolicyFetch,
+  botId: string
 ): VisibleToolServices {
   const downloadVideo = configBoolean(options.config, 'enableToolVideoDownload')
   const ttsAvailable = options.synthesizeAudio !== undefined && [
@@ -795,7 +866,7 @@ function visibleServices (
   const crossChannelAccess = resolveCrossChannelAccess(options.config)
   return {
     policyFetch,
-    qq: qqCapabilities(event, options.segment()),
+    qq: qqCapabilities(event, options.segment(), botId),
     generateImage: async (prompt, signal) => {
       return options.generateImage === undefined
         ? generateWithApPlugin(event, prompt, signal)
@@ -881,7 +952,7 @@ export function createYunzaiToolRuntimeBridge (
       const currentSource = await sourceFor(options, event, await options.getMasterIds())
       return resolveToolRuntimeFacts(currentSource, target, signal)
     }
-    const visibleToolServices = visibleServices(options, event, policyFetch)
+    const visibleToolServices = visibleServices(options, event, policyFetch, initialFacts.botId)
     const query = createQueryToolRuntime({
       policyFetch,
       config: queryConfig(options.config),
@@ -892,7 +963,10 @@ export function createYunzaiToolRuntimeBridge (
           : options.queryGame(event, gameInput, signal)
       },
       sendGameImage: async (resource, target, signal) => {
-        await visibleToolServices.qq.sendImage(target, resource, signal)
+        const address = sessionAddressForTarget(initialFacts.botId, target)
+        if (address === null) throw new TypeError('game image target is invalid')
+        const delivery = await visibleToolServices.qq.sendImage(address, resource, signal)
+        if (delivery.kind !== 'sent') throw new Error('game image delivery was not confirmed')
       }
     })
     const visible = createVisibleToolDefinitions(visibleToolServices)

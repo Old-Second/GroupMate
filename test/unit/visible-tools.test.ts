@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { AuthorizedToolContext, ToolRuntimeFacts, ToolTarget } from '../../src/agent/tools/tool-context.js'
+import type { AuthorizedToolContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
+import type { SessionAddress } from '../../src/agent/contracts/identity.js'
 import { ToolPolicyEngine } from '../../src/agent/tools/policy-engine.js'
 import {
   shouldFinalizeToolExecution,
@@ -11,6 +12,11 @@ import type { ToolObjectSchema } from '../../src/agent/tools/tool-schema.js'
 import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
 import { PolicyFetch, type PolicyTransportResponse } from '../../src/runtime/tools/policy-fetch.js'
 import { createVisibleToolDefinitions } from '../../src/runtime/tools/tool-runtime-factory.js'
+import type {
+  DeliveryResult,
+  OutboundMedia,
+  RuntimeDeliveryReceipt
+} from '../../src/runtime/presentation/presentation-result.js'
 import type {
   MusicShare,
   QqSendCapabilities,
@@ -32,6 +38,21 @@ const context: AuthorizedToolContext = {
   target: { kind: 'group', groupId: '9' }, signal: new AbortController().signal
 }
 
+function sentDelivery<M extends OutboundMedia> (media: M): DeliveryResult<M> {
+  return Object.freeze({
+    kind: 'sent', media, attempt: 1,
+    receipt: Object.freeze({ schemaVersion: 1, media }) as RuntimeDeliveryReceipt<M>
+  })
+}
+
+function definiteDelivery<M extends OutboundMedia> (media: M): DeliveryResult<M> {
+  return Object.freeze({ kind: 'failed_definite', media, attempt: 1, code: 'host_rejected' })
+}
+
+function unknownDelivery<M extends OutboundMedia> (media: M): DeliveryResult<M> {
+  return Object.freeze({ kind: 'outcome_unknown', media, attempt: 1, code: 'unknown_host_result' })
+}
+
 function response (body: string, contentType: string): PolicyTransportResponse {
   return {
     status: 200, statusText: 'OK', headers: { 'content-type': contentType },
@@ -41,17 +62,17 @@ function response (body: string, contentType: string): PolicyTransportResponse {
 
 function fixture (): {
   definitions: ReturnType<typeof createVisibleToolDefinitions>
-  calls: Array<{ kind: string; target: ToolTarget; value: unknown }>
+  calls: Array<{ kind: string; target: SessionAddress; value: unknown }>
 } {
-  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const qq: QqSendCapabilities = {
-    sendText: async (target, value) => { calls.push({ kind: 'text', target, value }) },
-    sendImage: async (target, value) => { calls.push({ kind: 'image', target, value }) },
-    sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }) },
-    sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }) },
-    sendMusic: async (target, value) => { calls.push({ kind: 'music', target, value }) },
-    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }) },
-    sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }) }
+    sendText: async (target, value) => { calls.push({ kind: 'text', target, value }); return sentDelivery('text') },
+    sendImage: async (target, value) => { calls.push({ kind: 'image', target, value }); return sentDelivery('picture') },
+    sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }); return sentDelivery('voice') },
+    sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }); return sentDelivery('video') },
+    sendMusic: async (target, value) => { calls.push({ kind: 'music', target, value }); return sentDelivery('music') },
+    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }); return sentDelivery('dice') },
+    sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }); return sentDelivery('rps') }
   }
   const services: VisibleToolServices = {
     policyFetch: new PolicyFetch({
@@ -161,7 +182,9 @@ test('sendDice clamps count to five and uses only the authorized target', async 
   const result = await byName(definitions, 'sendDice').execute({ count: 99 }, context)
   assert.equal(result.status, 'success')
   assert.equal(calls.length, 5)
-  assert.ok(calls.every(call => call.kind === 'dice' && JSON.stringify(call.target) === JSON.stringify(context.target)))
+  assert.ok(calls.every(call => call.kind === 'dice' && JSON.stringify(call.target) === JSON.stringify({
+    botId: '10000', scope: { kind: 'group', groupId: '9' }
+  })))
 })
 
 test('missing TTS and media services fail before QQ output', async () => {
@@ -202,7 +225,7 @@ test('sendMessage policy denies the current channel and never calls QQ capabilit
   assert.equal(calls.length, 0)
 })
 
-test('sendMessage cross-channel target is exact and capability runs once after authorization', async () => {
+test('cross-channel message keeps its explicit target', async () => {
   const { definitions, calls } = fixture()
   const definition = byName(definitions, 'sendMessage')
   const input = { targetKind: 'group', targetId: '88', text: 'hello' }
@@ -211,11 +234,15 @@ test('sendMessage cross-channel target is exact and capability runs once after a
   const result = await definition.execute(input, { ...context, target })
   assert.equal(result.status, 'success')
   if (result.status === 'success') assert.equal(result.effect, 'background')
-  assert.deepEqual(calls, [{ kind: 'text', target: { kind: 'group', groupId: '88' }, value: 'hello' }])
+  assert.deepEqual(calls, [{
+    kind: 'text',
+    target: { botId: '10000', scope: { kind: 'group', groupId: '88' } },
+    value: 'hello'
+  }])
 })
 
 test('sendMessage applies private and group configuration to the exact authorized target', async () => {
-  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const definitions = createVisibleToolDefinitions(visibleOptions(calls, {
     crossChannelAccess: { private: 'everyone', group: 'disabled' }
   }))
@@ -232,11 +259,15 @@ test('sendMessage applies private and group configuration to the exact authorize
   }, { ...context, target: groupTarget })
   assert.equal(groupResult.status, 'denied')
   if (groupResult.status === 'denied') assert.equal(groupResult.reasonCode, 'cross_channel_disabled')
-  assert.deepEqual(calls, [{ kind: 'text', target: privateTarget, value: 'hello' }])
+  assert.deepEqual(calls, [{
+    kind: 'text',
+    target: { botId: '10000', scope: privateTarget },
+    value: 'hello'
+  }])
 })
 
 test('sendMessage repeats master authorization at the capability boundary', async () => {
-  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const definitions = createVisibleToolDefinitions(visibleOptions(calls, {
     crossChannelAccess: { private: 'master', group: 'master' }
   }))
@@ -255,7 +286,35 @@ test('sendMessage repeats master authorization at the capability boundary', asyn
     target
   })
   assert.equal(allowed.status, 'success')
-  assert.deepEqual(calls, [{ kind: 'text', target, value: 'hello' }])
+  assert.deepEqual(calls, [{
+    kind: 'text',
+    target: { botId: '10000', scope: target },
+    value: 'hello'
+  }])
+})
+
+test('visible tools mark only confirmed deliveries visible', async () => {
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+  const services = visibleOptions(calls)
+  const results: DeliveryResult<'music'>[] = [
+    sentDelivery('music'), definiteDelivery('music'), unknownDelivery('music')
+  ]
+  const definitions = createVisibleToolDefinitions({
+    ...services,
+    qq: {
+      ...services.qq,
+      sendMusic: async () => results.shift() ?? unknownDelivery('music')
+    }
+  })
+  const confirmed = await byName(definitions, 'sendMusic').execute({ id: '1' }, context)
+  const rejected = await byName(definitions, 'sendMusic').execute({ id: '1' }, context)
+  const unknown = await byName(definitions, 'sendMusic').execute({ id: '1' }, context)
+  assert.equal(confirmed.status, 'success')
+  if (confirmed.status === 'success') assert.equal(confirmed.effect, 'visible')
+  assert.equal(rejected.status, 'failed')
+  if (rejected.status === 'failed') assert.equal(rejected.errorCode, 'tool_execution_failed')
+  assert.equal(unknown.status, 'indeterminate')
+  if (unknown.status === 'indeterminate') assert.equal(unknown.errorCode, 'tool_outcome_unknown')
 })
 
 test('typed effect finalizes only successful visible results', () => {
@@ -318,14 +377,17 @@ test('visible tool schemas reject model-supplied sender and admin authority', ()
   }
 })
 
-test('abort signal reaches the QQ capability and returns typed cancellation', async () => {
-  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+test('pre-dispatch abort stays a definite visible-tool execution failure', async () => {
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const services = visibleOptions(calls)
   const qq: QqSendCapabilities = {
     ...services.qq,
     sendMusic: async (_target, _music, signal) => {
       assert.equal(signal.aborted, true)
-      throw new DOMException('aborted', 'AbortError')
+      return {
+        kind: 'failed_definite', media: 'music', attempt: 1,
+        code: 'aborted_before_dispatch'
+      }
     }
   }
   const definitions = createVisibleToolDefinitions({ ...services, qq })
@@ -335,11 +397,11 @@ test('abort signal reaches the QQ capability and returns typed cancellation', as
     ...context, signal: controller.signal
   })
   assert.equal(result.status, 'failed')
-  if (result.status === 'failed') assert.equal(result.errorCode, 'tool_cancelled')
+  if (result.status === 'failed') assert.equal(result.errorCode, 'tool_execution_failed')
 })
 
 test('partial multi-send failure is indeterminate and cannot be replayed as a normal failure', async () => {
-  const calls: Array<{ kind: string; target: ToolTarget; value: unknown }> = []
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const services = visibleOptions(calls)
   let sent = 0
   const definitions = createVisibleToolDefinitions({
@@ -348,7 +410,7 @@ test('partial multi-send failure is indeterminate and cannot be replayed as a no
       ...services.qq,
       sendDice: async () => {
         sent += 1
-        if (sent === 2) throw new Error('fixture')
+        return sent === 2 ? unknownDelivery('dice') : sentDelivery('dice')
       }
     }
   })
@@ -357,18 +419,53 @@ test('partial multi-send failure is indeterminate and cannot be replayed as a no
   if (result.status === 'indeterminate') assert.equal(result.retryable, false)
 })
 
+test('multi-part visible tools never replay a confirmed prefix after definite failure', async () => {
+  const cases = [
+    ['sendAvatar', { userIds: ['7', '8'] }, 'picture'],
+    ['sendPicture', { urls: ['https://image.example/one.png', 'https://image.example/two.png'] }, 'picture'],
+    ['sendDice', { count: 2 }, 'dice']
+  ] as const
+  for (const [name, input, media] of cases) {
+    const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+    const services = visibleOptions(calls)
+    let attempts = 0
+    const next = () => {
+      attempts += 1
+      return attempts === 1 ? sentDelivery(media) : definiteDelivery(media)
+    }
+    const qq: QqSendCapabilities = media === 'picture'
+      ? { ...services.qq, sendImage: async () => next() as DeliveryResult<'picture'> }
+      : { ...services.qq, sendDice: async () => next() as DeliveryResult<'dice'> }
+    const result = await byName(createVisibleToolDefinitions({ ...services, qq }), name).execute(input, context)
+    assert.equal(result.status, 'indeterminate', name)
+    if (result.status === 'indeterminate') assert.equal(result.retryable, false, name)
+    assert.equal(attempts, 2, name)
+
+    const firstFailureQq: QqSendCapabilities = media === 'picture'
+      ? { ...services.qq, sendImage: async () => definiteDelivery('picture') }
+      : { ...services.qq, sendDice: async () => definiteDelivery('dice') }
+    const firstFailure = await byName(
+      createVisibleToolDefinitions({ ...services, qq: firstFailureQq }), name
+    ).execute(input, context)
+    assert.equal(firstFailure.status, 'failed', `${name} first failure`)
+    if (firstFailure.status === 'failed') {
+      assert.equal(firstFailure.errorCode, 'tool_execution_failed', `${name} first failure`)
+    }
+  }
+})
+
 function visibleOptions (
-  calls: Array<{ kind: string; target: ToolTarget; value: unknown }>,
+  calls: Array<{ kind: string; target: SessionAddress; value: unknown }>,
   overrides: Partial<VisibleToolServices> = {}
 ): VisibleToolServices {
   const qq: QqSendCapabilities = {
-    sendText: async (target, value) => { calls.push({ kind: 'text', target, value }) },
-    sendImage: async (target, value) => { calls.push({ kind: 'image', target, value }) },
-    sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }) },
-    sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }) },
-    sendMusic: async (target, value: MusicShare) => { calls.push({ kind: 'music', target, value }) },
-    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }) },
-    sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }) }
+    sendText: async (target, value) => { calls.push({ kind: 'text', target, value }); return sentDelivery('text') },
+    sendImage: async (target, value) => { calls.push({ kind: 'image', target, value }); return sentDelivery('picture') },
+    sendAudio: async (target, value) => { calls.push({ kind: 'audio', target, value }); return sentDelivery('voice') },
+    sendVideo: async (target, value) => { calls.push({ kind: 'video', target, value }); return sentDelivery('video') },
+    sendMusic: async (target, value: MusicShare) => { calls.push({ kind: 'music', target, value }); return sentDelivery('music') },
+    sendDice: async target => { calls.push({ kind: 'dice', target, value: null }); return sentDelivery('dice') },
+    sendRps: async (target, value) => { calls.push({ kind: 'rps', target, value }); return sentDelivery('rps') }
   }
   return {
     policyFetch: new PolicyFetch({

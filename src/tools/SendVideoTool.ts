@@ -3,7 +3,8 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments, isToolResult, request } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, resourceFromBytes, visibleDefinition, visibleResult,
+  cancelledResult, executionFailure, resourceFromBytes, sessionAddressForTarget,
+  visibleDefinition, visibleDeliveryResult,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -21,10 +22,12 @@ export function createSendVideoTool (services: VisibleToolServices): ToolDefinit
       const id = String(input.id ?? '').trim()
       if (!/^[A-Za-z0-9]{2,32}$/.test(id)) return invalidArguments('视频标识无效。')
       try {
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('视频发送失败。')
         const video = await services.resolveVideo(id, context.signal)
         if (!services.videoDownloadEnabled || video.videoUrl === undefined) {
-          await services.qq.sendText(context.target, video.shareText.slice(0, 4_000), context.signal)
-          return visibleResult('视频信息已发送。')
+          const delivery = await services.qq.sendText(target, video.shareText.slice(0, 4_000), context.signal)
+          return visibleDeliveryResult(delivery, '视频信息已发送。', '视频发送失败。')
         }
         const maxBytes = Math.min(Math.max(Math.trunc(services.videoMaxBytes), 1), 8 * 1024 * 1024)
         const policy: NetworkRequestPolicy = {
@@ -35,10 +38,10 @@ export function createSendVideoTool (services: VisibleToolServices): ToolDefinit
         })
         if (isToolResult(fetched)) return fetched
         if (fetched.status < 200 || fetched.status >= 300) return executionFailure('视频暂时无法下载。')
-        await services.qq.sendVideo(
-          context.target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
+        const delivery = await services.qq.sendVideo(
+          target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
         )
-        return visibleResult('视频已发送。')
+        return visibleDeliveryResult(delivery, '视频已发送。', '视频发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('视频发送失败。')
       }

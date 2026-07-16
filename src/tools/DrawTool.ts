@@ -2,7 +2,8 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { configurationFailure, invalidArguments } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, validResource, visibleDefinition, visibleResult,
+  cancelledResult, executionFailure, sessionAddressForTarget, validResource,
+  visibleDefinition, visibleDeliveryResult,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -22,8 +23,10 @@ export function createDrawTool (services: VisibleToolServices): ToolDefinition {
       try {
         const resource = await services.generateImage(prompt, context.signal)
         if (!validResource(resource)) return executionFailure()
-        await services.qq.sendImage(context.target, resource, context.signal)
-        return visibleResult('图片已发送。')
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('图片发送失败。')
+        const delivery = await services.qq.sendImage(target, resource, context.signal)
+        return visibleDeliveryResult(delivery, '图片已发送。', '图片发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('绘图暂时失败。')
       }

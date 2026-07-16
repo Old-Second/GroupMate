@@ -4,6 +4,8 @@ import type { ToolResult } from '../agent/tools/tool-result.js'
 import type { StrictToolSchema } from '../agent/tools/tool-schema.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
 import type { CrossChannelAccess } from '../agent/tools/cross-channel-access.js'
+import type { SessionAddress } from '../agent/contracts/identity.js'
+import type { DeliveryResult } from '../runtime/presentation/presentation-result.js'
 import {
   crossChannelResourceKeys,
   currentChannelResourceKeys
@@ -35,13 +37,13 @@ export interface MusicShare {
 }
 
 export interface QqSendCapabilities {
-  sendText(target: ToolTarget, text: string, signal: AbortSignal): Promise<void>
-  sendImage(target: ToolTarget, resource: ToolResource, signal: AbortSignal): Promise<void>
-  sendAudio(target: ToolTarget, resource: ToolResource, signal: AbortSignal): Promise<void>
-  sendVideo(target: ToolTarget, resource: ToolResource, signal: AbortSignal): Promise<void>
-  sendMusic(target: ToolTarget, music: MusicShare, signal: AbortSignal): Promise<void>
-  sendDice(target: ToolTarget, signal: AbortSignal): Promise<void>
-  sendRps(target: ToolTarget, value: 1 | 2 | 3, signal: AbortSignal): Promise<void>
+  sendText(target: SessionAddress, text: string, signal: AbortSignal): Promise<DeliveryResult<'text'>>
+  sendImage(target: SessionAddress, resource: ToolResource, signal: AbortSignal): Promise<DeliveryResult<'picture'>>
+  sendAudio(target: SessionAddress, resource: ToolResource, signal: AbortSignal): Promise<DeliveryResult<'voice'>>
+  sendVideo(target: SessionAddress, resource: ToolResource, signal: AbortSignal): Promise<DeliveryResult<'video'>>
+  sendMusic(target: SessionAddress, music: MusicShare, signal: AbortSignal): Promise<DeliveryResult<'music'>>
+  sendDice(target: SessionAddress, signal: AbortSignal): Promise<DeliveryResult<'dice'>>
+  sendRps(target: SessionAddress, value: 1 | 2 | 3, signal: AbortSignal): Promise<DeliveryResult<'rps'>>
 }
 
 export interface VideoResolution {
@@ -73,6 +75,25 @@ export function currentChannelTarget (facts: ToolRuntimeFacts): ToolTarget {
   return facts.channel.kind === 'group'
     ? Object.freeze({ kind: 'group' as const, groupId: facts.channel.groupId })
     : Object.freeze({ kind: 'private' as const, userId: facts.channel.userId })
+}
+
+export function sessionAddressForTarget (
+  botId: string,
+  target: ToolTarget
+): SessionAddress | null {
+  if (target.kind === 'group') {
+    return Object.freeze({
+      botId,
+      scope: Object.freeze({ kind: 'group' as const, groupId: target.groupId })
+    })
+  }
+  if (target.kind === 'private') {
+    return Object.freeze({
+      botId,
+      scope: Object.freeze({ kind: 'private' as const, userId: target.userId })
+    })
+  }
+  return null
 }
 
 export function visibleResult (message: string): ToolResult {
@@ -117,6 +138,16 @@ export function indeterminateResult (): ToolResult {
     status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
     userMessage: '部分操作可能已完成，结果暂时无法确认。', retryable: false
   })
+}
+
+export function visibleDeliveryResult (
+  delivery: DeliveryResult,
+  successMessage: string,
+  failureMessage = '工具执行失败。'
+): ToolResult {
+  if (delivery.kind === 'sent') return visibleResult(successMessage)
+  if (delivery.kind === 'outcome_unknown') return indeterminateResult()
+  return executionFailure(failureMessage)
 }
 
 export function visibleDefinition (input: {

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
+import type {
+  DeliveryResult,
+  OutboundMedia,
+  RuntimeDeliveryReceipt
+} from '../../src/runtime/presentation/presentation-result.js'
 import { resourceKey } from '../../src/agent/tools/resource-key.js'
 import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
 import type { PolicyFetch } from '../../src/runtime/tools/policy-fetch.js'
@@ -25,14 +30,25 @@ const resource: ToolResource = Object.freeze({
   kind: 'buffer', data: new Uint8Array(), mimeType: 'image/png', byteLength: 0
 })
 
+function sentDelivery<M extends OutboundMedia> (media: M): DeliveryResult<M> {
+  return Object.freeze({
+    kind: 'sent', media, attempt: 1,
+    receipt: Object.freeze({ schemaVersion: 1, media }) as RuntimeDeliveryReceipt<M>
+  })
+}
+
 function productionDefinitions () {
   const policyFetch = {} as PolicyFetch
   const visibleServices: VisibleToolServices = {
     policyFetch,
     qq: {
-      sendText: async () => {}, sendImage: async () => {}, sendAudio: async () => {},
-      sendVideo: async () => {}, sendMusic: async () => {}, sendDice: async () => {},
-      sendRps: async () => {}
+      sendText: async () => sentDelivery('text'),
+      sendImage: async () => sentDelivery('picture'),
+      sendAudio: async () => sentDelivery('voice'),
+      sendVideo: async () => sentDelivery('video'),
+      sendMusic: async () => sentDelivery('music'),
+      sendDice: async () => sentDelivery('dice'),
+      sendRps: async () => sentDelivery('rps')
     },
     generateImage: async () => resource,
     processImage: async () => resource,
