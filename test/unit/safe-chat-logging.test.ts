@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { terminalObservationId } from '../../src/agent/run/run-observation.js'
 import { findProjectRoot } from '../helpers/project-root.js'
 
 const projectRoot = findProjectRoot(import.meta.url)
@@ -57,22 +58,53 @@ test('safe chat log summaries expose bounded metadata without message content', 
     replySegmentCount: 3,
     error: new Error('private input error')
   })
+  const runRef = 'd'.repeat(32)
+  const observationId = terminalObservationId(runRef, 4)
   const agentRun = createAgentRunLog({
-    runId: 'private-run-id-123456',
-    fromStatus: 'calling_model',
-    toStatus: 'executing_tools',
-    modelTurns: 2,
-    toolCalls: 3,
-    usedActiveRuntimeMs: 400,
-    providerAttempts: 2,
-    recoveryAttempts: 1,
-    correctionAttempts: 0,
-    errorCode: 'provider_rate_limited',
-    storeKeyCount: 2,
-    estimatedBytes: 4096,
+    schemaVersion: 2,
+    observationId,
+    runRef,
+    revision: 4,
+    status: 'completed',
+    finishedAt: '2026-07-16T00:00:00.000Z',
+    completion: { kind: 'reply_text', lengthBucket: '1_40' },
+    errorCode: null,
+    cancellationReason: null,
+    counters: {
+      schemaVersion: 1,
+      providerAttempts: 2,
+      modelTurns: 2,
+      toolAttempts: 3,
+      providerRetries: 'unavailable',
+      recoveryAttempts: 1,
+      correctionTurns: 0,
+      toolCalls: 3,
+      approvalRequests: 1,
+      toolDenied: 0,
+      toolExpired: 0,
+      toolIndeterminate: 0,
+      estimatedTokens: 44,
+      providerInputTokens: 'unavailable',
+      providerOutputTokens: 4,
+      providerTotalTokens: 'unavailable',
+      providerActiveDurationMs: 400,
+      engineActiveDurationMs: 450
+    },
+    engineDurationMs: 450,
+    prompt: secretPrompt,
+    route: { actorId: '123456' },
+    error: new Error('private error')
+  }, {
+    schemaVersion: 1,
+    observationId,
+    runRef,
+    revision: 4,
+    deletedKeyCount: 2,
+    createdKeyCount: 1,
+    checkpointBytesDeleted: 120,
+    eventBytesDeleted: 512,
+    tombstoneBytes: 768,
     endpoint: 'https://private.example',
-    model: 'private-model',
-    actorId: '123456',
     content: secretPrompt
   })
 
@@ -109,20 +141,38 @@ test('safe chat log summaries expose bounded metadata without message content', 
   })
   assert.deepEqual(agentRun, {
     event: 'agent.run',
-    runRef: agentRun.runRef,
-    fromStatus: 'calling_model',
-    toStatus: 'executing_tools',
-    modelTurns: 2,
-    toolCalls: 3,
-    usedActiveRuntimeMs: 400,
+    observationId,
+    runRef,
+    revision: 4,
+    status: 'completed',
+    completion: { kind: 'reply_text', lengthBucket: '1_40' },
+    errorCode: null,
+    cancellationReason: null,
     providerAttempts: 2,
+    modelTurns: 2,
+    toolAttempts: 3,
+    providerRetries: 'unavailable',
     recoveryAttempts: 1,
-    correctionAttempts: 0,
-    errorCode: 'provider_rate_limited',
-    storeKeyCount: 2,
-    estimatedBytes: 4096
+    correctionTurns: 0,
+    toolCalls: 3,
+    approvalRequests: 1,
+    toolDenied: 0,
+    toolExpired: 0,
+    toolIndeterminate: 0,
+    estimatedTokens: 44,
+    providerInputTokens: 'unavailable',
+    providerOutputTokens: 4,
+    providerTotalTokens: 'unavailable',
+    providerActiveDurationMs: 400,
+    engineDurationMs: 450,
+    deletedKeyCount: 2,
+    createdKeyCount: 1,
+    checkpointBytesDeleted: 120,
+    eventBytesDeleted: 512,
+    tombstoneBytes: 768
   })
-  assert.match(agentRun.runRef, /^[a-f0-9]{16}$/)
+  assert.match(agentRun.runRef, /^[a-f0-9]{32}$/)
+  assert.match(agentRun.observationId, /^[a-f0-9]{64}$/)
 
   const serialized = JSON.stringify({ request, response, error, messageInput, agentRun })
   assert.doesNotMatch(serialized, /secret|private|123456|https:|conversation|arguments/)
@@ -189,8 +239,8 @@ test('active chat and run summaries use only the safe logging boundary', () => {
 
   assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatRequestLog/)
   assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatResponseLog/)
-  assert.match(serviceSource, /this\.#onRunLog\?\.\(createAgentRunLog\(\{/)
-  assert.match(bridgeSource, /onRunLog: entry => options\.logger\?\.info\?\.\(entry\)/)
+  assert.doesNotMatch(serviceSource, /#runStore\.load\(result\.runId\)/)
+  assert.match(bridgeSource, /createAgentRunLog\(snapshot, receipt\)/)
   assert.doesNotMatch(
     `${chatSource}\n${serviceSource}\n${bridgeSource}`,
     /logger\.debug\(create(?:Chat|Agent)/

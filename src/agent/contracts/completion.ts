@@ -2,6 +2,8 @@ import { parseAgentMessage, type AgentMessage } from './content.js'
 import { AgentError } from './error.js'
 import type { CheckpointRequestKind } from './interaction.js'
 
+export type SessionPersistenceOutcome = 'saved' | 'failed' | 'not_attempted'
+
 export type CompletionDisposition =
   | { readonly kind: 'reply_text'; readonly text: string }
   | { readonly kind: 'already_visible'; readonly source: 'tool_output' }

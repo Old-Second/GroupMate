@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
-import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type { ApprovalInterruption } from '../../src/agent/run/interruption.js'
 import {
   createInitialRunObservationCounters,
@@ -19,6 +18,13 @@ import {
   type RunApprovalControl
 } from '../../src/runtime/run-approval-router.js'
 import { AgentError } from '../../src/agent/contracts/error.js'
+import type { ChatReplyEnvelope } from '../../src/runtime/agent-service.js'
+import {
+  activateRequestObservation,
+  beginRequestObservation,
+  createRequestObservationDraft,
+  type ApprovalRecoveryDeferred
+} from '../../src/runtime/request-observation.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
 const groupAddress: SessionAddress = Object.freeze({
@@ -110,6 +116,7 @@ class MemoryReferenceIndex implements ApprovalReferenceIndex {
 class FakeApprovalControl implements RunApprovalControl {
   current: ApprovalInterruption | null = pending()
   readonly decisions: ApprovalDecisionInput[] = []
+  deferredReason: ApprovalRecoveryDeferred['reason'] | null = null
 
   async pendingApproval (runId: string, approvalId: string): Promise<ApprovalInterruption | null> {
     return this.current?.runId === runId && this.current.approvalId === approvalId
@@ -130,7 +137,9 @@ class FakeApprovalControl implements RunApprovalControl {
     return this.current
   }
 
-  async decideApproval (input: ApprovalDecisionInput): Promise<RunAdvanceResult | null> {
+  async decideApproval (
+    input: ApprovalDecisionInput
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     if (this.current === null || input.approvalId !== this.current.approvalId ||
       JSON.stringify(input.sessionAddress) !== JSON.stringify(this.current.approvalAddress)) {
       return null
@@ -139,15 +148,47 @@ class FakeApprovalControl implements RunApprovalControl {
     if (input.kind !== 'expired' && (actor === undefined ||
       !this.current.approverPolicy.eligibleActorIds.includes(actor.userId) ||
       !this.current.approverPolicy.allowedRoles.includes(actor.role))) return null
+    if (this.deferredReason !== null) {
+      const reason = this.deferredReason
+      this.deferredReason = null
+      return Object.freeze({
+        kind: 'approval_deferred',
+        reason,
+        retryable: true,
+        runRef: completedRunRef,
+        requestRef: '2'.repeat(32)
+      })
+    }
     this.decisions.push(input)
     this.current = null
+    const terminal = completedTerminal()
+    const context = activateRequestObservation({
+      context: beginRequestObservation({
+        requestRef: '2'.repeat(32),
+        requestKind: 'ordinary_chat',
+        startedAtMonotonicMs: 'unavailable'
+      }),
+      runRef: completedRunRef,
+      queueDurationMs: 'unavailable',
+      sessionLoadDurationMs: 'unavailable'
+    })
     return Object.freeze({
       kind: 'completed',
       runId: input.runId,
       runRef: completedRunRef,
       completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
       output: null,
-      terminal: completedTerminal()
+      terminal,
+      text: null,
+      visibleOutput: true,
+      requestObservationDraft: createRequestObservationDraft({
+        context,
+        outcome: 'completed',
+        admissionRejectionReason: 'not_applicable',
+        sessionSaveDurationMs: 'not_attempted',
+        terminalObservationId: terminal.snapshot.observationId
+      }),
+      sessionPersistence: 'not_attempted'
     })
   }
 }
@@ -189,6 +230,29 @@ test('reference approval requires an exact quote before deciding', async () => {
   assert.equal(control.decisions.length, 0)
   assert.equal(await router.route(reply()), true)
   assert.equal(control.decisions[0]?.kind, 'approved')
+})
+
+test('approval recovery deferral preserves the reference and allows the same decision to retry', async () => {
+  for (const reason of ['queue_full', 'queue_aborted', 'unavailable'] as const) {
+    const control = new FakeApprovalControl()
+    const index = new MemoryReferenceIndex()
+    const router = new RunApprovalRouter({ control, index })
+    assert.notEqual(await router.registerDisplayed({
+      runId: 'run-1', approvalId: 'approval-1', messageId: 'approval-message-1',
+      displayedAt: now, ttlSeconds: 120
+    }), null)
+    control.deferredReason = reason
+
+    assert.equal(await router.route(reply()), true)
+    assert.equal(index.values.size, 1)
+    assert.notEqual(control.current, null)
+    assert.equal(control.decisions.length, 0)
+
+    assert.equal(await router.route(reply()), true)
+    assert.equal(index.values.size, 0)
+    assert.equal(control.current, null)
+    assert.equal(control.decisions.length, 1)
+  }
 })
 
 test('Yunzai approval projection requires an exact quoted decision', async () => {

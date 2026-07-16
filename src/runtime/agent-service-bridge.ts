@@ -7,7 +7,6 @@ import type {
   PresentationIntentV1,
   TrustedRequestKind
 } from '../agent/contracts/interaction.js'
-import type { RunAdvanceResult } from '../agent/contracts/result.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
 import type { ContextItem } from '../agent/context/context-item.js'
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'
@@ -36,9 +35,18 @@ import type { RedisSessionClient } from '../agent/session/redis-session-store.js
 import {
   AgentService,
   type AgentServiceRunRuntime,
+  type AgentServiceRequestOptions,
   type ChatReplyEnvelope,
   type ConversationSessionPort
 } from './agent-service.js'
+import {
+  beginRequestObservation,
+  createRequestObservationDraft,
+  type ApprovalRecoveryDeferred,
+  type RequestObservationContextV1
+} from './request-observation.js'
+import { createAgentRunLog } from './safe-chat-logging.js'
+import { TerminalFactCollector } from './terminal-fact-collector.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js'
 import {
   RedisApprovalReferenceIndex,
@@ -99,6 +107,7 @@ export interface YunzaiAgentServiceBridgeOptions extends Omit<
   readonly now?: () => Date
   readonly generateId?: () => string
   readonly createRequestRef?: () => string
+  readonly monotonicNow?: () => number | 'unavailable'
 }
 
 export interface YunzaiAgentHandleOptions {
@@ -145,14 +154,14 @@ export class AgentServiceBridge {
 
   async handle (
     request: YunzaiAgentRequestDraft,
-    options: RunControlOptions = {}
+    options: AgentServiceRequestOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#service.handle(request, options)
   }
 
   async handleEphemeral (
     request: YunzaiAgentRequestDraft,
-    options: RunControlOptions = {}
+    options: AgentServiceRequestOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#service.handleEphemeral(request, options)
   }
@@ -160,14 +169,14 @@ export class AgentServiceBridge {
   async resume (
     runId: string,
     options: RunControlOptions = {}
-  ): Promise<ChatReplyEnvelope> {
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     return await this.#service.resume(runId, options)
   }
 
   async cancel (
     runId: string,
     reason = 'user_cancelled'
-  ): Promise<ChatReplyEnvelope> {
+  ): Promise<ChatReplyEnvelope | null> {
     return await this.#service.cancel(runId, reason)
   }
 
@@ -191,7 +200,7 @@ export class AgentServiceBridge {
   async decideApproval (
     input: RunApprovalDecisionCommand,
     options: RunControlOptions = {}
-  ): Promise<ChatReplyEnvelope | null> {
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     return await this.#service.decideApproval(input, options)
   }
 }
@@ -456,7 +465,11 @@ async function loadGroupContext (
   }
 }
 
-function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
+function failedEnvelope (
+  runId: string,
+  error: unknown,
+  context: RequestObservationContextV1
+): ChatReplyEnvelope {
   const normalized = error instanceof AgentError
     ? error
     : error instanceof ModelProviderError
@@ -473,8 +486,33 @@ function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
     runId,
     runRef: 'unavailable',
     error: serializeAgentError(normalized),
-    terminal: null
+    terminal: null,
+    requestObservationDraft: createRequestObservationDraft({
+      context,
+      runRef: 'unavailable',
+      outcome: 'failed_request_validation',
+      admissionRejectionReason: 'not_applicable',
+      queueDurationMs: 'not_attempted',
+      sessionLoadDurationMs: 'not_attempted',
+      sessionSaveDurationMs: 'not_attempted',
+      terminalObservationId: 'not_attempted'
+    }),
+    sessionPersistence: 'not_attempted'
   })
+}
+
+function safeMonotonicNow (
+  clock: () => number | 'unavailable'
+): number | 'unavailable' {
+  try {
+    const value = clock()
+    return value === 'unavailable' ||
+      (Number.isSafeInteger(value) && Number(value) >= 0)
+      ? value
+      : 'unavailable'
+  } catch {
+    return 'unavailable'
+  }
 }
 
 function messageIdentifier (value: unknown): string | null {
@@ -570,6 +608,7 @@ export class YunzaiAgentServiceBridge {
   readonly #now: () => Date
   readonly #generateId: () => string
   readonly #createRequestRef: () => string
+  readonly #monotonicNow: () => number | 'unavailable'
 
   constructor (input: Readonly<{
     options: YunzaiAgentServiceBridgeOptions
@@ -586,6 +625,7 @@ export class YunzaiAgentServiceBridge {
     this.#now = input.options.now ?? (() => new Date())
     this.#generateId = input.options.generateId ?? randomUUID
     this.#createRequestRef = input.options.createRequestRef ?? createRequestRef
+    this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()))
   }
 
   get conversations (): ConversationSessionPort {
@@ -638,8 +678,13 @@ export class YunzaiAgentServiceBridge {
     requestKind: TrustedRequestKind
   ): Promise<ChatReplyEnvelope> {
     const requestRef = this.#createRequestRef()
+    const requestObservationContext = beginRequestObservation({
+      requestRef,
+      requestKind,
+      startedAtMonotonicMs: safeMonotonicNow(this.#monotonicNow)
+    })
     const requestId = this.#generateId()
-    let runId = requestId
+    let request: YunzaiAgentRequestDraft
     try {
       if (typeof prompt !== 'string' || prompt.trim() === '') {
         throw new AgentError({
@@ -657,7 +702,7 @@ export class YunzaiAgentServiceBridge {
         options.enableGroupContext === true
       )
       const requestModel = modelConfig(this.#options.config, options)
-      const request = await adaptYunzaiRequest({
+      request = await adaptYunzaiRequest({
         event,
         currentPrompt: `${prompt}${toolRun.promptAddition}`,
         groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
@@ -680,17 +725,18 @@ export class YunzaiAgentServiceBridge {
         groupContext,
         ...(options.progress === undefined ? {} : { progress: options.progress })
       }))
+    } catch (error) {
+      return failedEnvelope(requestId, error, requestObservationContext)
+    }
+    try {
       const result = requestKind === 'proactive_chat'
-        ? await this.#bridge.handleEphemeral(request)
-        : await this.#bridge.handle(request)
-      runId = result.runId
+        ? await this.#bridge.handleEphemeral(request, { requestObservationContext })
+        : await this.#bridge.handle(request, { requestObservationContext })
       if (result.kind === 'paused') {
         this.#deliveryEvents.set(result.runId, event)
-        await this.#displayApprovalOrCancel(event, result.interruption)
+        return await this.#displayApprovalOrCancel(event, result)
       }
       return result
-    } catch (error) {
-      return failedEnvelope(runId, error)
     } finally {
       this.#prepared.delete(requestId)
     }
@@ -698,15 +744,17 @@ export class YunzaiAgentServiceBridge {
 
   async #displayApprovalOrCancel (
     event: YunzaiMessageEvent,
-    interruption: ApprovalInterruption
-  ): Promise<void> {
+    result: Extract<ChatReplyEnvelope, { readonly kind: 'paused' }>
+  ): Promise<ChatReplyEnvelope> {
     try {
-      await this.#displayApproval(event, interruption)
+      await this.#displayApproval(event, result.interruption)
+      return result
     } catch (error) {
-      this.#deliveryEvents.delete(interruption.runId)
-      this.#clearApprovalTimer(interruption.runId)
-      await this.#bridge.cancel(interruption.runId, 'approval_delivery_failed')
-      throw error
+      this.#deliveryEvents.delete(result.runId)
+      this.#clearApprovalTimer(result.runId)
+      const cancelled = await this.#bridge.cancel(result.runId, 'approval_delivery_failed')
+      if (cancelled === null) throw error
+      return cancelled
     }
   }
 
@@ -759,7 +807,7 @@ export class YunzaiAgentServiceBridge {
 
   async #presentRunResultSafely (
     event: YunzaiMessageEvent,
-    result: RunAdvanceResult
+    result: ChatReplyEnvelope
   ): Promise<void> {
     try {
       await this.#presentRunResult(event, result)
@@ -770,11 +818,14 @@ export class YunzaiAgentServiceBridge {
 
   async #presentRunResult (
     fallbackEvent: YunzaiMessageEvent,
-    result: RunAdvanceResult
+    result: ChatReplyEnvelope
   ): Promise<void> {
     const event = this.#deliveryEvents.get(result.runId) ?? fallbackEvent
     if (result.kind === 'paused') {
-      await this.#displayApprovalOrCancel(event, result.interruption)
+      const displayed = await this.#displayApprovalOrCancel(event, result)
+      if (displayed.kind !== 'paused') {
+        await this.#presentRunResult(event, displayed)
+      }
       return
     }
     try {
@@ -915,6 +966,11 @@ function createYunzaiAgentServiceBridge (
     maxPerRunConcurrency: 2,
     maxGlobalConcurrency: 2
   })
+  const terminalFacts = new TerminalFactCollector({
+    onCommitted: (snapshot, receipt) => {
+      options.logger?.info?.(createAgentRunLog(snapshot, receipt))
+    }
+  })
   const service = new AgentService({
     sessions,
     runStore,
@@ -971,7 +1027,9 @@ function createYunzaiAgentServiceBridge (
     now,
     generateId,
     observationLevel: () => options.config.observabilityLevel,
-    onRunLog: entry => options.logger?.info?.(entry),
+    monotonicNow: options.monotonicNow,
+    onTerminalSnapshot: snapshot => terminalFacts.acceptSnapshot(snapshot),
+    onTerminalCommitReceipt: receipt => terminalFacts.acceptCommitReceipt(receipt),
     onObserverFailure: entry => options.logger?.error?.(entry)
   })
   const bridge = new AgentServiceBridge(service)
@@ -982,7 +1040,7 @@ function createYunzaiAgentServiceBridge (
         approvalId
       ),
       displayApproval: async input => await bridge.displayApproval(input),
-      decideApproval: async input => await bridge.decideApproval(input) as RunAdvanceResult | null
+      decideApproval: async input => await bridge.decideApproval(input)
     },
     index: new RedisApprovalReferenceIndex(options.redis)
   })

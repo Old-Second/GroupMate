@@ -211,6 +211,8 @@ export class RunApprovalRouter {
         }, runtime);
         if (result === null)
             return false;
+        if (result.kind === 'approval_deferred')
+            return true;
         await this.#index.delete(reference);
         await onResult?.(result, reference);
         return true;
@@ -234,6 +236,8 @@ export class RunApprovalRouter {
         }, runtime);
         if (result === null)
             return false;
+        if (result.kind === 'approval_deferred')
+            return true;
         await this.#index.delete(reference);
         await onResult?.(result, reference);
         return true;

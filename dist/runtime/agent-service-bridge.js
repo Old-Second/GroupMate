@@ -12,6 +12,9 @@ import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { ToolScheduler } from '../agent/run/tool-scheduler.js';
 import { RedisAgentSessionStore } from '../agent/session/redis-agent-session-store.js';
 import { AgentService } from './agent-service.js';
+import { beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
+import { createAgentRunLog } from './safe-chat-logging.js';
+import { TerminalFactCollector } from './terminal-fact-collector.js';
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js';
 import { RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
 import { RunProgressPresenter } from './run-progress-presenter.js';
@@ -258,7 +261,7 @@ async function loadGroupContext(options, event, requestId, createdAt, enabled) {
         return Object.freeze([]);
     }
 }
-function failedEnvelope(runId, error) {
+function failedEnvelope(runId, error, context) {
     const normalized = error instanceof AgentError
         ? error
         : error instanceof ModelProviderError
@@ -275,8 +278,31 @@ function failedEnvelope(runId, error) {
         runId,
         runRef: 'unavailable',
         error: serializeAgentError(normalized),
-        terminal: null
+        terminal: null,
+        requestObservationDraft: createRequestObservationDraft({
+            context,
+            runRef: 'unavailable',
+            outcome: 'failed_request_validation',
+            admissionRejectionReason: 'not_applicable',
+            queueDurationMs: 'not_attempted',
+            sessionLoadDurationMs: 'not_attempted',
+            sessionSaveDurationMs: 'not_attempted',
+            terminalObservationId: 'not_attempted'
+        }),
+        sessionPersistence: 'not_attempted'
     });
+}
+function safeMonotonicNow(clock) {
+    try {
+        const value = clock();
+        return value === 'unavailable' ||
+            (Number.isSafeInteger(value) && Number(value) >= 0)
+            ? value
+            : 'unavailable';
+    }
+    catch {
+        return 'unavailable';
+    }
 }
 function messageIdentifier(value) {
     if (Array.isArray(value)) {
@@ -367,6 +393,7 @@ export class YunzaiAgentServiceBridge {
     #now;
     #generateId;
     #createRequestRef;
+    #monotonicNow;
     constructor(input) {
         this.#options = input.options;
         this.#bridge = input.bridge;
@@ -376,6 +403,7 @@ export class YunzaiAgentServiceBridge {
         this.#now = input.options.now ?? (() => new Date());
         this.#generateId = input.options.generateId ?? randomUUID;
         this.#createRequestRef = input.options.createRequestRef ?? createRequestRef;
+        this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()));
     }
     get conversations() {
         return this.#bridge.conversations;
@@ -411,8 +439,13 @@ export class YunzaiAgentServiceBridge {
     }
     async #execute(event, prompt, options, requestKind) {
         const requestRef = this.#createRequestRef();
+        const requestObservationContext = beginRequestObservation({
+            requestRef,
+            requestKind,
+            startedAtMonotonicMs: safeMonotonicNow(this.#monotonicNow)
+        });
         const requestId = this.#generateId();
-        let runId = requestId;
+        let request;
         try {
             if (typeof prompt !== 'string' || prompt.trim() === '') {
                 throw new AgentError({
@@ -424,7 +457,7 @@ export class YunzaiAgentServiceBridge {
             const toolRun = await this.#toolRuntime.prepareAgentRun({ event, prompt });
             const groupContext = await loadGroupContext(this.#options, event, requestId, createdAt, options.enableGroupContext === true);
             const requestModel = modelConfig(this.#options.config, options);
-            const request = await adaptYunzaiRequest({
+            request = await adaptYunzaiRequest({
                 event,
                 currentPrompt: `${prompt}${toolRun.promptAddition}`,
                 groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
@@ -447,32 +480,36 @@ export class YunzaiAgentServiceBridge {
                 groupContext,
                 ...(options.progress === undefined ? {} : { progress: options.progress })
             }));
-            const result = requestKind === 'proactive_chat'
-                ? await this.#bridge.handleEphemeral(request)
-                : await this.#bridge.handle(request);
-            runId = result.runId;
-            if (result.kind === 'paused') {
-                this.#deliveryEvents.set(result.runId, event);
-                await this.#displayApprovalOrCancel(event, result.interruption);
-            }
-            return result;
         }
         catch (error) {
-            return failedEnvelope(runId, error);
+            return failedEnvelope(requestId, error, requestObservationContext);
+        }
+        try {
+            const result = requestKind === 'proactive_chat'
+                ? await this.#bridge.handleEphemeral(request, { requestObservationContext })
+                : await this.#bridge.handle(request, { requestObservationContext });
+            if (result.kind === 'paused') {
+                this.#deliveryEvents.set(result.runId, event);
+                return await this.#displayApprovalOrCancel(event, result);
+            }
+            return result;
         }
         finally {
             this.#prepared.delete(requestId);
         }
     }
-    async #displayApprovalOrCancel(event, interruption) {
+    async #displayApprovalOrCancel(event, result) {
         try {
-            await this.#displayApproval(event, interruption);
+            await this.#displayApproval(event, result.interruption);
+            return result;
         }
         catch (error) {
-            this.#deliveryEvents.delete(interruption.runId);
-            this.#clearApprovalTimer(interruption.runId);
-            await this.#bridge.cancel(interruption.runId, 'approval_delivery_failed');
-            throw error;
+            this.#deliveryEvents.delete(result.runId);
+            this.#clearApprovalTimer(result.runId);
+            const cancelled = await this.#bridge.cancel(result.runId, 'approval_delivery_failed');
+            if (cancelled === null)
+                throw error;
+            return cancelled;
         }
     }
     async #displayApproval(event, interruption) {
@@ -516,7 +553,10 @@ export class YunzaiAgentServiceBridge {
     async #presentRunResult(fallbackEvent, result) {
         const event = this.#deliveryEvents.get(result.runId) ?? fallbackEvent;
         if (result.kind === 'paused') {
-            await this.#displayApprovalOrCancel(event, result.interruption);
+            const displayed = await this.#displayApprovalOrCancel(event, result);
+            if (displayed.kind !== 'paused') {
+                await this.#presentRunResult(event, displayed);
+            }
             return;
         }
         try {
@@ -643,6 +683,11 @@ function createYunzaiAgentServiceBridge(options) {
         maxPerRunConcurrency: 2,
         maxGlobalConcurrency: 2
     });
+    const terminalFacts = new TerminalFactCollector({
+        onCommitted: (snapshot, receipt) => {
+            options.logger?.info?.(createAgentRunLog(snapshot, receipt));
+        }
+    });
     const service = new AgentService({
         sessions,
         runStore,
@@ -687,7 +732,9 @@ function createYunzaiAgentServiceBridge(options) {
         now,
         generateId,
         observationLevel: () => options.config.observabilityLevel,
-        onRunLog: entry => options.logger?.info?.(entry),
+        monotonicNow: options.monotonicNow,
+        onTerminalSnapshot: snapshot => terminalFacts.acceptSnapshot(snapshot),
+        onTerminalCommitReceipt: receipt => terminalFacts.acceptCommitReceipt(receipt),
         onObserverFailure: entry => options.logger?.error?.(entry)
     });
     const bridge = new AgentServiceBridge(service);

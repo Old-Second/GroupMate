@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
+import { RunAdmissionRejectionError } from '../agent/run/run-admission.js';
 import { RunReferenceConflictError } from '../agent/run/run-store.js';
 import { createFrozenObservationPolicy } from '../agent/run/run-observation.js';
 import { createRunRef } from '../agent/run/run-reference.js';
 import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
-import { createAgentRunLog } from './safe-chat-logging.js';
+import { activateRequestObservation, beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
+function isApprovalRecoveryDeferred(value) {
+    return 'kind' in value && value.kind === 'approval_deferred';
+}
 const EMPTY_ITEMS = Object.freeze([]);
 function internalError(cause) {
     return new AgentError({
@@ -19,7 +23,7 @@ function internalError(cause) {
 function asAgentError(error) {
     return error instanceof AgentError ? error : internalError(error);
 }
-function failedEnvelope(runId, error, runRef = 'unavailable') {
+function failedRunResult(runId, error, runRef = 'unavailable') {
     return Object.freeze({
         kind: 'failed',
         runId,
@@ -56,7 +60,7 @@ function freezeRequest(draft, runRef) {
         runRef
     });
 }
-function cancelledEnvelope(runId, reason = 'user_cancelled', runRef = 'unavailable') {
+function cancelledRunResult(runId, reason = 'user_cancelled', runRef = 'unavailable') {
     return Object.freeze({
         kind: 'cancelled',
         runId,
@@ -64,6 +68,23 @@ function cancelledEnvelope(runId, reason = 'user_cancelled', runRef = 'unavailab
         reason: cancellationReason(reason),
         terminal: null
     });
+}
+function readMonotonic(clock) {
+    try {
+        const value = clock();
+        return value === 'unavailable' ||
+            (Number.isSafeInteger(value) && Number(value) >= 0)
+            ? value
+            : 'unavailable';
+    }
+    catch {
+        return 'unavailable';
+    }
+}
+function elapsed(started, finished) {
+    return started === 'unavailable' || finished === 'unavailable' || finished < started
+        ? 'unavailable'
+        : finished - started;
 }
 function linkedAbortSignal(callerSignal, lifecycleSignal) {
     const controller = new AbortController();
@@ -291,17 +312,63 @@ function freshSession(request, sessionId, timestamp) {
         state: Object.freeze({ schemaVersion: 1, messages: Object.freeze([]) })
     });
 }
-function terminalEnvelope(result) {
-    if (result.kind !== 'completed')
-        return result;
+function finalEnvelope(result, requestObservationDraft, sessionPersistence) {
+    if (result.kind !== 'completed') {
+        return Object.freeze({
+            ...result,
+            requestObservationDraft,
+            sessionPersistence
+        });
+    }
     const text = result.completion.kind === 'reply_text'
         ? result.completion.text
         : null;
     return Object.freeze({
         ...result,
         visibleOutput: result.completion.kind === 'already_visible',
-        text
+        text,
+        requestObservationDraft,
+        sessionPersistence
     });
+}
+function preCreateEnvelope(result, context, outcome, admissionRejectionReason, queueDurationMs, sessionLoadDurationMs) {
+    const normalized = result.kind === 'failed'
+        ? Object.freeze({ ...result, runRef: 'unavailable', terminal: null })
+        : Object.freeze({ ...result, runRef: 'unavailable', terminal: null });
+    return finalEnvelope(normalized, createRequestObservationDraft({
+        context,
+        runRef: 'unavailable',
+        outcome,
+        admissionRejectionReason,
+        queueDurationMs,
+        sessionLoadDurationMs,
+        sessionSaveDurationMs: 'not_attempted',
+        terminalObservationId: 'not_attempted'
+    }), 'not_attempted');
+}
+function activeFinalEnvelope(result, context, sessionPersistence, sessionSaveDurationMs) {
+    const terminalObservationId = result.terminal?.snapshot.observationId ?? 'unavailable';
+    const failedSessionSave = sessionPersistence === 'failed';
+    const requestObservationDraft = failedSessionSave
+        ? createRequestObservationDraft({
+            context,
+            outcome: 'failed_session_save',
+            admissionRejectionReason: 'not_applicable',
+            sessionSaveDurationMs: sessionSaveDurationMs === 'not_attempted'
+                ? 'unavailable'
+                : sessionSaveDurationMs,
+            terminalObservationId: terminalObservationId === 'unavailable'
+                ? (() => { throw new TypeError('failed session save terminal fact is unavailable'); })()
+                : terminalObservationId
+        })
+        : createRequestObservationDraft({
+            context,
+            outcome: 'completed',
+            admissionRejectionReason: 'not_applicable',
+            sessionSaveDurationMs,
+            terminalObservationId
+        });
+    return finalEnvelope(result, requestObservationDraft, sessionPersistence);
 }
 function appendTerminalTurn(record, request, result, updatedAt) {
     const existing = [...record.state.messages];
@@ -342,7 +409,6 @@ function appendTerminalTurn(record, request, result, updatedAt) {
 export class AgentService {
     conversations;
     #sessions;
-    #runStore;
     #admission;
     #contextEngine;
     #progressPresenter;
@@ -352,7 +418,9 @@ export class AgentService {
     #generateId;
     #createRunRef;
     #observationLevel;
-    #onRunLog;
+    #monotonicNow;
+    #onTerminalSnapshot;
+    #onTerminalCommitReceipt;
     #onObserverFailure;
     #engine;
     #pending = new Map();
@@ -362,7 +430,6 @@ export class AgentService {
     #observerFailureReported = false;
     constructor(options) {
         this.#sessions = options.sessions;
-        this.#runStore = options.runStore;
         this.#admission = options.admission;
         this.#contextEngine = options.contextEngine;
         this.#progressPresenter = options.progressPresenter;
@@ -372,7 +439,9 @@ export class AgentService {
         this.#generateId = options.generateId ?? randomUUID;
         this.#createRunRef = options.createRunRef ?? createRunRef;
         this.#observationLevel = options.observationLevel;
-        this.#onRunLog = options.onRunLog;
+        this.#monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()));
+        this.#onTerminalSnapshot = options.onTerminalSnapshot;
+        this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt;
         this.#onObserverFailure = options.onObserverFailure;
         this.#engine = options.createEngine(event => {
             try {
@@ -400,17 +469,13 @@ export class AgentService {
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(runId);
         try {
-            if (linked.signal.aborted) {
-                return await this.cancel(runId, linked.signal.reason);
-            }
             if (pending === undefined) {
                 pending = await this.#recoverPending(runId, linked.signal);
             }
-            if (pending === null) {
-                return terminalEnvelope(await this.#engine.resume(runId, undefined, {
-                    ...options,
-                    signal: linked.signal
-                }));
+            if (pending === null || isApprovalRecoveryDeferred(pending))
+                return pending;
+            if (linked.signal.aborted) {
+                return await this.cancel(runId, linked.signal.reason);
             }
             const result = await this.#engine.resume(runId, pending.binding, {
                 ...options,
@@ -422,9 +487,11 @@ export class AgentService {
             if (linked.signal.aborted) {
                 return await this.cancel(runId, linked.signal.reason);
             }
-            if (pending === undefined || pending === null)
-                return failedEnvelope(runId, error);
-            return await this.#abortPending(pending, failedEnvelope(runId, error, pending.request?.runRef ?? 'unavailable'));
+            if (pending === undefined)
+                throw error;
+            if (pending === null || isApprovalRecoveryDeferred(pending))
+                return pending;
+            return await this.#abortPending(pending, error);
         }
         finally {
             linked.dispose();
@@ -432,20 +499,18 @@ export class AgentService {
     }
     async cancel(runId, reason = 'user_cancelled') {
         const pending = this.#pending.get(runId);
+        if (pending === undefined)
+            return null;
         try {
             const result = await this.#engine.cancel(runId, reason);
-            return pending === undefined
-                ? terminalEnvelope(result)
-                : await this.#finish(pending, result);
+            return await this.#finish(pending, result);
         }
         catch (error) {
-            if (pending !== undefined) {
-                this.#pending.delete(runId);
-                await this.#progressPresenter.drain(runId).catch(() => undefined);
-                this.#progressPresenter.detach(runId);
-                await pending.lease.release().catch(() => undefined);
-            }
-            return failedEnvelope(runId, error, pending?.request?.runRef ?? 'unavailable');
+            this.#pending.delete(runId);
+            await this.#progressPresenter.drain(runId).catch(() => undefined);
+            this.#progressPresenter.detach(runId);
+            await pending.lease.release().catch(() => undefined);
+            return activeFinalEnvelope(failedRunResult(runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
         }
     }
     shutdown(reason = 'process_shutdown') {
@@ -467,24 +532,18 @@ export class AgentService {
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(input.runId);
         try {
+            if (pending === undefined) {
+                pending = await this.#recoverPending(input.runId, linked.signal);
+            }
+            if (pending === null || isApprovalRecoveryDeferred(pending))
+                return pending;
             if (linked.signal.aborted) {
                 return await this.cancel(input.runId, linked.signal.reason);
             }
-            if (pending === undefined) {
-                try {
-                    pending = await this.#recoverPending(input.runId, linked.signal);
-                }
-                catch {
-                    if (linked.signal.aborted) {
-                        return await this.cancel(input.runId, linked.signal.reason);
-                    }
-                    return null;
-                }
-            }
-            const result = await this.#engine.decideApproval(input, pending?.binding, { ...options, signal: linked.signal });
+            const result = await this.#engine.decideApproval(input, pending.binding, { ...options, signal: linked.signal });
             if (result === null)
                 return null;
-            return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result);
+            return await this.#finish(pending, result);
         }
         finally {
             linked.dispose();
@@ -492,23 +551,69 @@ export class AgentService {
     }
     async #start(draft, ephemeral, options) {
         const runId = this.#generateId();
+        const startedAtMonotonicMs = options.requestObservationContext?.startedAtMonotonicMs ??
+            readMonotonic(this.#monotonicNow);
+        const requestObservationContext = beginRequestObservation({
+            requestRef: draft.requestRef,
+            requestKind: draft.requestKind,
+            startedAtMonotonicMs
+        });
+        if (draft.requestKind !== (ephemeral ? 'proactive_chat' : 'ordinary_chat') ||
+            (options.requestObservationContext !== undefined &&
+                (options.requestObservationContext.requestRef !== draft.requestRef ||
+                    options.requestObservationContext.requestKind !== draft.requestKind))) {
+            return preCreateEnvelope(failedRunResult(runId, new AgentError({
+                code: 'invalid_request',
+                stage: 'agent.service.observation',
+                retryable: false,
+                userMessage: '请求格式不正确，请联系机器人主人。'
+            })), requestObservationContext, 'failed_request_validation', 'not_applicable', 'not_attempted', 'not_attempted');
+        }
         const levelAtStart = safeObservationLevel(this.#observationLevel);
         let runRef = this.#createRunRef();
         let request = freezeRequest(draft, runRef);
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let lease;
+        const queueStarted = readMonotonic(this.#monotonicNow);
+        let queueDurationMs = 'unavailable';
+        let sessionLoadDurationMs = 'not_attempted';
         try {
-            if (linked.signal.aborted) {
-                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason, runRef);
+            try {
+                lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
+                queueDurationMs = elapsed(queueStarted, readMonotonic(this.#monotonicNow));
             }
-            lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
-            if (linked.signal.aborted)
-                throw new Error('run start was cancelled');
+            catch (error) {
+                queueDurationMs = elapsed(queueStarted, readMonotonic(this.#monotonicNow));
+                const reason = error instanceof RunAdmissionRejectionError
+                    ? error.rejectionReason
+                    : 'unavailable';
+                const result = error instanceof RunAdmissionRejectionError &&
+                    error.rejectionReason === 'queue_aborted'
+                    ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason, 'unavailable')
+                    : failedRunResult(runId, error);
+                return preCreateEnvelope(result, requestObservationContext, 'rejected_admission', reason, queueDurationMs, 'not_attempted');
+            }
             const timestamp = this.#now().toISOString();
-            const session = ephemeral
-                ? null
-                : await this.#sessions.get(request.sessionAddress, { signal: linked.signal }) ??
-                    freshSession(request, this.#generateId(), timestamp);
+            let session;
+            if (ephemeral) {
+                session = null;
+            }
+            else {
+                const sessionLoadStarted = readMonotonic(this.#monotonicNow);
+                try {
+                    session = await this.#sessions.get(request.sessionAddress, { signal: linked.signal }) ?? freshSession(request, this.#generateId(), timestamp);
+                    sessionLoadDurationMs = elapsed(sessionLoadStarted, readMonotonic(this.#monotonicNow));
+                }
+                catch (error) {
+                    sessionLoadDurationMs = elapsed(sessionLoadStarted, readMonotonic(this.#monotonicNow));
+                    await lease.release().catch(() => undefined);
+                    lease = undefined;
+                    const result = linked.signal.aborted
+                        ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
+                        : failedRunResult(runId, error);
+                    return preCreateEnvelope(result, requestObservationContext, 'failed_session_load', 'not_applicable', queueDurationMs, sessionLoadDurationMs);
+                }
+            }
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
             const runtime = await this.#createRuntime(request);
@@ -516,15 +621,6 @@ export class AgentService {
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
             let binding = this.#bindingFor(runId, request, session, runtime);
-            let pending = Object.freeze({
-                runId,
-                request,
-                session,
-                binding,
-                lease,
-                ephemeral
-            });
-            this.#pending.set(runId, pending);
             this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined));
             let result;
             for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -545,7 +641,7 @@ export class AgentService {
                         deadlineAt: request.deadlineAt,
                         model: request.model,
                         runtime: binding
-                    }, { ...options, signal: linked.signal });
+                    }, { signal: linked.signal });
                     break;
                 }
                 catch (error) {
@@ -554,19 +650,35 @@ export class AgentService {
                     runRef = this.#createRunRef();
                     request = freezeRequest(draft, runRef);
                     binding = this.#bindingFor(runId, request, session, runtime);
-                    pending = Object.freeze({
-                        runId,
-                        request,
-                        session,
-                        binding,
-                        lease,
-                        ephemeral
-                    });
-                    this.#pending.set(runId, pending);
                 }
             }
             if (result === undefined)
                 throw new RunReferenceConflictError();
+            if (result.runRef === 'unavailable') {
+                await lease.release().catch(() => undefined);
+                lease = undefined;
+                this.#progressPresenter.detach(runId);
+                if (result.kind === 'paused' || result.kind === 'completed') {
+                    throw new TypeError('run result lacks a claimed reference');
+                }
+                return preCreateEnvelope(result, requestObservationContext, 'failed_run_create', 'not_applicable', queueDurationMs, sessionLoadDurationMs);
+            }
+            const activeContext = activateRequestObservation({
+                context: requestObservationContext,
+                runRef: result.runRef,
+                queueDurationMs,
+                sessionLoadDurationMs
+            });
+            const pending = Object.freeze({
+                runId,
+                request,
+                session,
+                binding,
+                lease,
+                ephemeral,
+                requestObservationContext: activeContext
+            });
+            this.#pending.set(runId, pending);
             return await this.#finish(pending, result);
         }
         catch (error) {
@@ -578,10 +690,10 @@ export class AgentService {
             }
             this.#pending.delete(runId);
             this.#progressPresenter.detach(runId);
-            if (linked.signal.aborted) {
-                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason, runRef);
-            }
-            return failedEnvelope(runId, error, runRef);
+            const result = linked.signal.aborted
+                ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
+                : failedRunResult(runId, error);
+            return preCreateEnvelope(result, requestObservationContext, 'failed_run_create', 'not_applicable', queueDurationMs, sessionLoadDurationMs);
         }
         finally {
             linked.dispose();
@@ -641,7 +753,22 @@ export class AgentService {
                 userMessage: '任务运行环境已失效，请重新发起。'
             });
         }
-        const lease = await this.#admission.recover(checkpoint, signal);
+        let lease;
+        try {
+            lease = await this.#admission.recover(checkpoint, signal);
+        }
+        catch (error) {
+            const reason = error instanceof RunAdmissionRejectionError
+                ? error.rejectionReason
+                : 'unavailable';
+            return Object.freeze({
+                kind: 'approval_deferred',
+                reason,
+                retryable: true,
+                runRef: checkpoint.runRef,
+                requestRef: checkpoint.requestRef
+            });
+        }
         try {
             const runtime = await this.#recoverRuntime(checkpoint);
             const binding = Object.freeze({
@@ -665,7 +792,19 @@ export class AgentService {
                 lease,
                 // A restarted process cannot recreate the canonical QQ message without
                 // inventing provenance, so recovery must not mutate chat history.
-                ephemeral: true
+                ephemeral: true,
+                requestObservationContext: activateRequestObservation({
+                    context: beginRequestObservation({
+                        requestRef: checkpoint.requestRef,
+                        requestKind: checkpoint.requestKind,
+                        startedAtMonotonicMs: 'unavailable'
+                    }),
+                    runRef: checkpoint.runRef,
+                    queueDurationMs: 'unavailable',
+                    sessionLoadDurationMs: checkpoint.requestKind === 'proactive_chat'
+                        ? 'not_attempted'
+                        : 'unavailable'
+                })
             });
             this.#pending.set(runId, pending);
             this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined), checkpoint.events);
@@ -677,14 +816,35 @@ export class AgentService {
         }
     }
     async #finish(pending, result) {
-        await this.#progressPresenter.drain(pending.runId);
-        if (result.kind === 'paused')
-            return result;
-        const envelope = terminalEnvelope(result);
-        try {
+        if (result.kind === 'paused') {
+            await this.#progressPresenter.drain(pending.runId);
+            return Object.freeze({
+                ...result,
+                requestObservationContext: pending.requestObservationContext
+            });
+        }
+        if (result.terminal !== null) {
             try {
-                if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
-                    result.kind === 'completed') {
+                this.#onTerminalSnapshot?.(result.terminal.snapshot);
+            }
+            catch {
+                this.#reportObserverFailure();
+            }
+            try {
+                this.#onTerminalCommitReceipt?.(result.terminal.receipt);
+            }
+            catch {
+                this.#reportObserverFailure();
+            }
+        }
+        await this.#progressPresenter.drain(pending.runId);
+        let sessionPersistence = 'not_attempted';
+        let sessionSaveDurationMs = 'not_attempted';
+        try {
+            if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
+                result.kind === 'completed') {
+                const sessionSaveStarted = readMonotonic(this.#monotonicNow);
+                try {
                     const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString());
                     await this.#sessions.save(next, {
                         signal: undefined,
@@ -692,59 +852,40 @@ export class AgentService {
                             ? {}
                             : { ttlSeconds: pending.request.sessionTtlSeconds })
                     });
+                    sessionPersistence = 'saved';
+                }
+                catch {
+                    sessionPersistence = 'failed';
+                    this.#reportObserverFailure();
+                }
+                finally {
+                    sessionSaveDurationMs = elapsed(sessionSaveStarted, readMonotonic(this.#monotonicNow));
                 }
             }
-            catch {
-                // The terminal store commit is authoritative. A secondary session
-                // projection must not rewrite or discard its snapshot and receipt.
-                this.#reportObserverFailure();
-            }
-            this.#recordRun(result);
         }
         finally {
             this.#pending.delete(pending.runId);
             this.#progressPresenter.detach(pending.runId);
             await pending.lease.release().catch(() => undefined);
         }
-        return envelope;
+        return activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs);
     }
-    async #abortPending(pending, envelope) {
+    async #abortPending(pending, error) {
+        let cancelled = null;
+        try {
+            cancelled = await this.#engine.cancel(pending.runId, 'service_failure');
+        }
+        catch {
+            // A terminal-null safe failure below is the only valid fallback.
+        }
+        if (cancelled !== null && cancelled.kind !== 'paused' && cancelled.terminal !== null) {
+            return await this.#finish(pending, cancelled);
+        }
         this.#pending.delete(pending.runId);
-        await this.#engine.cancel(pending.runId, 'service_failure').catch(() => undefined);
         await this.#progressPresenter.drain(pending.runId);
         this.#progressPresenter.detach(pending.runId);
         await pending.lease.release().catch(() => undefined);
-        return envelope;
-    }
-    #recordRun(result) {
-        if (this.#onRunLog === undefined)
-            return;
-        void this.#runStore.load(result.runId).then(checkpoint => {
-            const counters = checkpoint?.budgetCounters;
-            const observed = result.kind === 'paused'
-                ? undefined
-                : result.terminal?.snapshot.counters;
-            try {
-                this.#onRunLog?.(createAgentRunLog({
-                    runId: result.runId,
-                    fromStatus: 'active',
-                    toStatus: result.kind,
-                    modelTurns: observed?.modelTurns ?? counters?.modelTurns,
-                    toolCalls: observed?.toolCalls ?? counters?.toolCalls,
-                    usedActiveRuntimeMs: observed?.providerActiveDurationMs ??
-                        counters?.usedActiveRuntimeMs,
-                    providerAttempts: observed?.providerAttempts ?? (counters === undefined
-                        ? undefined
-                        : counters.modelTurns + counters.providerRetries),
-                    recoveryAttempts: observed?.recoveryAttempts ?? counters?.recoveryAttempts,
-                    correctionAttempts: observed?.correctionTurns ?? counters?.correctionTurns,
-                    errorCode: result.kind === 'failed' ? result.error.code : undefined
-                }));
-            }
-            catch {
-                this.#reportObserverFailure();
-            }
-        }).catch(() => this.#reportObserverFailure());
+        return activeFinalEnvelope(failedRunResult(pending.runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
     }
     #reportObserverFailure() {
         if (this.#observerFailureReported)

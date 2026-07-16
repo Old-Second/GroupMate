@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { parseRunTerminalSnapshot } from '../agent/run/run-observation.js';
+import { parseTerminalCommitReceipt } from '../agent/run/run-store.js';
 import { readChatErrorMetadata } from './chat-error-presentation.js';
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
@@ -67,21 +68,65 @@ export function createMessageInputLog(input) {
         promptCharacters: getStringLength(input.prompt)
     };
 }
-export function createAgentRunLog(input) {
-    const runId = typeof input.runId === 'string' ? input.runId : 'unknown';
-    return {
+export function createAgentRunLog(snapshotValue, receiptValue) {
+    const snapshot = parseRunTerminalSnapshot({
+        schemaVersion: snapshotValue.schemaVersion,
+        observationId: snapshotValue.observationId,
+        runRef: snapshotValue.runRef,
+        revision: snapshotValue.revision,
+        status: snapshotValue.status,
+        finishedAt: snapshotValue.finishedAt,
+        completion: snapshotValue.completion,
+        errorCode: snapshotValue.errorCode,
+        cancellationReason: snapshotValue.cancellationReason,
+        counters: snapshotValue.counters,
+        engineDurationMs: snapshotValue.engineDurationMs
+    });
+    const receipt = parseTerminalCommitReceipt({
+        schemaVersion: receiptValue.schemaVersion,
+        observationId: receiptValue.observationId,
+        runRef: receiptValue.runRef,
+        revision: receiptValue.revision,
+        deletedKeyCount: receiptValue.deletedKeyCount,
+        createdKeyCount: receiptValue.createdKeyCount,
+        checkpointBytesDeleted: receiptValue.checkpointBytesDeleted,
+        eventBytesDeleted: receiptValue.eventBytesDeleted,
+        tombstoneBytes: receiptValue.tombstoneBytes
+    });
+    if (snapshot.observationId !== receipt.observationId ||
+        snapshot.runRef !== receipt.runRef || snapshot.revision !== receipt.revision) {
+        throw new TypeError('agent run facts do not match');
+    }
+    return Object.freeze({
         event: 'agent.run',
-        runRef: createHash('sha256').update(runId).digest('hex').slice(0, 16),
-        fromStatus: getSafeToken(input.fromStatus),
-        toStatus: getSafeToken(input.toStatus),
-        modelTurns: getSafeCount(input.modelTurns),
-        toolCalls: getSafeCount(input.toolCalls),
-        usedActiveRuntimeMs: getSafeCount(input.usedActiveRuntimeMs),
-        providerAttempts: getSafeCount(input.providerAttempts),
-        recoveryAttempts: getSafeCount(input.recoveryAttempts),
-        correctionAttempts: getSafeCount(input.correctionAttempts),
-        errorCode: getSafeToken(input.errorCode),
-        storeKeyCount: getSafeCount(input.storeKeyCount),
-        estimatedBytes: getSafeCount(input.estimatedBytes)
-    };
+        observationId: snapshot.observationId,
+        runRef: snapshot.runRef,
+        revision: snapshot.revision,
+        status: snapshot.status,
+        completion: snapshot.completion,
+        errorCode: snapshot.errorCode,
+        cancellationReason: snapshot.cancellationReason,
+        providerAttempts: snapshot.counters.providerAttempts,
+        modelTurns: snapshot.counters.modelTurns,
+        toolAttempts: snapshot.counters.toolAttempts,
+        providerRetries: snapshot.counters.providerRetries,
+        recoveryAttempts: snapshot.counters.recoveryAttempts,
+        correctionTurns: snapshot.counters.correctionTurns,
+        toolCalls: snapshot.counters.toolCalls,
+        approvalRequests: snapshot.counters.approvalRequests,
+        toolDenied: snapshot.counters.toolDenied,
+        toolExpired: snapshot.counters.toolExpired,
+        toolIndeterminate: snapshot.counters.toolIndeterminate,
+        estimatedTokens: snapshot.counters.estimatedTokens,
+        providerInputTokens: snapshot.counters.providerInputTokens,
+        providerOutputTokens: snapshot.counters.providerOutputTokens,
+        providerTotalTokens: snapshot.counters.providerTotalTokens,
+        providerActiveDurationMs: snapshot.counters.providerActiveDurationMs,
+        engineDurationMs: snapshot.engineDurationMs,
+        deletedKeyCount: receipt.deletedKeyCount,
+        createdKeyCount: receipt.createdKeyCount,
+        checkpointBytesDeleted: receipt.checkpointBytesDeleted,
+        eventBytesDeleted: receipt.eventBytesDeleted,
+        tombstoneBytes: receipt.tombstoneBytes
+    });
 }

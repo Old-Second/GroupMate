@@ -86,6 +86,71 @@ test('Task 2 host entries hand off one exact presentation intent scalar', async 
   assert.match(bym, /presentationIntent:\s*\{[\s\S]*?kind:\s*'proactive'[\s\S]*?recallAfterMs/)
   assert.match(bym, /recallMsg:\s*recallAfterMs\s*\/\s*1000/)
   assert.doesNotMatch(bridge, /bymFuckRecallTime|forcePictureMode/)
+  assert.match(
+    bridge,
+    /onTerminalSnapshot:\s*snapshot\s*=>\s*terminalFacts\.acceptSnapshot\(snapshot\)/
+  )
+  assert.match(
+    bridge,
+    /onTerminalCommitReceipt:\s*receipt\s*=>\s*terminalFacts\.acceptCommitReceipt\(receipt\)/
+  )
+  assert.match(
+    bridge,
+    /onCommitted:\s*\(snapshot,\s*receipt\)\s*=>\s*\{[\s\S]*?createAgentRunLog\(snapshot,\s*receipt\)/
+  )
+})
+
+test('Task 5 contracts have one canonical owner and consumers import those types', async () => {
+  const completion = await readFile(
+    path.join(root, 'src/agent/contracts/completion.ts'),
+    'utf8'
+  )
+  const observation = await readFile(
+    path.join(root, 'src/runtime/request-observation.ts'),
+    'utf8'
+  )
+  const service = await readFile(
+    path.join(root, 'src/runtime/agent-service.ts'),
+    'utf8'
+  )
+  const bridge = await readFile(
+    path.join(root, 'src/runtime/agent-service-bridge.ts'),
+    'utf8'
+  )
+  const router = await readFile(
+    path.join(root, 'src/runtime/run-approval-router.ts'),
+    'utf8'
+  )
+  const routerTest = await readFile(
+    path.join(root, 'test/unit/approval-reference-router.test.ts'),
+    'utf8'
+  )
+
+  assert.match(completion, /export type SessionPersistenceOutcome\s*=/)
+  assert.doesNotMatch(observation, /(?:export\s+)?type SessionPersistenceOutcome\s*=/)
+  assert.match(
+    observation,
+    /export type \{ SessionPersistenceOutcome \} from '\.\.\/agent\/contracts\/completion\.js'/
+  )
+  assert.match(
+    service,
+    /import type \{ SessionPersistenceOutcome \} from '\.\.\/agent\/contracts\/completion\.js'/
+  )
+
+  assert.match(observation, /export interface ApprovalRecoveryDeferred/)
+  assert.doesNotMatch(service, /export interface ApprovalRecoveryDeferred/)
+  const deferredDeclarations = [observation, service, bridge, router]
+    .flatMap(source => source.match(/export interface ApprovalRecoveryDeferred/g) ?? [])
+  assert.equal(deferredDeclarations.length, 1)
+  for (const [source, modulePath] of [
+    [service, "from './request-observation.js'"],
+    [bridge, "from './request-observation.js'"],
+    [router, "from './request-observation.js'"],
+    [routerTest, "from '../../src/runtime/request-observation.js'"]
+  ]) {
+    assert.equal(source.includes('ApprovalRecoveryDeferred'), true)
+    assert.equal(source.includes(modulePath), true)
+  }
 })
 
 function modelResponse (text: string) {
@@ -151,6 +216,7 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   const redis = new FakeRedis(() => Date.parse(timestamp))
   const responses = [modelResponse('ordinary reply'), modelResponse('<EMPTY>')]
   const requests: Array<Record<string, unknown>> = []
+  const agentRunLogs: Array<Readonly<Record<string, unknown>>> = []
   let groupHistory: readonly unknown[] = []
   let generated = 0
   const config: Record<string, unknown> = {
@@ -182,6 +248,9 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     getBotId: () => 'bot-1',
     loadGroupHistory: async () => groupHistory,
     segment: () => ({}),
+    logger: {
+      info: entry => { agentRunLogs.push(entry) }
+    },
     now: () => new Date(timestamp),
     generateId: () => `production-${++generated}`
   })
@@ -209,6 +278,19 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   })
   assert.equal(ordinary.kind, 'completed')
   assert.equal(ordinary.kind === 'completed' ? ordinary.text : null, 'ordinary reply')
+  assert.equal(ordinary.kind === 'completed' ? ordinary.sessionPersistence : null, 'saved')
+  assert.equal(
+    ordinary.kind === 'completed' ? ordinary.requestObservationDraft.outcome : null,
+    'completed'
+  )
+  assert.equal(agentRunLogs.length, 1)
+  assert.equal(agentRunLogs[0]?.event, 'agent.run')
+  assert.match(String(agentRunLogs[0]?.runRef), /^[0-9a-f]{32}$/)
+  assert.match(String(agentRunLogs[0]?.observationId), /^[0-9a-f]{64}$/)
+  assert.equal(agentRunLogs[0]?.providerAttempts, 1)
+  assert.equal(agentRunLogs[0]?.modelTurns, 1)
+  assert.equal(agentRunLogs[0]?.deletedKeyCount, 2)
+  assert.equal(agentRunLogs[0]?.createdKeyCount, 1)
   assert.equal(requests.length, 1)
   assert.equal(requests[0]?.temperature, 0.7)
   const firstMessages = requests[0]?.messages as Array<{
@@ -240,6 +322,21 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   })
   assert.equal(ephemeral.kind, 'completed')
   assert.equal(ephemeral.kind === 'completed' ? ephemeral.text : null, null)
+  assert.equal(ephemeral.kind === 'completed' ? ephemeral.visibleOutput : null, false)
+  assert.equal(
+    ephemeral.kind === 'completed' ? ephemeral.sessionPersistence : null,
+    'not_attempted'
+  )
+  assert.equal(
+    ephemeral.kind === 'completed'
+      ? ephemeral.requestObservationDraft.sessionSaveDurationMs
+      : null,
+    'not_attempted'
+  )
+  assert.equal(agentRunLogs.length, 2)
+  assert.equal(agentRunLogs[1]?.event, 'agent.run')
+  assert.equal(agentRunLogs[1]?.providerAttempts, 1)
+  assert.equal(agentRunLogs[1]?.modelTurns, 1)
   assert.equal((await bridge.conversations.get({
     botId: 'bot-1', scope: { kind: 'private', userId: 'actor-1' }
   }))?.turnCount, 1)
@@ -430,4 +527,55 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     index > 0 && (message.role === 'user' || message.role === 'assistant') &&
     message.role === all[index - 1]?.role
   )), false)
+
+  config.toolPolicyProfile = 'safe'
+  config.toolPrivateSendPolicy = 'everyone'
+  responses.push(modelToolResponse(
+    'call-private-send-display-failure',
+    'sendMessage',
+    { text: 'must not be sent', targetKind: 'private', targetId: '2002' }
+  ))
+  const logsBeforeDisplayFailure = agentRunLogs.filter(entry => (
+    entry.event === 'agent.run'
+  )).length
+  const displayFailure = await bridge.handle({
+    ...privateRequestEvent,
+    message_id: 'message-display-failure',
+    msg: '请给用户 2002 发送消息并验证审批消息发送失败',
+    message: [{ type: 'text', text: '请给用户 2002 发送消息并验证审批消息发送失败' }],
+    bot: {
+      ...approvalEventBase.bot,
+      pickFriend: () => ({
+        sendMsg: async () => { throw new Error('injected approval display failure') }
+      })
+    }
+  }, '请给用户 2002 发送消息并验证审批消息发送失败', {
+    systemInstructions: ['You are GroupMate.'],
+    presentationIntent: Object.freeze({
+      schemaVersion: 1, kind: 'ordinary', forcePicture: false
+    })
+  })
+
+  assert.equal(displayFailure.kind, 'cancelled')
+  if (displayFailure.kind !== 'cancelled') {
+    assert.fail('approval display failure did not return the cancellation envelope')
+  }
+  if (displayFailure.terminal === null) {
+    assert.fail('approval display cancellation did not commit a terminal fact')
+  }
+  assert.equal(displayFailure.reason, 'approval_delivery_failed')
+  assert.equal(displayFailure.terminal.snapshot.status, 'cancelled')
+  assert.equal(
+    displayFailure.terminal.snapshot.cancellationReason,
+    'approval_delivery_failed'
+  )
+  assert.equal(displayFailure.requestObservationDraft.outcome, 'completed')
+  assert.equal(
+    displayFailure.requestObservationDraft.terminalObservationId,
+    displayFailure.terminal.snapshot.observationId
+  )
+  assert.equal(displayFailure.sessionPersistence, 'not_attempted')
+  assert.equal(agentRunLogs.filter(entry => (
+    entry.event === 'agent.run'
+  )).length, logsBeforeDisplayFailure + 1)
 })

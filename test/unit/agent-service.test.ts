@@ -2,17 +2,30 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import type { AgentMessage } from '../../src/agent/contracts/content.js'
+import type { CompletionDisposition } from '../../src/agent/contracts/completion.js'
+import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
 import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
-import { RunAdmission } from '../../src/agent/run/run-admission.js'
+import {
+  RunAdmission,
+  RunAdmissionRejectionError,
+  type RunLease
+} from '../../src/agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import { RunEngine } from '../../src/agent/run/run-engine.js'
+import type { RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
 import {
   RunReferenceConflictError,
+  type TerminalCommitReceiptV1,
   type RunStore
 } from '../../src/agent/run/run-store.js'
+import {
+  createInitialRunObservationCounters,
+  terminalObservationId,
+  type RunTerminalSnapshotV2
+} from '../../src/agent/run/run-observation.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import type { AgentSessionState } from '../../src/agent/session/agent-session-state.js'
 import { RedisAgentSessionStore } from '../../src/agent/session/redis-agent-session-store.js'
@@ -54,7 +67,11 @@ const intent = Object.freeze({
   replyMessageId: null
 })
 
-function request (id: string, text: string): YunzaiAgentRequestDraft {
+function request (
+  id: string,
+  text: string,
+  requestKind: 'ordinary_chat' | 'proactive_chat' = 'ordinary_chat'
+): YunzaiAgentRequestDraft {
   const message: AgentMessage = Object.freeze({
     id: `message-${id}`,
     role: 'user',
@@ -69,23 +86,38 @@ function request (id: string, text: string): YunzaiAgentRequestDraft {
     botId: 'bot-1',
     scope: Object.freeze({ kind: 'group_user' as const, groupId: 'group-1', userId: 'actor-1' })
   })
+  const presentationRoute = requestKind === 'ordinary_chat'
+    ? Object.freeze({
+        schemaVersion: 1 as const,
+        requestKind: 'ordinary_chat' as const,
+        profile: 'ordinary' as const,
+        presentationIntent: Object.freeze({
+          schemaVersion: 1 as const,
+          kind: 'ordinary' as const,
+          forcePicture: false
+        }),
+        sessionAddress,
+        actorId: 'actor-1',
+        requestMessageId: message.id
+      })
+    : Object.freeze({
+        schemaVersion: 1 as const,
+        requestKind: 'proactive_chat' as const,
+        profile: 'proactive' as const,
+        presentationIntent: Object.freeze({
+          schemaVersion: 1 as const,
+          kind: 'proactive' as const,
+          recallAfterMs: null
+        }),
+        sessionAddress,
+        actorId: 'actor-1',
+        requestMessageId: message.id
+      })
   return Object.freeze({
     requestId: id,
     requestRef: createHash('sha256').update(`request:${id}`).digest('hex').slice(0, 32),
-    requestKind: 'ordinary_chat',
-    presentationRoute: Object.freeze({
-      schemaVersion: 1,
-      requestKind: 'ordinary_chat',
-      profile: 'ordinary',
-      presentationIntent: Object.freeze({
-        schemaVersion: 1,
-        kind: 'ordinary',
-        forcePicture: false
-      }),
-      sessionAddress,
-      actorId: 'actor-1',
-      requestMessageId: message.id
-    }),
+    requestKind,
+    presentationRoute,
     createdAt,
     deadlineAt: '2026-07-14T01:04:00.000Z',
     sessionAddress,
@@ -276,15 +308,726 @@ class InjectedCollisionRunStore implements RunStore {
   )
 }
 
+function terminalFactsFor (
+  runRef: string,
+  completion: CompletionDisposition,
+  revision = 3
+) {
+  const observationId = terminalObservationId(runRef, revision)
+  const counters = createInitialRunObservationCounters()
+  const completionObservation = completion.kind === 'reply_text'
+    ? Object.freeze({ kind: 'reply_text' as const, lengthBucket: '1_40' as const })
+    : completion.kind === 'already_visible'
+      ? Object.freeze({ kind: 'already_visible' as const, source: 'tool_output' as const })
+      : Object.freeze({
+          kind: 'allowed_silence' as const,
+          reason: 'proactive_empty_directive' as const
+        })
+  return Object.freeze({
+    snapshot: Object.freeze({
+      schemaVersion: 2 as const,
+      observationId,
+      runRef,
+      revision,
+      status: 'completed' as const,
+      finishedAt: createdAt,
+      completion: completionObservation,
+      errorCode: null,
+      cancellationReason: null,
+      counters,
+      engineDurationMs: counters.engineActiveDurationMs
+    }),
+    receipt: Object.freeze({
+      schemaVersion: 1 as const,
+      observationId,
+      runRef,
+      revision,
+      deletedKeyCount: 2,
+      createdKeyCount: 1,
+      checkpointBytesDeleted: 100,
+      eventBytesDeleted: 20,
+      tombstoneBytes: 200
+    })
+  })
+}
+
+function terminalOutput (text: string): AgentMessage {
+  return Object.freeze({
+    id: `terminal-${text}`,
+    role: 'assistant',
+    parts: Object.freeze([{ type: 'text' as const, text }]),
+    createdAt,
+    provenance: Object.freeze({
+      source: 'agent_output',
+      trust: 'trusted',
+      sensitivity: 'group',
+      sourceId: `terminal-${text}`,
+      createdAt
+    })
+  })
+}
+
+function completedResult (
+  runId: string,
+  runRef: string,
+  completion: CompletionDisposition
+): Extract<RunAdvanceResult, { readonly kind: 'completed' }> {
+  return Object.freeze({
+    kind: 'completed',
+    runId,
+    runRef,
+    completion,
+    output: completion.kind === 'already_visible'
+      ? null
+      : terminalOutput(completion.kind === 'allowed_silence' ? '<EMPTY>' : completion.text),
+    terminal: terminalFactsFor(runRef, completion)
+  })
+}
+
+function cancelledResult (
+  runId: string,
+  runRef: string,
+  reason: string
+): Extract<RunAdvanceResult, { readonly kind: 'cancelled' }> {
+  const revision = 4
+  const observationId = terminalObservationId(runRef, revision)
+  const counters = createInitialRunObservationCounters()
+  return Object.freeze({
+    kind: 'cancelled',
+    runId,
+    runRef,
+    reason,
+    terminal: Object.freeze({
+      snapshot: Object.freeze({
+        schemaVersion: 2,
+        observationId,
+        runRef,
+        revision,
+        status: 'cancelled',
+        finishedAt: createdAt,
+        completion: Object.freeze({ kind: 'none' }),
+        errorCode: null,
+        cancellationReason: reason,
+        counters,
+        engineDurationMs: counters.engineActiveDurationMs
+      }),
+      receipt: Object.freeze({
+        schemaVersion: 1,
+        observationId,
+        runRef,
+        revision,
+        deletedKeyCount: 2,
+        createdKeyCount: 1,
+        checkpointBytesDeleted: 100,
+        eventBytesDeleted: 20,
+        tombstoneBytes: 200
+      })
+    })
+  })
+}
+
+function noOpLease (): RunLease {
+  return Object.freeze({
+    leaseId: 'contract-lease',
+    sessionAddress: request('lease', 'lease').sessionAddress,
+    release: async () => undefined
+  })
+}
+
+function contractSessions (
+  save: SessionStore<AgentSessionState>['save'] = async () => undefined
+): SessionStore<AgentSessionState> {
+  return Object.freeze({
+    get: async () => null,
+    save,
+    delete: async () => false,
+    list: async function * () {},
+    deleteAll: async () => 0,
+    fork: async () => { throw new Error('not used by contract test') }
+  })
+}
+
+function contractContextEngine (): ContextEngine {
+  return new ContextEngine({
+    estimator: {
+      estimate: () => 1,
+      estimateModelMessage: () => 1
+    },
+    memoryStore: new NoopMemoryStore()
+  })
+}
+
+function contractSnapshot () {
+  const definitions = Object.freeze([toolDefinition('website')])
+  return new ToolRegistry(definitions).createSnapshot({
+    id: 'snapshot-contract', facts, enabledTools: ['website']
+  })
+}
+
+function contractRuntime () {
+  const snapshot = contractSnapshot()
+  return Object.freeze({
+    binding: Object.freeze({
+      snapshot,
+      prepareToolContext: async (): Promise<ToolPreparationContext> => Object.freeze({
+        runId: 'contract-run', profile: 'compatible', facts, intent, now: createdAt
+      }),
+      contextFor: async (): Promise<ToolExecutionContext> => Object.freeze({
+        runId: 'contract-run', profile: 'compatible', facts, intent, now: createdAt
+      })
+    })
+  })
+}
+
+function contractEngine (
+  methods: Partial<Pick<
+    RunEngine,
+    'start' | 'resume' | 'cancel' | 'loadCheckpoint' | 'pendingApproval' |
+    'displayApproval' | 'decideApproval'
+  >>
+): RunEngine {
+  return Object.freeze({
+    start: async () => { throw new Error('unexpected start') },
+    resume: async () => { throw new Error('unexpected resume') },
+    cancel: async () => { throw new Error('unexpected cancel') },
+    loadCheckpoint: async () => null,
+    pendingApproval: async () => null,
+    displayApproval: async () => null,
+    decideApproval: async () => null,
+    ...methods
+  }) as unknown as RunEngine
+}
+
+test('fresh admission maps only the three fixed rejection reasons before run claim', async () => {
+  const cases = [
+    Object.freeze({
+      error: new RunAdmissionRejectionError('queue_full'),
+      reason: 'queue_full' as const,
+      kind: 'failed' as const
+    }),
+    Object.freeze({
+      error: new RunAdmissionRejectionError('queue_aborted'),
+      reason: 'queue_aborted' as const,
+      kind: 'cancelled' as const
+    }),
+    Object.freeze({
+      error: new Error('private redis admission failure'),
+      reason: 'unavailable' as const,
+      kind: 'failed' as const
+    })
+  ]
+  for (const [index, entry] of cases.entries()) {
+    let monotonic = 10
+    const service = new AgentService({
+      sessions: contractSessions(),
+      runStore: new InMemoryRunStore(),
+      admission: {
+        acquire: async () => { throw entry.error },
+        recover: async () => noOpLease()
+      },
+      contextEngine: contractContextEngine(),
+      progressPresenter: new RunProgressPresenter(),
+      createEngine: () => contractEngine({}),
+      createRuntime: async () => contractRuntime(),
+      generateId: () => `admission-contract-${index}`,
+      createRunRef: () => `${index + 1}`.repeat(32),
+      monotonicNow: () => monotonic++
+    })
+
+    const outcome = await service.handle(request(
+      `admission-contract-${index}`,
+      '验证准入拒绝'
+    ))
+
+    assert.equal(outcome.kind, entry.kind)
+    assert.equal(outcome.runRef, 'unavailable')
+    assert.equal(outcome.requestObservationDraft.runRef, 'unavailable')
+    assert.equal(outcome.requestObservationDraft.terminalObservationId, 'not_attempted')
+    assert.equal(outcome.requestObservationDraft.outcome, 'rejected_admission')
+    assert.equal(outcome.requestObservationDraft.admissionRejectionReason, entry.reason)
+    assert.equal(outcome.sessionPersistence, 'not_attempted')
+  }
+})
+
+test('terminal session-save failure preserves every completed disposition and committed fact', async () => {
+  const dispositions: readonly CompletionDisposition[] = Object.freeze([
+    Object.freeze({ kind: 'reply_text', text: '保留正文' }),
+    Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
+    Object.freeze({ kind: 'allowed_silence', reason: 'proactive_empty_directive' })
+  ])
+  for (const [index, completion] of dispositions.entries()) {
+    const runRef = `${index + 4}`.repeat(32)
+    const original = completedResult(`save-failure-${index}`, runRef, completion)
+    const observed: string[] = []
+    let monotonic = 100
+    const service = new AgentService({
+      sessions: contractSessions(async () => {
+        observed.push('session_save')
+        throw new Error('injected session persistence failure')
+      }),
+      runStore: new InMemoryRunStore(),
+      admission: {
+        acquire: async () => noOpLease(),
+        recover: async () => noOpLease()
+      },
+      contextEngine: contractContextEngine(),
+      progressPresenter: new RunProgressPresenter(),
+      createEngine: () => contractEngine({
+        start: async () => original
+      }),
+      createRuntime: async () => contractRuntime(),
+      generateId: () => `save-failure-${index}`,
+      createRunRef: () => runRef,
+      monotonicNow: () => monotonic++,
+      onTerminalSnapshot: () => { observed.push('snapshot') },
+      onTerminalCommitReceipt: () => { observed.push('receipt') }
+    })
+
+    const outcome = await service.handle(request(
+      `save-failure-request-${index}`,
+      '验证持久化失败不改写终态'
+    ))
+
+    assert.equal(outcome.kind, 'completed')
+    if (outcome.kind !== 'completed') assert.fail('completed result was rewritten')
+    assert.deepEqual(outcome.completion, completion)
+    assert.deepEqual(outcome.output, original.output)
+    assert.deepEqual(outcome.terminal, original.terminal)
+    assert.equal(outcome.sessionPersistence, 'failed')
+    assert.equal(outcome.requestObservationDraft.outcome, 'failed_session_save')
+    assert.equal(
+      outcome.requestObservationDraft.terminalObservationId,
+      original.terminal.snapshot.observationId
+    )
+    assert.equal(outcome.text, completion.kind === 'reply_text' ? completion.text : null)
+    assert.equal(outcome.visibleOutput, completion.kind === 'already_visible')
+    assert.deepEqual(observed, ['snapshot', 'receipt', 'session_save'])
+  }
+})
+
+test('same-process resume reuses one active request context and creates one final draft', async () => {
+  const runRef = '8'.repeat(32)
+  const runId = 'same-process-resume'
+  const interruption = Object.freeze({
+    schemaVersion: 1 as const,
+    approvalId: 'same-process-approval',
+    runId,
+    step: 0,
+    callId: 'same-process-call',
+    toolFingerprint: 'a'.repeat(64),
+    argumentHash: 'b'.repeat(64),
+    action: 'website',
+    target: 'none',
+    keyParameters: Object.freeze([]),
+    requester: Object.freeze({ userId: 'actor-1', role: 'bot_master' as const }),
+    approverPolicy: Object.freeze({
+      profile: 'safe' as const,
+      allowedRoles: Object.freeze(['bot_master'] as const),
+      eligibleActorIds: Object.freeze(['actor-1']),
+      requireDifferentActor: false
+    }),
+    approvalAddress: request('same-process-address', 'unused').sessionAddress,
+    createdAt
+  })
+  const terminal = completedResult(
+    runId,
+    runRef,
+    Object.freeze({ kind: 'reply_text', text: '恢复完成' })
+  )
+  let monotonic = 200
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      start: async () => Object.freeze({
+        kind: 'paused' as const,
+        runId,
+        runRef,
+        interruption
+      }),
+      resume: async () => terminal
+    }),
+    createRuntime: async () => contractRuntime(),
+    generateId: () => runId,
+    createRunRef: () => runRef,
+    monotonicNow: () => monotonic++
+  })
+
+  const paused = await service.handle(request('same-process', '等待后恢复'))
+  assert.equal(paused.kind, 'paused')
+  if (paused.kind !== 'paused') assert.fail('run did not pause')
+  const activeContext = paused.requestObservationContext
+  for (const forbidden of [
+    'outcome', 'sessionSaveDurationMs', 'terminalObservationId',
+    'requestObservationDraft', 'sessionPersistence'
+  ]) {
+    assert.equal(Object.hasOwn(paused, forbidden), false)
+  }
+
+  const resumed = await service.resume(runId)
+  assert.notEqual(resumed, null)
+  if (resumed === null || resumed.kind === 'approval_deferred') {
+    assert.fail('same-process resume did not return a final envelope')
+  }
+  assert.equal(resumed.kind, 'completed')
+  assert.equal(resumed.requestObservationDraft.requestRef, activeContext.requestRef)
+  assert.equal(resumed.requestObservationDraft.runRef, activeContext.runRef)
+  assert.equal(
+    resumed.requestObservationDraft.startedAtMonotonicMs,
+    activeContext.startedAtMonotonicMs
+  )
+  assert.equal(await service.resume(runId), null)
+})
+
+test('approval recovery defers each admission failure and retries with restart durations', async () => {
+  const runId = 'restarted-approval-run'
+  const runRef = '9'.repeat(32)
+  const requestRef = 'a'.repeat(32)
+  const checkpoint = Object.freeze({
+    runId,
+    runRef,
+    requestRef,
+    requestKind: 'ordinary_chat' as const,
+    status: 'waiting_approval' as const,
+    messages: Object.freeze([]),
+    estimatedInputTokens: 0,
+    events: Object.freeze([])
+  }) as unknown as RunCheckpoint
+  const recoveryErrors = [
+    new RunAdmissionRejectionError('queue_full'),
+    new RunAdmissionRejectionError('queue_aborted'),
+    new Error('private redis recovery failure')
+  ]
+  let recoverCalls = 0
+  let releases = 0
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => {
+        const error = recoveryErrors[recoverCalls++]
+        if (error !== undefined) throw error
+        return Object.freeze({
+          ...noOpLease(),
+          release: async () => { releases += 1 }
+        })
+      }
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      loadCheckpoint: async () => checkpoint,
+      decideApproval: async input => completedResult(
+        input.runId,
+        runRef,
+        Object.freeze({ kind: 'reply_text', text: '重启恢复完成' })
+      )
+    }),
+    createRuntime: async () => contractRuntime(),
+    recoverRuntime: async () => contractRuntime()
+  })
+  const decision = Object.freeze({
+    runId,
+    approvalId: 'restarted-approval',
+    kind: 'approved' as const,
+    decidedAt: createdAt,
+    sessionAddress: request('restart-address', 'unused').sessionAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'bot_master' as const })
+  })
+
+  for (const reason of ['queue_full', 'queue_aborted', 'unavailable'] as const) {
+    const deferred = await service.decideApproval(decision)
+    assert.deepEqual(deferred, {
+      kind: 'approval_deferred',
+      reason,
+      retryable: true,
+      runRef,
+      requestRef
+    })
+    assert.equal(deferred === null ? false : Object.hasOwn(deferred, 'requestObservationDraft'), false)
+  }
+
+  const completed = await service.decideApproval(decision)
+  assert.notEqual(completed, null)
+  if (completed === null || completed.kind === 'approval_deferred') {
+    assert.fail('recovery retry did not reach the terminal envelope')
+  }
+  assert.equal(completed.kind, 'completed')
+  assert.equal(completed.requestObservationDraft.requestRef, requestRef)
+  assert.equal(completed.requestObservationDraft.runRef, runRef)
+  assert.equal(completed.requestObservationDraft.startedAtMonotonicMs, 'unavailable')
+  assert.equal(completed.requestObservationDraft.queueDurationMs, 'unavailable')
+  assert.equal(completed.requestObservationDraft.sessionLoadDurationMs, 'unavailable')
+  assert.equal(completed.requestObservationDraft.sessionSaveDurationMs, 'not_attempted')
+  assert.equal(completed.sessionPersistence, 'not_attempted')
+  assert.equal(recoverCalls, 4)
+  assert.equal(releases, 1)
+})
+
+test('approval recovery infrastructure failure never masquerades as a missing run', async () => {
+  const runId = 'recovery-infrastructure-failure'
+  const runRef = 'c'.repeat(32)
+  const checkpoint = Object.freeze({
+    runId,
+    runRef,
+    requestRef: 'd'.repeat(32),
+    requestKind: 'ordinary_chat' as const,
+    status: 'waiting_approval' as const,
+    messages: Object.freeze([]),
+    estimatedInputTokens: 0,
+    events: Object.freeze([])
+  }) as unknown as RunCheckpoint
+  let releases = 0
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => Object.freeze({
+        ...noOpLease(),
+        release: async () => { releases += 1 }
+      })
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      loadCheckpoint: async () => checkpoint
+    }),
+    createRuntime: async () => contractRuntime(),
+    recoverRuntime: async () => {
+      throw new Error('injected private recovery runtime failure')
+    }
+  })
+
+  await assert.rejects(service.decideApproval({
+    runId,
+    approvalId: 'recovery-infrastructure-approval',
+    kind: 'approved',
+    decidedAt: createdAt,
+    sessionAddress: request('recovery-failure-address', 'unused').sessionAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'bot_master' })
+  }), /injected private recovery runtime failure/)
+  assert.equal(releases, 1)
+})
+
+test('restart recovery observes a pre-aborted signal before resume or approval decision', async () => {
+  const runId = 'restart-pre-aborted'
+  const runRef = 'e'.repeat(32)
+  const requestRef = 'f'.repeat(32)
+  const checkpoint = Object.freeze({
+    runId,
+    runRef,
+    requestRef,
+    requestKind: 'ordinary_chat' as const,
+    status: 'waiting_approval' as const,
+    messages: Object.freeze([]),
+    estimatedInputTokens: 0,
+    events: Object.freeze([])
+  }) as unknown as RunCheckpoint
+  const observedAbortState: boolean[] = []
+  const createService = (): AgentService => new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async (_checkpoint, signal) => {
+        observedAbortState.push(signal?.aborted === true)
+        if (signal?.aborted === true) {
+          throw new RunAdmissionRejectionError('queue_aborted')
+        }
+        return noOpLease()
+      }
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ loadCheckpoint: async () => checkpoint }),
+    createRuntime: async () => contractRuntime(),
+    recoverRuntime: async () => contractRuntime()
+  })
+  const controller = new AbortController()
+  controller.abort('caller_abort')
+  const expected = {
+    kind: 'approval_deferred',
+    reason: 'queue_aborted',
+    retryable: true,
+    runRef,
+    requestRef
+  }
+
+  const resumed = await createService().resume(runId, { signal: controller.signal })
+  const decided = await createService().decideApproval({
+    runId,
+    approvalId: 'restart-pre-aborted-approval',
+    kind: 'approved',
+    decidedAt: createdAt,
+    sessionAddress: request('restart-pre-aborted-address', 'unused').sessionAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'bot_master' })
+  }, { signal: controller.signal })
+
+  assert.deepEqual(resumed, expected)
+  assert.deepEqual(decided, expected)
+  assert.deepEqual(observedAbortState, [true, true])
+})
+
+test('resume cleanup preserves a terminal cancellation and delivers both callbacks', async () => {
+  const runId = 'resume-cleanup-terminal'
+  const runRef = '1'.repeat(32)
+  const interruption = Object.freeze({
+    schemaVersion: 1 as const,
+    approvalId: 'resume-cleanup-approval',
+    runId,
+    step: 0,
+    callId: 'resume-cleanup-call',
+    toolFingerprint: 'a'.repeat(64),
+    argumentHash: 'b'.repeat(64),
+    action: 'website',
+    target: 'none',
+    keyParameters: Object.freeze([]),
+    requester: Object.freeze({ userId: 'actor-1', role: 'bot_master' as const }),
+    approverPolicy: Object.freeze({
+      profile: 'safe' as const,
+      allowedRoles: Object.freeze(['bot_master'] as const),
+      eligibleActorIds: Object.freeze(['actor-1']),
+      requireDifferentActor: false
+    }),
+    approvalAddress: request('resume-cleanup-address', 'unused').sessionAddress,
+    createdAt
+  })
+  const committed = cancelledResult(runId, runRef, 'service_failure')
+  const observed: string[] = []
+  let releases = 0
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => Object.freeze({
+        ...noOpLease(),
+        release: async () => { releases += 1 }
+      }),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      start: async () => Object.freeze({
+        kind: 'paused' as const,
+        runId,
+        runRef,
+        interruption
+      }),
+      resume: async () => { throw new Error('injected resume failure') },
+      cancel: async () => committed
+    }),
+    createRuntime: async () => contractRuntime(),
+    generateId: () => runId,
+    createRunRef: () => runRef,
+    onTerminalSnapshot: snapshot => { observed.push(`snapshot:${snapshot.observationId}`) },
+    onTerminalCommitReceipt: receipt => { observed.push(`receipt:${receipt.observationId}`) }
+  })
+
+  const paused = await service.handle(request('resume-cleanup', '等待恢复清理'))
+  assert.equal(paused.kind, 'paused')
+  const outcome = await service.resume(runId)
+
+  assert.notEqual(outcome, null)
+  if (outcome === null || outcome.kind === 'approval_deferred') {
+    assert.fail('resume cleanup did not return a final envelope')
+  }
+  assert.equal(outcome.kind, 'cancelled')
+  if (outcome.kind !== 'cancelled') assert.fail('resume cleanup rewrote cancellation as failure')
+  assert.deepEqual(outcome.terminal, committed.terminal)
+  assert.equal(outcome.requestObservationDraft.outcome, 'completed')
+  assert.equal(
+    outcome.requestObservationDraft.terminalObservationId,
+    committed.terminal?.snapshot.observationId
+  )
+  assert.equal(outcome.sessionPersistence, 'not_attempted')
+  assert.deepEqual(observed, [
+    `snapshot:${committed.terminal?.snapshot.observationId}`,
+    `receipt:${committed.terminal?.receipt.observationId}`
+  ])
+  assert.equal(releases, 1)
+})
+
+test('real RunEngine create failure never exposes the unclaimed candidate run reference', async () => {
+  const base = new InMemoryRunStore()
+  const runStore: RunStore = Object.freeze({
+    create: async () => { throw new Error('injected run store create failure') },
+    load: base.load.bind(base),
+    upgrade: base.upgrade.bind(base),
+    compareAndSet: base.compareAndSet.bind(base),
+    appendEvents: base.appendEvents.bind(base),
+    commitTerminal: base.commitTerminal.bind(base),
+    loadTombstone: base.loadTombstone.bind(base)
+  })
+  let providerCalls = 0
+  let generated = 0
+  const candidateRunRef = '2'.repeat(32)
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore,
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: observer => new RunEngine({
+      adapter: Object.freeze({
+        complete: async () => {
+          providerCalls += 1
+          return Object.freeze({
+            text: 'must not run', finishReason: 'stop' as const,
+            toolCalls: Object.freeze([])
+          })
+        }
+      }),
+      profile: standardOpenAIProfile,
+      scheduler: new ToolScheduler({ runtime: new ServiceToolRuntime() }),
+      store: runStore,
+      budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
+      now: () => new Date(createdAt),
+      generateId: () => `create-failure-engine-${++generated}`,
+      observer
+    }),
+    createRuntime: async () => contractRuntime(),
+    generateId: () => `create-failure-service-${++generated}`,
+    createRunRef: () => candidateRunRef,
+    monotonicNow: () => generated++
+  })
+
+  const outcome = await service.handle(request('create-failure', '验证创建失败'))
+
+  assert.equal(outcome.kind, 'failed')
+  assert.equal(outcome.runRef, 'unavailable')
+  assert.equal(outcome.terminal, null)
+  assert.equal(outcome.requestObservationDraft.outcome, 'failed_run_create')
+  assert.equal(outcome.requestObservationDraft.runRef, 'unavailable')
+  assert.equal(outcome.requestObservationDraft.terminalObservationId, 'not_attempted')
+  assert.equal(outcome.sessionPersistence, 'not_attempted')
+  assert.equal(providerCalls, 0)
+})
+
 test('AgentService owns context, progress, run execution and terminal session writes', async () => {
   const redis = new FakeRedis(() => Date.parse(createdAt))
   const persistedSessions = new RedisAgentSessionStore({
     redis, now: () => new Date(createdAt), generateId: () => 'session-1'
   })
   let rejectSessionSave = false
+  let rejectSnapshotObserver = false
+  let rejectReceiptObserver = false
+  const terminalOrder: string[] = []
   const sessions: SessionStore<AgentSessionState> = {
     get: async (address, options) => await persistedSessions.get(address, options),
     save: async (record, options) => {
+      terminalOrder.push('session_save')
       if (rejectSessionSave) throw new Error('injected terminal session save failure')
       await persistedSessions.save(record, options)
     },
@@ -340,7 +1083,17 @@ test('AgentService owns context, progress, run execution and terminal session wr
       progress: async (text: string) => { progress.push(text) }
     }),
     now: () => new Date(createdAt),
-    generateId: () => `service-run-${++generated}`
+    generateId: () => `service-run-${++generated}`,
+    onTerminalSnapshot: (snapshot: RunTerminalSnapshotV2) => {
+      terminalOrder.push('snapshot')
+      if (rejectSnapshotObserver) throw new Error('private snapshot observer failure')
+      assert.match(snapshot.observationId, /^[0-9a-f]{64}$/)
+    },
+    onTerminalCommitReceipt: (receipt: TerminalCommitReceiptV1) => {
+      terminalOrder.push('receipt')
+      if (rejectReceiptObserver) throw new Error('private receipt observer failure')
+      assert.match(receipt.observationId, /^[0-9a-f]{64}$/)
+    }
   })
 
   const completed = await service.handle(request('request-1', '请完成两阶段任务'), {
@@ -348,6 +1101,24 @@ test('AgentService owns context, progress, run execution and terminal session wr
   })
   assert.equal(completed.kind, 'completed')
   assert.equal(completed.kind === 'completed' ? completed.text : '', '任务完成。')
+  assert.equal(completed.kind === 'completed' ? completed.sessionPersistence : null, 'saved')
+  assert.equal(
+    completed.kind === 'completed' ? completed.requestObservationDraft.outcome : null,
+    'completed'
+  )
+  assert.equal(
+    completed.kind === 'completed'
+      ? completed.requestObservationDraft.terminalObservationId
+      : null,
+    completed.kind === 'completed' ? completed.terminal.snapshot.observationId : null
+  )
+  assert.equal(
+    completed.kind === 'completed'
+      ? Object.hasOwn(completed.requestObservationDraft, 'requestDurationMs')
+      : true,
+    false
+  )
+  assert.deepEqual(terminalOrder, ['snapshot', 'receipt', 'session_save'])
   assert.equal(adapter.requests.length, 2)
   assert.deepEqual(progress, ['正在读取网页', '正在查询天气'])
   assert.equal(adapter.requests[1]?.messages.some(message => (
@@ -360,10 +1131,24 @@ test('AgentService owns context, progress, run execution and terminal session wr
     item.kind === 'message' ? item.message.role : item.kind
   )), ['user', 'assistant'])
 
-  const ephemeral = await service.handleEphemeral(request('request-2', '临时任务'), {
+  terminalOrder.length = 0
+  const invalidEphemeral = await service.handleEphemeral(request(
+    'request-invalid-ephemeral',
+    '入口类型不匹配'
+  ))
+  assert.equal(invalidEphemeral.kind, 'failed')
+  assert.equal(invalidEphemeral.requestObservationDraft.outcome, 'failed_request_validation')
+
+  const ephemeral = await service.handleEphemeral(request(
+    'request-2',
+    '临时任务',
+    'proactive_chat'
+  ), {
     signal: new AbortController().signal
   })
   assert.equal(ephemeral.kind, 'completed')
+  assert.equal(ephemeral.kind === 'completed' ? ephemeral.sessionPersistence : null, 'not_attempted')
+  assert.deepEqual(terminalOrder, ['snapshot', 'receipt'])
   assert.equal((await sessions.get(request('lookup', 'unused').sessionAddress))?.turnCount, 1)
 
   const callerAbort = new AbortController()
@@ -373,17 +1158,34 @@ test('AgentService owns context, progress, run execution and terminal session wr
   })
   assert.equal(aborted.kind, 'cancelled')
   assert.equal(aborted.kind === 'cancelled' ? aborted.reason : null, 'user_cancelled')
+  assert.equal(aborted.runRef, 'unavailable')
+  assert.equal(aborted.requestObservationDraft.outcome, 'rejected_admission')
+  assert.equal(aborted.requestObservationDraft.admissionRejectionReason, 'queue_aborted')
+  assert.equal(aborted.sessionPersistence, 'not_attempted')
 
   rejectSessionSave = true
+  rejectSnapshotObserver = true
+  rejectReceiptObserver = true
+  terminalOrder.length = 0
   const committedBeforeSessionFailure = await service.handle(
     request('request-3', '保留已提交终态'),
     { signal: new AbortController().signal }
   )
   assert.equal(committedBeforeSessionFailure.kind, 'completed')
+  assert.equal(committedBeforeSessionFailure.kind === 'completed'
+    ? committedBeforeSessionFailure.text
+    : null, '终态已提交。')
+  assert.equal(committedBeforeSessionFailure.kind === 'completed'
+    ? committedBeforeSessionFailure.sessionPersistence
+    : null, 'failed')
+  assert.equal(committedBeforeSessionFailure.kind === 'completed'
+    ? committedBeforeSessionFailure.requestObservationDraft.outcome
+    : null, 'failed_session_save')
   assert.equal(committedBeforeSessionFailure.terminal.snapshot.status, 'completed')
   assert.equal(committedBeforeSessionFailure.terminal.snapshot.runRef, committedBeforeSessionFailure.runRef)
   assert.equal(committedBeforeSessionFailure.terminal.receipt.runRef, committedBeforeSessionFailure.runRef)
   assert.equal(await runStore.load(committedBeforeSessionFailure.runId), null)
+  assert.deepEqual(terminalOrder, ['snapshot', 'receipt', 'session_save'])
 
   let bridgeCreations = 0
   const firstBridge = getAgentServiceBridge(() => {
@@ -661,6 +1463,7 @@ test('AgentService cancellation releases a paused run before the next session tu
   const paused = await service.handle(request('cancel-1', '执行需要审批的任务'))
   assert.equal(paused.kind, 'paused')
   const cancelled = await service.cancel(paused.runId, 'approval_delivery_failed')
+  if (cancelled === null) assert.fail('pending cancellation must return an envelope')
   assert.equal(cancelled.kind, 'cancelled')
 
   const next = await service.handle(request('cancel-2', '继续下一轮'))

@@ -960,7 +960,7 @@ export class RunEngine {
       return Object.freeze({
         kind: 'failed',
         runId: input.runId,
-        runRef: input.runRef,
+        runRef: 'unavailable',
         error: serializeAgentError(asAgentError(error)),
         terminal: null
       })

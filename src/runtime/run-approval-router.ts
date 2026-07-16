@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 import type { SessionAddress } from '../agent/contracts/identity.js'
-import type { RunAdvanceResult } from '../agent/contracts/result.js'
 import {
   isApprovalActorEligible,
   parseApprovalInterruption,
@@ -20,6 +19,10 @@ import {
   buildModelMessageInput,
   type MessageEventLike
 } from './message-input.js'
+import type {
+  ChatReplyEnvelope
+} from './agent-service.js'
+import type { ApprovalRecoveryDeferred } from './request-observation.js'
 
 export interface ApprovalReference {
   readonly schemaVersion: 1
@@ -66,7 +69,7 @@ export interface RunApprovalControl {
   decideApproval(
     input: ApprovalDecisionInput,
     runtime?: RunRuntimeBinding
-  ): Promise<RunAdvanceResult | null>
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null>
 }
 
 export interface RunApprovalRouterOptions {
@@ -95,7 +98,7 @@ export interface ProjectYunzaiApprovalReplyOptions {
 }
 
 export type ApprovalRouteResultHandler = (
-  result: RunAdvanceResult,
+  result: ChatReplyEnvelope,
   reference: ApprovalReference
 ) => void | Promise<void>
 
@@ -351,6 +354,7 @@ export class RunApprovalRouter {
       ...(expired ? {} : { actor: reply.actor })
     }, runtime)
     if (result === null) return false
+    if (result.kind === 'approval_deferred') return true
     await this.#index.delete(reference)
     await onResult?.(result, reference)
     return true
@@ -377,6 +381,7 @@ export class RunApprovalRouter {
       sessionAddress: pending.approvalAddress
     }, runtime)
     if (result === null) return false
+    if (result.kind === 'approval_deferred') return true
     await this.#index.delete(reference)
     await onResult?.(result, reference)
     return true

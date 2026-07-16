@@ -5,6 +5,7 @@ import {
 } from '../agent/contracts/error.js'
 import type { AgentEvent } from '../agent/contracts/event.js'
 import type { AgentContentPart, AgentMessage } from '../agent/contracts/content.js'
+import type { SessionPersistenceOutcome } from '../agent/contracts/completion.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import type { RunAdvanceResult } from '../agent/contracts/result.js'
 import type { AbortOptions, ListOptions, SaveOptions } from '../agent/contracts/storage.js'
@@ -23,7 +24,11 @@ import type {
   RunRuntimeBinding
 } from '../agent/run/run-engine.js'
 import type { RunCheckpoint } from '../agent/run/run-checkpoint.js'
-import type { RunAdmission, RunLease } from '../agent/run/run-admission.js'
+import {
+  RunAdmissionRejectionError,
+  type RunAdmission,
+  type RunLease
+} from '../agent/run/run-admission.js'
 import {
   RunReferenceConflictError,
   type RunStore
@@ -43,33 +48,56 @@ import {
 } from '../agent/session/agent-session-state.js'
 import type { SessionRecord, SessionSummary } from '../agent/session/session-record.js'
 import type { SessionStore } from '../agent/session/session-store.js'
-import {
-  createAgentRunLog
-} from './safe-chat-logging.js'
+import type { TerminalCommitReceiptV1 } from '../agent/run/run-store.js'
+import type { RunTerminalSnapshotV2 } from '../agent/run/run-observation.js'
 import {
   RunProgressPresenter,
   type ProgressDelivery
 } from './run-progress-presenter.js'
+import {
+  activateRequestObservation,
+  beginRequestObservation,
+  createRequestObservationDraft,
+  type ActiveRequestObservationContextV1,
+  type AdmissionRejectionReason,
+  type ApprovalRecoveryDeferred,
+  type RequestObservationContextV1,
+  type RequestObservationDraftV1,
+  type RequestObservationOutcome
+} from './request-observation.js'
 import type {
   YunzaiAgentRequest,
   YunzaiAgentRequestDraft
 } from './yunzai-request-adapter.js'
 
-export type ChatReplyEnvelope =
-  | Readonly<{
-      kind: 'completed'
-      runId: string
-      runRef: string
-      completion: Extract<
-        RunAdvanceResult,
-        { readonly kind: 'completed' }
-      >['completion']
-      output: Extract<RunAdvanceResult, { readonly kind: 'completed' }>['output']
-      terminal: Extract<RunAdvanceResult, { readonly kind: 'completed' }>['terminal']
-      visibleOutput: boolean
-      text: string | null
-    }>
-  | Extract<RunAdvanceResult, { readonly kind: 'paused' | 'failed' | 'cancelled' }>
+export type PausedChatReplyEnvelope =
+  Extract<RunAdvanceResult, { readonly kind: 'paused' }> & {
+    readonly requestObservationContext: ActiveRequestObservationContextV1
+  }
+
+type WithFinalObservationMetadata<T> = T & {
+  readonly requestObservationDraft: RequestObservationDraftV1
+  readonly sessionPersistence: SessionPersistenceOutcome
+}
+
+export type FinalChatReplyEnvelope =
+  | WithFinalObservationMetadata<
+      Extract<RunAdvanceResult, { readonly kind: 'completed' }>
+    > & {
+      /** @deprecated Phase 6B Task 6 removes this compatibility projection. */
+      readonly text: string | null
+      /** @deprecated Phase 6B Task 6 removes this compatibility projection. */
+      readonly visibleOutput: boolean
+    }
+  | WithFinalObservationMetadata<
+      Extract<RunAdvanceResult, { readonly kind: 'failed' | 'cancelled' }>
+    >
+
+export type ChatReplyEnvelope = PausedChatReplyEnvelope | FinalChatReplyEnvelope
+
+export interface AgentServiceRequestOptions extends RunControlOptions {
+  readonly requestObservationContext?: RequestObservationContextV1
+}
 
 export interface AgentServiceRunRuntime {
   readonly binding: Readonly<Pick<
@@ -107,7 +135,9 @@ export interface AgentServiceOptions {
   readonly generateId?: () => string
   readonly createRunRef?: () => string
   readonly observationLevel?: () => unknown
-  readonly onRunLog?: (entry: ReturnType<typeof createAgentRunLog>) => void
+  readonly monotonicNow?: () => number | 'unavailable'
+  readonly onTerminalSnapshot?: (snapshot: RunTerminalSnapshotV2) => void
+  readonly onTerminalCommitReceipt?: (receipt: TerminalCommitReceiptV1) => void
   readonly onObserverFailure?: (entry: Readonly<{
     event: 'agent.observer_failed'
   }>) => void
@@ -120,6 +150,13 @@ interface PendingRun {
   readonly binding: RunRuntimeBinding
   readonly lease: RunLease
   readonly ephemeral: boolean
+  readonly requestObservationContext: ActiveRequestObservationContextV1
+}
+
+function isApprovalRecoveryDeferred (
+  value: PendingRun | ApprovalRecoveryDeferred
+): value is ApprovalRecoveryDeferred {
+  return 'kind' in value && value.kind === 'approval_deferred'
 }
 
 const EMPTY_ITEMS: readonly ContextItem[] = Object.freeze([])
@@ -138,11 +175,11 @@ function asAgentError (error: unknown): AgentError {
   return error instanceof AgentError ? error : internalError(error)
 }
 
-function failedEnvelope (
+function failedRunResult (
   runId: string,
   error: unknown,
   runRef: string | 'unavailable' = 'unavailable'
-): ChatReplyEnvelope {
+): Extract<RunAdvanceResult, { readonly kind: 'failed' }> {
   return Object.freeze({
     kind: 'failed',
     runId,
@@ -185,11 +222,11 @@ function freezeRequest (
   })
 }
 
-function cancelledEnvelope (
+function cancelledRunResult (
   runId: string,
   reason: unknown = 'user_cancelled',
   runRef: string | 'unavailable' = 'unavailable'
-): ChatReplyEnvelope {
+): Extract<RunAdvanceResult, { readonly kind: 'cancelled' }> {
   return Object.freeze({
     kind: 'cancelled',
     runId,
@@ -197,6 +234,29 @@ function cancelledEnvelope (
     reason: cancellationReason(reason),
     terminal: null
   })
+}
+
+function readMonotonic (
+  clock: () => number | 'unavailable'
+): number | 'unavailable' {
+  try {
+    const value = clock()
+    return value === 'unavailable' ||
+      (Number.isSafeInteger(value) && Number(value) >= 0)
+      ? value
+      : 'unavailable'
+  } catch {
+    return 'unavailable'
+  }
+}
+
+function elapsed (
+  started: number | 'unavailable',
+  finished: number | 'unavailable'
+): number | 'unavailable' {
+  return started === 'unavailable' || finished === 'unavailable' || finished < started
+    ? 'unavailable'
+    : finished - started
 }
 
 function linkedAbortSignal (
@@ -459,16 +519,81 @@ function freshSession (
   })
 }
 
-function terminalEnvelope (result: RunAdvanceResult): ChatReplyEnvelope {
-  if (result.kind !== 'completed') return result
+function finalEnvelope (
+  result: Exclude<RunAdvanceResult, { readonly kind: 'paused' }>,
+  requestObservationDraft: RequestObservationDraftV1,
+  sessionPersistence: SessionPersistenceOutcome
+): FinalChatReplyEnvelope {
+  if (result.kind !== 'completed') {
+    return Object.freeze({
+      ...result,
+      requestObservationDraft,
+      sessionPersistence
+    })
+  }
   const text = result.completion.kind === 'reply_text'
     ? result.completion.text
     : null
   return Object.freeze({
     ...result,
     visibleOutput: result.completion.kind === 'already_visible',
-    text
+    text,
+    requestObservationDraft,
+    sessionPersistence
   })
+}
+
+function preCreateEnvelope (
+  result: Extract<RunAdvanceResult, { readonly kind: 'failed' | 'cancelled' }>,
+  context: RequestObservationContextV1,
+  outcome: Exclude<RequestObservationOutcome, 'completed' | 'failed_session_save'>,
+  admissionRejectionReason: AdmissionRejectionReason,
+  queueDurationMs: number | 'unavailable' | 'not_attempted',
+  sessionLoadDurationMs: number | 'unavailable' | 'not_attempted'
+): FinalChatReplyEnvelope {
+  const normalized = result.kind === 'failed'
+    ? Object.freeze({ ...result, runRef: 'unavailable' as const, terminal: null })
+    : Object.freeze({ ...result, runRef: 'unavailable' as const, terminal: null })
+  return finalEnvelope(normalized, createRequestObservationDraft({
+    context,
+    runRef: 'unavailable',
+    outcome,
+    admissionRejectionReason,
+    queueDurationMs,
+    sessionLoadDurationMs,
+    sessionSaveDurationMs: 'not_attempted',
+    terminalObservationId: 'not_attempted'
+  }), 'not_attempted')
+}
+
+function activeFinalEnvelope (
+  result: Exclude<RunAdvanceResult, { readonly kind: 'paused' }>,
+  context: ActiveRequestObservationContextV1,
+  sessionPersistence: SessionPersistenceOutcome,
+  sessionSaveDurationMs: number | 'unavailable' | 'not_attempted'
+): FinalChatReplyEnvelope {
+  const terminalObservationId = result.terminal?.snapshot.observationId ?? 'unavailable'
+  const failedSessionSave = sessionPersistence === 'failed'
+  const requestObservationDraft = failedSessionSave
+    ? createRequestObservationDraft({
+        context,
+        outcome: 'failed_session_save',
+        admissionRejectionReason: 'not_applicable',
+        sessionSaveDurationMs: sessionSaveDurationMs === 'not_attempted'
+          ? 'unavailable'
+          : sessionSaveDurationMs,
+        terminalObservationId: terminalObservationId === 'unavailable'
+          ? (() => { throw new TypeError('failed session save terminal fact is unavailable') })()
+          : terminalObservationId
+      })
+    : createRequestObservationDraft({
+        context,
+        outcome: 'completed',
+        admissionRejectionReason: 'not_applicable',
+        sessionSaveDurationMs,
+        terminalObservationId
+      })
+  return finalEnvelope(result, requestObservationDraft, sessionPersistence)
 }
 
 function appendTerminalTurn (
@@ -516,7 +641,6 @@ function appendTerminalTurn (
 export class AgentService {
   readonly conversations: ConversationSessionPort
   readonly #sessions: SessionStore<AgentSessionState>
-  readonly #runStore: RunStore
   readonly #admission: Pick<RunAdmission, 'acquire' | 'recover'>
   readonly #contextEngine: ContextEngine
   readonly #progressPresenter: RunProgressPresenter
@@ -526,7 +650,9 @@ export class AgentService {
   readonly #generateId: () => string
   readonly #createRunRef: () => string
   readonly #observationLevel?: () => unknown
-  readonly #onRunLog?: AgentServiceOptions['onRunLog']
+  readonly #monotonicNow: () => number | 'unavailable'
+  readonly #onTerminalSnapshot?: AgentServiceOptions['onTerminalSnapshot']
+  readonly #onTerminalCommitReceipt?: AgentServiceOptions['onTerminalCommitReceipt']
   readonly #onObserverFailure?: AgentServiceOptions['onObserverFailure']
   readonly #engine: RunEngine
   readonly #pending = new Map<string, PendingRun>()
@@ -537,7 +663,6 @@ export class AgentService {
 
   constructor (options: AgentServiceOptions) {
     this.#sessions = options.sessions
-    this.#runStore = options.runStore
     this.#admission = options.admission
     this.#contextEngine = options.contextEngine
     this.#progressPresenter = options.progressPresenter
@@ -547,7 +672,9 @@ export class AgentService {
     this.#generateId = options.generateId ?? randomUUID
     this.#createRunRef = options.createRunRef ?? createRunRef
     this.#observationLevel = options.observationLevel
-    this.#onRunLog = options.onRunLog
+    this.#monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()))
+    this.#onTerminalSnapshot = options.onTerminalSnapshot
+    this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt
     this.#onObserverFailure = options.onObserverFailure
     this.#engine = options.createEngine(event => {
       try {
@@ -580,14 +707,14 @@ export class AgentService {
 
   async handle (
     request: YunzaiAgentRequestDraft,
-    options: RunControlOptions = {}
+    options: AgentServiceRequestOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#start(request, false, options)
   }
 
   async handleEphemeral (
     request: YunzaiAgentRequestDraft,
-    options: RunControlOptions = {}
+    options: AgentServiceRequestOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#start(request, true, options)
   }
@@ -595,21 +722,16 @@ export class AgentService {
   async resume (
     runId: string,
     options: RunControlOptions = {}
-  ): Promise<ChatReplyEnvelope> {
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
-    let pending: PendingRun | null | undefined = this.#pending.get(runId)
+    let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(runId)
     try {
-      if (linked.signal.aborted) {
-        return await this.cancel(runId, linked.signal.reason)
-      }
       if (pending === undefined) {
         pending = await this.#recoverPending(runId, linked.signal)
       }
-      if (pending === null) {
-        return terminalEnvelope(await this.#engine.resume(runId, undefined, {
-          ...options,
-          signal: linked.signal
-        }))
+      if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
+      if (linked.signal.aborted) {
+        return await this.cancel(runId, linked.signal.reason)
       }
       const result = await this.#engine.resume(runId, pending.binding, {
         ...options,
@@ -620,11 +742,9 @@ export class AgentService {
       if (linked.signal.aborted) {
         return await this.cancel(runId, linked.signal.reason)
       }
-      if (pending === undefined || pending === null) return failedEnvelope(runId, error)
-      return await this.#abortPending(
-        pending,
-        failedEnvelope(runId, error, pending.request?.runRef ?? 'unavailable')
-      )
+      if (pending === undefined) throw error
+      if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
+      return await this.#abortPending(pending, error)
     } finally {
       linked.dispose()
     }
@@ -633,21 +753,23 @@ export class AgentService {
   async cancel (
     runId: string,
     reason = 'user_cancelled'
-  ): Promise<ChatReplyEnvelope> {
+  ): Promise<ChatReplyEnvelope | null> {
     const pending = this.#pending.get(runId)
+    if (pending === undefined) return null
     try {
       const result = await this.#engine.cancel(runId, reason)
-      return pending === undefined
-        ? terminalEnvelope(result)
-        : await this.#finish(pending, result)
+      return await this.#finish(pending, result)
     } catch (error) {
-      if (pending !== undefined) {
-        this.#pending.delete(runId)
-        await this.#progressPresenter.drain(runId).catch(() => undefined)
-        this.#progressPresenter.detach(runId)
-        await pending.lease.release().catch(() => undefined)
-      }
-      return failedEnvelope(runId, error, pending?.request?.runRef ?? 'unavailable')
+      this.#pending.delete(runId)
+      await this.#progressPresenter.drain(runId).catch(() => undefined)
+      this.#progressPresenter.detach(runId)
+      await pending.lease.release().catch(() => undefined)
+      return activeFinalEnvelope(
+        failedRunResult(runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef),
+        pending.requestObservationContext,
+        'not_attempted',
+        'not_attempted'
+      )
     }
   }
 
@@ -678,30 +800,24 @@ export class AgentService {
   async decideApproval (
     input: RunApprovalDecisionCommand,
     options: RunControlOptions = {}
-  ): Promise<ChatReplyEnvelope | null> {
+  ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
-    let pending: PendingRun | null | undefined = this.#pending.get(input.runId)
+    let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(input.runId)
     try {
+      if (pending === undefined) {
+        pending = await this.#recoverPending(input.runId, linked.signal)
+      }
+      if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
       if (linked.signal.aborted) {
         return await this.cancel(input.runId, linked.signal.reason)
       }
-      if (pending === undefined) {
-        try {
-          pending = await this.#recoverPending(input.runId, linked.signal)
-        } catch {
-          if (linked.signal.aborted) {
-            return await this.cancel(input.runId, linked.signal.reason)
-          }
-          return null
-        }
-      }
       const result = await this.#engine.decideApproval(
         input,
-        pending?.binding,
+        pending.binding,
         { ...options, signal: linked.signal }
       )
       if (result === null) return null
-      return pending === null ? terminalEnvelope(result) : await this.#finish(pending, result)
+      return await this.#finish(pending, result)
     } finally {
       linked.dispose()
     }
@@ -710,43 +826,114 @@ export class AgentService {
   async #start (
     draft: YunzaiAgentRequestDraft,
     ephemeral: boolean,
-    options: RunControlOptions
+    options: AgentServiceRequestOptions
   ): Promise<ChatReplyEnvelope> {
     const runId = this.#generateId()
+    const startedAtMonotonicMs = options.requestObservationContext?.startedAtMonotonicMs ??
+      readMonotonic(this.#monotonicNow)
+    const requestObservationContext = beginRequestObservation({
+      requestRef: draft.requestRef,
+      requestKind: draft.requestKind,
+      startedAtMonotonicMs
+    })
+    if (draft.requestKind !== (ephemeral ? 'proactive_chat' : 'ordinary_chat') ||
+      (options.requestObservationContext !== undefined &&
+        (options.requestObservationContext.requestRef !== draft.requestRef ||
+          options.requestObservationContext.requestKind !== draft.requestKind))) {
+      return preCreateEnvelope(
+        failedRunResult(runId, new AgentError({
+          code: 'invalid_request',
+          stage: 'agent.service.observation',
+          retryable: false,
+          userMessage: '请求格式不正确，请联系机器人主人。'
+        })),
+        requestObservationContext,
+        'failed_request_validation',
+        'not_applicable',
+        'not_attempted',
+        'not_attempted'
+      )
+    }
     const levelAtStart = safeObservationLevel(this.#observationLevel)
     let runRef = this.#createRunRef()
     let request = freezeRequest(draft, runRef)
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let lease: RunLease | undefined
+    const queueStarted = readMonotonic(this.#monotonicNow)
+    let queueDurationMs: number | 'unavailable' = 'unavailable'
+    let sessionLoadDurationMs: number | 'unavailable' | 'not_attempted' = 'not_attempted'
     try {
-      if (linked.signal.aborted) {
-        return cancelledEnvelope(
-          runId,
-          linked.signal.reason ?? this.#shutdownReason,
-          runRef
+      try {
+        lease = await this.#admission.acquire(request.sessionAddress, linked.signal)
+        queueDurationMs = elapsed(
+          queueStarted,
+          readMonotonic(this.#monotonicNow)
+        )
+      } catch (error) {
+        queueDurationMs = elapsed(
+          queueStarted,
+          readMonotonic(this.#monotonicNow)
+        )
+        const reason: AdmissionRejectionReason = error instanceof RunAdmissionRejectionError
+          ? error.rejectionReason
+          : 'unavailable'
+        const result = error instanceof RunAdmissionRejectionError &&
+          error.rejectionReason === 'queue_aborted'
+          ? cancelledRunResult(
+              runId,
+              linked.signal.reason ?? this.#shutdownReason,
+              'unavailable'
+            )
+          : failedRunResult(runId, error)
+        return preCreateEnvelope(
+          result,
+          requestObservationContext,
+          'rejected_admission',
+          reason,
+          queueDurationMs,
+          'not_attempted'
         )
       }
-      lease = await this.#admission.acquire(request.sessionAddress, linked.signal)
-      if (linked.signal.aborted) throw new Error('run start was cancelled')
       const timestamp = this.#now().toISOString()
-      const session = ephemeral
-        ? null
-        : await this.#sessions.get(request.sessionAddress, { signal: linked.signal }) ??
-          freshSession(request, this.#generateId(), timestamp)
+      let session: SessionRecord<AgentSessionState> | null
+      if (ephemeral) {
+        session = null
+      } else {
+        const sessionLoadStarted = readMonotonic(this.#monotonicNow)
+        try {
+          session = await this.#sessions.get(
+            request.sessionAddress,
+            { signal: linked.signal }
+          ) ?? freshSession(request, this.#generateId(), timestamp)
+          sessionLoadDurationMs = elapsed(
+            sessionLoadStarted,
+            readMonotonic(this.#monotonicNow)
+          )
+        } catch (error) {
+          sessionLoadDurationMs = elapsed(
+            sessionLoadStarted,
+            readMonotonic(this.#monotonicNow)
+          )
+          await lease.release().catch(() => undefined)
+          lease = undefined
+          const result = linked.signal.aborted
+            ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
+            : failedRunResult(runId, error)
+          return preCreateEnvelope(
+            result,
+            requestObservationContext,
+            'failed_session_load',
+            'not_applicable',
+            queueDurationMs,
+            sessionLoadDurationMs
+          )
+        }
+      }
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const runtime = await this.#createRuntime(request)
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       let binding = this.#bindingFor(runId, request, session, runtime)
-      let pending: PendingRun = Object.freeze({
-        runId,
-        request,
-        session,
-        binding,
-        lease,
-        ephemeral
-      })
-      this.#pending.set(runId, pending)
       this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined))
       let result: RunAdvanceResult | undefined
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -767,25 +954,48 @@ export class AgentService {
             deadlineAt: request.deadlineAt,
             model: request.model,
             runtime: binding
-          }, { ...options, signal: linked.signal })
+          }, { signal: linked.signal })
           break
         } catch (error) {
           if (!(error instanceof RunReferenceConflictError) || attempt !== 0) throw error
           runRef = this.#createRunRef()
           request = freezeRequest(draft, runRef)
           binding = this.#bindingFor(runId, request, session, runtime)
-          pending = Object.freeze({
-            runId,
-            request,
-            session,
-            binding,
-            lease,
-            ephemeral
-          })
-          this.#pending.set(runId, pending)
         }
       }
       if (result === undefined) throw new RunReferenceConflictError()
+      if (result.runRef === 'unavailable') {
+        await lease.release().catch(() => undefined)
+        lease = undefined
+        this.#progressPresenter.detach(runId)
+        if (result.kind === 'paused' || result.kind === 'completed') {
+          throw new TypeError('run result lacks a claimed reference')
+        }
+        return preCreateEnvelope(
+          result,
+          requestObservationContext,
+          'failed_run_create',
+          'not_applicable',
+          queueDurationMs,
+          sessionLoadDurationMs
+        )
+      }
+      const activeContext = activateRequestObservation({
+        context: requestObservationContext,
+        runRef: result.runRef,
+        queueDurationMs,
+        sessionLoadDurationMs
+      })
+      const pending: PendingRun = Object.freeze({
+        runId,
+        request,
+        session,
+        binding,
+        lease,
+        ephemeral,
+        requestObservationContext: activeContext
+      })
+      this.#pending.set(runId, pending)
       return await this.#finish(pending, result)
     } catch (error) {
       if (this.#pending.has(runId)) {
@@ -796,14 +1006,17 @@ export class AgentService {
       }
       this.#pending.delete(runId)
       this.#progressPresenter.detach(runId)
-      if (linked.signal.aborted) {
-        return cancelledEnvelope(
-          runId,
-          linked.signal.reason ?? this.#shutdownReason,
-          runRef
-        )
-      }
-      return failedEnvelope(runId, error, runRef)
+      const result = linked.signal.aborted
+        ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
+        : failedRunResult(runId, error)
+      return preCreateEnvelope(
+        result,
+        requestObservationContext,
+        'failed_run_create',
+        'not_applicable',
+        queueDurationMs,
+        sessionLoadDurationMs
+      )
     } finally {
       linked.dispose()
     }
@@ -872,7 +1085,7 @@ export class AgentService {
   async #recoverPending (
     runId: string,
     signal?: AbortSignal
-  ): Promise<PendingRun | null> {
+  ): Promise<PendingRun | ApprovalRecoveryDeferred | null> {
     const checkpoint = await this.#engine.loadCheckpoint(runId)
     if (checkpoint === null) return null
     if (isTerminalRunStatus(checkpoint.status)) return null
@@ -884,7 +1097,21 @@ export class AgentService {
         userMessage: '任务运行环境已失效，请重新发起。'
       })
     }
-    const lease = await this.#admission.recover(checkpoint, signal)
+    let lease: RunLease
+    try {
+      lease = await this.#admission.recover(checkpoint, signal)
+    } catch (error) {
+      const reason = error instanceof RunAdmissionRejectionError
+        ? error.rejectionReason
+        : 'unavailable'
+      return Object.freeze({
+        kind: 'approval_deferred',
+        reason,
+        retryable: true,
+        runRef: checkpoint.runRef,
+        requestRef: checkpoint.requestRef
+      })
+    }
     try {
       const runtime = await this.#recoverRuntime(checkpoint)
       const binding: RunRuntimeBinding = Object.freeze({
@@ -908,7 +1135,19 @@ export class AgentService {
         lease,
         // A restarted process cannot recreate the canonical QQ message without
         // inventing provenance, so recovery must not mutate chat history.
-        ephemeral: true
+        ephemeral: true,
+        requestObservationContext: activateRequestObservation({
+          context: beginRequestObservation({
+            requestRef: checkpoint.requestRef,
+            requestKind: checkpoint.requestKind,
+            startedAtMonotonicMs: 'unavailable'
+          }),
+          runRef: checkpoint.runRef,
+          queueDurationMs: 'unavailable',
+          sessionLoadDurationMs: checkpoint.requestKind === 'proactive_chat'
+            ? 'not_attempted'
+            : 'unavailable'
+        })
       })
       this.#pending.set(runId, pending)
       this.#progressPresenter.attach(
@@ -927,13 +1166,33 @@ export class AgentService {
     pending: PendingRun,
     result: RunAdvanceResult
   ): Promise<ChatReplyEnvelope> {
-    await this.#progressPresenter.drain(pending.runId)
-    if (result.kind === 'paused') return result
-    const envelope = terminalEnvelope(result)
-    try {
+    if (result.kind === 'paused') {
+      await this.#progressPresenter.drain(pending.runId)
+      return Object.freeze({
+        ...result,
+        requestObservationContext: pending.requestObservationContext
+      })
+    }
+    if (result.terminal !== null) {
       try {
-        if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
-          result.kind === 'completed') {
+        this.#onTerminalSnapshot?.(result.terminal.snapshot)
+      } catch {
+        this.#reportObserverFailure()
+      }
+      try {
+        this.#onTerminalCommitReceipt?.(result.terminal.receipt)
+      } catch {
+        this.#reportObserverFailure()
+      }
+    }
+    await this.#progressPresenter.drain(pending.runId)
+    let sessionPersistence: SessionPersistenceOutcome = 'not_attempted'
+    let sessionSaveDurationMs: number | 'unavailable' | 'not_attempted' = 'not_attempted'
+    try {
+      if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
+        result.kind === 'completed') {
+        const sessionSaveStarted = readMonotonic(this.#monotonicNow)
+        try {
           const next = appendTerminalTurn(
             pending.session,
             pending.request,
@@ -946,60 +1205,57 @@ export class AgentService {
               ? {}
               : { ttlSeconds: pending.request.sessionTtlSeconds })
           })
+          sessionPersistence = 'saved'
+        } catch {
+          sessionPersistence = 'failed'
+          this.#reportObserverFailure()
+        } finally {
+          sessionSaveDurationMs = elapsed(
+            sessionSaveStarted,
+            readMonotonic(this.#monotonicNow)
+          )
         }
-      } catch {
-        // The terminal store commit is authoritative. A secondary session
-        // projection must not rewrite or discard its snapshot and receipt.
-        this.#reportObserverFailure()
       }
-      this.#recordRun(result)
     } finally {
       this.#pending.delete(pending.runId)
       this.#progressPresenter.detach(pending.runId)
       await pending.lease.release().catch(() => undefined)
     }
-    return envelope
+    return activeFinalEnvelope(
+      result,
+      pending.requestObservationContext,
+      sessionPersistence,
+      sessionSaveDurationMs
+    )
   }
 
   async #abortPending (
     pending: PendingRun,
-    envelope: ChatReplyEnvelope
+    error: unknown
   ): Promise<ChatReplyEnvelope> {
+    let cancelled: RunAdvanceResult | null = null
+    try {
+      cancelled = await this.#engine.cancel(pending.runId, 'service_failure')
+    } catch {
+      // A terminal-null safe failure below is the only valid fallback.
+    }
+    if (cancelled !== null && cancelled.kind !== 'paused' && cancelled.terminal !== null) {
+      return await this.#finish(pending, cancelled)
+    }
     this.#pending.delete(pending.runId)
-    await this.#engine.cancel(pending.runId, 'service_failure').catch(() => undefined)
     await this.#progressPresenter.drain(pending.runId)
     this.#progressPresenter.detach(pending.runId)
     await pending.lease.release().catch(() => undefined)
-    return envelope
-  }
-
-  #recordRun (result: RunAdvanceResult): void {
-    if (this.#onRunLog === undefined) return
-    void this.#runStore.load(result.runId).then(checkpoint => {
-      const counters = checkpoint?.budgetCounters
-      const observed = result.kind === 'paused'
-        ? undefined
-        : result.terminal?.snapshot.counters
-      try {
-        this.#onRunLog?.(createAgentRunLog({
-          runId: result.runId,
-          fromStatus: 'active',
-          toStatus: result.kind,
-          modelTurns: observed?.modelTurns ?? counters?.modelTurns,
-          toolCalls: observed?.toolCalls ?? counters?.toolCalls,
-          usedActiveRuntimeMs: observed?.providerActiveDurationMs ??
-            counters?.usedActiveRuntimeMs,
-          providerAttempts: observed?.providerAttempts ?? (counters === undefined
-            ? undefined
-            : counters.modelTurns + counters.providerRetries),
-          recoveryAttempts: observed?.recoveryAttempts ?? counters?.recoveryAttempts,
-          correctionAttempts: observed?.correctionTurns ?? counters?.correctionTurns,
-          errorCode: result.kind === 'failed' ? result.error.code : undefined
-        }))
-      } catch {
-        this.#reportObserverFailure()
-      }
-    }).catch(() => this.#reportObserverFailure())
+    return activeFinalEnvelope(
+      failedRunResult(
+        pending.runId,
+        error,
+        pending.request?.runRef ?? pending.requestObservationContext.runRef
+      ),
+      pending.requestObservationContext,
+      'not_attempted',
+      'not_attempted'
+    )
   }
 
   #reportObserverFailure (): void {

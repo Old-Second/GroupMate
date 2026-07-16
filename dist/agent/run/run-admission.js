@@ -8,21 +8,26 @@ const MAX_ACTIVE_RUNS = 2;
 const MAX_QUEUED_RUNS = 3;
 const DEFAULT_LEASE_TTL_SECONDS = 600;
 const LEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+export class RunAdmissionRejectionError extends AgentError {
+    rejectionReason;
+    constructor(rejectionReason) {
+        super({
+            code: rejectionReason === 'queue_full' ? 'run_budget_exceeded' : 'cancelled',
+            stage: 'run.admission',
+            retryable: false,
+            userMessage: rejectionReason === 'queue_full'
+                ? '当前任务队列已满，请稍后重试。'
+                : '操作已取消。'
+        });
+        this.name = 'RunAdmissionRejectionError';
+        this.rejectionReason = rejectionReason;
+    }
+}
 function cancelled() {
-    return new AgentError({
-        code: 'cancelled',
-        stage: 'run.admission',
-        retryable: false,
-        userMessage: '操作已取消。'
-    });
+    return new RunAdmissionRejectionError('queue_aborted');
 }
 function queueFull() {
-    return new AgentError({
-        code: 'run_budget_exceeded',
-        stage: 'run.admission',
-        retryable: false,
-        userMessage: '当前任务队列已满，请稍后重试。'
-    });
+    return new RunAdmissionRejectionError('queue_full');
 }
 function invalidCheckpoint(cause) {
     return new AgentError({
