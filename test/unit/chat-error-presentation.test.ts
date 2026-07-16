@@ -70,6 +70,19 @@ test('uses the fixed unknown fallback for unlisted provider failures', () => {
   })
 })
 
+test('legacy entry kind unavailable keeps its fixed safe presentation', () => {
+  assert.deepEqual(getChatErrorPresentation({
+    code: 'legacy_entry_kind_unavailable',
+    statusCode: 503,
+    message: '<EMPTY> private legacy body'
+  }), {
+    code: 'legacy_entry_kind_unavailable',
+    message: '旧任务缺少可信入口信息，无法安全恢复回复。',
+    statusCode: null,
+    resetConversation: false
+  })
+})
+
 const stableRunErrorCases = [
   ['provider_authentication', 'provider_auth_failed', 'AI 服务鉴权失败，请联系机器人主人'],
   ['provider_invalid_request', 'provider_invalid_format', '请求格式不正确，请联系机器人主人'],

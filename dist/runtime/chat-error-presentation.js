@@ -120,6 +120,11 @@ const STABLE_ERROR_PRESENTATIONS = new Map([
             message: '操作结果暂时无法确认，请勿重复提交',
             resetConversation: false
         }],
+    ['legacy_entry_kind_unavailable', {
+            code: 'legacy_entry_kind_unavailable',
+            message: '旧任务缺少可信入口信息，无法安全恢复回复。',
+            resetConversation: false
+        }],
     ['cancelled', {
             code: 'cancelled',
             message: '任务已取消',
@@ -193,7 +198,10 @@ export function getChatErrorPresentation(error) {
         ? undefined
         : STABLE_ERROR_PRESENTATIONS.get(code);
     if (stablePresentation) {
-        return { ...stablePresentation, statusCode: getStatusCode(error) };
+        return {
+            ...stablePresentation,
+            statusCode: code === 'legacy_entry_kind_unavailable' ? null : getStatusCode(error)
+        };
     }
     const statusCode = getStatusCode(error);
     const statusPresentation = statusCode === null

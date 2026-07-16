@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import {
   buildLegacyQuoteForwardMessages,
@@ -8,19 +7,12 @@ import {
   selectLegacyPresentationMode
 } from '../../model/legacy/reply-presenter.js'
 import { createLegacyYunzaiFake } from '../helpers/legacy-yunzai-fake.js'
-
-function extractObjectCallOptions (source, marker) {
-  const start = source.indexOf(marker)
-  assert.notEqual(start, -1, `missing ${marker}`)
-  const openBrace = start + marker.length - 1
-  let depth = 0
-  for (let index = openBrace; index < source.length; index++) {
-    if (source[index] === '{') depth++
-    if (source[index] === '}') depth--
-    if (depth === 0) return source.slice(openBrace + 1, index)
-  }
-  assert.fail(`unterminated ${marker}`)
-}
+import { ReplyPresenter } from '../../dist/runtime/presentation/reply-presenter.js'
+import { ordinaryProfile } from '../../dist/runtime/presentation/presentation-profile.js'
+import {
+  createInitialRunObservationCounters,
+  terminalObservationId
+} from '../../dist/agent/run/run-observation.js'
 
 test('legacy reasoning forwards explicit segments before parsed thinking blocks', () => {
   assert.deepEqual(buildLegacyThinkingForwardMessages('', []), [])
@@ -206,47 +198,143 @@ test('legacy markdown handler uses the dynamic event while reply and recall stay
   }
 })
 
-test('chat app delegates only the characterized presenter decisions to the legacy seam', async () => {
-  const source = await readFile(new URL('../../apps/chat.js', import.meta.url), 'utf8')
-  const presenterImport = source.match(
-    /import\s*\{(?<names>[^}]*)\}\s*from '\.\.\/model\/legacy\/reply-presenter\.js'/
-  )
-
-  assert.ok(presenterImport)
-  for (const name of [
-    'buildLegacyQuoteForwardMessages',
-    'buildLegacyThinkingForwardMessages',
-    'presentLegacyReply',
-    'selectLegacyPresentationMode'
-  ]) {
-    assert.match(presenterImport.groups.names, new RegExp(`\\b${name}\\b`))
+test('typed presenter preserves quote forward trusted button and response-post behavior', async () => {
+  const calls = []
+  const notifications = []
+  const port = {
+    target: { botId: 'bot-1', scope: { kind: 'group', groupId: 'group-1' } },
+    async deliver (part, attempt, options) {
+      calls.push({ part, attempt, options })
+      return {
+        kind: 'sent',
+        media: part.media,
+        attempt,
+        receipt: { schemaVersion: 1, media: part.media, messageId: `bot-${calls.length}` }
+      }
+    },
+    async recall () {
+      return { kind: 'recalled' }
+    }
   }
-  assert.equal(source.match(/\bpresentLegacyReply\(\{/g)?.length ?? 0, 1)
-  const presenterOptions = extractObjectCallOptions(source, 'presentLegacyReply({')
-  assert.match(presenterOptions, /event:\s*e/)
-  assert.match(presenterOptions, /handlerEvent:\s*this\.e/)
-  assert.match(presenterOptions, /message:\s*msg/)
-  assert.match(presenterOptions, /quote,/)
-  assert.match(presenterOptions, /data,/)
-  assert.match(presenterOptions, /markdownEnabled:\s*Config\.enableMd/)
-  assert.match(presenterOptions, /handler:\s*e\.runtime\?\.handler\s*\|\|\s*\{\}/)
-  assert.match(presenterOptions, /logger,/)
-  assert.match(presenterOptions, /schedule:\s*setTimeout/)
-  assert.equal(source.match(/\bconst presentationMode\s*=\s*selectLegacyPresentationMode\(\{/g)?.length ?? 0, 1)
-  const modeOptions = extractObjectCallOptions(source, 'selectLegacyPresentationMode({')
-  assert.match(modeOptions, /useTTS,/)
-  assert.match(modeOptions, /forcePictureMode,/)
-  assert.match(modeOptions, /userPictureMode:\s*userSetting\.usePicture/)
-  assert.match(modeOptions, /autoPicture:\s*Config\.autoUsePicture/)
-  assert.match(modeOptions, /responseLength:\s*response\.length/)
-  assert.match(modeOptions, /autoPictureThreshold:\s*Config\.autoUsePictureThreshold/)
-  assert.equal(source.match(/presentationMode\s*===\s*'tts'/g)?.length ?? 0, 1)
-  assert.equal(source.match(/presentationMode\s*===\s*'picture'/g)?.length ?? 0, 1)
-  assert.equal(source.match(/buildLegacyQuoteForwardMessages\(quotemessage\)/g)?.length ?? 0, 2)
-  assert.equal(
-    source.match(/buildLegacyThinkingForwardMessages\(thinking, thinkingSegments\)/g)?.length ?? 0,
-    1
-  )
-  assert.doesNotMatch(source, /\breplyWithoutRecallingUserMessage\b/)
-  assert.doesNotMatch(source, /\bbuildThinkingForwardMessages\b/)
+  const presenter = new ReplyPresenter({
+    outboundFactory: { forTarget: async () => port },
+    random: () => 0.5,
+    sleep: async () => undefined,
+    schedule: () => undefined
+  })
+  const route = {
+    schemaVersion: 1,
+    requestKind: 'ordinary_chat',
+    profile: 'ordinary',
+    presentationIntent: { schemaVersion: 1, kind: 'ordinary', forcePicture: false },
+    sessionAddress: port.target,
+    actorId: 'actor-1',
+    requestMessageId: 'request-1'
+  }
+  const runRef = '3'.repeat(32)
+  const revision = 2
+  const observationId = terminalObservationId(runRef, revision)
+  const counters = createInitialRunObservationCounters()
+  const result = await presenter.present({
+    result: {
+      kind: 'completed',
+      runId: 'run-1',
+      runRef,
+      completion: { kind: 'reply_text', text: 'fixture response' },
+      output: {
+        id: 'message-1',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'fixture response' }],
+        createdAt: '2026-07-16T00:00:00.000Z',
+        provenance: {
+          source: 'agent_output',
+          trust: 'trusted',
+          sensitivity: 'group',
+          sourceId: runRef,
+          createdAt: '2026-07-16T00:00:00.000Z'
+        }
+      },
+      terminal: {
+        snapshot: {
+          schemaVersion: 2,
+          observationId,
+          runRef,
+          revision,
+          status: 'completed',
+          finishedAt: '2026-07-16T00:00:00.000Z',
+          completion: { kind: 'reply_text', lengthBucket: '1_40' },
+          errorCode: null,
+          cancellationReason: null,
+          counters,
+          engineDurationMs: counters.engineActiveDurationMs
+        },
+        receipt: {
+          schemaVersion: 1,
+          observationId,
+          runRef,
+          revision,
+          deletedKeyCount: 2,
+          createdKeyCount: 1,
+          checkpointBytesDeleted: 10,
+          eventBytesDeleted: 10,
+          tombstoneBytes: 100
+        }
+      }
+    },
+    sessionPersistence: 'saved',
+    route,
+    profile: ordinaryProfile({ forcePicture: false, quoteCurrentRequest: true }),
+    settings: {
+      schemaVersion: 1,
+      quoteReply: true,
+      enableRobotAt: true,
+      enableMarkdown: true,
+      enableSuggestedResponses: true,
+      forwardReasoning: true,
+      blockWords: [],
+      promptBlockWords: [],
+      tts: {
+        enabled: false,
+        mode: 'vits-uma-genshin-honkai',
+        activeVoice: 'fixture',
+        alsoSendText: false,
+        autoFallbackThreshold: 299,
+        filter: null,
+        azureEmotionEnabled: false
+      },
+      picture: {
+        userEnabled: false,
+        autoEnabled: false,
+        autoThreshold: 1200,
+        deviceScaleFactor: 1,
+        closeBrowserAfterRender: true,
+        showQRCode: true,
+        live2d: null
+      }
+    },
+    citationForwards: [{ title: 'fixture source', text: 'fixture citation' }],
+    suggestions: ['fixture suggestion'],
+    hooks: {
+      postprocess: async ({ text }) => ({
+        text,
+        reasoningView: { text: 'fixture reasoning', truncated: false }
+      }),
+      convertText: async ({ text }) => [{ kind: 'text', text }],
+      notifyResponsePost: value => notifications.push(value)
+    }
+  })
+
+  assert.equal(result.outcome, 'complete')
+  assert.deepEqual(calls.map(call => call.part.media), ['forward', 'text', 'forward', 'text'])
+  assert.deepEqual(calls.map(call => call.options?.quoteMessageId), [undefined, 'request-1', undefined, undefined])
+  assert.deepEqual(calls[3].part.buttons, {
+    schemaVersion: 1,
+    kind: 'chat_suggestions',
+    suggestions: ['fixture suggestion']
+  })
+  assert.deepEqual(notifications, [{
+    runRef,
+    text: 'fixture response',
+    hasReasoning: true
+  }])
 })
