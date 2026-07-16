@@ -17,6 +17,7 @@ export const AGENT_ERROR_CODES = Object.freeze([
     'authorization_changed',
     'tool_outcome_unknown',
     'cancelled',
+    'legacy_entry_kind_unavailable',
     'internal_error',
     'internal'
 ]);

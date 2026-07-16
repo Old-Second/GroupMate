@@ -1,3 +1,5 @@
+export type Phase6CompletionErrorCode = 'legacy_entry_kind_unavailable'
+
 export type AgentErrorCode =
   | 'invalid_request'
   | 'invalid_session'
@@ -17,6 +19,7 @@ export type AgentErrorCode =
   | 'authorization_changed'
   | 'tool_outcome_unknown'
   | 'cancelled'
+  | Phase6CompletionErrorCode
   | 'internal_error'
   | 'internal'
 
@@ -39,6 +42,7 @@ export const AGENT_ERROR_CODES: readonly AgentErrorCode[] = Object.freeze([
   'authorization_changed',
   'tool_outcome_unknown',
   'cancelled',
+  'legacy_entry_kind_unavailable',
   'internal_error',
   'internal'
 ])

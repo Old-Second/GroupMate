@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { parseAgentMessage } from '../../src/agent/contracts/content.js'
-import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
+import {
+  AGENT_ERROR_CODES,
+  AgentError,
+  isAgentErrorCode,
+  serializeAgentError
+} from '../../src/agent/contracts/error.js'
 import { parseAgentEvent } from '../../src/agent/contracts/event.js'
 import { parseAgentRequest } from '../../src/agent/contracts/request.js'
 import { parseAgentResult } from '../../src/agent/contracts/result.js'
@@ -79,6 +84,24 @@ test('AgentError serializes only safe fields', () => {
   const serialized = JSON.stringify(serializeAgentError(error))
   assert.match(serialized, /storage_unavailable/)
   assert.doesNotMatch(serialized, /password|private payload|redis:\/\//)
+})
+
+test('legacy entry kind error survives allowlist and result parser round trips', () => {
+  const error = serializeAgentError(new AgentError({
+    code: 'legacy_entry_kind_unavailable',
+    stage: 'run.completion',
+    retryable: false,
+    userMessage: '旧任务缺少可信入口信息，无法安全恢复回复。'
+  }))
+
+  assert.equal(isAgentErrorCode('legacy_entry_kind_unavailable'), true)
+  assert.equal(AGENT_ERROR_CODES.includes('legacy_entry_kind_unavailable'), true)
+  const parsed = parseAgentResult({ status: 'failed', error })
+  assert.equal(parsed.status, 'failed')
+  if (parsed.status === 'failed') {
+    assert.equal(parsed.error.code, 'legacy_entry_kind_unavailable')
+    assert.notEqual(parsed.error.code, 'internal_error')
+  }
 })
 
 test('event parser accepts only stable events with primitive payloads', () => {
