@@ -23,9 +23,10 @@ import { createPendingIndicatorConfigPort } from './presentation/pending-indicat
 import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
 import { createPresentationSettingsPort } from './presentation/presentation-settings.js';
 import { ReplyPresenter } from './presentation/reply-presenter.js';
+import { TTS_SYNTHESIS_DIAGNOSTIC_EVENT } from './presentation/tts-reply-presentation.js';
 import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
 import { plainTextPart } from './presentation/text-presentation.js';
-import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
+import { PLAIN_TEXT_PRESENTATION_HOOKS, UNAVAILABLE_TTS_REPLY_PORT } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
 import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
@@ -250,6 +251,8 @@ class ApprovalRoutePresenter {
         this.#settings = input.settings;
         this.#presenter = new ReplyPresenter({
             outboundFactory: input.outboundFactory,
+            tts: UNAVAILABLE_TTS_REPLY_PORT,
+            ttsDiagnostics: input.ttsDiagnostics,
             random: Math.random,
             sleep: async (milliseconds) => await new Promise(resolve => setTimeout(resolve, milliseconds)),
             schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
@@ -907,12 +910,22 @@ export function createYunzaiAgentServiceBridge(options) {
         botPicker: botAccess.picker,
         segment: options.segment
     });
+    const ttsDiagnostics = Object.freeze({
+        reportSynthesisFailure: (code) => options.logger?.error?.(Object.freeze({
+            event: TTS_SYNTHESIS_DIAGNOSTIC_EVENT,
+            code
+        }))
+    });
     const settings = createPresentationSettingsPort(presentationSettingsSource(options));
     const pendingConfig = createPendingIndicatorConfigPort(options.redis);
     const pendingIndicator = new PendingIndicatorPresenter({
         onDeliveryFailure: failure => options.logger?.warn?.(`运行提示发送失败：${failure.resultCode}`)
     });
-    const approvalPresenter = new ApprovalRoutePresenter({ settings, outboundFactory });
+    const approvalPresenter = new ApprovalRoutePresenter({
+        settings,
+        outboundFactory,
+        ttsDiagnostics
+    });
     const toolRuntime = createYunzaiToolRuntimeBridge({
         ...options,
         config: options.config,

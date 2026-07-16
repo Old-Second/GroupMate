@@ -15,11 +15,17 @@ import {
 import { createPendingIndicatorConfigPort } from '../../src/runtime/presentation/pending-indicator-config.js'
 import { RECOVERED_LEGACY_PROFILE } from '../../src/runtime/presentation/presentation-profile.js'
 import { ReplyPresenter } from '../../src/runtime/presentation/reply-presenter.js'
+import {
+  TTS_SYNTHESIS_DIAGNOSTIC_EVENT
+} from '../../src/runtime/presentation/tts-reply-presentation.js'
 import type {
   PresentationSettings,
   PresentationSettingsPort
 } from '../../src/runtime/presentation/presentation-settings.js'
-import { PLAIN_TEXT_PRESENTATION_HOOKS } from '../../src/runtime/runtime-presentation-hooks.js'
+import {
+  PLAIN_TEXT_PRESENTATION_HOOKS,
+  UNAVAILABLE_TTS_REPLY_PORT
+} from '../../src/runtime/runtime-presentation-hooks.js'
 import type { YunzaiOutboundPort } from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
@@ -112,7 +118,8 @@ function modelToolResponse (
 }
 
 async function ordinaryRestartFixture (
-  decision: '确认' | '拒绝' = '确认'
+  decision: '确认' | '拒绝' = '确认',
+  options: Readonly<{ useTts?: boolean }> = Object.freeze({})
 ): Promise<Readonly<{
   routed: boolean
   messages: ReadonlyMap<string, readonly unknown[]>
@@ -120,17 +127,19 @@ async function ordinaryRestartFixture (
   providerRequests: readonly unknown[]
   settingsKeys: readonly string[]
   recoveryImageReads: number
+  diagnostics: readonly Readonly<Record<string, unknown>>[]
 }>> {
   const timestamp = '2026-07-16T00:00:00.000Z'
   const redis = new RecordingRedis(() => Date.parse(timestamp))
   await createPendingIndicatorConfigPort(redis).setEnabled(false)
   await redis.set('CHATGPT:USER:requester-u', JSON.stringify({
     usePicture: false,
-    useTTS: false
+    useTTS: options.useTts === true
   }))
   const messages = new Map<string, unknown[]>()
   const pickerCalls: string[] = []
   const providerRequests: unknown[] = []
+  const diagnostics: Readonly<Record<string, unknown>>[] = []
   let recoveryImageReads = 0
   const recoveredResponses = [modelResponse('<think>private reasoning</think>restart completed')]
   const send = async (targetId: string, message: unknown) => {
@@ -223,6 +232,9 @@ async function ordinaryRestartFixture (
         pickerCalls.push(botId)
         return botId === 'bot-original' ? bot as never : null
       }
+    },
+    logger: {
+      error: event => { diagnostics.push(event) }
     }
   })
   const routed = await bridgeB.routeApprovalReply({
@@ -243,7 +255,8 @@ async function ordinaryRestartFixture (
     pickerCalls: Object.freeze([...pickerCalls]),
     providerRequests: Object.freeze([...providerRequests]),
     settingsKeys: Object.freeze(redis.getCalls.filter(key => key.startsWith('CHATGPT:USER:'))),
-    recoveryImageReads
+    recoveryImageReads,
+    diagnostics: Object.freeze([...diagnostics])
   })
 }
 
@@ -542,6 +555,19 @@ test('approval recovery after restart uses bot picker and plain safe hooks', asy
   assert.doesNotMatch(JSON.stringify(restarted.messages.get('requester-u')), /private reasoning/)
 })
 
+test('approval TTS diagnostic logger exposes only fixed event and code', async () => {
+  const restarted = await ordinaryRestartFixture('确认', { useTts: true })
+  assert.equal(restarted.routed, true)
+  assert.deepEqual(restarted.diagnostics, [{
+    event: TTS_SYNTHESIS_DIAGNOSTIC_EVENT,
+    code: 'synthesis_rejected'
+  }])
+  assert.doesNotMatch(
+    JSON.stringify(restarted.diagnostics),
+    /restart completed|requester-u|bot-original|fixture-key|fixture-model/
+  )
+})
+
 test('legacy null route recovers without actor message id or rich presentation', async () => {
   const route: RecoveredLegacyPresentationRoute = Object.freeze({
     schemaVersion: 1,
@@ -585,6 +611,8 @@ test('legacy null route recovers without actor message id or rich presentation',
   }
   await new ReplyPresenter({
     outboundFactory: { forTarget: async () => outbound },
+    tts: UNAVAILABLE_TTS_REPLY_PORT,
+    ttsDiagnostics: { reportSynthesisFailure: () => undefined },
     random: () => 1,
     sleep: async () => undefined,
     schedule: callback => setTimeout(callback, 1)

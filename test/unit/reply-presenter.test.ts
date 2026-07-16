@@ -9,6 +9,7 @@ import { createInitialRunObservationCounters, terminalObservationId } from '../.
 import {
   aggregatePresentationResults,
   type DeliveryResult,
+  type PresentationDeliveryMedia,
   type PresentationResult,
   type RuntimeDeliveryReceipt
 } from '../../src/runtime/presentation/presentation-result.js'
@@ -24,6 +25,7 @@ import {
   SESSION_PERSISTENCE_FAILED_MESSAGE
 } from '../../src/runtime/presentation/response-presentation-safety.js'
 import { ReplyPresenter } from '../../src/runtime/presentation/reply-presenter.js'
+import type { TtsPresentationDiagnosticPort } from '../../src/runtime/presentation/tts-reply-presentation.js'
 import {
   createRuntimePresentationHooks,
   type PresentationInput,
@@ -38,6 +40,11 @@ import type {
   YunzaiOutboundPortFactory
 } from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
+import type {
+  TtsReplyPort,
+  TtsSynthesisErrorCode,
+  TtsSynthesisResult
+} from '../../src/runtime/presentation/yunzai-tts-reply-port.js'
 
 const createdAt = '2026-07-16T00:00:00.000Z'
 const runRef = '2'.repeat(32)
@@ -183,18 +190,28 @@ const cancelled: Extract<RunAdvanceResult, { kind: 'cancelled' }> = Object.freez
   terminal: terminalFacts('cancelled', null)
 })
 
-function sent (media: 'text' | 'forward', attempt: 1 | 2 = 1, messageId = `${media}-${attempt}`): DeliveryResult<typeof media> {
+function sent (
+  media: PresentationDeliveryMedia,
+  attempt: 1 | 2 = 1,
+  messageId = `${media}-${attempt}`
+): DeliveryResult<typeof media> {
   return Object.freeze({
     kind: 'sent', media, attempt,
     receipt: Object.freeze({ schemaVersion: 1, media, messageId }) as RuntimeDeliveryReceipt<typeof media>
   })
 }
 
-function definite (media: 'text' | 'forward', attempt: 1 | 2 = 1): DeliveryResult<typeof media> {
+function definite (
+  media: PresentationDeliveryMedia,
+  attempt: 1 | 2 = 1
+): DeliveryResult<typeof media> {
   return Object.freeze({ kind: 'failed_definite', media, attempt, code: 'host_rejected' })
 }
 
-function indeterminate (media: 'text' | 'forward', attempt: 1 | 2 = 1): DeliveryResult<typeof media> {
+function indeterminate (
+  media: PresentationDeliveryMedia,
+  attempt: 1 | 2 = 1
+): DeliveryResult<typeof media> {
   return Object.freeze({ kind: 'outcome_unknown', media, attempt, code: 'unknown_host_result' })
 }
 
@@ -209,6 +226,8 @@ function fixture (input: {
   readonly random?: number[]
   readonly hooks?: Partial<RuntimePresentationHooks>
   readonly recall?: (receipt: RuntimeDeliveryReceipt) => Promise<RecallResult>
+  readonly synthesis?: TtsSynthesisResult
+  readonly diagnostic?: (code: TtsSynthesisErrorCode) => void | Promise<void>
 } = {}) {
   const deliveries = [...(input.deliveries ?? [])]
   const calls: OutboundCall[] = []
@@ -218,6 +237,8 @@ function fixture (input: {
   const schedules: Array<{ callback: () => void; milliseconds: number }> = []
   const notifications: Array<{ runRef: string; text: string; hasReasoning: boolean }> = []
   const conversions: Array<{ text: string; enableRobotAt: boolean; enableMarkdown: boolean }> = []
+  const ttsCalls: object[] = []
+  const ttsDiagnosticCalls: TtsSynthesisErrorCode[] = []
   const random = [...(input.random ?? [])]
   const port: YunzaiOutboundPort = {
     target: groupAddress,
@@ -225,7 +246,7 @@ function fixture (input: {
       calls.push({ part, attempt, options })
       const next = deliveries.shift()
       if (next !== undefined) return next as DeliveryResult<typeof part.media>
-      return sent(part.media === 'forward' ? 'forward' : 'text', attempt) as DeliveryResult<typeof part.media>
+      return sent(part.media as PresentationDeliveryMedia, attempt) as DeliveryResult<typeof part.media>
     },
     recall: receipt => {
       recalls.push(receipt)
@@ -248,8 +269,27 @@ function fixture (input: {
     }),
     notifyResponsePost: input.hooks?.notifyResponsePost ?? (value => { notifications.push(value) })
   }
+  const tts: TtsReplyPort = {
+    synthesize: async value => {
+      ttsCalls.push(value)
+      return input.synthesis ?? Object.freeze({
+        kind: 'ready',
+        audio: Object.freeze({
+          kind: 'buffer', data: new Uint8Array([1]), mimeType: 'audio/ogg', byteLength: 1
+        })
+      })
+    }
+  }
+  const ttsDiagnostics: TtsPresentationDiagnosticPort = {
+    reportSynthesisFailure: code => {
+      ttsDiagnosticCalls.push(code)
+      return input.diagnostic?.(code)
+    }
+  }
   const presenter = new ReplyPresenter({
     outboundFactory,
+    tts,
+    ttsDiagnostics,
     random: () => random.shift() ?? 0.5,
     sleep: async milliseconds => { sleeps.push(milliseconds) },
     schedule: (callback, milliseconds) => {
@@ -266,6 +306,8 @@ function fixture (input: {
     schedules,
     notifications,
     conversions,
+    ttsCalls,
+    ttsDiagnosticCalls,
     hooks
   }
 }
@@ -790,4 +832,82 @@ test('recovered legacy profile cannot use rich presentation or silence', async (
     hooks: blocked.hooks
   }))
   assert.deepEqual(sentTexts(blocked.calls), [BLOCKED_RESPONSE_MESSAGE])
+})
+
+test('ReplyPresenter selects TTS before text with required port', async () => {
+  const ttsSettings = settings({
+    tts: Object.freeze({
+      enabled: true,
+      mode: 'azure',
+      activeVoice: 'zh-CN-XiaoxiaoNeural',
+      alsoSendText: false,
+      autoFallbackThreshold: 299,
+      filter: null,
+      azureEmotionEnabled: false
+    })
+  })
+  const ordinary = fixture()
+  const ordinaryResult = await ordinary.presenter.present(input(completed({
+    kind: 'reply_text', text: '语音优先正文'
+  }), {
+    settings: ttsSettings,
+    hooks: ordinary.hooks
+  }))
+  assert.equal(ordinaryResult.outcome, 'complete')
+  assert.equal(ordinary.ttsCalls.length, 1)
+  assert.deepEqual(ordinary.calls.map(call => call.part.media), ['voice'])
+  assert.equal(ordinary.conversions.length, 0)
+
+  const disabled = fixture()
+  await disabled.presenter.present(input(completed({ kind: 'reply_text', text: '普通文本' }), {
+    hooks: disabled.hooks
+  }))
+  assert.equal(disabled.ttsCalls.length, 0)
+  assert.deepEqual(disabled.calls.map(call => call.part.media), ['text'])
+
+  const proactive = fixture()
+  await proactive.presenter.present(input(completed({ kind: 'reply_text', text: '主动正文' }), {
+    route: proactiveRoute,
+    profile: proactiveProfile({ recallAfterMs: 2_000 }),
+    settings: ttsSettings,
+    hooks: proactive.hooks
+  }))
+  assert.equal(proactive.ttsCalls.length, 0)
+  assert.deepEqual(proactive.calls.map(call => call.part.media), ['text'])
+
+  const legacy = fixture()
+  await legacy.presenter.present(input(completed({ kind: 'reply_text', text: '恢复正文' }), {
+    route: recoveredRoute,
+    profile: RECOVERED_LEGACY_PROFILE,
+    settings: ttsSettings,
+    hooks: legacy.hooks
+  }))
+  assert.equal(legacy.ttsCalls.length, 0)
+  assert.deepEqual(legacy.calls.map(call => call.part.media), ['text'])
+
+  const textFirstFailure = fixture({
+    synthesis: Object.freeze({ kind: 'failed_definite', code: 'synthesis_rejected' }),
+    deliveries: [sent('forward'), sent('text'), sent('text')]
+  })
+  const partial = await textFirstFailure.presenter.present(input(completed({
+    kind: 'reply_text', text: '聚合时只能出现一次的原文'
+  }), {
+    sessionPersistence: 'failed',
+    citationForwards: Object.freeze([{ title: '来源', text: '引用' }]),
+    settings: settings({
+      tts: Object.freeze({
+        ...ttsSettings.tts,
+        alsoSendText: true
+      })
+    }),
+    hooks: textFirstFailure.hooks
+  }))
+  assert.equal(partial.outcome, 'partial')
+  assert.deepEqual(partial.deliveries.map(item => item.media), ['forward', 'text', 'text'])
+  assert.equal(
+    sentTexts(textFirstFailure.calls).filter(text => text === '聚合时只能出现一次的原文').length,
+    1
+  )
+  assert.deepEqual(sentTexts(textFirstFailure.calls).at(-1), SESSION_PERSISTENCE_FAILED_MESSAGE)
+  assert.deepEqual(textFirstFailure.ttsDiagnosticCalls, ['synthesis_rejected'])
 })

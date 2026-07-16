@@ -218,6 +218,14 @@ test('typed presenter preserves quote forward trusted button and response-post b
   }
   const presenter = new ReplyPresenter({
     outboundFactory: { forTarget: async () => port },
+    tts: {
+      async synthesize () {
+        return { kind: 'failed_definite', code: 'synthesis_rejected' }
+      }
+    },
+    ttsDiagnostics: {
+      reportSynthesisFailure () {}
+    },
     random: () => 0.5,
     sleep: async () => undefined,
     schedule: () => undefined

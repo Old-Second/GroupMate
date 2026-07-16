@@ -4,6 +4,7 @@ import { buildChatSuggestionButtonRequest, normalizeCitationForwards, normalizeR
 import { BLOCKED_RESPONSE_MESSAGE, CANCELLED_MESSAGE, POSTPROCESS_EMPTY_MESSAGE, responseIsBlocked, SESSION_PERSISTENCE_FAILED_MESSAGE } from './response-presentation-safety.js';
 import { citationForwardPart, codePointLength, plainTextPart, reasoningForwardPart, repairCodeFences, splitProactiveText, textPart } from './text-presentation.js';
 import { deliverWithDefiniteRetry } from './yunzai-outbound-port.js';
+import { presentTtsReply } from './tts-reply-presentation.js';
 function frozenResult(outcome, deliveries, skipReason) {
     return Object.freeze({
         schemaVersion: 1,
@@ -131,16 +132,31 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             ...(input.signal === undefined ? {} : { signal: input.signal })
         }));
     }
-    const atoms = await input.hooks.convertText({
-        text,
-        enableRobotAt: input.settings.enableRobotAt,
-        enableMarkdown: input.settings.enableMarkdown
-    });
     const quote = quoteMessageId(input, profile);
-    children.push(await deliverLogicalPart(port, textPart(atoms), {
-        ...(quote === undefined ? {} : { quoteMessageId: quote }),
-        ...(input.signal === undefined ? {} : { signal: input.signal })
-    }));
+    if (input.settings.tts.enabled) {
+        children.push(await presentTtsReply({
+            text,
+            target: input.route.sessionAddress,
+            settings: input.settings.tts,
+            ...(quote === undefined ? {} : { quoteMessageId: quote }),
+            ...(input.signal === undefined ? {} : { signal: input.signal })
+        }, {
+            tts: dependencies.tts,
+            diagnostics: dependencies.ttsDiagnostics,
+            outboundFactory: dependencies.outboundFactory
+        }));
+    }
+    else {
+        const atoms = await input.hooks.convertText({
+            text,
+            enableRobotAt: input.settings.enableRobotAt,
+            enableMarkdown: input.settings.enableMarkdown
+        });
+        children.push(await deliverLogicalPart(port, textPart(atoms), {
+            ...(quote === undefined ? {} : { quoteMessageId: quote }),
+            ...(input.signal === undefined ? {} : { signal: input.signal })
+        }));
+    }
     if (reasoningView !== undefined) {
         children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
             ...(input.signal === undefined ? {} : { signal: input.signal })

@@ -36,10 +36,17 @@ import {
   type YunzaiOutboundPort,
   type YunzaiOutboundPortFactory
 } from './yunzai-outbound-port.js'
+import {
+  presentTtsReply,
+  type TtsPresentationDiagnosticPort
+} from './tts-reply-presentation.js'
+import type { TtsReplyPort } from './yunzai-tts-reply-port.js'
 import type { PresentationInput } from '../runtime-presentation-hooks.js'
 
 export interface ReplyPresenterDependencies {
   readonly outboundFactory: YunzaiOutboundPortFactory
+  readonly tts: TtsReplyPort
+  readonly ttsDiagnostics: TtsPresentationDiagnosticPort
   readonly random: () => number
   readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>
   readonly schedule: (
@@ -215,16 +222,30 @@ async function presentOrdinary (
     }))
   }
 
-  const atoms = await input.hooks.convertText({
-    text,
-    enableRobotAt: input.settings.enableRobotAt,
-    enableMarkdown: input.settings.enableMarkdown
-  })
   const quote = quoteMessageId(input, profile)
-  children.push(await deliverLogicalPart(port, textPart(atoms), {
-    ...(quote === undefined ? {} : { quoteMessageId: quote }),
-    ...(input.signal === undefined ? {} : { signal: input.signal })
-  }))
+  if (input.settings.tts.enabled) {
+    children.push(await presentTtsReply({
+      text,
+      target: input.route.sessionAddress,
+      settings: input.settings.tts,
+      ...(quote === undefined ? {} : { quoteMessageId: quote }),
+      ...(input.signal === undefined ? {} : { signal: input.signal })
+    }, {
+      tts: dependencies.tts,
+      diagnostics: dependencies.ttsDiagnostics,
+      outboundFactory: dependencies.outboundFactory
+    }))
+  } else {
+    const atoms = await input.hooks.convertText({
+      text,
+      enableRobotAt: input.settings.enableRobotAt,
+      enableMarkdown: input.settings.enableMarkdown
+    })
+    children.push(await deliverLogicalPart(port, textPart(atoms), {
+      ...(quote === undefined ? {} : { quoteMessageId: quote }),
+      ...(input.signal === undefined ? {} : { signal: input.signal })
+    }))
+  }
 
   if (reasoningView !== undefined) {
     children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {

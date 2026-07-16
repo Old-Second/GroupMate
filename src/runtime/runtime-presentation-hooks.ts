@@ -15,6 +15,16 @@ import { normalizeReasoningView } from './presentation/reply-content.js'
 import type { PresentationSettings } from './presentation/presentation-settings.js'
 import type { SafeTextAtom } from './presentation/yunzai-outbound-port.js'
 
+export {
+  UNAVAILABLE_TTS_REPLY_PORT
+} from './presentation/yunzai-tts-reply-port.js'
+export type {
+  TtsReplyPort,
+  TtsSynthesisResult,
+  TtsTargetEncodingPort,
+  YunzaiTtsBackendPort
+} from './presentation/yunzai-tts-reply-port.js'
+
 export interface RuntimePresentationHooks {
   postprocess(input: { readonly text: string }): Promise<PostprocessResult>
   convertText(input: {
