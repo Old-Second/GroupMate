@@ -102,7 +102,11 @@ class FakeApprovalControl implements RunApprovalControl {
     this.decisions.push(input)
     this.current = null
     return Object.freeze({
-      kind: 'completed', runId: input.runId, output: null, visibleOutput: true
+      kind: 'completed',
+      runId: input.runId,
+      runRef: '1'.repeat(32),
+      completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
+      output: null
     })
   }
 }

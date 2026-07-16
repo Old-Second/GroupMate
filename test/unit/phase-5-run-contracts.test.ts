@@ -192,6 +192,7 @@ test('freezes every confirmed provider and tool protocol byte limit', () => {
     checkpointKeys: 16,
     eventKeys: 16,
     tombstoneKeys: 128,
+    referenceKeys: 144,
     indexAdmissionKeys: 64
   })
   assert.equal(Object.isFrozen(RUN_RESOURCE_LIMITS), true)
@@ -254,24 +255,28 @@ test('parses every bounded run advance result branch', () => {
   const completed = parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
+    runRef: '1'.repeat(32),
+    completion: { kind: 'reply_text', text: '完成' },
     output: assistantMessage,
-    visibleOutput: false
   })
   assert.equal(completed.kind, 'completed')
   assert.equal(parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
+    runRef: '1'.repeat(32),
+    completion: { kind: 'already_visible', source: 'tool_output' },
     output: null,
-    visibleOutput: true
   }).kind, 'completed')
   assert.equal(parseRunAdvanceResult({
     kind: 'paused',
     runId: 'run-1',
+    runRef: '1'.repeat(32),
     interruption
   }).kind, 'paused')
   assert.equal(parseRunAdvanceResult({
     kind: 'failed',
     runId: 'run-1',
+    runRef: 'unavailable',
     error: serializeAgentError(new AgentError({
       code: 'provider_protocol_error',
       stage: 'model.decode',
@@ -282,18 +287,21 @@ test('parses every bounded run advance result branch', () => {
   assert.equal(parseRunAdvanceResult({
     kind: 'cancelled',
     runId: 'run-1',
+    runRef: 'unavailable',
     reason: 'caller_aborted'
   }).kind, 'cancelled')
 
   assert.throws(() => parseRunAdvanceResult({
     kind: 'completed',
     runId: 'run-1',
+    runRef: '1'.repeat(32),
+    completion: { kind: 'reply_text', text: '完成' },
     output: null,
-    visibleOutput: false
   }), /completed run output/)
   assert.throws(() => parseRunAdvanceResult({
     kind: 'failed',
     runId: 'run-1',
+    runRef: 'unavailable',
     error: {
       code: 'provider_protocol_error',
       stage: 'model.decode',

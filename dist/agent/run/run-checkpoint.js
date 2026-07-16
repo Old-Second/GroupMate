@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { parseAgentMessage } from '../contracts/content.js';
+import { completionFromTerminalOutput, parseCompletionDisposition } from '../contracts/completion.js';
 import { isAgentErrorCode } from '../contracts/error.js';
+import { parsePresentationRoute } from '../contracts/interaction.js';
 import { parseAgentEvent } from '../contracts/event.js';
 import { parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from './provider-state.js';
@@ -10,6 +12,8 @@ import { assertRunTransition, parseRunStatus } from './run-state.js';
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../session/conversation-scope.js';
 import { parseSerializablePreparedCapability } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
+import { RUN_REF_PATTERN } from './run-reference.js';
+import { createFrozenObservationPolicy, createInitialRunObservationCounters, parseFrozenObservationPolicy, parseRunObservationCounters } from './run-observation.js';
 const CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROFILE = /^[a-z][a-z0-9_.-]{0,63}$/;
 function timestamp(value, label) {
@@ -51,7 +55,7 @@ function finiteNumber(value, label) {
 function jsonBytes(value) {
     return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
-const CHECKPOINT_KEYS = Object.freeze([
+const CHECKPOINT_V1_KEYS = Object.freeze([
     'schemaVersion', 'kernelVersion', 'profileId', 'profileVersion', 'runId',
     'sessionId', 'sessionAddress', 'revision', 'status', 'step', 'model',
     'messages', 'estimatedInputTokens', 'modelTurn', 'toolSnapshot',
@@ -59,6 +63,17 @@ const CHECKPOINT_KEYS = Object.freeze([
     'budgetCounters', 'recoveryUsed', 'forceCorrection', 'output',
     'visibleOutput', 'error', 'cancellationReason', 'events',
     'nextEventSequence', 'deadlineAt', 'createdAt', 'updatedAt'
+]);
+const CHECKPOINT_V2_KEYS = Object.freeze([
+    'schemaVersion', 'kernelVersion', 'profileId', 'profileVersion', 'runId',
+    'sessionId', 'sessionAddress', 'revision', 'status', 'step', 'model',
+    'messages', 'estimatedInputTokens', 'modelTurn', 'toolSnapshot',
+    'toolLedgers', 'preparedBatch', 'interruption', 'approvalHistory', 'budgetLimits',
+    'budgetCounters', 'recoveryUsed', 'forceCorrection', 'output', 'error',
+    'cancellationReason', 'events', 'nextEventSequence', 'deadlineAt', 'createdAt',
+    'updatedAt', 'runRef', 'requestRef', 'requestKind', 'presentationRoute',
+    'completion', 'observationCounters', 'providerDispatch', 'engineActivity',
+    'observationPolicy'
 ]);
 const MODEL_KEYS = Object.freeze([
     'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
@@ -341,14 +356,77 @@ function splitCheckpoint(checkpoint) {
     const { events, ...state } = checkpoint;
     return Object.freeze({ state, events });
 }
-export function parseRunCheckpoint(value) {
+function validateObservationState(value, label) {
+    const state = record(value, label);
+    exactKeys(state, ['state'], ['state'], label);
+    if (state.state !== 'idle' && state.state !== 'reserved') {
+        throw new TypeError(`${label} is invalid`);
+    }
+}
+function validateCheckpointV2(parsed) {
+    if (!RUN_REF_PATTERN.test(parsed.runRef) || !RUN_REF_PATTERN.test(parsed.requestRef)) {
+        throw new TypeError('run checkpoint reference is invalid');
+    }
+    if (parsed.requestKind === 'legacy_unknown') {
+        if (parsed.presentationRoute !== null) {
+            throw new TypeError('legacy checkpoint presentation route is invalid');
+        }
+    }
+    else {
+        if (parsed.presentationRoute === null) {
+            throw new TypeError('trusted checkpoint presentation route is missing');
+        }
+        const route = parsePresentationRoute(parsed.presentationRoute);
+        if (route.requestKind !== parsed.requestKind ||
+            canonicalSessionKey(route.sessionAddress) !== canonicalSessionKey(parsed.sessionAddress)) {
+            throw new TypeError('checkpoint presentation route matrix is invalid');
+        }
+    }
+    parseRunObservationCounters(parsed.observationCounters);
+    validateObservationState(parsed.providerDispatch, 'provider dispatch observation');
+    validateObservationState(parsed.engineActivity, 'engine activity observation');
+    const observationPolicy = parseFrozenObservationPolicy(parsed.observationPolicy);
+    const expectedObservationPolicy = createFrozenObservationPolicy({
+        levelAtStart: observationPolicy.levelAtStart,
+        runRef: parsed.runRef
+    });
+    if (expectedObservationPolicy.sampledSuccess !== observationPolicy.sampledSuccess) {
+        throw new TypeError('run checkpoint observation policy sample is invalid');
+    }
+    if (parsed.status === 'completed') {
+        if (parsed.completion === null || parsed.error !== null ||
+            parsed.cancellationReason !== null) {
+            throw new TypeError('completed run checkpoint is invalid');
+        }
+        const completion = parseCompletionDisposition(parsed.completion);
+        const expected = completionFromTerminalOutput({
+            requestKind: parsed.requestKind,
+            output: parsed.output,
+            visibleToolOutput: completion.kind === 'already_visible' ? 'confirmed' : 'none'
+        });
+        if (JSON.stringify(expected) !== JSON.stringify(completion)) {
+            throw new TypeError('run completion does not match its output');
+        }
+    }
+    else if (parsed.completion !== null || parsed.output !== null) {
+        throw new TypeError('non-completed run terminal output is invalid');
+    }
+}
+function parseLoadedRunCheckpoint(value) {
     const parsedJson = parseJsonValue(value, {
         maxBytes: RUN_RESOURCE_LIMITS.checkpointBytes + RUN_RESOURCE_LIMITS.eventBytes,
         maxDepth: 32,
         maxNodes: 32_768
     });
     const unparsed = record(parsedJson, 'run checkpoint');
-    exactKeys(unparsed, CHECKPOINT_KEYS, CHECKPOINT_KEYS, 'checkpoint');
+    const checkpointKeys = unparsed.schemaVersion === 1
+        ? CHECKPOINT_V1_KEYS
+        : unparsed.schemaVersion === 2
+            ? CHECKPOINT_V2_KEYS
+            : undefined;
+    if (checkpointKeys === undefined)
+        throw new TypeError('run checkpoint schema version is invalid');
+    exactKeys(unparsed, checkpointKeys, checkpointKeys, 'checkpoint');
     if (!Array.isArray(unparsed.events))
         throw new TypeError('run checkpoint events are invalid');
     if (unparsed.events.length > RUN_RESOURCE_LIMITS.eventCount) {
@@ -362,7 +440,7 @@ export function parseRunCheckpoint(value) {
     if (jsonBytes(split.events) > RUN_RESOURCE_LIMITS.eventBytes) {
         throw new TypeError('run event byte limit exceeded');
     }
-    if (parsed.schemaVersion !== 1 || parsed.kernelVersion !== 1 ||
+    if (parsed.kernelVersion !== 1 ||
         !PROFILE.test(parsed.profileId) || !Number.isSafeInteger(parsed.profileVersion) ||
         parsed.profileVersion <= 0 || !CODE.test(parsed.runId) || !CODE.test(parsed.sessionId)) {
         throw new TypeError('run checkpoint identity is invalid');
@@ -411,7 +489,7 @@ export function parseRunCheckpoint(value) {
     }
     validateBudgets(parsed.budgetLimits, parsed.budgetCounters);
     if (typeof parsed.recoveryUsed !== 'boolean' || typeof parsed.forceCorrection !== 'boolean' ||
-        typeof parsed.visibleOutput !== 'boolean') {
+        (parsed.schemaVersion === 1 && typeof parsed.visibleOutput !== 'boolean')) {
         throw new TypeError('run checkpoint flags are invalid');
     }
     if (parsed.output !== null)
@@ -429,10 +507,15 @@ export function parseRunCheckpoint(value) {
     timestamp(parsed.deadlineAt, 'run deadline');
     timestamp(parsed.createdAt, 'run creation time');
     timestamp(parsed.updatedAt, 'run update time');
-    if (parsed.status === 'completed' &&
-        ((parsed.output === null && !parsed.visibleOutput) || parsed.error !== null ||
-            parsed.cancellationReason !== null)) {
-        throw new TypeError('completed run checkpoint is invalid');
+    if (parsed.schemaVersion === 1) {
+        if (parsed.status === 'completed' &&
+            ((parsed.output === null && !parsed.visibleOutput) || parsed.error !== null ||
+                parsed.cancellationReason !== null)) {
+            throw new TypeError('completed run checkpoint is invalid');
+        }
+    }
+    else {
+        validateCheckpointV2(parsed);
     }
     if (parsed.status === 'failed' && (parsed.error === null || parsed.cancellationReason !== null)) {
         throw new TypeError('failed run checkpoint is invalid');
@@ -443,6 +526,13 @@ export function parseRunCheckpoint(value) {
     if ((parsed.status === 'waiting_approval') !== (parsed.interruption !== null) ||
         (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
         throw new TypeError('run approval checkpoint state is invalid');
+    }
+    return parsed;
+}
+export function parseRunCheckpoint(value) {
+    const parsed = parseLoadedRunCheckpoint(value);
+    if (parsed.schemaVersion !== 2) {
+        throw new TypeError('runtime run checkpoint must use schema version 2');
     }
     return parsed;
 }
@@ -465,17 +555,50 @@ export function createInitialRunCheckpoint(input) {
         input.event.sessionId !== input.sessionId) {
         throw new TypeError('initial run checkpoint identity is invalid');
     }
+    const requestIdentityFields = [
+        input.runRef,
+        input.requestRef,
+        input.requestKind,
+        input.presentationRoute,
+        input.observationPolicy
+    ];
+    const hasLegacyIdentity = requestIdentityFields.every(value => value === undefined);
+    const hasCompleteIdentity = requestIdentityFields.every(value => value !== undefined);
+    if (!hasLegacyIdentity && !hasCompleteIdentity) {
+        throw new TypeError('initial run checkpoint request identity is invalid');
+    }
+    // Pre-v2 offline callers have no trustworthy entry intent. Preserve only the
+    // all-missing tuple as an isolated legacy checkpoint; partial identity fails closed.
+    const runRef = input.runRef ?? createHash('sha256')
+        .update(`groupmate:legacy-run:v1:${input.runId}`, 'ascii')
+        .digest('hex')
+        .slice(0, 32);
+    const requestRef = input.requestRef ?? createHash('sha256')
+        .update(`groupmate:legacy-request:v1:${input.runId}`, 'ascii')
+        .digest('hex')
+        .slice(0, 32);
+    const requestKind = input.requestKind ?? 'legacy_unknown';
+    const presentationRoute = input.presentationRoute ?? null;
+    const observationPolicy = input.observationPolicy ?? Object.freeze({
+        schemaVersion: 1,
+        levelAtStart: 'off',
+        sampledSuccess: false
+    });
     timestamp(input.deadlineAt, 'run deadline');
     timestamp(input.createdAt, 'run creation time');
     validateEvents([input.event], 0, input.runId, input.sessionId);
     return freezeCheckpoint({
-        schemaVersion: 1,
+        schemaVersion: 2,
         kernelVersion: 1,
         profileId: input.profileId,
         profileVersion: input.profileVersion,
         runId: input.runId,
         sessionId: input.sessionId,
         sessionAddress: input.sessionAddress,
+        runRef,
+        requestRef,
+        requestKind,
+        presentationRoute,
         revision: 0,
         status: 'created',
         step: 0,
@@ -493,7 +616,11 @@ export function createInitialRunCheckpoint(input) {
         recoveryUsed: false,
         forceCorrection: false,
         output: null,
-        visibleOutput: false,
+        completion: null,
+        observationCounters: createInitialRunObservationCounters(),
+        providerDispatch: Object.freeze({ state: 'idle' }),
+        engineActivity: Object.freeze({ state: 'idle' }),
+        observationPolicy,
         error: null,
         cancellationReason: null,
         events: Object.freeze([input.event]),
@@ -504,7 +631,8 @@ export function createInitialRunCheckpoint(input) {
     });
 }
 export function nextRunCheckpoint(checkpoint, status, changes, events, updatedAt) {
-    assertRunTransition(checkpoint.status, status);
+    if (checkpoint.status !== status)
+        assertRunTransition(checkpoint.status, status);
     timestamp(updatedAt, 'run update time');
     validateEvents(events, checkpoint.nextEventSequence, checkpoint.runId, checkpoint.sessionId);
     const nextSequence = checkpoint.nextEventSequence + events.length;
@@ -519,7 +647,8 @@ export function nextRunCheckpoint(checkpoint, status, changes, events, updatedAt
         updatedAt
     });
 }
-const CHECKPOINT_STATE_KEYS = Object.freeze(CHECKPOINT_KEYS.filter(key => key !== 'events'));
+const CHECKPOINT_V1_STATE_KEYS = Object.freeze(CHECKPOINT_V1_KEYS.filter(key => key !== 'events'));
+const CHECKPOINT_V2_STATE_KEYS = Object.freeze(CHECKPOINT_V2_KEYS.filter(key => key !== 'events'));
 const EVENT_ENVELOPE_KEYS = Object.freeze([
     'schemaVersion', 'revision', 'events'
 ]);
@@ -539,7 +668,7 @@ export class RunCheckpointCodec {
         const parsed = parseRunCheckpoint(value);
         const split = splitCheckpoint(parsed);
         const envelope = Object.freeze({
-            schemaVersion: 1,
+            schemaVersion: 2,
             revision: parsed.revision,
             events: split.events
         });
@@ -555,14 +684,23 @@ export class RunCheckpointCodec {
     }
     decode(checkpointRaw, eventsRaw) {
         const state = record(parseJsonText(checkpointRaw, 'run checkpoint', RUN_RESOURCE_LIMITS.checkpointBytes), 'run checkpoint state');
-        exactKeys(state, CHECKPOINT_STATE_KEYS, CHECKPOINT_STATE_KEYS, 'checkpoint');
+        const checkpointKeys = state.schemaVersion === 1
+            ? CHECKPOINT_V1_STATE_KEYS
+            : state.schemaVersion === 2
+                ? CHECKPOINT_V2_STATE_KEYS
+                : undefined;
+        if (checkpointKeys === undefined) {
+            throw new TypeError('run checkpoint schema version is invalid');
+        }
+        exactKeys(state, checkpointKeys, checkpointKeys, 'checkpoint');
         const envelope = record(parseJsonText(eventsRaw, 'run event', RUN_RESOURCE_LIMITS.eventBytes), 'run event envelope');
         exactKeys(envelope, EVENT_ENVELOPE_KEYS, EVENT_ENVELOPE_KEYS, 'event envelope');
-        if (envelope.schemaVersion !== 1 || !Number.isSafeInteger(envelope.revision) ||
+        if (envelope.schemaVersion !== state.schemaVersion ||
+            !Number.isSafeInteger(envelope.revision) ||
             envelope.revision !== state.revision || !Array.isArray(envelope.events)) {
             throw new TypeError('run event envelope is invalid');
         }
-        return parseRunCheckpoint({
+        return parseLoadedRunCheckpoint({
             ...state,
             events: envelope.events
         });

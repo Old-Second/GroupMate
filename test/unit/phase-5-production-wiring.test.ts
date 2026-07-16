@@ -73,6 +73,21 @@ test('Phase 5 approval app accepts only an exact quoted decision', async () => {
   assert.match(source, /priority:\s*1143/)
 })
 
+test('Task 2 host entries hand off one exact presentation intent scalar', async () => {
+  const chat = await readFile(path.join(root, 'apps/chat.js'), 'utf8')
+  const bym = await readFile(path.join(root, 'apps/bym.js'), 'utf8')
+  const bridge = await readFile(
+    path.join(root, 'src/runtime/agent-service-bridge.ts'),
+    'utf8'
+  )
+
+  assert.match(chat, /presentationIntent:\s*\{[\s\S]*?kind:\s*'ordinary'[\s\S]*?forcePicture:\s*forcePictureMode/)
+  assert.match(bym, /Math\.min\(Math\.max\(Math\.trunc\(Number\(Config\.bymFuckRecallTime\)\s*\|\|\s*100\),\s*1\),\s*3600\)\s*\*\s*1000/)
+  assert.match(bym, /presentationIntent:\s*\{[\s\S]*?kind:\s*'proactive'[\s\S]*?recallAfterMs/)
+  assert.match(bym, /recallMsg:\s*recallAfterMs\s*\/\s*1000/)
+  assert.doesNotMatch(bridge, /bymFuckRecallTime|forcePictureMode/)
+})
+
 function modelResponse (text: string) {
   const body = JSON.stringify({
     id: `response-${text}`,
@@ -187,7 +202,10 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
 
   const ordinary = await bridge.handle(event, 'hello', {
     systemInstructions: ['You are GroupMate.'],
-    sessionTtlSeconds: 600
+    sessionTtlSeconds: 600,
+    presentationIntent: Object.freeze({
+      schemaVersion: 1, kind: 'ordinary', forcePicture: false
+    })
   })
   assert.equal(ordinary.kind, 'completed')
   assert.equal(ordinary.kind === 'completed' ? ordinary.text : null, 'ordinary reply')
@@ -214,9 +232,14 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     message_id: 'message-2',
     msg: 'ambient',
     message: [{ type: 'text', text: 'ambient' }]
-  }, 'ambient', { systemInstructions: ['You are GroupMate.'] })
+  }, 'ambient', {
+    systemInstructions: ['You are GroupMate.'],
+    presentationIntent: Object.freeze({
+      schemaVersion: 1, kind: 'proactive', recallAfterMs: null
+    })
+  })
   assert.equal(ephemeral.kind, 'completed')
-  assert.equal(ephemeral.kind === 'completed' ? ephemeral.text : null, '<EMPTY>')
+  assert.equal(ephemeral.kind === 'completed' ? ephemeral.text : null, null)
   assert.equal((await bridge.conversations.get({
     botId: 'bot-1', scope: { kind: 'private', userId: 'actor-1' }
   }))?.turnCount, 1)
@@ -268,7 +291,12 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   const paused = await bridge.handle(
     privateRequestEvent,
     '请发送给用户 2002 一条测试消息',
-    { systemInstructions: ['You are GroupMate.'] }
+    {
+      systemInstructions: ['You are GroupMate.'],
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      })
+    }
   )
   assert.equal(paused.kind, 'paused')
   assert.equal(approvalMessages.length, 1)
@@ -317,7 +345,12 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
   const approvedPaused = await bridge.handle(
     approvedRequestEvent,
     '请再次发送给用户 2002 一条测试消息',
-    { systemInstructions: ['You are GroupMate.'] }
+    {
+      systemInstructions: ['You are GroupMate.'],
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      })
+    }
   )
   assert.equal(approvedPaused.kind, 'paused')
   assert.equal(approvalMessages.length, 2)
@@ -376,7 +409,11 @@ test('Phase 5 production wiring runs ordinary and ephemeral requests through Age
     group: groupRuntime,
     bot: { uin: 'bot-1' }
   }, 'current group prompt', {
-    systemInstructions: ['You are GroupMate.'], enableGroupContext: true
+    systemInstructions: ['You are GroupMate.'],
+    enableGroupContext: true,
+    presentationIntent: Object.freeze({
+      schemaVersion: 1, kind: 'ordinary', forcePicture: false
+    })
   })
   assert.equal(groupResult.kind, 'completed')
   const groupMessages = requests.at(-1)?.messages as Array<{

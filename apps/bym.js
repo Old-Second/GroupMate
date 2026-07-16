@@ -106,11 +106,19 @@ export class bym extends plugin {
     }
     if (prop < Config.bymRate) {
       logger.info('random chat hit')
+      const recallAfterMs = fuck && Config.bymFuckRecall
+        ? Math.min(Math.max(Math.trunc(Number(Config.bymFuckRecallTime) || 100), 1), 3600) * 1000
+        : null
       let system = `你的名字是“${Config.assistantLabel}”，你是QQ群里的一名普通群友。请结合用户发言和聊天记录作出回应，表现得随性自然，最好参与讨论、融入其中。不要过分插科打诨，不知道说什么可以复读群友的话。要求你做搜索、发图、发视频和音乐等操作时使用工具，不可以直接发[图片]蒙混过关。优先使用中文；如果此时不需要自己说话，只回复<EMPTY>。` +
         candidate +
         `\n你的回复应该尽可能简练，像人类一样随意，不要附加任何奇怪的东西，如聊天记录的格式（比如${Config.assistantLabel}：），禁止重复聊天记录。`
 
       const rsp = await this.agentServiceBridge.handleEphemeral(e, trigger.prompt, {
+        presentationIntent: {
+          schemaVersion: 1,
+          kind: 'proactive',
+          recallAfterMs
+        },
         systemInstructions: [system],
         enableGroupContext: true,
         thinkingMode: Config.bymThinkingMode,
@@ -138,14 +146,13 @@ export class bym extends plugin {
         logger.info(JSON.stringify(finalMsg))
         finalMsg = finalMsg.map(filterResponseChunk).filter(i => !!i)
         if (finalMsg && finalMsg.length > 0) {
-          const recallMsg = fuck && Config.bymFuckRecall ? Number(Config.bymFuckRecallTime) || 100 : 0
           if (Math.floor(Math.random() * 100) < 10) {
             await replyWithoutRecallingUserMessage(e, finalMsg, true, {
-              recallMsg
+              recallMsg: recallAfterMs / 1000
             })
           } else {
             await replyWithoutRecallingUserMessage(e, finalMsg, false, {
-              recallMsg
+              recallMsg: recallAfterMs / 1000
             })
           }
           await new Promise((resolve, reject) => {

@@ -15,6 +15,7 @@ export const RUN_RESOURCE_LIMITS = Object.freeze({
   checkpointKeys: 16,
   eventKeys: 16,
   tombstoneKeys: 128,
+  referenceKeys: 144,
   indexAdmissionKeys: 64
 })
 

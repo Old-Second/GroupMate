@@ -544,6 +544,11 @@ export class chatgpt extends plugin {
       const currentDate = formatDate2(new Date())
       const systemInstruction = `You are ${Config.assistantLabel}. ${userData.cast?.api || Config.promptPrefixOverride} Current date: ${currentDate}.`
       const agentReply = await this.agentServiceBridge.handle(e, prompt, {
+        presentationIntent: {
+          schemaVersion: 1,
+          kind: 'ordinary',
+          forcePicture: forcePictureMode
+        },
         systemInstructions: [systemInstruction],
         enableGroupContext: Config.enableGroupContext,
         thinkingMode: Config.apiThinkingMode,

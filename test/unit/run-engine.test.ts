@@ -5,7 +5,12 @@ import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import { nextRunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
 import { RunEngine, type StartRunInput } from '../../src/agent/run/run-engine.js'
+import {
+  RunStoreConflictError,
+  type RunStore
+} from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
 import type {
@@ -240,6 +245,7 @@ interface HarnessOptions {
   readonly recoverContext?: StartRunInput['runtime']['recoverContext']
   readonly contextFor?: StartRunInput['runtime']['contextFor']
   readonly now?: () => Date
+  readonly store?: RunStore
 }
 
 function harness (
@@ -248,7 +254,7 @@ function harness (
 ) {
   const adapter = new ScriptedAdapter(items)
   const tools = new ScriptedToolRuntime()
-  const store = new InMemoryRunStore()
+  const store = options.store ?? new InMemoryRunStore()
   const events: string[] = []
   let id = 0
   const engine = new RunEngine({
@@ -263,8 +269,25 @@ function harness (
   })
   const input: StartRunInput = Object.freeze({
     runId: 'run-1',
+    runRef: '1'.repeat(32),
+    requestRef: '2'.repeat(32),
+    requestKind: 'ordinary_chat',
     sessionId: 'session-1',
     sessionAddress: Object.freeze({ botId: facts.botId, scope: facts.scope }),
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      }),
+      sessionAddress: Object.freeze({ botId: facts.botId, scope: facts.scope }),
+      actorId: 'actor-1',
+      requestMessageId: 'message-current'
+    }),
+    observationPolicy: Object.freeze({
+      schemaVersion: 1, levelAtStart: 'basic', sampledSuccess: false
+    }),
     deadlineAt,
     model: Object.freeze({
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
@@ -284,6 +307,62 @@ function harness (
   return { adapter, tools, store, events, engine, input }
 }
 
+class TerminalRaceRunStore implements RunStore {
+  readonly base = new InMemoryRunStore()
+  injected = false
+  readonly #phase: 'provider_reservation' | 'dispatch_completion'
+
+  constructor (phase: 'provider_reservation' | 'dispatch_completion') {
+    this.#phase = phase
+  }
+
+  create: RunStore['create'] = async checkpoint => await this.base.create(checkpoint)
+  load: RunStore['load'] = async runId => await this.base.load(runId)
+  upgrade: RunStore['upgrade'] = async (expected, next) => (
+    await this.base.upgrade(expected, next)
+  )
+
+  compareAndSet: RunStore['compareAndSet'] = async (expected, next) => {
+    const reservation = expected.status === 'calling_model' &&
+      expected.providerDispatch.state === 'idle' &&
+      next.status === expected.status &&
+      next.providerDispatch.state === 'reserved'
+    const completion = expected.status === 'calling_model' &&
+      expected.providerDispatch.state === 'reserved' &&
+      next.status === expected.status &&
+      next.providerDispatch.state === 'idle'
+    const shouldInject = this.#phase === 'provider_reservation'
+      ? reservation
+      : completion
+    if (!this.injected && shouldInject) {
+      this.injected = true
+      const terminal = nextRunCheckpoint(expected, 'cancelled', {
+        modelTurn: null,
+        preparedBatch: null,
+        interruption: null,
+        providerDispatch: Object.freeze({ state: 'idle' }),
+        engineActivity: Object.freeze({ state: 'idle' }),
+        cancellationReason: 'concurrent_terminal'
+      }, [], timestamp)
+      await this.base.compareAndSet(expected, terminal)
+      throw new RunStoreConflictError()
+    }
+    return await this.base.compareAndSet(expected, next)
+  }
+
+  appendEvents: RunStore['appendEvents'] = async (expected, events) => (
+    await this.base.appendEvents(expected, events)
+  )
+
+  finish: RunStore['finish'] = async (expected, summary) => (
+    await this.base.finish(expected, summary)
+  )
+
+  loadTombstone: RunStore['loadTombstone'] = async runId => (
+    await this.base.loadTombstone(runId)
+  )
+}
+
 function outputText (result: Awaited<ReturnType<RunEngine['start']>>): string | null {
   if (result.kind !== 'completed' || result.output === null) return null
   const part = result.output.parts[0]
@@ -296,7 +375,7 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
 
   assert.equal(result.kind, 'completed')
   assert.equal(outputText(result), '完成')
-  assert.equal(result.kind === 'completed' && result.visibleOutput, false)
+  assert.equal(result.kind === 'completed' ? result.completion.kind : null, 'reply_text')
   assert.deepEqual(fixture.events, [
     'run.created', 'run.started', 'context.prepared', 'model.started',
     'model.completed', 'run.completed'
@@ -304,6 +383,96 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
   const checkpoint = await fixture.store.load('run-1')
   assert.equal(checkpoint?.status, 'completed')
   assert.equal(checkpoint?.budgetCounters.modelTurns, 1)
+})
+
+test('RunEngine persists Provider dispatch reservation before wire and trusted usage after success', async () => {
+  let fixture: ReturnType<typeof harness>
+  fixture = harness([async () => {
+    const reserved = await fixture.store.load('run-1')
+    assert.equal(reserved?.schemaVersion, 2)
+    if (reserved?.schemaVersion !== 2) throw new TypeError('reserved checkpoint is missing')
+    assert.deepEqual(reserved.providerDispatch, { state: 'reserved' })
+    assert.equal(reserved.observationCounters.providerAttempts, 1)
+    assert.deepEqual({
+      input: reserved.observationCounters.providerInputTokens,
+      output: reserved.observationCounters.providerOutputTokens,
+      total: reserved.observationCounters.providerTotalTokens
+    }, {
+      input: 'unavailable', output: 'unavailable', total: 'unavailable'
+    })
+    return Object.freeze({
+      ...modelText('带用量完成'),
+      usage: Object.freeze({ inputTokens: 7, outputTokens: 3, totalTokens: 10 })
+    })
+  }])
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  const completed = await fixture.store.load('run-1')
+  assert.equal(completed?.schemaVersion, 2)
+  if (completed?.schemaVersion !== 2) throw new TypeError('completed checkpoint is missing')
+  assert.deepEqual(completed.providerDispatch, { state: 'idle' })
+  assert.deepEqual({
+    attempts: completed.observationCounters.providerAttempts,
+    modelTurns: completed.observationCounters.modelTurns,
+    input: completed.observationCounters.providerInputTokens,
+    output: completed.observationCounters.providerOutputTokens,
+    total: completed.observationCounters.providerTotalTokens
+  }, {
+    attempts: 1, modelTurns: 1, input: 7, output: 3, total: 10
+  })
+})
+
+test('RunEngine returns a concurrent terminal before Provider wire when dispatch reservation CAS loses', async () => {
+  const store = new TerminalRaceRunStore('provider_reservation')
+  const fixture = harness([modelText('不应调用 Provider')], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(store.injected, true)
+  assert.deepEqual(result, {
+    kind: 'cancelled',
+    runId: 'run-1',
+    runRef: '1'.repeat(32),
+    reason: 'concurrent_terminal'
+  })
+  assert.equal(fixture.adapter.requests.length, 0)
+  assert.equal(fixture.tools.preparations, 0)
+  assert.equal(fixture.tools.executions, 0)
+  assert.deepEqual(fixture.events, [
+    'run.created', 'run.started', 'context.prepared', 'model.started'
+  ])
+})
+
+test('RunEngine stops model completion evaluation when dispatch-completion CAS loses to a terminal', async () => {
+  const store = new TerminalRaceRunStore('dispatch_completion')
+  let modelEvaluationReads = 0
+  const providerTurn: ModelTurn = Object.freeze({
+    text: 'wire 已完成但不应继续求值',
+    toolCalls: Object.freeze([]),
+    get finishReason (): ModelTurn['finishReason'] {
+      modelEvaluationReads += 1
+      return 'stop'
+    }
+  })
+  const fixture = harness([providerTurn], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(store.injected, true)
+  assert.deepEqual(result, {
+    kind: 'cancelled',
+    runId: 'run-1',
+    runRef: '1'.repeat(32),
+    reason: 'concurrent_terminal'
+  })
+  assert.equal(fixture.adapter.requests.length, 1)
+  assert.equal(modelEvaluationReads, 0)
+  assert.equal(fixture.tools.preparations, 0)
+  assert.equal(fixture.tools.executions, 0)
+  assert.equal(fixture.events.includes('model.completed'), false)
+  assert.equal(fixture.events.some(event => event.startsWith('tool.')), false)
 })
 
 test('RunEngine feeds every tool result in Provider index order before the next model turn', async () => {
@@ -430,9 +599,21 @@ test('RunEngine completes visible tool output without asking the Provider for an
   const result = await fixture.engine.start(fixture.input)
 
   assert.deepEqual(result, {
-    kind: 'completed', runId: 'run-1', output: null, visibleOutput: true
+    kind: 'completed',
+    runId: 'run-1',
+    runRef: '1'.repeat(32),
+    completion: { kind: 'already_visible', source: 'tool_output' },
+    output: null
   })
   assert.equal(fixture.adapter.requests.length, 1)
+  const checkpoint = await fixture.store.load('run-1')
+  assert.equal(checkpoint?.schemaVersion, 2)
+  if (checkpoint?.schemaVersion !== 2) throw new TypeError('completed checkpoint is missing')
+  assert.deepEqual({
+    providerAttempts: checkpoint.observationCounters.providerAttempts,
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    toolCalls: checkpoint.observationCounters.toolCalls
+  }, { providerAttempts: 1, toolAttempts: 1, toolCalls: 1 })
 })
 
 test('RunEngine rejects a whole over-budget batch before preparing any capability and corrects once', async () => {
@@ -463,8 +644,20 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
   assert.deepEqual({
     provider: retried?.budgetCounters.providerRetries,
     recovery: retried?.budgetCounters.recoveryAttempts,
-    correction: retried?.budgetCounters.correctionTurns
-  }, { provider: 1, recovery: 0, correction: 0 })
+    correction: retried?.budgetCounters.correctionTurns,
+    providerAttempts: retried?.schemaVersion === 2
+      ? retried.observationCounters.providerAttempts
+      : null,
+    providerUsage: retried?.schemaVersion === 2
+      ? retried.observationCounters.providerTotalTokens
+      : null
+  }, {
+    provider: 1,
+    recovery: 0,
+    correction: 0,
+    providerAttempts: 2,
+    providerUsage: 'unavailable'
+  })
 
   const legacyContext = new ModelProviderError({
     code: 'provider_invalid_request', stage: 'model.response', retryable: false,
@@ -543,7 +736,10 @@ test('RunEngine cancels an expired deadline before any Provider call', async () 
   const result = await fixture.engine.start(fixture.input)
 
   assert.deepEqual(result, {
-    kind: 'cancelled', runId: 'run-1', reason: 'deadline_exceeded'
+    kind: 'cancelled',
+    runId: 'run-1',
+    runRef: '1'.repeat(32),
+    reason: 'deadline_exceeded'
   })
   assert.equal(fixture.adapter.requests.length, 0)
 })
@@ -606,6 +802,10 @@ test('RunEngine marks an in-flight side effect indeterminate when cancellation w
   assert.equal(result.kind, 'cancelled')
   const checkpoint = await fixture.store.load('run-1')
   assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, 'indeterminate')
+  assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+    toolAttempts: checkpoint.observationCounters.toolAttempts,
+    toolIndeterminate: checkpoint.observationCounters.toolIndeterminate
+  } : null, { toolAttempts: 1, toolIndeterminate: 1 })
 
   toolResult.resolve(success('迟到副作用'))
   await new Promise(resolve => setImmediate(resolve))

@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks'
 import type { AgentMessage } from '../contracts/content.js'
+import { completionFromTerminalOutput } from '../contracts/completion.js'
 import {
   AgentError,
   serializeAgentError,
@@ -7,6 +8,10 @@ import {
 } from '../contracts/error.js'
 import type { AgentEvent, AgentEventType } from '../contracts/event.js'
 import type { SessionAddress } from '../contracts/identity.js'
+import type {
+  PresentationRouteV1,
+  TrustedRequestKind
+} from '../contracts/interaction.js'
 import type { RunAdvanceResult } from '../contracts/result.js'
 import type {
   ModelAdapter,
@@ -47,9 +52,20 @@ import {
   type RunCheckpointChanges,
   type RunModelConfig
 } from './run-checkpoint.js'
+import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js'
+import type {
+  FrozenObservationPolicyV1,
+  ObservationCount,
+  RunObservationCountersV1
+} from './run-observation.js'
+import { createRequestRef, createRunRef } from './run-reference.js'
 import { createRunEvent } from './run-events.js'
 import { isTerminalRunStatus, type RunStatus } from './run-state.js'
-import { RunStoreConflictError, type RunStore } from './run-store.js'
+import {
+  RunReferenceConflictError,
+  RunStoreConflictError,
+  type RunStore
+} from './run-store.js'
 import {
   applyToolPreflight,
   cancelToolExecutionLedger,
@@ -123,6 +139,11 @@ export interface RunApprovalDecisionCommand {
 
 export interface StartRunInput {
   readonly runId: string
+  readonly runRef: string
+  readonly requestRef: string
+  readonly requestKind: TrustedRequestKind
+  readonly presentationRoute: PresentationRouteV1
+  readonly observationPolicy: FrozenObservationPolicyV1
   readonly sessionId: string
   readonly sessionAddress: SessionAddress
   readonly deadlineAt: string
@@ -142,6 +163,8 @@ export interface RunEngineOptions {
   readonly budget: RunBudget
   readonly now?: () => Date
   readonly generateId?: () => string
+  readonly createRunRef?: () => string
+  readonly createRequestRef?: () => string
   readonly observer?: (event: AgentEvent) => void | Promise<void>
 }
 
@@ -151,6 +174,7 @@ interface EventDraft {
 }
 
 interface ModelAttemptResult {
+  readonly checkpoint: RunCheckpoint
   readonly turn: ModelTurn
   readonly counters: RunBudgetCounters
   readonly messages: readonly ModelMessage[]
@@ -158,8 +182,16 @@ interface ModelAttemptResult {
   readonly recoveryUsed: boolean
 }
 
+interface TerminalModelAttemptResult {
+  readonly terminal: true
+  readonly checkpoint: RunCheckpoint
+}
+
+type ModelAttemptOutcome = ModelAttemptResult | TerminalModelAttemptResult
+
 class ModelAttemptFailure extends Error {
   readonly agentError: AgentError
+  readonly checkpoint: RunCheckpoint
   readonly counters: RunBudgetCounters
   readonly messages: readonly ModelMessage[]
   readonly estimatedInputTokens: number
@@ -172,6 +204,7 @@ class ModelAttemptFailure extends Error {
     super('model attempt failed', { cause: agentError })
     this.name = 'ModelAttemptFailure'
     this.agentError = agentError
+    this.checkpoint = state.checkpoint
     this.counters = state.counters
     this.messages = state.messages
     this.estimatedInputTokens = state.estimatedInputTokens
@@ -187,6 +220,88 @@ class RunAbortedError extends Error {
 }
 
 const EMPTY_PAYLOAD = Object.freeze({})
+
+function knownObservation (
+  current: ObservationCount,
+  value: number
+): ObservationCount {
+  return typeof current === 'number' ? Math.max(current, value) : current
+}
+
+function incrementObservation (
+  current: ObservationCount,
+  increment = 1
+): ObservationCount {
+  if (typeof current !== 'number') return current
+  const next = current + increment
+  return Number.isSafeInteger(next) && next >= 0 ? next : 'unavailable'
+}
+
+function mergedProviderUsage (
+  previous: ObservationCount,
+  current: number | undefined
+): ObservationCount {
+  if (current === undefined || !Number.isSafeInteger(current) || current < 0) {
+    return 'unavailable'
+  }
+  if (previous === 'not_attempted') return current
+  if (typeof previous !== 'number') return 'unavailable'
+  const total = previous + current
+  return Number.isSafeInteger(total) ? total : 'unavailable'
+}
+
+function synchronizedObservationCounters (
+  current: RunObservationCountersV1,
+  budget: RunBudgetCounters,
+  ledgers: readonly ToolExecutionLedger[],
+  interruption: ApprovalInterruption | null,
+  approvalHistory: readonly ApprovalInterruption[]
+): RunObservationCountersV1 {
+  const approvalIds = new Set(approvalHistory.map(value => value.approvalId))
+  if (interruption !== null) approvalIds.add(interruption.approvalId)
+  const calls = ledgers.flatMap(ledger => ledger.calls)
+  return Object.freeze({
+    ...current,
+    modelTurns: knownObservation(current.modelTurns, budget.modelTurns),
+    providerRetries: knownObservation(
+      current.providerRetries,
+      budget.providerRetries
+    ),
+    recoveryAttempts: knownObservation(
+      current.recoveryAttempts,
+      budget.recoveryAttempts
+    ),
+    correctionTurns: knownObservation(
+      current.correctionTurns,
+      budget.correctionTurns
+    ),
+    toolCalls: knownObservation(current.toolCalls, budget.toolCalls),
+    approvalRequests: knownObservation(
+      current.approvalRequests,
+      approvalIds.size
+    ),
+    toolDenied: knownObservation(
+      current.toolDenied,
+      calls.filter(call => call.status === 'denied' || call.status === 'rejected').length
+    ),
+    toolExpired: knownObservation(
+      current.toolExpired,
+      calls.filter(call => call.status === 'expired').length
+    ),
+    toolIndeterminate: knownObservation(
+      current.toolIndeterminate,
+      calls.filter(call => call.status === 'indeterminate').length
+    ),
+    estimatedTokens: knownObservation(
+      current.estimatedTokens,
+      budget.estimatedTokens
+    ),
+    providerActiveDurationMs: knownObservation(
+      current.providerActiveDurationMs,
+      budget.usedActiveRuntimeMs
+    )
+  })
+}
 
 function internalError (cause?: unknown): AgentError {
   return new AgentError({
@@ -236,17 +351,22 @@ function estimatedTokensFor (value: unknown): number {
 
 function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
   if (checkpoint.status === 'completed') {
+    if (checkpoint.completion === null) {
+      throw new TypeError('completed checkpoint disposition is missing')
+    }
     return Object.freeze({
       kind: 'completed',
       runId: checkpoint.runId,
-      output: checkpoint.output,
-      visibleOutput: checkpoint.visibleOutput
+      runRef: checkpoint.runRef,
+      completion: checkpoint.completion,
+      output: checkpoint.output
     })
   }
   if (checkpoint.status === 'failed' && checkpoint.error !== null) {
     return Object.freeze({
       kind: 'failed',
       runId: checkpoint.runId,
+      runRef: checkpoint.runRef,
       error: checkpoint.error
     })
   }
@@ -254,6 +374,7 @@ function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
     return Object.freeze({
       kind: 'cancelled',
       runId: checkpoint.runId,
+      runRef: checkpoint.runRef,
       reason: checkpoint.cancellationReason
     })
   }
@@ -261,6 +382,7 @@ function terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
     return Object.freeze({
       kind: 'paused',
       runId: checkpoint.runId,
+      runRef: checkpoint.runRef,
       interruption: checkpoint.interruption
     })
   }
@@ -396,10 +518,13 @@ export class RunEngine {
   readonly #budget: RunBudget
   readonly #now: () => Date
   readonly #generateId: () => string
+  readonly #createRunRef: () => string
+  readonly #createRequestRef: () => string
   readonly #observer?: (event: AgentEvent) => void | Promise<void>
   readonly #runtimeBindings = new Map<string, RunRuntimeBinding>()
   readonly #controllers = new Map<string, AbortController>()
   readonly #startedToolCalls = new Map<string, Set<string>>()
+  readonly #toolAttemptCounts = new Map<string, number>()
 
   constructor (options: RunEngineOptions) {
     this.#adapter = options.adapter
@@ -409,14 +534,26 @@ export class RunEngine {
     this.#budget = options.budget
     this.#now = options.now ?? (() => new Date())
     this.#generateId = options.generateId ?? (() => crypto.randomUUID())
+    this.#createRunRef = options.createRunRef ?? createRunRef
+    this.#createRequestRef = options.createRequestRef ?? createRequestRef
     this.#observer = options.observer
+  }
+
+  async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
+    const loaded = await this.#store.load(runId)
+    if (loaded === null || loaded.schemaVersion === 2) return loaded
+    const upgraded = upgradeRunCheckpointV1(loaded, {
+      runRef: this.#createRunRef(),
+      requestRef: this.#createRequestRef()
+    })
+    return await this.#store.upgrade(loaded, upgraded)
   }
 
   async pendingApproval (
     runId: string,
     approvalId: string
   ): Promise<ApprovalInterruption | null> {
-    const checkpoint = await this.#store.load(runId)
+    const checkpoint = await this.loadCheckpoint(runId)
     if (checkpoint?.status !== 'waiting_approval' ||
       checkpoint.interruption?.approvalId !== approvalId) return null
     return parseApprovalInterruption(checkpoint.interruption)
@@ -425,7 +562,7 @@ export class RunEngine {
   async displayApproval (
     input: RunApprovalDisplayCommand
   ): Promise<ApprovalInterruption | null> {
-    const checkpoint = await this.#store.load(input.runId)
+    const checkpoint = await this.loadCheckpoint(input.runId)
     if (checkpoint?.status !== 'waiting_approval' ||
       checkpoint.interruption?.approvalId !== input.approvalId) return null
     let interruption: ApprovalInterruption
@@ -462,7 +599,7 @@ export class RunEngine {
     options: RunControlOptions = {}
   ): Promise<RunAdvanceResult | null> {
     if (runtime !== undefined) this.#runtimeBindings.set(input.runId, runtime)
-    const checkpoint = await this.#store.load(input.runId)
+    const checkpoint = await this.loadCheckpoint(input.runId)
     if (checkpoint === null || checkpoint.status !== 'waiting_approval' ||
       checkpoint.interruption === null) return null
     const interruption = checkpoint.interruption
@@ -655,7 +792,7 @@ export class RunEngine {
         return await this.#drive(stored, controller)
       } finally {
         if (timer !== undefined) clearTimeout(timer)
-        const latest = await this.#store.load(input.runId).catch(() => null)
+        const latest = await this.loadCheckpoint(input.runId).catch(() => null)
         if (latest === null || isTerminalRunStatus(latest.status)) {
           this.#cleanupRun(input.runId, controller)
         }
@@ -698,6 +835,11 @@ export class RunEngine {
       runId: input.runId,
       sessionId: input.sessionId,
       sessionAddress: input.sessionAddress,
+      runRef: input.runRef,
+      requestRef: input.requestRef,
+      requestKind: input.requestKind,
+      presentationRoute: input.presentationRoute,
+      observationPolicy: input.observationPolicy,
       model,
       toolSnapshot: Object.freeze({
         id: input.runtime.snapshot.id,
@@ -715,9 +857,11 @@ export class RunEngine {
     try {
       stored = await this.#store.create(checkpoint)
     } catch (error) {
+      if (error instanceof RunReferenceConflictError) throw error
       return Object.freeze({
         kind: 'failed',
         runId: input.runId,
+        runRef: input.runRef,
         error: serializeAgentError(asAgentError(error))
       })
     }
@@ -735,7 +879,7 @@ export class RunEngine {
     } finally {
       detach()
       if (timer !== undefined) clearTimeout(timer)
-      const latest = await this.#store.load(input.runId).catch(() => null)
+      const latest = await this.loadCheckpoint(input.runId).catch(() => null)
       if (latest === null || isTerminalRunStatus(latest.status)) {
         this.#cleanupRun(input.runId, controller)
       }
@@ -750,12 +894,14 @@ export class RunEngine {
     if (runtime !== undefined) this.#runtimeBindings.set(runId, runtime)
     let checkpoint: RunCheckpoint | null
     try {
-      checkpoint = await this.#store.load(runId)
+      checkpoint = await this.loadCheckpoint(runId)
     } catch (error) {
       this.#runtimeBindings.delete(runId)
+      if (error instanceof RunReferenceConflictError) throw error
       return Object.freeze({
         kind: 'failed',
         runId,
+        runRef: 'unavailable',
         error: serializeAgentError(asAgentError(error))
       })
     }
@@ -764,6 +910,7 @@ export class RunEngine {
       return Object.freeze({
         kind: 'failed',
         runId,
+        runRef: 'unavailable',
         error: serializeAgentError(new AgentError({
           code: 'checkpoint_invalid',
           stage: 'run.resume',
@@ -795,7 +942,7 @@ export class RunEngine {
     } finally {
       detach()
       if (timer !== undefined) clearTimeout(timer)
-      const latest = await this.#store.load(runId).catch(() => null)
+      const latest = await this.loadCheckpoint(runId).catch(() => null)
       if (latest === null || isTerminalRunStatus(latest.status)) {
         this.#cleanupRun(runId, controller)
       }
@@ -806,9 +953,14 @@ export class RunEngine {
     const cancellationReason = boundedCancellationReason(reason)
     this.#controllers.get(runId)?.abort(cancellationReason)
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      const checkpoint = await this.#store.load(runId)
+      const checkpoint = await this.loadCheckpoint(runId)
       if (checkpoint === null) {
-        return Object.freeze({ kind: 'cancelled', runId, reason: cancellationReason })
+        return Object.freeze({
+          kind: 'cancelled',
+          runId,
+          runRef: 'unavailable',
+          reason: cancellationReason
+        })
       }
       if (isTerminalRunStatus(checkpoint.status)) return terminalResult(checkpoint)
       const started = this.#startedToolCalls.get(runId) ?? new Set<string>()
@@ -819,9 +971,20 @@ export class RunEngine {
       ))
       const next = this.#next(checkpoint, 'cancelled', {
         toolLedgers: Object.freeze(ledgers),
+        observationCounters: Object.freeze({
+          ...checkpoint.observationCounters,
+          toolAttempts: incrementObservation(
+            checkpoint.observationCounters.toolAttempts,
+            checkpoint.status === 'executing_tools'
+              ? this.#toolAttemptCounts.get(runId) ?? 0
+              : 0
+          )
+        }),
         preparedBatch: null,
         interruption: null,
         modelTurn: null,
+        providerDispatch: Object.freeze({ state: 'idle' }),
+        engineActivity: Object.freeze({ state: 'idle' }),
         cancellationReason
       }, [{ type: 'run.cancelled', payload: { reason: cancellationReason } }])
       try {
@@ -835,6 +998,7 @@ export class RunEngine {
     return Object.freeze({
       kind: 'failed',
       runId,
+      runRef: 'unavailable',
       error: serializeAgentError(checkpointConflict())
     })
   }
@@ -963,7 +1127,9 @@ export class RunEngine {
     switch (checkpoint.status) {
       case 'created': return await this.#prepare(checkpoint, signal)
       case 'preparing': return await this.#reserveNormalTurn(checkpoint)
-      case 'calling_model': return checkpoint.visibleOutput
+      case 'calling_model': return checkpoint.modelTurn === null &&
+        checkpoint.toolLedgers.at(-1) !== undefined &&
+        toolLedgerHasVisibleOutput(checkpoint.toolLedgers.at(-1) as ToolExecutionLedger)
         ? await this.#completeVisibleOutput(checkpoint)
         : checkpoint.modelTurn === null
           ? await this.#beginCorrection(checkpoint)
@@ -1062,12 +1228,12 @@ export class RunEngine {
     if (reserved === null || reserved.kind !== (correction ? 'correction' : 'normal')) {
       throw new TypeError('reserved model turn does not match run state')
     }
-    let attempted: ModelAttemptResult
+    let attempted: ModelAttemptOutcome
     try {
       attempted = await this.#attemptModel(checkpoint, reserved, signal, correction)
     } catch (error) {
       if (!(error instanceof ModelAttemptFailure)) throw error
-      return await this.#fail(checkpoint, error.agentError, [], {
+      return await this.#fail(error.checkpoint, error.agentError, [], {
         budgetCounters: error.counters,
         messages: error.messages,
         estimatedInputTokens: error.estimatedInputTokens,
@@ -1075,7 +1241,69 @@ export class RunEngine {
         modelTurn: null
       })
     }
-    return await this.#evaluateModelTurn(checkpoint, attempted, correction)
+    if ('terminal' in attempted) return attempted.checkpoint
+    return await this.#evaluateModelTurn(attempted.checkpoint, attempted, correction)
+  }
+
+  async #reserveProviderDispatch (
+    checkpoint: RunCheckpoint
+  ): Promise<Readonly<{
+      checkpoint: RunCheckpoint
+      previousUsage: Pick<
+      RunObservationCountersV1,
+      'providerInputTokens' | 'providerOutputTokens' | 'providerTotalTokens'
+      >
+    }>> {
+    const previousUsage = Object.freeze({
+      providerInputTokens: checkpoint.observationCounters.providerInputTokens,
+      providerOutputTokens: checkpoint.observationCounters.providerOutputTokens,
+      providerTotalTokens: checkpoint.observationCounters.providerTotalTokens
+    })
+    const observationCounters: RunObservationCountersV1 = Object.freeze({
+      ...checkpoint.observationCounters,
+      providerAttempts: incrementObservation(
+        checkpoint.observationCounters.providerAttempts
+      ),
+      providerInputTokens: 'unavailable',
+      providerOutputTokens: 'unavailable',
+      providerTotalTokens: 'unavailable'
+    })
+    const stored = await this.#commit(checkpoint, checkpoint.status, {
+      observationCounters,
+      providerDispatch: Object.freeze({ state: 'reserved' })
+    }, [])
+    return Object.freeze({ checkpoint: stored, previousUsage })
+  }
+
+  async #completeProviderDispatch (
+    checkpoint: RunCheckpoint,
+    counters: RunBudgetCounters,
+    previousUsage: Pick<
+    RunObservationCountersV1,
+    'providerInputTokens' | 'providerOutputTokens' | 'providerTotalTokens'
+    >,
+    usage?: ModelTurn['usage']
+  ): Promise<RunCheckpoint> {
+    const observationCounters: RunObservationCountersV1 = Object.freeze({
+      ...checkpoint.observationCounters,
+      providerInputTokens: mergedProviderUsage(
+        previousUsage.providerInputTokens,
+        usage?.inputTokens
+      ),
+      providerOutputTokens: mergedProviderUsage(
+        previousUsage.providerOutputTokens,
+        usage?.outputTokens
+      ),
+      providerTotalTokens: mergedProviderUsage(
+        previousUsage.providerTotalTokens,
+        usage?.totalTokens
+      )
+    })
+    return await this.#commit(checkpoint, checkpoint.status, {
+      budgetCounters: counters,
+      observationCounters,
+      providerDispatch: Object.freeze({ state: 'idle' })
+    }, [])
   }
 
   async #attemptModel (
@@ -1083,13 +1311,14 @@ export class RunEngine {
     reserved: ReservedModelTurn,
     signal: AbortSignal,
     correction: boolean
-  ): Promise<ModelAttemptResult> {
+  ): Promise<ModelAttemptOutcome> {
     const runtime = this.#runtime(checkpoint.runId)
     this.#assertSnapshot(checkpoint, runtime.snapshot)
     let counters = checkpoint.budgetCounters
     let messages = checkpoint.messages
     let estimatedInputTokens = checkpoint.estimatedInputTokens
     let recoveryUsed = checkpoint.recoveryUsed
+    let current = checkpoint
 
     try {
       while (true) {
@@ -1106,15 +1335,28 @@ export class RunEngine {
             : { temperature: checkpoint.model.temperature }),
           ...(checkpoint.model.topP === undefined ? {} : { topP: checkpoint.model.topP })
         })
+        const timeoutMs = this.#providerTimeout(current, counters)
+        const reservedDispatch = await this.#reserveProviderDispatch(current)
+        current = reservedDispatch.checkpoint
+        if (isTerminalRunStatus(current.status)) {
+          return Object.freeze({ terminal: true, checkpoint: current })
+        }
         const startedAt = performance.now()
         let turn: ModelTurn
         try {
-          const timeoutMs = this.#providerTimeout(checkpoint, counters)
           turn = await this.#providerCall(request, signal, timeoutMs)
         } catch (error) {
           if (isAbortError(error) || signal.aborted) throw new RunAbortedError()
           const activeRuntimeMs = Math.max(0, Math.ceil(performance.now() - startedAt))
           counters = this.#budget.recordUsage(counters, { activeRuntimeMs })
+          current = await this.#completeProviderDispatch(
+            current,
+            counters,
+            reservedDispatch.previousUsage
+          )
+          if (isTerminalRunStatus(current.status)) {
+            return Object.freeze({ terminal: true, checkpoint: current })
+          }
           if (error instanceof ModelProviderError) {
             const recoveryHint = this.#profile.recoveryHint(error)
             const recoveryAllowed = reserved.kind === 'normal' &&
@@ -1137,12 +1379,21 @@ export class RunEngine {
                 recoveryUsed = true
                 messages = Object.freeze([...recovered.messages])
                 estimatedInputTokens = recovered.estimatedInputTokens
+                current = await this.#commit(current, current.status, {
+                  budgetCounters: counters,
+                  messages,
+                  estimatedInputTokens,
+                  recoveryUsed
+                }, [])
                 continue
               }
             }
             if (error.retryable &&
               counters.providerRetries < checkpoint.budgetLimits.maxProviderRetries) {
               counters = this.#budget.recordProviderRetry(counters)
+              current = await this.#commit(current, current.status, {
+                budgetCounters: counters
+              }, [])
               continue
             }
             throw error
@@ -1154,7 +1405,17 @@ export class RunEngine {
           activeRuntimeMs,
           providerReportedTokens: turn.usage?.totalTokens ?? 0
         })
+        current = await this.#completeProviderDispatch(
+          current,
+          counters,
+          reservedDispatch.previousUsage,
+          turn.usage
+        )
+        if (isTerminalRunStatus(current.status)) {
+          return Object.freeze({ terminal: true, checkpoint: current })
+        }
         return Object.freeze({
+          checkpoint: current,
           turn,
           counters,
           messages,
@@ -1165,6 +1426,7 @@ export class RunEngine {
     } catch (error) {
       if (isAbortError(error) || signal.aborted) throw new RunAbortedError()
       throw new ModelAttemptFailure(asAgentError(error), {
+        checkpoint: current,
         counters,
         messages,
         estimatedInputTokens,
@@ -1255,6 +1517,11 @@ export class RunEngine {
     const text = turn.text.normalize('NFC').trim()
     if (turn.finishReason === 'stop' && text.length > 0) {
       const output = this.#assistantMessage(checkpoint, text)
+      const completion = completionFromTerminalOutput({
+        requestKind: checkpoint.requestKind,
+        output,
+        visibleToolOutput: 'none'
+      })
       return await this.#commit(checkpoint, 'completed', {
         messages: attempted.messages,
         estimatedInputTokens: attempted.estimatedInputTokens,
@@ -1262,8 +1529,11 @@ export class RunEngine {
         recoveryUsed: attempted.recoveryUsed,
         modelTurn: null,
         output,
-        visibleOutput: false
-      }, [completedEvent, { type: 'run.completed', payload: { visibleOutput: false } }])
+        completion
+      }, [completedEvent, {
+        type: 'run.completed',
+        payload: { completionKind: completion.kind }
+      }])
     }
 
     if (correction) {
@@ -1416,6 +1686,7 @@ export class RunEngine {
     const runtime = this.#runtime(checkpoint.runId)
     this.#assertSnapshot(checkpoint, runtime.snapshot)
     this.#startedToolCalls.set(checkpoint.runId, new Set<string>())
+    this.#toolAttemptCounts.set(checkpoint.runId, 0)
     const execution = await this.#raceAbort(this.#scheduler.execute(batch, {
       snapshot: runtime.snapshot,
       contextFor: async capability => {
@@ -1455,6 +1726,13 @@ export class RunEngine {
     const common: RunCheckpointChanges = {
       messages,
       estimatedInputTokens,
+      observationCounters: Object.freeze({
+        ...checkpoint.observationCounters,
+        toolAttempts: incrementObservation(
+          checkpoint.observationCounters.toolAttempts,
+          this.#toolAttemptCounts.get(checkpoint.runId) ?? 0
+        )
+      }),
       toolLedgers: this.#replaceLastLedger(checkpoint, completedLedger),
       preparedBatch: null,
       interruption: null,
@@ -1465,7 +1743,6 @@ export class RunEngine {
       const readyToComplete = await this.#commit(checkpoint, 'calling_model', {
         ...common,
         output: null,
-        visibleOutput: true,
         step: checkpoint.step + 1
       }, events)
       if (isTerminalRunStatus(readyToComplete.status)) return readyToComplete
@@ -1509,13 +1786,20 @@ export class RunEngine {
   }
 
   async #completeVisibleOutput (checkpoint: RunCheckpoint): Promise<RunCheckpoint> {
-    if (checkpoint.status !== 'calling_model' || !checkpoint.visibleOutput ||
-      checkpoint.output !== null || checkpoint.modelTurn !== null) {
+    const ledger = checkpoint.toolLedgers.at(-1)
+    if (checkpoint.status !== 'calling_model' || ledger === undefined ||
+      !toolLedgerHasVisibleOutput(ledger) || checkpoint.output !== null ||
+      checkpoint.modelTurn !== null) {
       throw new TypeError('visible-output completion state is invalid')
     }
-    return await this.#commit(checkpoint, 'completed', {}, [{
+    const completion = completionFromTerminalOutput({
+      requestKind: checkpoint.requestKind,
+      output: null,
+      visibleToolOutput: 'confirmed'
+    })
+    return await this.#commit(checkpoint, 'completed', { completion }, [{
       type: 'run.completed',
-      payload: { visibleOutput: true }
+      payload: { completionKind: completion.kind }
     }])
   }
 
@@ -1599,7 +1883,7 @@ export class RunEngine {
       return stored
     } catch (error) {
       if (error instanceof RunStoreConflictError) {
-        const latest = await this.#store.load(checkpoint.runId)
+        const latest = await this.loadCheckpoint(checkpoint.runId)
         if (latest !== null && isTerminalRunStatus(latest.status)) return latest
         throw checkpointConflict(error)
       }
@@ -1623,7 +1907,23 @@ export class RunEngine {
       type: draft.type,
       payload: draft.payload ?? EMPTY_PAYLOAD
     }))
-    return nextRunCheckpoint(checkpoint, status, changes, events, occurredAt)
+    const budgetCounters = changes.budgetCounters ?? checkpoint.budgetCounters
+    const toolLedgers = changes.toolLedgers ?? checkpoint.toolLedgers
+    const interruption = changes.interruption === undefined
+      ? checkpoint.interruption
+      : changes.interruption
+    const approvalHistory = changes.approvalHistory ?? checkpoint.approvalHistory
+    const observationCounters = synchronizedObservationCounters(
+      changes.observationCounters ?? checkpoint.observationCounters,
+      budgetCounters,
+      toolLedgers,
+      interruption,
+      approvalHistory
+    )
+    return nextRunCheckpoint(checkpoint, status, {
+      ...changes,
+      observationCounters
+    }, events, occurredAt)
   }
 
   async #fail (
@@ -1646,6 +1946,8 @@ export class RunEngine {
       modelTurn: null,
       preparedBatch: null,
       interruption: null,
+      providerDispatch: Object.freeze({ state: 'idle' }),
+      engineActivity: Object.freeze({ state: 'idle' }),
       error: serialized
     }, [...prefixEvents, {
       type: 'run.failed',
@@ -1927,6 +2229,10 @@ export class RunEngine {
     const started = this.#startedToolCalls.get(runId) ?? new Set<string>()
     started.add(callId)
     this.#startedToolCalls.set(runId, started)
+    this.#toolAttemptCounts.set(
+      runId,
+      (this.#toolAttemptCounts.get(runId) ?? 0) + 1
+    )
   }
 
   #assertSnapshot (checkpoint: RunCheckpoint, snapshot: ToolSnapshot): void {
@@ -2003,6 +2309,7 @@ export class RunEngine {
   #cleanupRun (runId: string, controller: AbortController): void {
     this.#runtimeBindings.delete(runId)
     this.#startedToolCalls.delete(runId)
+    this.#toolAttemptCounts.delete(runId)
     if (this.#controllers.get(runId) === controller) {
       this.#controllers.delete(runId)
     }

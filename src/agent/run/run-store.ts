@@ -7,6 +7,9 @@ import type { AgentEvent } from '../contracts/event.js'
 import { parseJsonValue } from '../model/json-value.js'
 import {
   appendRunCheckpointEvents,
+  type LoadedRunCheckpoint,
+  type RunCheckpointV1,
+  type RunCheckpointV2,
   type RunCheckpoint
 } from './run-checkpoint.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
@@ -29,7 +32,11 @@ export interface RunTombstone {
 
 export interface RunStore {
   create(checkpoint: RunCheckpoint): Promise<RunCheckpoint>
-  load(runId: string): Promise<RunCheckpoint | null>
+  load(runId: string): Promise<LoadedRunCheckpoint | null>
+  upgrade(
+    expected: RunCheckpointV1,
+    next: RunCheckpointV2
+  ): Promise<RunCheckpointV2>
   compareAndSet(
     expected: RunCheckpoint,
     next: RunCheckpoint
@@ -57,6 +64,13 @@ export class RunStoreConflictError extends AgentError {
     })
     this.name = 'RunStoreConflictError'
     this.code = 'checkpoint_conflict'
+  }
+}
+
+export class RunReferenceConflictError extends RunStoreConflictError {
+  constructor () {
+    super()
+    this.name = 'RunReferenceConflictError'
   }
 }
 
@@ -119,7 +133,7 @@ export function createRunTombstone (checkpoint: RunCheckpoint): RunTombstone {
     revision: checkpoint.revision,
     status: checkpoint.status,
     finishedAt: checkpoint.updatedAt,
-    visibleOutput: checkpoint.visibleOutput,
+    visibleOutput: checkpoint.completion?.kind === 'already_visible',
     errorCode: checkpoint.error?.code ?? null,
     cancellationReason: checkpoint.cancellationReason,
     providerRetries: checkpoint.budgetCounters.providerRetries,

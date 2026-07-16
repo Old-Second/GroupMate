@@ -6,6 +6,9 @@ import { canonicalSessionKey } from '../session/conversation-scope.js'
 import {
   RunCheckpointCodec,
   type EncodedRunCheckpoint,
+  type LoadedRunCheckpoint,
+  type RunCheckpointV1,
+  type RunCheckpointV2,
   type RunCheckpoint
 } from './run-checkpoint.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
@@ -14,10 +17,12 @@ import {
   checkpointWithAppendedEvents,
   createRunTombstone,
   parseRunTombstone,
+  RunReferenceConflictError,
   RunStoreConflictError,
   type RunStore,
   type RunTombstone
 } from './run-store.js'
+import { RUN_REF_PATTERN } from './run-reference.js'
 
 export interface RedisRunClient {
   get(key: string): Promise<string | null>
@@ -70,9 +75,9 @@ end
 local metadataKey = KEYS[#KEYS]
 local metadata = redis.call('GET', metadataKey)
 if not metadata then return 'reconcile' end
-local bytes, checkpoints, events, tombstones, indexes = string.match(
+local bytes, checkpoints, events, tombstones, indexes, references = string.match(
   metadata,
-  '^(%d+)|(%d+)|(%d+)|(%d+)|(%d+)$'
+  '^(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)$'
 )
 if not bytes then return 'reconcile' end
 local current = {
@@ -80,7 +85,8 @@ local current = {
   checkpoints = tonumber(checkpoints),
   events = tonumber(events),
   tombstones = tonumber(tombstones),
-  indexes = tonumber(indexes)
+  indexes = tonumber(indexes),
+  references = tonumber(references)
 }
 
 local function exceeds(value)
@@ -88,12 +94,13 @@ local function exceeds(value)
     value.checkpoints > ${RUN_RESOURCE_LIMITS.checkpointKeys} or
     value.events > ${RUN_RESOURCE_LIMITS.eventKeys} or
     value.tombstones > ${RUN_RESOURCE_LIMITS.tombstoneKeys} or
-    value.indexes > ${RUN_RESOURCE_LIMITS.indexAdmissionKeys}
+    value.indexes > ${RUN_RESOURCE_LIMITS.indexAdmissionKeys} or
+    value.references > ${RUN_RESOURCE_LIMITS.referenceKeys}
 end
 
 local function invalid(value)
   return value.bytes < 0 or value.checkpoints < 0 or value.events < 0 or
-    value.tombstones < 0 or value.indexes < 0
+    value.tombstones < 0 or value.indexes < 0 or value.references < 0
 end
 
 local function save(value)
@@ -102,23 +109,53 @@ local function save(value)
     value.checkpoints,
     value.events,
     value.tombstones,
-    value.indexes
+    value.indexes,
+    value.references
   }, '|'))
 end
 
 if operation == 'create' then
   if redis.call('EXISTS', KEYS[1], KEYS[2], KEYS[3]) > 0 then return 'conflict' end
+  if redis.call('EXISTS', KEYS[4]) > 0 then return 'reference_conflict' end
   local projected = {
-    bytes = current.bytes + string.len(ARGV[2]) + string.len(ARGV[3]),
+    bytes = current.bytes + string.len(ARGV[2]) + string.len(ARGV[3]) +
+      string.len(KEYS[4]) + string.len(ARGV[5]),
     checkpoints = current.checkpoints + 1,
     events = current.events + 1,
     tombstones = current.tombstones,
-    indexes = current.indexes
+    indexes = current.indexes,
+    references = current.references + 1
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
   redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[4]))
   redis.call('SET', KEYS[2], ARGV[3], 'EX', tonumber(ARGV[4]))
+  redis.call('SET', KEYS[4], ARGV[5], 'EX', tonumber(ARGV[4]))
+  save(projected)
+  return 'ok'
+end
+
+if operation == 'upgrade' then
+  local oldCheckpoint = redis.call('GET', KEYS[1])
+  local oldEvents = redis.call('GET', KEYS[2])
+  if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] or
+    redis.call('EXISTS', KEYS[3]) > 0 then return 'conflict' end
+  if redis.call('EXISTS', KEYS[4]) > 0 then return 'reference_conflict' end
+  local projected = {
+    bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents) +
+      string.len(ARGV[4]) + string.len(ARGV[5]) + string.len(KEYS[4]) +
+      string.len(ARGV[7]),
+    checkpoints = current.checkpoints,
+    events = current.events,
+    tombstones = current.tombstones,
+    indexes = current.indexes,
+    references = current.references + 1
+  }
+  if invalid(projected) then return 'reconcile' end
+  if exceeds(projected) then return 'budget' end
+  redis.call('SET', KEYS[1], ARGV[4], 'EX', tonumber(ARGV[6]))
+  redis.call('SET', KEYS[2], ARGV[5], 'EX', tonumber(ARGV[6]))
+  redis.call('SET', KEYS[4], ARGV[7], 'EX', tonumber(ARGV[6]))
   save(projected)
   return 'ok'
 end
@@ -126,14 +163,17 @@ end
 if operation == 'cas' then
   local oldCheckpoint = redis.call('GET', KEYS[1])
   local oldEvents = redis.call('GET', KEYS[2])
-  if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] then return 'conflict' end
+  local reference = redis.call('GET', KEYS[4])
+  if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] or
+    reference ~= ARGV[10] then return 'conflict' end
   local terminal = ARGV[7] == '1'
   local projected = {
     bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents),
     checkpoints = current.checkpoints - 1,
     events = current.events - 1,
     tombstones = current.tombstones,
-    indexes = current.indexes
+    indexes = current.indexes,
+    references = current.references
   }
   if terminal then
     if redis.call('EXISTS', KEYS[3]) > 0 then return 'conflict' end
@@ -149,9 +189,11 @@ if operation == 'cas' then
   if terminal then
     redis.call('DEL', KEYS[1], KEYS[2])
     redis.call('SET', KEYS[3], ARGV[8], 'EX', tonumber(ARGV[9]))
+    redis.call('SET', KEYS[4], ARGV[10], 'EX', tonumber(ARGV[9]))
   else
     redis.call('SET', KEYS[1], ARGV[4], 'EX', tonumber(ARGV[6]))
     redis.call('SET', KEYS[2], ARGV[5], 'EX', tonumber(ARGV[6]))
+    redis.call('SET', KEYS[4], ARGV[10], 'EX', tonumber(ARGV[6]))
   end
   save(projected)
   return 'ok'
@@ -160,19 +202,22 @@ end
 if operation == 'finish' then
   local oldCheckpoint = redis.call('GET', KEYS[1])
   local oldEvents = redis.call('GET', KEYS[2])
+  local reference = redis.call('GET', KEYS[4])
   if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] or
-    redis.call('EXISTS', KEYS[3]) > 0 then return 'conflict' end
+    redis.call('EXISTS', KEYS[3]) > 0 or reference ~= ARGV[6] then return 'conflict' end
   local projected = {
     bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents) + string.len(ARGV[4]),
     checkpoints = current.checkpoints - 1,
     events = current.events - 1,
     tombstones = current.tombstones + 1,
-    indexes = current.indexes
+    indexes = current.indexes,
+    references = current.references
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
   redis.call('DEL', KEYS[1], KEYS[2])
   redis.call('SET', KEYS[3], ARGV[4], 'EX', tonumber(ARGV[5]))
+  redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[5]))
   save(projected)
   return 'ok'
 end
@@ -184,7 +229,8 @@ if operation == 'admission_acquire' then
     checkpoints = current.checkpoints,
     events = current.events,
     tombstones = current.tombstones,
-    indexes = current.indexes + 1
+    indexes = current.indexes + 1,
+    references = current.references
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -201,7 +247,8 @@ if operation == 'admission_recover' then
     checkpoints = current.checkpoints,
     events = current.events,
     tombstones = current.tombstones,
-    indexes = current.indexes
+    indexes = current.indexes,
+    references = current.references
   }
   if claim == '' then projected.indexes = projected.indexes + 1 end
   if invalid(projected) then return 'reconcile' end
@@ -219,7 +266,8 @@ if operation == 'admission_release' then
     checkpoints = current.checkpoints,
     events = current.events,
     tombstones = current.tombstones,
-    indexes = current.indexes - 1
+    indexes = current.indexes - 1,
+    references = current.references
   }
   if invalid(projected) then return 'reconcile' end
   redis.call('DEL', KEYS[1])
@@ -234,7 +282,8 @@ if operation == 'approval_index_create' then
     checkpoints = current.checkpoints,
     events = current.events,
     tombstones = current.tombstones,
-    indexes = current.indexes + 1
+    indexes = current.indexes + 1,
+    references = current.references
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -251,7 +300,8 @@ if operation == 'approval_index_delete' then
     checkpoints = current.checkpoints,
     events = current.events,
     tombstones = current.tombstones,
-    indexes = current.indexes - 1
+    indexes = current.indexes - 1,
+    references = current.references
   }
   if invalid(projected) then return 'reconcile' end
   redis.call('DEL', KEYS[1])
@@ -274,6 +324,7 @@ interface RunNamespaceUsage {
   events: number
   tombstones: number
   indexes: number
+  references: number
 }
 
 function digest (value: string): string {
@@ -294,6 +345,13 @@ export function redisRunKeys (runId: string): RedisRunKeys {
     events: `${RUN_STORE_NAMESPACE}events:${id}`,
     tombstone: `${RUN_STORE_NAMESPACE}tombstone:${id}`
   })
+}
+
+export function redisRunReferenceKey (runRef: string): string {
+  if (typeof runRef !== 'string' || !RUN_REF_PATTERN.test(runRef)) {
+    throw new TypeError('run reference is invalid')
+  }
+  return `${RUN_STORE_NAMESPACE}reference:${runRef}`
 }
 
 export function redisAdmissionKey (address: SessionAddress): string {
@@ -333,7 +391,14 @@ function runBudgetExceeded (operation: string): AgentError {
 }
 
 function emptyNamespaceUsage (): RunNamespaceUsage {
-  return { bytes: 0, checkpoints: 0, events: 0, tombstones: 0, indexes: 0 }
+  return {
+    bytes: 0,
+    checkpoints: 0,
+    events: 0,
+    tombstones: 0,
+    indexes: 0,
+    references: 0
+  }
 }
 
 function encodeNamespaceUsage (usage: RunNamespaceUsage): string {
@@ -342,7 +407,8 @@ function encodeNamespaceUsage (usage: RunNamespaceUsage): string {
     usage.checkpoints,
     usage.events,
     usage.tombstones,
-    usage.indexes
+    usage.indexes,
+    usage.references
   ].join('|')
 }
 
@@ -351,7 +417,8 @@ function namespaceLimitExceeded (usage: RunNamespaceUsage): boolean {
     usage.checkpoints > RUN_RESOURCE_LIMITS.checkpointKeys ||
     usage.events > RUN_RESOURCE_LIMITS.eventKeys ||
     usage.tombstones > RUN_RESOURCE_LIMITS.tombstoneKeys ||
-    usage.indexes > RUN_RESOURCE_LIMITS.indexAdmissionKeys
+    usage.indexes > RUN_RESOURCE_LIMITS.indexAdmissionKeys ||
+    usage.references > RUN_RESOURCE_LIMITS.referenceKeys
 }
 
 async function auditNamespace (client: RedisRunClient): Promise<RunNamespaceUsage> {
@@ -377,6 +444,10 @@ async function auditNamespace (client: RedisRunClient): Promise<RunNamespaceUsag
         if (key.startsWith(`${RUN_STORE_NAMESPACE}checkpoint:`)) usage.checkpoints += 1
         else if (key.startsWith(`${RUN_STORE_NAMESPACE}events:`)) usage.events += 1
         else if (key.startsWith(`${RUN_STORE_NAMESPACE}tombstone:`)) usage.tombstones += 1
+        else if (key.startsWith(`${RUN_STORE_NAMESPACE}reference:`)) {
+          usage.bytes += Buffer.byteLength(key, 'utf8')
+          usage.references += 1
+        }
         else usage.indexes += 1
         if (namespaceLimitExceeded(usage)) throw runBudgetExceeded('namespace_reconcile')
       }
@@ -447,6 +518,7 @@ async function mutate (
 
 function requireMutationSuccess (result: unknown, operation: string): void {
   if (result === 'ok') return
+  if (result === 'reference_conflict') throw new RunReferenceConflictError()
   if (result === 'conflict') throw new RunStoreConflictError()
   if (result === 'budget') throw runBudgetExceeded(operation)
   throw storageUnavailable(operation, new TypeError('unexpected Lua result'))
@@ -560,14 +632,20 @@ export class RedisRunStore implements RunStore {
     }
     const encoded = this.#encode(checkpoint, 'create')
     const keys = redisRunKeys(checkpoint.runId)
+    const referenceKey = redisRunReferenceKey(checkpoint.runRef)
     const result = await mutate(this.#client, 'create', [
-      keys.checkpoint, keys.events, keys.tombstone
-    ], [encoded.checkpoint, encoded.events, String(this.#activeTtlSeconds)])
+      keys.checkpoint, keys.events, keys.tombstone, referenceKey
+    ], [
+      encoded.checkpoint,
+      encoded.events,
+      String(this.#activeTtlSeconds),
+      checkpoint.runId
+    ])
     requireMutationSuccess(result, 'create')
     return checkpoint
   }
 
-  async load (runId: string): Promise<RunCheckpoint | null> {
+  async load (runId: string): Promise<LoadedRunCheckpoint | null> {
     const keys = redisRunKeys(runId)
     const result = await evaluate(this.#client, 'load', [
       keys.checkpoint, keys.events
@@ -594,24 +672,56 @@ export class RedisRunStore implements RunStore {
     }
   }
 
+  async upgrade (
+    expected: RunCheckpointV1,
+    next: RunCheckpointV2
+  ): Promise<RunCheckpointV2> {
+    if (expected.schemaVersion !== 1 || next.schemaVersion !== 2 ||
+      next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
+      next.revision !== expected.revision + 1) {
+      throw new RunStoreConflictError()
+    }
+    const expectedEncoded = this.#encodeLoaded(expected, 'upgrade_expected')
+    const nextEncoded = this.#encode(next, 'upgrade_next')
+    const keys = redisRunKeys(expected.runId)
+    const referenceKey = redisRunReferenceKey(next.runRef)
+    const activeTtlSeconds = next.status === 'waiting_approval'
+      ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
+      : this.#activeTtlSeconds
+    const result = await mutate(this.#client, 'upgrade', [
+      keys.checkpoint, keys.events, keys.tombstone, referenceKey
+    ], [
+      expectedEncoded.checkpoint,
+      expectedEncoded.events,
+      nextEncoded.checkpoint,
+      nextEncoded.events,
+      String(activeTtlSeconds),
+      next.runId
+    ])
+    requireMutationSuccess(result, 'upgrade')
+    return next
+  }
+
   async compareAndSet (
     expected: RunCheckpoint,
     next: RunCheckpoint
   ): Promise<RunCheckpoint> {
     if (next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
-      next.revision !== expected.revision + 1 || isTerminalRunStatus(expected.status)) {
+      next.revision !== expected.revision + 1 || next.runRef !== expected.runRef ||
+      next.requestRef !== expected.requestRef || isTerminalRunStatus(expected.status)) {
       throw new RunStoreConflictError()
     }
     const expectedEncoded = this.#encode(expected, 'compare_expected')
     const nextEncoded = this.#encode(next, 'compare_next')
     const keys = redisRunKeys(expected.runId)
+    const referenceKey = redisRunReferenceKey(expected.runRef)
     const terminal = isTerminalRunStatus(next.status)
     const tombstone = terminal ? encodeTombstone(createRunTombstone(next)) : ''
     const activeTtlSeconds = next.status === 'waiting_approval'
       ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
       : this.#activeTtlSeconds
     const result = await mutate(this.#client, 'cas', [
-      keys.checkpoint, keys.events, keys.tombstone
+      keys.checkpoint, keys.events, keys.tombstone, referenceKey
     ], [
       expectedEncoded.checkpoint,
       expectedEncoded.events,
@@ -620,7 +730,8 @@ export class RedisRunStore implements RunStore {
       String(activeTtlSeconds),
       terminal ? '1' : '0',
       tombstone,
-      String(TOMBSTONE_TTL_SECONDS)
+      String(TOMBSTONE_TTL_SECONDS),
+      expected.runId
     ])
     requireMutationSuccess(result, 'compare_and_set')
     return next
@@ -648,13 +759,15 @@ export class RedisRunStore implements RunStore {
     }
     const encoded = this.#encode(expected, 'finish_expected')
     const keys = redisRunKeys(expected.runId)
+    const referenceKey = redisRunReferenceKey(expected.runRef)
     const result = await mutate(this.#client, 'finish', [
-      keys.checkpoint, keys.events, keys.tombstone
+      keys.checkpoint, keys.events, keys.tombstone, referenceKey
     ], [
       encoded.checkpoint,
       encoded.events,
       encodeTombstone(parsed),
-      String(TOMBSTONE_TTL_SECONDS)
+      String(TOMBSTONE_TTL_SECONDS),
+      expected.runId
     ])
     requireMutationSuccess(result, 'finish')
     return parsed
@@ -684,6 +797,31 @@ export class RedisRunStore implements RunStore {
   #encode (checkpoint: RunCheckpoint, operation: string): EncodedRunCheckpoint {
     try {
       return this.#codec.encode(checkpoint)
+    } catch (error) {
+      throw checkpointInvalid(operation, error)
+    }
+  }
+
+  #encodeLoaded (
+    checkpoint: LoadedRunCheckpoint,
+    operation: string
+  ): EncodedRunCheckpoint {
+    if (checkpoint.schemaVersion === 2) return this.#encode(checkpoint, operation)
+    try {
+      const { events, ...state } = checkpoint
+      const encoded = Object.freeze({
+        checkpoint: JSON.stringify(state),
+        events: JSON.stringify({
+          schemaVersion: 1,
+          revision: checkpoint.revision,
+          events
+        })
+      })
+      if (Buffer.byteLength(encoded.checkpoint, 'utf8') > RUN_RESOURCE_LIMITS.checkpointBytes ||
+        Buffer.byteLength(encoded.events, 'utf8') > RUN_RESOURCE_LIMITS.eventBytes) {
+        throw new TypeError('legacy checkpoint byte limit exceeded')
+      }
+      return encoded
     } catch (error) {
       throw checkpointInvalid(operation, error)
     }

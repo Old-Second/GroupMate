@@ -92,7 +92,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (marker !== RUN_STORE_LUA_MARKER) {
       throw new TypeError('unsupported Lua script')
     }
-    const [checkpointKey, eventKey, tombstoneKey] = options.keys
+    const [checkpointKey, eventKey, tombstoneKey, referenceKey] = options.keys
     const args = options.arguments
     if (operation === 'load') {
       return [
@@ -116,16 +116,46 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (operation === 'create') {
       if ([checkpointKey, eventKey, tombstoneKey]
         .some(key => key !== undefined && this.entries.has(key))) return 'conflict'
+      if (referenceKey !== undefined && this.entries.has(referenceKey)) {
+        return 'reference_conflict'
+      }
       const projected = {
         ...usage,
-        bytes: usage.bytes + this.bytes(args[1]) + this.bytes(args[2]),
+        bytes: usage.bytes + this.bytes(args[1]) + this.bytes(args[2]) +
+          this.bytes(referenceKey) + this.bytes(args[4]),
         checkpoints: usage.checkpoints + 1,
-        events: usage.events + 1
+        events: usage.events + 1,
+        references: usage.references + 1
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
       this.setDirect(checkpointKey, args[1], Number(args[3]))
       this.setDirect(eventKey, args[2], Number(args[3]))
+      this.setDirect(referenceKey, args[4], Number(args[3]))
+      this.saveRunNamespaceUsage(metadataKey, projected)
+      return 'ok'
+    }
+
+    if (operation === 'upgrade') {
+      const oldCheckpoint = this.entryValue(checkpointKey)
+      const oldEvents = this.entryValue(eventKey)
+      if (oldCheckpoint !== args[1] || oldEvents !== args[2] ||
+        (tombstoneKey !== undefined && this.entries.has(tombstoneKey))) return 'conflict'
+      if (referenceKey !== undefined && this.entries.has(referenceKey)) {
+        return 'reference_conflict'
+      }
+      const projected = {
+        ...usage,
+        bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents) +
+          this.bytes(args[3]) + this.bytes(args[4]) + this.bytes(referenceKey) +
+          this.bytes(args[6]),
+        references: usage.references + 1
+      }
+      if (this.invalidRunUsage(projected)) return 'reconcile'
+      if (this.exceedsRunLimits(projected)) return 'budget'
+      this.setDirect(checkpointKey, args[3], Number(args[5]))
+      this.setDirect(eventKey, args[4], Number(args[5]))
+      this.setDirect(referenceKey, args[6], Number(args[5]))
       this.saveRunNamespaceUsage(metadataKey, projected)
       return 'ok'
     }
@@ -133,14 +163,17 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (operation === 'cas') {
       const oldCheckpoint = this.entryValue(checkpointKey)
       const oldEvents = this.entryValue(eventKey)
-      if (oldCheckpoint !== args[1] || oldEvents !== args[2]) return 'conflict'
+      const reference = this.entryValue(referenceKey)
+      if (oldCheckpoint !== args[1] || oldEvents !== args[2] ||
+        reference !== args[9]) return 'conflict'
       const terminal = args[6] === '1'
       const projected = {
         bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents),
         checkpoints: usage.checkpoints - 1,
         events: usage.events - 1,
         tombstones: usage.tombstones,
-        indexes: usage.indexes
+        indexes: usage.indexes,
+        references: usage.references
       }
       if (terminal) {
         if (tombstoneKey === undefined || this.entries.has(tombstoneKey)) return 'conflict'
@@ -157,9 +190,11 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         this.entries.delete(checkpointKey)
         this.entries.delete(eventKey)
         this.setDirect(tombstoneKey, args[7], Number(args[8]))
+        this.setDirect(referenceKey, args[9], Number(args[8]))
       } else {
         this.setDirect(checkpointKey, args[3], Number(args[5]))
         this.setDirect(eventKey, args[4], Number(args[5]))
+        this.setDirect(referenceKey, args[9], Number(args[5]))
       }
       this.saveRunNamespaceUsage(metadataKey, projected)
       return 'ok'
@@ -168,20 +203,24 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (operation === 'finish') {
       const oldCheckpoint = this.entryValue(checkpointKey)
       const oldEvents = this.entryValue(eventKey)
+      const reference = this.entryValue(referenceKey)
       if (oldCheckpoint !== args[1] || oldEvents !== args[2] ||
-        tombstoneKey === undefined || this.entries.has(tombstoneKey)) return 'conflict'
+        tombstoneKey === undefined || this.entries.has(tombstoneKey) ||
+        reference !== args[5]) return 'conflict'
       const projected = {
         bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents) + this.bytes(args[3]),
         checkpoints: usage.checkpoints - 1,
         events: usage.events - 1,
         tombstones: usage.tombstones + 1,
-        indexes: usage.indexes
+        indexes: usage.indexes,
+        references: usage.references
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
       this.entries.delete(checkpointKey)
       this.entries.delete(eventKey)
       this.setDirect(tombstoneKey, args[3], Number(args[4]))
+      this.setDirect(referenceKey, args[5], Number(args[4]))
       this.saveRunNamespaceUsage(metadataKey, projected)
       return 'ok'
     }
@@ -291,23 +330,38 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     events: number
     tombstones: number
     indexes: number
+    references: number
   } | null {
-    if (raw === null || !/^\d+\|\d+\|\d+\|\d+\|\d+$/.test(raw)) return null
-    const [bytes, checkpoints, events, tombstones, indexes] = raw
+    if (raw === null || !/^\d+\|\d+\|\d+\|\d+\|\d+\|\d+$/.test(raw)) return null
+    const [bytes, checkpoints, events, tombstones, indexes, references] = raw
       .split('|')
       .map(value => Number(value))
-    if ([bytes, checkpoints, events, tombstones, indexes]
+    if ([bytes, checkpoints, events, tombstones, indexes, references]
       .some(value => !Number.isSafeInteger(value))) return null
-    return { bytes, checkpoints, events, tombstones, indexes }
+    return { bytes, checkpoints, events, tombstones, indexes, references }
   }
 
   private saveRunNamespaceUsage (
     key: string | undefined,
-    usage: { bytes: number; checkpoints: number; events: number; tombstones: number; indexes: number }
+    usage: {
+      bytes: number
+      checkpoints: number
+      events: number
+      tombstones: number
+      indexes: number
+      references: number
+    }
   ): void {
     if (key !== RUN_STORE_METADATA_KEY) throw new TypeError('invalid run metadata key')
     this.entries.set(key, {
-      value: [usage.bytes, usage.checkpoints, usage.events, usage.tombstones, usage.indexes].join('|')
+      value: [
+        usage.bytes,
+        usage.checkpoints,
+        usage.events,
+        usage.tombstones,
+        usage.indexes,
+        usage.references
+      ].join('|')
     })
   }
 
@@ -317,6 +371,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     events: number
     tombstones: number
     indexes: number
+    references: number
   }): boolean {
     return Object.values(usage).some(value => !Number.isSafeInteger(value) || value < 0)
   }
@@ -327,12 +382,14 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     events: number
     tombstones: number
     indexes: number
+    references: number
   }): boolean {
     return usage.bytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
       usage.checkpoints > RUN_RESOURCE_LIMITS.checkpointKeys ||
       usage.events > RUN_RESOURCE_LIMITS.eventKeys ||
       usage.tombstones > RUN_RESOURCE_LIMITS.tombstoneKeys ||
-      usage.indexes > RUN_RESOURCE_LIMITS.indexAdmissionKeys
+      usage.indexes > RUN_RESOURCE_LIMITS.indexAdmissionKeys ||
+      usage.references > RUN_RESOURCE_LIMITS.referenceKeys
   }
 
   private purgeExpired (key: string): void {

@@ -9,7 +9,10 @@ import {
 } from '../../src/agent/contracts/error.js'
 import { parseAgentEvent } from '../../src/agent/contracts/event.js'
 import { parseAgentRequest } from '../../src/agent/contracts/request.js'
-import { parseAgentResult } from '../../src/agent/contracts/result.js'
+import {
+  parseAgentResult,
+  parseRunAdvanceResult
+} from '../../src/agent/contracts/result.js'
 
 const userMessage = {
   id: 'message-1',
@@ -51,10 +54,26 @@ test('message parser rejects nested quotes and inline base64 resources', () => {
 
 test('request parser rejects provider credentials', () => {
   const request = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     requestId: 'request-1',
+    requestRef: '11111111111111111111111111111111',
+    runRef: '22222222222222222222222222222222',
+    requestKind: 'ordinary_chat',
     createdAt: '2026-07-13T00:00:00.000Z',
     session: { botId: '10000', scope: { kind: 'private', userId: '7' } },
+    presentationRoute: {
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: {
+        schemaVersion: 1,
+        kind: 'ordinary',
+        forcePicture: false
+      },
+      sessionAddress: { botId: '10000', scope: { kind: 'private', userId: '7' } },
+      actorId: '7',
+      requestMessageId: 'message-1'
+    },
     actor: { userId: '7', role: 'member' },
     channel: { kind: 'private', botId: '10000', userId: '7' },
     message: userMessage,
@@ -67,8 +86,55 @@ test('request parser rejects provider credentials', () => {
   } as const
 
   assert.equal(parseAgentRequest(request).requestId, 'request-1')
+  assert.equal(parseAgentRequest(request).runRef, '22222222222222222222222222222222')
+  assert.throws(() => parseAgentRequest({
+    ...request,
+    presentationRoute: {
+      ...request.presentationRoute,
+      requestKind: 'proactive_chat'
+    }
+  }))
   assert.throws(() => parseAgentRequest({ ...request, apiKey: 'secret' }))
   assert.throws(() => parseAgentRequest({ ...request, baseURL: 'https://provider.invalid' }))
+})
+
+test('result parsers use one completion contract and freeze run references on every branch', () => {
+  assert.deepEqual(parseAgentResult({
+    status: 'completed',
+    completion: { kind: 'reply_text', text: '  已完成  ' }
+  }), {
+    status: 'completed',
+    completion: { kind: 'reply_text', text: '已完成' }
+  })
+  assert.throws(() => parseAgentResult({
+    status: 'completed',
+    output: userMessage
+  }))
+
+  assert.deepEqual(parseRunAdvanceResult({
+    kind: 'completed',
+    runId: 'run-1',
+    runRef: '22222222222222222222222222222222',
+    completion: { kind: 'already_visible', source: 'tool_output' },
+    output: null
+  }), {
+    kind: 'completed',
+    runId: 'run-1',
+    runRef: '22222222222222222222222222222222',
+    completion: { kind: 'already_visible', source: 'tool_output' },
+    output: null
+  })
+  assert.deepEqual(parseRunAdvanceResult({
+    kind: 'failed',
+    runId: 'run-1',
+    runRef: 'unavailable',
+    error: serializeAgentError(new AgentError({
+      code: 'internal_error',
+      stage: 'fixture',
+      retryable: false,
+      userMessage: '失败。'
+    }))
+  }).runRef, 'unavailable')
 })
 
 test('AgentError serializes only safe fields', () => {

@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
+import { RunReferenceConflictError } from '../agent/run/run-store.js';
+import { createFrozenObservationPolicy } from '../agent/run/run-observation.js';
+import { createRunRef } from '../agent/run/run-reference.js';
 import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
 import { createAgentRunLog } from './safe-chat-logging.js';
@@ -16,10 +19,11 @@ function internalError(cause) {
 function asAgentError(error) {
     return error instanceof AgentError ? error : internalError(error);
 }
-function failedEnvelope(runId, error) {
+function failedEnvelope(runId, error, runRef = 'unavailable') {
     return Object.freeze({
         kind: 'failed',
         runId,
+        runRef,
         error: serializeAgentError(asAgentError(error))
     });
 }
@@ -31,10 +35,31 @@ function cancellationReason(value, fallback = 'user_cancelled') {
         ? normalized
         : fallback;
 }
-function cancelledEnvelope(runId, reason = 'user_cancelled') {
+function safeObservationLevel(read) {
+    if (read === undefined)
+        return 'basic';
+    try {
+        const value = read();
+        return value === 'off' || value === 'diagnostic' || value === 'basic'
+            ? value
+            : 'basic';
+    }
+    catch {
+        return 'basic';
+    }
+}
+function freezeRequest(draft, runRef) {
+    return Object.freeze({
+        ...draft,
+        schemaVersion: 2,
+        runRef
+    });
+}
+function cancelledEnvelope(runId, reason = 'user_cancelled', runRef = 'unavailable') {
     return Object.freeze({
         kind: 'cancelled',
         runId,
+        runRef,
         reason: cancellationReason(reason)
     });
 }
@@ -267,9 +292,13 @@ function freshSession(request, sessionId, timestamp) {
 function terminalEnvelope(result) {
     if (result.kind !== 'completed')
         return result;
+    const text = result.completion.kind === 'reply_text'
+        ? result.completion.text
+        : null;
     return Object.freeze({
         ...result,
-        text: result.output === null ? null : messageText(result.output)
+        visibleOutput: result.completion.kind === 'already_visible',
+        text
     });
 }
 function appendTerminalTurn(record, request, result, updatedAt) {
@@ -319,6 +348,8 @@ export class AgentService {
     #recoverRuntime;
     #now;
     #generateId;
+    #createRunRef;
+    #observationLevel;
     #onRunLog;
     #onObserverFailure;
     #engine;
@@ -337,6 +368,8 @@ export class AgentService {
         this.#recoverRuntime = options.recoverRuntime;
         this.#now = options.now ?? (() => new Date());
         this.#generateId = options.generateId ?? randomUUID;
+        this.#createRunRef = options.createRunRef ?? createRunRef;
+        this.#observationLevel = options.observationLevel;
         this.#onRunLog = options.onRunLog;
         this.#onObserverFailure = options.onObserverFailure;
         this.#engine = options.createEngine(event => {
@@ -389,7 +422,7 @@ export class AgentService {
             }
             if (pending === undefined || pending === null)
                 return failedEnvelope(runId, error);
-            return await this.#abortPending(pending, failedEnvelope(runId, error));
+            return await this.#abortPending(pending, failedEnvelope(runId, error, pending.request?.runRef ?? 'unavailable'));
         }
         finally {
             linked.dispose();
@@ -410,7 +443,7 @@ export class AgentService {
                 this.#progressPresenter.detach(runId);
                 await pending.lease.release().catch(() => undefined);
             }
-            return failedEnvelope(runId, error);
+            return failedEnvelope(runId, error, pending?.request?.runRef ?? 'unavailable');
         }
     }
     shutdown(reason = 'process_shutdown') {
@@ -455,13 +488,16 @@ export class AgentService {
             linked.dispose();
         }
     }
-    async #start(request, ephemeral, options) {
+    async #start(draft, ephemeral, options) {
         const runId = this.#generateId();
+        const levelAtStart = safeObservationLevel(this.#observationLevel);
+        let runRef = this.#createRunRef();
+        let request = freezeRequest(draft, runRef);
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let lease;
         try {
             if (linked.signal.aborted) {
-                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason);
+                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason, runRef);
             }
             lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
             if (linked.signal.aborted)
@@ -477,8 +513,8 @@ export class AgentService {
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
-            const binding = this.#bindingFor(runId, request, session, runtime);
-            const pending = Object.freeze({
+            let binding = this.#bindingFor(runId, request, session, runtime);
+            let pending = Object.freeze({
                 runId,
                 request,
                 session,
@@ -488,14 +524,47 @@ export class AgentService {
             });
             this.#pending.set(runId, pending);
             this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined));
-            const result = await this.#engine.start({
-                runId,
-                sessionId,
-                sessionAddress: request.sessionAddress,
-                deadlineAt: request.deadlineAt,
-                model: request.model,
-                runtime: binding
-            }, { ...options, signal: linked.signal });
+            let result;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                const observationPolicy = createFrozenObservationPolicy({
+                    levelAtStart,
+                    runRef
+                });
+                try {
+                    result = await this.#engine.start({
+                        runId,
+                        runRef,
+                        requestRef: request.requestRef,
+                        requestKind: request.requestKind,
+                        presentationRoute: request.presentationRoute,
+                        observationPolicy,
+                        sessionId,
+                        sessionAddress: request.sessionAddress,
+                        deadlineAt: request.deadlineAt,
+                        model: request.model,
+                        runtime: binding
+                    }, { ...options, signal: linked.signal });
+                    break;
+                }
+                catch (error) {
+                    if (!(error instanceof RunReferenceConflictError) || attempt !== 0)
+                        throw error;
+                    runRef = this.#createRunRef();
+                    request = freezeRequest(draft, runRef);
+                    binding = this.#bindingFor(runId, request, session, runtime);
+                    pending = Object.freeze({
+                        runId,
+                        request,
+                        session,
+                        binding,
+                        lease,
+                        ephemeral
+                    });
+                    this.#pending.set(runId, pending);
+                }
+            }
+            if (result === undefined)
+                throw new RunReferenceConflictError();
             return await this.#finish(pending, result);
         }
         catch (error) {
@@ -508,9 +577,9 @@ export class AgentService {
             this.#pending.delete(runId);
             this.#progressPresenter.detach(runId);
             if (linked.signal.aborted) {
-                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason);
+                return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason, runRef);
             }
-            return failedEnvelope(runId, error);
+            return failedEnvelope(runId, error, runRef);
         }
         finally {
             linked.dispose();
@@ -557,7 +626,7 @@ export class AgentService {
         });
     }
     async #recoverPending(runId, signal) {
-        const checkpoint = await this.#runStore.load(runId);
+        const checkpoint = await this.#engine.loadCheckpoint(runId);
         if (checkpoint === null)
             return null;
         if (isTerminalRunStatus(checkpoint.status))
@@ -624,7 +693,7 @@ export class AgentService {
             this.#recordRun(result);
         }
         catch (error) {
-            envelope = failedEnvelope(pending.runId, error);
+            envelope = failedEnvelope(pending.runId, error, pending.request?.runRef ?? 'unavailable');
         }
         finally {
             this.#pending.delete(pending.runId);

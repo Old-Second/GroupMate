@@ -24,7 +24,15 @@ import type {
 } from '../agent/run/run-engine.js'
 import type { RunCheckpoint } from '../agent/run/run-checkpoint.js'
 import type { RunAdmission, RunLease } from '../agent/run/run-admission.js'
-import type { RunStore } from '../agent/run/run-store.js'
+import {
+  RunReferenceConflictError,
+  type RunStore
+} from '../agent/run/run-store.js'
+import {
+  createFrozenObservationPolicy,
+  type FrozenObservationPolicyV1
+} from '../agent/run/run-observation.js'
+import { createRunRef } from '../agent/run/run-reference.js'
 import { isTerminalRunStatus } from '../agent/run/run-state.js'
 import type { ApprovalInterruption } from '../agent/run/interruption.js'
 import {
@@ -42,12 +50,20 @@ import {
   RunProgressPresenter,
   type ProgressDelivery
 } from './run-progress-presenter.js'
-import type { YunzaiAgentRequest } from './yunzai-request-adapter.js'
+import type {
+  YunzaiAgentRequest,
+  YunzaiAgentRequestDraft
+} from './yunzai-request-adapter.js'
 
 export type ChatReplyEnvelope =
   | Readonly<{
       kind: 'completed'
       runId: string
+      runRef: string
+      completion: Extract<
+        RunAdvanceResult,
+        { readonly kind: 'completed' }
+      >['completion']
       output: Extract<RunAdvanceResult, { readonly kind: 'completed' }>['output']
       visibleOutput: boolean
       text: string | null
@@ -88,6 +104,8 @@ export interface AgentServiceOptions {
   readonly recoverRuntime?: (checkpoint: RunCheckpoint) => Promise<AgentServiceRunRuntime>
   readonly now?: () => Date
   readonly generateId?: () => string
+  readonly createRunRef?: () => string
+  readonly observationLevel?: () => unknown
   readonly onRunLog?: (entry: ReturnType<typeof createAgentRunLog>) => void
   readonly onObserverFailure?: (entry: Readonly<{
     event: 'agent.observer_failed'
@@ -119,10 +137,15 @@ function asAgentError (error: unknown): AgentError {
   return error instanceof AgentError ? error : internalError(error)
 }
 
-function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
+function failedEnvelope (
+  runId: string,
+  error: unknown,
+  runRef: string | 'unavailable' = 'unavailable'
+): ChatReplyEnvelope {
   return Object.freeze({
     kind: 'failed',
     runId,
+    runRef,
     error: serializeAgentError(asAgentError(error))
   })
 }
@@ -135,13 +158,40 @@ function cancellationReason (value: unknown, fallback = 'user_cancelled'): strin
     : fallback
 }
 
+function safeObservationLevel (
+  read: (() => unknown) | undefined
+): FrozenObservationPolicyV1['levelAtStart'] {
+  if (read === undefined) return 'basic'
+  try {
+    const value = read()
+    return value === 'off' || value === 'diagnostic' || value === 'basic'
+      ? value
+      : 'basic'
+  } catch {
+    return 'basic'
+  }
+}
+
+function freezeRequest (
+  draft: YunzaiAgentRequestDraft,
+  runRef: string
+): YunzaiAgentRequest {
+  return Object.freeze({
+    ...draft,
+    schemaVersion: 2,
+    runRef
+  })
+}
+
 function cancelledEnvelope (
   runId: string,
-  reason: unknown = 'user_cancelled'
+  reason: unknown = 'user_cancelled',
+  runRef: string | 'unavailable' = 'unavailable'
 ): ChatReplyEnvelope {
   return Object.freeze({
     kind: 'cancelled',
     runId,
+    runRef,
     reason: cancellationReason(reason)
   })
 }
@@ -384,7 +434,7 @@ function boundedOptionalContext (
 }
 
 function freshSession (
-  request: YunzaiAgentRequest,
+  request: YunzaiAgentRequestDraft,
   sessionId: string,
   timestamp: string
 ): SessionRecord<AgentSessionState> {
@@ -408,9 +458,13 @@ function freshSession (
 
 function terminalEnvelope (result: RunAdvanceResult): ChatReplyEnvelope {
   if (result.kind !== 'completed') return result
+  const text = result.completion.kind === 'reply_text'
+    ? result.completion.text
+    : null
   return Object.freeze({
     ...result,
-    text: result.output === null ? null : messageText(result.output)
+    visibleOutput: result.completion.kind === 'already_visible',
+    text
   })
 }
 
@@ -467,6 +521,8 @@ export class AgentService {
   readonly #recoverRuntime?: AgentServiceOptions['recoverRuntime']
   readonly #now: () => Date
   readonly #generateId: () => string
+  readonly #createRunRef: () => string
+  readonly #observationLevel?: () => unknown
   readonly #onRunLog?: AgentServiceOptions['onRunLog']
   readonly #onObserverFailure?: AgentServiceOptions['onObserverFailure']
   readonly #engine: RunEngine
@@ -486,6 +542,8 @@ export class AgentService {
     this.#recoverRuntime = options.recoverRuntime
     this.#now = options.now ?? (() => new Date())
     this.#generateId = options.generateId ?? randomUUID
+    this.#createRunRef = options.createRunRef ?? createRunRef
+    this.#observationLevel = options.observationLevel
     this.#onRunLog = options.onRunLog
     this.#onObserverFailure = options.onObserverFailure
     this.#engine = options.createEngine(event => {
@@ -518,14 +576,14 @@ export class AgentService {
   }
 
   async handle (
-    request: YunzaiAgentRequest,
+    request: YunzaiAgentRequestDraft,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#start(request, false, options)
   }
 
   async handleEphemeral (
-    request: YunzaiAgentRequest,
+    request: YunzaiAgentRequestDraft,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#start(request, true, options)
@@ -560,7 +618,10 @@ export class AgentService {
         return await this.cancel(runId, linked.signal.reason)
       }
       if (pending === undefined || pending === null) return failedEnvelope(runId, error)
-      return await this.#abortPending(pending, failedEnvelope(runId, error))
+      return await this.#abortPending(
+        pending,
+        failedEnvelope(runId, error, pending.request?.runRef ?? 'unavailable')
+      )
     } finally {
       linked.dispose()
     }
@@ -583,7 +644,7 @@ export class AgentService {
         this.#progressPresenter.detach(runId)
         await pending.lease.release().catch(() => undefined)
       }
-      return failedEnvelope(runId, error)
+      return failedEnvelope(runId, error, pending?.request?.runRef ?? 'unavailable')
     }
   }
 
@@ -644,16 +705,23 @@ export class AgentService {
   }
 
   async #start (
-    request: YunzaiAgentRequest,
+    draft: YunzaiAgentRequestDraft,
     ephemeral: boolean,
     options: RunControlOptions
   ): Promise<ChatReplyEnvelope> {
     const runId = this.#generateId()
+    const levelAtStart = safeObservationLevel(this.#observationLevel)
+    let runRef = this.#createRunRef()
+    let request = freezeRequest(draft, runRef)
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let lease: RunLease | undefined
     try {
       if (linked.signal.aborted) {
-        return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason)
+        return cancelledEnvelope(
+          runId,
+          linked.signal.reason ?? this.#shutdownReason,
+          runRef
+        )
       }
       lease = await this.#admission.acquire(request.sessionAddress, linked.signal)
       if (linked.signal.aborted) throw new Error('run start was cancelled')
@@ -666,8 +734,8 @@ export class AgentService {
       const runtime = await this.#createRuntime(request)
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
-      const binding = this.#bindingFor(runId, request, session, runtime)
-      const pending: PendingRun = Object.freeze({
+      let binding = this.#bindingFor(runId, request, session, runtime)
+      let pending: PendingRun = Object.freeze({
         runId,
         request,
         session,
@@ -677,14 +745,44 @@ export class AgentService {
       })
       this.#pending.set(runId, pending)
       this.#progressPresenter.attach(runId, runtime.progress ?? (async () => undefined))
-      const result = await this.#engine.start({
-        runId,
-        sessionId,
-        sessionAddress: request.sessionAddress,
-        deadlineAt: request.deadlineAt,
-        model: request.model,
-        runtime: binding
-      }, { ...options, signal: linked.signal })
+      let result: RunAdvanceResult | undefined
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const observationPolicy = createFrozenObservationPolicy({
+          levelAtStart,
+          runRef
+        })
+        try {
+          result = await this.#engine.start({
+            runId,
+            runRef,
+            requestRef: request.requestRef,
+            requestKind: request.requestKind,
+            presentationRoute: request.presentationRoute,
+            observationPolicy,
+            sessionId,
+            sessionAddress: request.sessionAddress,
+            deadlineAt: request.deadlineAt,
+            model: request.model,
+            runtime: binding
+          }, { ...options, signal: linked.signal })
+          break
+        } catch (error) {
+          if (!(error instanceof RunReferenceConflictError) || attempt !== 0) throw error
+          runRef = this.#createRunRef()
+          request = freezeRequest(draft, runRef)
+          binding = this.#bindingFor(runId, request, session, runtime)
+          pending = Object.freeze({
+            runId,
+            request,
+            session,
+            binding,
+            lease,
+            ephemeral
+          })
+          this.#pending.set(runId, pending)
+        }
+      }
+      if (result === undefined) throw new RunReferenceConflictError()
       return await this.#finish(pending, result)
     } catch (error) {
       if (this.#pending.has(runId)) {
@@ -696,9 +794,13 @@ export class AgentService {
       this.#pending.delete(runId)
       this.#progressPresenter.detach(runId)
       if (linked.signal.aborted) {
-        return cancelledEnvelope(runId, linked.signal.reason ?? this.#shutdownReason)
+        return cancelledEnvelope(
+          runId,
+          linked.signal.reason ?? this.#shutdownReason,
+          runRef
+        )
       }
-      return failedEnvelope(runId, error)
+      return failedEnvelope(runId, error, runRef)
     } finally {
       linked.dispose()
     }
@@ -768,7 +870,7 @@ export class AgentService {
     runId: string,
     signal?: AbortSignal
   ): Promise<PendingRun | null> {
-    const checkpoint = await this.#runStore.load(runId)
+    const checkpoint = await this.#engine.loadCheckpoint(runId)
     if (checkpoint === null) return null
     if (isTerminalRunStatus(checkpoint.status)) return null
     if (this.#recoverRuntime === undefined) {
@@ -843,7 +945,11 @@ export class AgentService {
       }
       this.#recordRun(result)
     } catch (error) {
-      envelope = failedEnvelope(pending.runId, error)
+      envelope = failedEnvelope(
+        pending.runId,
+        error,
+        pending.request?.runRef ?? 'unavailable'
+      )
     } finally {
       this.#pending.delete(pending.runId)
       this.#progressPresenter.detach(pending.runId)

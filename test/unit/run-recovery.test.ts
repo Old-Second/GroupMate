@@ -7,10 +7,16 @@ import { ModelProviderError, type ModelAdapter, type ModelRequest, type ModelTur
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { RunAdmission } from '../../src/agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
-import { createInitialRunCheckpoint, nextRunCheckpoint, type RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
+import {
+  createInitialRunCheckpoint,
+  nextRunCheckpoint,
+  type RunCheckpoint,
+  type RunCheckpointV1
+} from '../../src/agent/run/run-checkpoint.js'
 import { RunEngine, type RunRuntimeBinding } from '../../src/agent/run/run-engine.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
-import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
+import { RedisRunStore, redisRunKeys } from '../../src/agent/run/redis-run-store.js'
+import { RunReferenceConflictError } from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import { applyToolPreflight, createToolExecutionLedger } from '../../src/agent/run/tool-ledger.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
@@ -88,6 +94,23 @@ function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
   return createInitialRunCheckpoint({
     profileId: 'standard', profileVersion: 1, runId,
     sessionId: 'session-1', sessionAddress: address,
+    runRef: createHash('sha256').update(`run:${runId}`).digest('hex').slice(0, 32),
+    requestRef: createHash('sha256').update(`request:${runId}`).digest('hex').slice(0, 32),
+    requestKind: 'ordinary_chat',
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      }),
+      sessionAddress: address,
+      actorId: 'actor-private-value',
+      requestMessageId: 'message-current'
+    }),
+    observationPolicy: Object.freeze({
+      schemaVersion: 1, levelAtStart: 'basic', sampledSuccess: false
+    }),
     model: Object.freeze({
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
@@ -99,6 +122,37 @@ function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
     budgetLimits: budget.limits, budgetCounters: budget.initialCounters,
     deadlineAt, createdAt: timestamp, event: runEvent(runId, 0, 'run.created')
   })
+}
+
+function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
+  const {
+    schemaVersion: _schemaVersion,
+    runRef: _runRef,
+    requestRef: _requestRef,
+    requestKind: _requestKind,
+    presentationRoute: _presentationRoute,
+    completion: _completion,
+    observationCounters: _observationCounters,
+    providerDispatch: _providerDispatch,
+    engineActivity: _engineActivity,
+    observationPolicy: _observationPolicy,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
+}
+
+async function persistLegacy (
+  redis: FakeRedis,
+  checkpoint: RunCheckpointV1
+): Promise<void> {
+  const keys = redisRunKeys(checkpoint.runId)
+  const { events, ...state } = checkpoint
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 1,
+    revision: checkpoint.revision,
+    events
+  }), { EX: 300 })
 }
 
 function callingModelPath (source: RunCheckpoint): readonly RunCheckpoint[] {
@@ -236,6 +290,107 @@ test('RunEngine resumes a complete calling-model checkpoint exactly once', async
   assert.equal(adapter.calls, 1)
   assert.equal(await store.load(source.runId), null)
   assert.equal((await store.loadTombstone(source.runId))?.status, 'completed')
+})
+
+test('RunEngine upgrades v1 before any recovered tool or Provider action', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const source = initial('run-v1-action-gate')
+  const path = executingPath(source, 'read_only')
+  const latest = path.at(-1)
+  if (latest === undefined) throw new TypeError('legacy path is missing')
+  await persistLegacy(redis, legacyCheckpoint(latest))
+  const upgradedRunRef = '3'.repeat(32)
+  const upgradedRequestRef = '4'.repeat(32)
+  let runRefAllocations = 0
+  let requestRefAllocations = 0
+  let toolObservedUpgrade = false
+  let providerObservedUpgrade = false
+  const baseRuntime = new CountingRuntime()
+  const checkedRuntime: ToolRuntime = Object.freeze({
+    prepare: async (...args: Parameters<ToolRuntime['prepare']>) => (
+      await baseRuntime.prepare(...args)
+    ),
+    executePrepared: async () => {
+      const checkpoint = await store.load(source.runId)
+      assert.equal(checkpoint?.schemaVersion, 2)
+      if (checkpoint?.schemaVersion !== 2) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint.runRef, upgradedRunRef)
+      assert.equal(checkpoint.requestRef, upgradedRequestRef)
+      toolObservedUpgrade = true
+      return await baseRuntime.executePrepared()
+    }
+  })
+  const adapter: ModelAdapter = Object.freeze({
+    complete: async () => {
+      const checkpoint = await store.load(source.runId)
+      assert.equal(checkpoint?.schemaVersion, 2)
+      if (checkpoint?.schemaVersion !== 2) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint.runRef, upgradedRunRef)
+      assert.equal(checkpoint.requestRef, upgradedRequestRef)
+      providerObservedUpgrade = true
+      return textTurn('迁移后完成')
+    }
+  })
+  const engine = new RunEngine({
+    adapter,
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: checkedRuntime }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    generateId: () => 'generated-id',
+    createRunRef: () => {
+      runRefAllocations += 1
+      return upgradedRunRef
+    },
+    createRequestRef: () => {
+      requestRefAllocations += 1
+      return upgradedRequestRef
+    }
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(toolObservedUpgrade, true)
+  assert.equal(providerObservedUpgrade, true)
+  assert.equal(runRefAllocations, 1)
+  assert.equal(requestRefAllocations, 1)
+  assert.equal(redis.evalCalls.some(call => call.operation === 'upgrade'), true)
+})
+
+test('RunEngine lets a v1 runRef upgrade conflict escape before recovery actions', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const collisionRef = '9'.repeat(32)
+  await store.create(Object.freeze({
+    ...initial('run-reference-holder'),
+    runRef: collisionRef
+  }))
+  const legacy = legacyCheckpoint(initial('run-v1-reference-collision'))
+  await persistLegacy(redis, legacy)
+  const adapter = new ScriptedAdapter(textTurn('不应调用'))
+  const toolRuntime = new CountingRuntime()
+  const engine = new RunEngine({
+    adapter,
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: toolRuntime }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    generateId: () => 'generated-id',
+    createRunRef: () => collisionRef,
+    createRequestRef: () => 'a'.repeat(32)
+  })
+
+  await assert.rejects(
+    engine.resume(legacy.runId, runtimeBinding(snapshot())),
+    error => error instanceof RunReferenceConflictError
+  )
+  assert.equal(adapter.calls, 0)
+  assert.equal(toolRuntime.preparations, 0)
+  assert.equal(toolRuntime.executions, 0)
 })
 
 test('RunEngine fails closed when the recovered Profile or ToolSnapshot changed', async () => {

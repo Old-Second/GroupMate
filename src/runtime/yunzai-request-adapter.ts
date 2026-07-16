@@ -8,9 +8,16 @@ import type {
   ChannelIdentity,
   SessionAddress
 } from '../agent/contracts/identity.js'
+import {
+  parsePresentationRoute,
+  type PresentationIntentV1,
+  type PresentationRouteV1,
+  type TrustedRequestKind
+} from '../agent/contracts/interaction.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
 import { resolveConversationScope } from '../agent/session/conversation-scope.js'
 import type { RunModelConfig } from '../agent/run/run-checkpoint.js'
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js'
 import {
   buildModelMessageInput,
   type MessageEventLike
@@ -34,6 +41,9 @@ export interface AdaptYunzaiRequestInput {
   readonly currentPrompt: string
   readonly groupMerge: boolean
   readonly requestId: string
+  readonly requestRef: string
+  readonly requestKind: TrustedRequestKind
+  readonly presentationIntent: PresentationIntentV1
   readonly createdAt: string
   readonly deadlineAt: string
   readonly systemInstructions: readonly string[]
@@ -42,8 +52,11 @@ export interface AdaptYunzaiRequestInput {
   readonly sessionTtlSeconds?: number
 }
 
-export interface YunzaiAgentRequest {
+export interface YunzaiAgentRequestDraft {
   readonly requestId: string
+  readonly requestRef: string
+  readonly requestKind: TrustedRequestKind
+  readonly presentationRoute: PresentationRouteV1
   readonly createdAt: string
   readonly deadlineAt: string
   readonly sessionAddress: SessionAddress
@@ -58,6 +71,11 @@ export interface YunzaiAgentRequest {
   readonly model: RunModelConfig
   readonly contextBudget: ContextBudget
   readonly sessionTtlSeconds?: number
+}
+
+export interface YunzaiAgentRequest extends YunzaiAgentRequestDraft {
+  readonly schemaVersion: 2
+  readonly runRef: string
 }
 
 function identifier (value: unknown, label: string): string {
@@ -120,15 +138,58 @@ function frozenBudget (input: ContextBudget): ContextBudget {
   })
 }
 
+function frozenPresentationRoute (
+  requestKind: TrustedRequestKind,
+  intent: PresentationIntentV1,
+  sessionAddress: SessionAddress,
+  actorId: string,
+  requestMessageId: string | null
+): PresentationRouteV1 {
+  const profile = requestKind === 'ordinary_chat' ? 'ordinary' : 'proactive'
+  parsePresentationRoute({
+    schemaVersion: 1,
+    requestKind,
+    profile,
+    presentationIntent: intent,
+    sessionAddress,
+    actorId,
+    ...(requestMessageId === null ? {} : { requestMessageId })
+  })
+  const presentationIntent: PresentationIntentV1 = intent.kind === 'ordinary'
+    ? Object.freeze({
+        schemaVersion: intent.schemaVersion,
+        kind: intent.kind,
+        forcePicture: intent.forcePicture
+      })
+    : Object.freeze({
+        schemaVersion: intent.schemaVersion,
+        kind: intent.kind,
+        recallAfterMs: intent.recallAfterMs
+      })
+  const raw = Object.freeze({
+    schemaVersion: 1 as const,
+    requestKind,
+    profile,
+    presentationIntent,
+    sessionAddress,
+    actorId,
+    ...(requestMessageId === null ? {} : { requestMessageId })
+  })
+  return parsePresentationRoute(raw)
+}
+
 export async function adaptYunzaiRequest (
   input: AdaptYunzaiRequestInput
-): Promise<YunzaiAgentRequest> {
+): Promise<YunzaiAgentRequestDraft> {
   const createdAt = timestamp(input.createdAt, 'request creation timestamp')
   const deadlineAt = timestamp(input.deadlineAt, 'request deadline')
   if (new Date(deadlineAt).getTime() <= new Date(createdAt).getTime()) {
     throw new TypeError('request deadline is invalid')
   }
   const requestId = identifier(input.requestId, 'request ID')
+  if (typeof input.requestRef !== 'string' || !RUN_REF_PATTERN.test(input.requestRef)) {
+    throw new TypeError('request reference is invalid')
+  }
   const botId = identifier(input.event.self_id ?? input.event.bot?.uin, 'bot identity')
   const actorId = identifier(
     input.event.sender?.user_id ?? input.event.user_id,
@@ -197,8 +258,18 @@ export async function adaptYunzaiRequest (
     input.sessionTtlSeconds <= 0)) {
     throw new TypeError('session TTL is invalid')
   }
+  const presentationRoute = frozenPresentationRoute(
+    input.requestKind,
+    input.presentationIntent,
+    sessionAddress,
+    actorId,
+    messageInput.currentMessageId
+  )
   return Object.freeze({
     requestId,
+    requestRef: input.requestRef,
+    requestKind: input.requestKind,
+    presentationRoute,
     createdAt,
     deadlineAt,
     sessionAddress,

@@ -8,6 +8,10 @@ import type {
 } from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import type {
+  RunCheckpoint,
+  RunCheckpointV1
+} from '../../src/agent/run/run-checkpoint.js'
 import {
   RunEngine,
   type ApprovalControlContext,
@@ -257,9 +261,8 @@ class ApprovalAdapter implements ModelAdapter {
   readonly requests: ModelRequest[] = []
   readonly #turns: ModelTurn[]
 
-  constructor (calls: number) {
-    this.#turns = [
-      Object.freeze({
+  constructor (calls: number, recovered = false) {
+    const planned: ModelTurn = Object.freeze({
         text: '',
         toolCalls: Object.freeze(Array.from({ length: calls }, (_, index) => Object.freeze({
           index,
@@ -269,13 +272,13 @@ class ApprovalAdapter implements ModelAdapter {
           arguments: Object.freeze({ value: `value-${index + 1}` })
         }))),
         finishReason: 'tool_calls' as const
-      }),
-      Object.freeze({
+      })
+    const completed: ModelTurn = Object.freeze({
         text: '任务结果已确认。',
         toolCalls: Object.freeze([]),
         finishReason: 'stop' as const
       })
-    ]
+    this.#turns = recovered ? [completed] : [planned, completed]
   }
 
   async complete (request: ModelRequest): Promise<ModelTurn> {
@@ -293,6 +296,10 @@ function approvalHarness (options: {
   actorId?: string
   actorGroupRole?: ToolRuntimeFacts['actorGroupRole']
   eligibleApprovers?: ApprovalActorReference[]
+  store?: InMemoryRunStore
+  recovered?: boolean
+  createRunRef?: () => string
+  createRequestRef?: () => string
 } = {}) {
   const address = options.address ?? groupAddress
   const state: ApprovalHarnessState = {
@@ -307,8 +314,8 @@ function approvalHarness (options: {
     ]
   }
   const toolRuntime = new ApprovalToolRuntime(state)
-  const adapter = new ApprovalAdapter(options.calls ?? 1)
-  const store = new InMemoryRunStore()
+  const adapter = new ApprovalAdapter(options.calls ?? 1, options.recovered)
+  const store = options.store ?? new InMemoryRunStore()
   let nowValue = createdAt
   let generated = 0
   const initialFacts = stateFacts(state, address)
@@ -325,7 +332,11 @@ function approvalHarness (options: {
     store,
     budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
     now: () => new Date(nowValue),
-    generateId: () => `approval-generated-${++generated}`
+    generateId: () => `approval-generated-${++generated}`,
+    ...(options.createRunRef === undefined ? {} : { createRunRef: options.createRunRef }),
+    ...(options.createRequestRef === undefined
+      ? {}
+      : { createRequestRef: options.createRequestRef })
   })
   const binding = (runtimeSnapshot = snapshot): RunRuntimeBinding => Object.freeze({
     snapshot: runtimeSnapshot,
@@ -363,8 +374,25 @@ function approvalHarness (options: {
   })
   const input: StartRunInput = Object.freeze({
     runId: 'run-approval-1',
+    runRef: '1'.repeat(32),
+    requestRef: '2'.repeat(32),
+    requestKind: 'ordinary_chat',
     sessionId: 'session-approval-1',
     sessionAddress: address,
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      }),
+      sessionAddress: address,
+      actorId: 'actor-1',
+      requestMessageId: 'message-current'
+    }),
+    observationPolicy: Object.freeze({
+      schemaVersion: 1, levelAtStart: 'basic', sampledSuccess: false
+    }),
     deadlineAt,
     model: Object.freeze({
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
@@ -376,6 +404,23 @@ function approvalHarness (options: {
     adapter, toolRuntime, store, state, snapshot, engine, input, binding,
     setNow: (value: string) => { nowValue = value }
   })
+}
+
+function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
+  const {
+    schemaVersion: _schemaVersion,
+    runRef: _runRef,
+    requestRef: _requestRef,
+    requestKind: _requestKind,
+    presentationRoute: _presentationRoute,
+    completion: _completion,
+    observationCounters: _observationCounters,
+    providerDispatch: _providerDispatch,
+    engineActivity: _engineActivity,
+    observationPolicy: _observationPolicy,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
 }
 
 async function displayCurrent (
@@ -396,6 +441,100 @@ async function displayCurrent (
   assert.notEqual(displayed, null)
   return displayed as ApprovalInterruption
 }
+
+test('RunEngine upgrades waiting-approval v1 before display, decide and cancel', async () => {
+  const source = approvalHarness()
+  const paused = await source.engine.start(source.input)
+  assert.equal(paused.kind, 'paused')
+  if (paused.kind !== 'paused') return
+  const undisplayed = await source.store.load(paused.runId)
+  assert.equal(undisplayed?.schemaVersion, 2)
+  if (undisplayed?.schemaVersion !== 2) throw new TypeError('approval checkpoint is missing')
+  await displayCurrent(
+    source,
+    paused.interruption,
+    'approval-message-v1',
+    '2026-07-14T00:00:01.000Z'
+  )
+  const displayed = await source.store.load(paused.runId)
+  assert.equal(displayed?.schemaVersion, 2)
+  if (displayed?.schemaVersion !== 2) throw new TypeError('displayed checkpoint is missing')
+
+  const recovered = (
+    legacy: RunCheckpointV1,
+    resumeAfterApproval = false
+  ) => {
+    const store = new InMemoryRunStore()
+    store.seedLoadedCheckpoint(legacy)
+    let runRefAllocations = 0
+    let requestRefAllocations = 0
+    const fixture = approvalHarness({
+      store,
+      recovered: resumeAfterApproval,
+      createRunRef: () => {
+        runRefAllocations += 1
+        return '7'.repeat(32)
+      },
+      createRequestRef: () => {
+        requestRefAllocations += 1
+        return '8'.repeat(32)
+      }
+    })
+    return Object.freeze({
+      fixture,
+      allocations: () => Object.freeze({ runRefAllocations, requestRefAllocations })
+    })
+  }
+
+  const displayCase = recovered(legacyCheckpoint(undisplayed))
+  const redisplayed = await displayCase.fixture.engine.displayApproval({
+    runId: paused.runId,
+    approvalId: paused.interruption.approvalId,
+    messageId: 'approval-message-recovered',
+    displayedAt: '2026-07-14T00:00:01.000Z',
+    ttlSeconds: 120
+  })
+  assert.notEqual(redisplayed, null)
+  assert.deepEqual(displayCase.allocations(), {
+    runRefAllocations: 1, requestRefAllocations: 1
+  })
+  assert.equal(displayCase.fixture.adapter.requests.length, 0)
+  assert.equal(displayCase.fixture.toolRuntime.executions.length, 0)
+
+  const decideCase = recovered(legacyCheckpoint(displayed), true)
+  decideCase.fixture.setNow('2026-07-14T00:00:02.000Z')
+  const decided = await decideCase.fixture.engine.decideApproval({
+    runId: paused.runId,
+    approvalId: paused.interruption.approvalId,
+    kind: 'approved',
+    decidedAt: '2026-07-14T00:00:02.000Z',
+    sessionAddress: groupAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'group_owner' })
+  }, decideCase.fixture.binding())
+  assert.equal(decided?.kind, 'completed')
+  assert.deepEqual(decideCase.allocations(), {
+    runRefAllocations: 1, requestRefAllocations: 1
+  })
+  assert.deepEqual(decideCase.fixture.toolRuntime.executions, ['call-1'])
+  assert.equal(decideCase.fixture.adapter.requests.length, 1)
+
+  const cancelCase = recovered(legacyCheckpoint(undisplayed))
+  const cancelled = await cancelCase.fixture.engine.cancel(paused.runId, 'user_cancelled')
+  assert.equal(cancelled.kind, 'cancelled')
+  assert.deepEqual(cancelCase.allocations(), {
+    runRefAllocations: 1, requestRefAllocations: 1
+  })
+  const cancelledCheckpoint = await cancelCase.fixture.store.load(paused.runId)
+  assert.equal(cancelledCheckpoint?.schemaVersion, 2)
+  assert.equal(
+    cancelledCheckpoint?.schemaVersion === 2
+      ? cancelledCheckpoint.observationCounters.approvalRequests
+      : null,
+    1
+  )
+  assert.equal(cancelCase.fixture.adapter.requests.length, 0)
+  assert.equal(cancelCase.fixture.toolRuntime.executions.length, 0)
+})
 
 test('RunEngine resolves ordered approvals in one run without executing an undecided batch', async () => {
   const fixture = approvalHarness({ calls: 2 })
@@ -481,6 +620,17 @@ test('RunEngine turns rejection and expiry into exact terminal tool results with
     assert.equal(fixture.toolRuntime.executions.length, 0)
     const checkpoint = await fixture.store.load('run-approval-1')
     assert.equal(checkpoint?.toolLedgers[0]?.calls[0]?.status, branch)
+    assert.deepEqual(checkpoint?.schemaVersion === 2 ? {
+      approvalRequests: checkpoint.observationCounters.approvalRequests,
+      toolDenied: checkpoint.observationCounters.toolDenied,
+      toolExpired: checkpoint.observationCounters.toolExpired,
+      toolAttempts: checkpoint.observationCounters.toolAttempts
+    } : null, {
+      approvalRequests: 1,
+      toolDenied: branch === 'rejected' ? 1 : 0,
+      toolExpired: branch === 'expired' ? 1 : 0,
+      toolAttempts: 0
+    })
     const toolMessage = fixture.adapter.requests[1]?.messages.find(message => message.role === 'tool')
     assert.match(toolMessage?.role === 'tool' ? toolMessage.content : '',
       branch === 'expired' ? /已过期/ : /已拒绝/)

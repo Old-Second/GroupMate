@@ -1,4 +1,7 @@
 import { parseAgentMessage } from './content.js';
+import { parsePresentationRoute } from './interaction.js';
+import { canonicalSessionKey } from '../session/conversation-scope.js';
+import { RUN_REF_PATTERN } from '../run/run-reference.js';
 function record(value, label) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError(`${label} must be an object`);
@@ -79,12 +82,30 @@ function parseChannel(value) {
 }
 export function parseAgentRequest(value) {
     const request = record(value, 'agent request');
-    exact(request, ['schemaVersion', 'requestId', 'createdAt', 'session', 'actor', 'channel', 'message', 'limits', 'model', 'transport'], 'agent request');
-    if (request.schemaVersion !== 1)
+    exact(request, [
+        'schemaVersion', 'requestId', 'requestRef', 'runRef', 'requestKind',
+        'presentationRoute', 'createdAt', 'session', 'actor', 'channel', 'message',
+        'limits', 'model', 'transport'
+    ], 'agent request');
+    if (request.schemaVersion !== 2)
         throw new TypeError('request schema version is invalid');
     text(request.requestId, 'request ID');
+    if (typeof request.requestRef !== 'string' || !RUN_REF_PATTERN.test(request.requestRef)) {
+        throw new TypeError('request reference is invalid');
+    }
+    if (typeof request.runRef !== 'string' || !RUN_REF_PATTERN.test(request.runRef)) {
+        throw new TypeError('run reference is invalid');
+    }
+    if (request.requestKind !== 'ordinary_chat' && request.requestKind !== 'proactive_chat') {
+        throw new TypeError('request kind is invalid');
+    }
     timestamp(request.createdAt, 'request timestamp');
-    parseSession(request.session);
+    const session = parseSession(request.session);
+    const presentationRoute = parsePresentationRoute(request.presentationRoute);
+    if (presentationRoute.requestKind !== request.requestKind ||
+        canonicalSessionKey(presentationRoute.sessionAddress) !== canonicalSessionKey(session)) {
+        throw new TypeError('request presentation route is invalid');
+    }
     parseActor(request.actor);
     parseChannel(request.channel);
     parseAgentMessage(request.message);

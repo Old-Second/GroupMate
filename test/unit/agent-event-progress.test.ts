@@ -42,7 +42,7 @@ test('progress presenter deduplicates persisted events and suppresses terminal l
 
   presenter.handle(historical)
   presenter.handle(event(1, 'tool.started', { toolName: 'website' }))
-  presenter.handle(event(2, 'run.completed', { visibleOutput: false }))
+  presenter.handle(event(2, 'run.completed', { completionKind: 'reply_text' }))
   presenter.handle(event(3, 'tool.started', { toolName: 'weather' }))
   await presenter.drain('run-private-value')
 

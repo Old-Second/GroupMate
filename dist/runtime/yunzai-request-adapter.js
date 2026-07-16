@@ -1,5 +1,7 @@
 import { parseAgentMessage } from '../agent/contracts/content.js';
+import { parsePresentationRoute } from '../agent/contracts/interaction.js';
 import { resolveConversationScope } from '../agent/session/conversation-scope.js';
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js';
 import { buildModelMessageInput } from './message-input.js';
 function identifier(value, label) {
     if ((typeof value !== 'string' && typeof value !== 'number') ||
@@ -58,6 +60,39 @@ function frozenBudget(input) {
         maxBytes: input.maxBytes
     });
 }
+function frozenPresentationRoute(requestKind, intent, sessionAddress, actorId, requestMessageId) {
+    const profile = requestKind === 'ordinary_chat' ? 'ordinary' : 'proactive';
+    parsePresentationRoute({
+        schemaVersion: 1,
+        requestKind,
+        profile,
+        presentationIntent: intent,
+        sessionAddress,
+        actorId,
+        ...(requestMessageId === null ? {} : { requestMessageId })
+    });
+    const presentationIntent = intent.kind === 'ordinary'
+        ? Object.freeze({
+            schemaVersion: intent.schemaVersion,
+            kind: intent.kind,
+            forcePicture: intent.forcePicture
+        })
+        : Object.freeze({
+            schemaVersion: intent.schemaVersion,
+            kind: intent.kind,
+            recallAfterMs: intent.recallAfterMs
+        });
+    const raw = Object.freeze({
+        schemaVersion: 1,
+        requestKind,
+        profile,
+        presentationIntent,
+        sessionAddress,
+        actorId,
+        ...(requestMessageId === null ? {} : { requestMessageId })
+    });
+    return parsePresentationRoute(raw);
+}
 export async function adaptYunzaiRequest(input) {
     const createdAt = timestamp(input.createdAt, 'request creation timestamp');
     const deadlineAt = timestamp(input.deadlineAt, 'request deadline');
@@ -65,6 +100,9 @@ export async function adaptYunzaiRequest(input) {
         throw new TypeError('request deadline is invalid');
     }
     const requestId = identifier(input.requestId, 'request ID');
+    if (typeof input.requestRef !== 'string' || !RUN_REF_PATTERN.test(input.requestRef)) {
+        throw new TypeError('request reference is invalid');
+    }
     const botId = identifier(input.event.self_id ?? input.event.bot?.uin, 'bot identity');
     const actorId = identifier(input.event.sender?.user_id ?? input.event.user_id, 'actor identity');
     const isGroup = input.event.isGroup === true;
@@ -128,8 +166,12 @@ export async function adaptYunzaiRequest(input) {
         input.sessionTtlSeconds <= 0)) {
         throw new TypeError('session TTL is invalid');
     }
+    const presentationRoute = frozenPresentationRoute(input.requestKind, input.presentationIntent, sessionAddress, actorId, messageInput.currentMessageId);
     return Object.freeze({
         requestId,
+        requestRef: input.requestRef,
+        requestKind: input.requestKind,
+        presentationRoute,
         createdAt,
         deadlineAt,
         sessionAddress,

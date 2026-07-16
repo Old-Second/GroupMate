@@ -16,6 +16,12 @@ export class RunStoreConflictError extends AgentError {
         this.code = 'checkpoint_conflict';
     }
 }
+export class RunReferenceConflictError extends RunStoreConflictError {
+    constructor() {
+        super();
+        this.name = 'RunReferenceConflictError';
+    }
+}
 const CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TOMBSTONE_KEYS = Object.freeze([
     'schemaVersion', 'runId', 'sessionId', 'revision', 'status', 'finishedAt',
@@ -71,7 +77,7 @@ export function createRunTombstone(checkpoint) {
         revision: checkpoint.revision,
         status: checkpoint.status,
         finishedAt: checkpoint.updatedAt,
-        visibleOutput: checkpoint.visibleOutput,
+        visibleOutput: checkpoint.completion?.kind === 'already_visible',
         errorCode: checkpoint.error?.code ?? null,
         cancellationReason: checkpoint.cancellationReason,
         providerRetries: checkpoint.budgetCounters.providerRetries,

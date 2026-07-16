@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import type { AgentMessage } from '../../src/agent/contracts/content.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
@@ -8,6 +9,11 @@ import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-pro
 import { RunAdmission } from '../../src/agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import { RunEngine } from '../../src/agent/run/run-engine.js'
+import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
+import {
+  RunReferenceConflictError,
+  type RunStore
+} from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import { RedisAgentSessionStore } from '../../src/agent/session/redis-agent-session-store.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
@@ -27,7 +33,7 @@ import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
 import { AgentService } from '../../src/runtime/agent-service.js'
 import { getAgentServiceBridge } from '../../src/runtime/agent-service-bridge.js'
 import { RunProgressPresenter } from '../../src/runtime/run-progress-presenter.js'
-import type { YunzaiAgentRequest } from '../../src/runtime/yunzai-request-adapter.js'
+import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
 
@@ -47,7 +53,7 @@ const intent = Object.freeze({
   replyMessageId: null
 })
 
-function request (id: string, text: string): YunzaiAgentRequest {
+function request (id: string, text: string): YunzaiAgentRequestDraft {
   const message: AgentMessage = Object.freeze({
     id: `message-${id}`,
     role: 'user',
@@ -58,14 +64,30 @@ function request (id: string, text: string): YunzaiAgentRequest {
       sourceId: `message-${id}`, createdAt
     })
   })
+  const sessionAddress = Object.freeze({
+    botId: 'bot-1',
+    scope: Object.freeze({ kind: 'group_user' as const, groupId: 'group-1', userId: 'actor-1' })
+  })
   return Object.freeze({
     requestId: id,
+    requestRef: createHash('sha256').update(`request:${id}`).digest('hex').slice(0, 32),
+    requestKind: 'ordinary_chat',
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1,
+        kind: 'ordinary',
+        forcePicture: false
+      }),
+      sessionAddress,
+      actorId: 'actor-1',
+      requestMessageId: message.id
+    }),
     createdAt,
     deadlineAt: '2026-07-14T01:04:00.000Z',
-    sessionAddress: Object.freeze({
-      botId: 'bot-1',
-      scope: Object.freeze({ kind: 'group_user', groupId: 'group-1', userId: 'actor-1' })
-    }),
+    sessionAddress,
     actor: Object.freeze({ userId: 'actor-1', role: 'owner' }),
     channel: Object.freeze({ kind: 'group', botId: 'bot-1', groupId: 'group-1' }),
     message,
@@ -213,6 +235,43 @@ class SerialAdapter implements ModelAdapter {
   }
 }
 
+class InjectedCollisionRunStore implements RunStore {
+  readonly base = new InMemoryRunStore()
+  createCalls = 0
+  readonly #collisions: number
+
+  constructor (collisions: number) {
+    this.#collisions = collisions
+  }
+
+  create: RunStore['create'] = async checkpoint => {
+    this.createCalls += 1
+    if (this.createCalls <= this.#collisions) throw new RunReferenceConflictError()
+    return await this.base.create(checkpoint)
+  }
+
+  load: RunStore['load'] = async runId => await this.base.load(runId)
+  upgrade: RunStore['upgrade'] = async (expected, next) => (
+    await this.base.upgrade(expected, next)
+  )
+
+  compareAndSet: RunStore['compareAndSet'] = async (expected, next) => (
+    await this.base.compareAndSet(expected, next)
+  )
+
+  appendEvents: RunStore['appendEvents'] = async (expected, events) => (
+    await this.base.appendEvents(expected, events)
+  )
+
+  finish: RunStore['finish'] = async (expected, summary) => (
+    await this.base.finish(expected, summary)
+  )
+
+  loadTombstone: RunStore['loadTombstone'] = async runId => (
+    await this.base.loadTombstone(runId)
+  )
+}
+
 test('AgentService owns context, progress, run execution and terminal session writes', async () => {
   const redis = new FakeRedis(() => Date.parse(createdAt))
   const sessions = new RedisAgentSessionStore({
@@ -309,6 +368,122 @@ test('AgentService owns context, progress, run execution and terminal session wr
   assert.equal(firstBridge, secondBridge)
   assert.equal(firstBridge.conversations, service.conversations)
   assert.equal(bridgeCreations, 1)
+})
+
+test('AgentService retries one runRef collision and fails the second with zero model or tool calls', async () => {
+  for (const collisions of [1, 2]) {
+    const redis = new FakeRedis(() => Date.parse(createdAt))
+    const sessions = new RedisAgentSessionStore({
+      redis,
+      now: () => new Date(createdAt),
+      generateId: () => `session-collision-${collisions}`
+    })
+    const runStore = new InjectedCollisionRunStore(collisions)
+    let providerCalls = 0
+    let toolPreparations = 0
+    let toolExecutions = 0
+    let runtimeCreations = 0
+    const adapter: ModelAdapter = Object.freeze({
+      complete: async () => {
+        providerCalls += 1
+        return Object.freeze({
+          text: '碰撞恢复完成。',
+          finishReason: 'stop' as const,
+          toolCalls: Object.freeze([])
+        })
+      }
+    })
+    const delegateRuntime = new ServiceToolRuntime()
+    const toolRuntime: ToolRuntime = Object.freeze({
+      prepare: async (...args: Parameters<ToolRuntime['prepare']>) => {
+        toolPreparations += 1
+        return await delegateRuntime.prepare(args[0])
+      },
+      executePrepared: async (...args: Parameters<ToolRuntime['executePrepared']>) => {
+        toolExecutions += 1
+        return await delegateRuntime.executePrepared(args[0])
+      }
+    })
+    const definitions = Object.freeze([toolDefinition('website')])
+    const snapshot = new ToolRegistry(definitions).createSnapshot({
+      id: `snapshot-collision-${collisions}`,
+      facts,
+      enabledTools: ['website']
+    })
+    let generated = 0
+    let runRefIndex = 0
+    const runRefs = ['5'.repeat(32), '6'.repeat(32)] as const
+    const service = new AgentService({
+      sessions,
+      runStore,
+      admission: new RunAdmission({
+        client: redis,
+        generateId: () => `collision-lease-${collisions}-${++generated}`
+      }),
+      contextEngine: new ContextEngine({
+        estimator: {
+          estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
+          estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
+        },
+        memoryStore: new NoopMemoryStore()
+      }),
+      progressPresenter: new RunProgressPresenter(),
+      createEngine: observer => new RunEngine({
+        adapter,
+        profile: standardOpenAIProfile,
+        scheduler: new ToolScheduler({ runtime: toolRuntime }),
+        store: runStore,
+        budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
+        now: () => new Date(createdAt),
+        generateId: () => `collision-engine-${collisions}-${++generated}`,
+        observer
+      }),
+      createRuntime: async () => {
+        runtimeCreations += 1
+        return Object.freeze({
+          binding: Object.freeze({
+            snapshot,
+            prepareToolContext: async (): Promise<ToolPreparationContext> => Object.freeze({
+              runId: 'collision-run', profile: 'compatible', facts, intent, now: createdAt
+            }),
+            contextFor: async (): Promise<ToolExecutionContext> => Object.freeze({
+              runId: 'collision-run', profile: 'compatible', facts, intent, now: createdAt
+            })
+          })
+        })
+      },
+      now: () => new Date(createdAt),
+      generateId: () => `collision-service-${collisions}-${++generated}`,
+      createRunRef: () => runRefs[Math.min(runRefIndex++, 1)]
+    })
+
+    const result = await service.handle(request(
+      `collision-request-${collisions}`,
+      '验证运行引用碰撞'
+    ))
+
+    assert.equal(runStore.createCalls, 2)
+    assert.equal(runtimeCreations, 1)
+    if (collisions === 1) {
+      assert.equal(result.kind, 'completed')
+      assert.equal(result.runRef, runRefs[1])
+      assert.equal(providerCalls, 1)
+      const stored = await runStore.base.load(result.runId)
+      assert.equal(stored?.schemaVersion, 2)
+      assert.equal(stored?.schemaVersion === 2 ? stored.runRef : null, runRefs[1])
+      assert.deepEqual(
+        stored?.schemaVersion === 2 ? stored.observationPolicy : null,
+        createFrozenObservationPolicy({ levelAtStart: 'basic', runRef: runRefs[1] })
+      )
+    } else {
+      assert.equal(result.kind, 'failed')
+      assert.equal(result.kind === 'failed' ? result.error.code : null, 'checkpoint_conflict')
+      assert.equal(await runStore.base.load(result.runId), null)
+      assert.equal(providerCalls, 0)
+    }
+    assert.equal(toolPreparations, 0)
+    assert.equal(toolExecutions, 0)
+  }
 })
 
 test('AgentService serializes active runs for the same canonical session', async () => {

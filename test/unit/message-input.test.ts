@@ -129,6 +129,13 @@ test('Yunzai request adapter freezes group addressing and quoted message referen
     currentPrompt: 'current request',
     groupMerge: false,
     requestId: 'request-1',
+    requestRef: '11111111111111111111111111111111',
+    requestKind: 'ordinary_chat',
+    presentationIntent: {
+      schemaVersion: 1,
+      kind: 'ordinary',
+      forcePicture: true
+    },
     createdAt: '2026-07-14T01:00:00.000Z',
     deadlineAt: '2026-07-14T01:04:00.000Z',
     systemInstructions: ['system fixture'],
@@ -153,6 +160,23 @@ test('Yunzai request adapter freezes group addressing and quoted message referen
   assert.deepEqual(request.references, {
     currentMessageId: 'current-message-1', quotedMessageId: 'quoted-message-1'
   })
+  assert.equal(request.requestRef, '11111111111111111111111111111111')
+  assert.equal(request.requestKind, 'ordinary_chat')
+  assert.equal(Object.hasOwn(request, 'runRef'), false)
+  assert.equal(Object.hasOwn(request, 'schemaVersion'), false)
+  assert.deepEqual(request.presentationRoute, {
+    schemaVersion: 1,
+    requestKind: 'ordinary_chat',
+    profile: 'ordinary',
+    presentationIntent: {
+      schemaVersion: 1,
+      kind: 'ordinary',
+      forcePicture: true
+    },
+    sessionAddress: request.sessionAddress,
+    actorId: 'actor-1',
+    requestMessageId: 'current-message-1'
+  })
   assert.equal(request.message.replyTo?.messageId, 'quoted-message-1')
   assert.equal(request.message.replyTo?.sender.userId, 'actor-2')
   assert.equal(request.message.parts.some(part => (
@@ -165,6 +189,13 @@ test('Yunzai request adapter freezes group addressing and quoted message referen
 test('Yunzai request adapter preserves merged group scope without trusting missing identities', async () => {
   const base = {
     currentPrompt: 'hello', groupMerge: true, requestId: 'request-2',
+    requestRef: '22222222222222222222222222222222',
+    requestKind: 'proactive_chat' as const,
+    presentationIntent: {
+      schemaVersion: 1 as const,
+      kind: 'proactive' as const,
+      recallAfterMs: 100_000
+    },
     createdAt: '2026-07-14T01:00:00.000Z', deadlineAt: '2026-07-14T01:04:00.000Z',
     systemInstructions: ['system fixture'],
     model: {
@@ -185,10 +216,68 @@ test('Yunzai request adapter preserves merged group scope without trusting missi
     }
   })
   assert.deepEqual(merged.sessionAddress.scope, { kind: 'group', groupId: 'group-1' })
+  assert.deepEqual(merged.presentationRoute, {
+    schemaVersion: 1,
+    requestKind: 'proactive_chat',
+    profile: 'proactive',
+    presentationIntent: {
+      schemaVersion: 1,
+      kind: 'proactive',
+      recallAfterMs: 100_000
+    },
+    sessionAddress: merged.sessionAddress,
+    actorId: 'actor-1'
+  })
   await assert.rejects(adaptYunzaiRequest({
     ...base,
     event: { isGroup: false, user_id: 'actor-1', message: [] }
   }), /bot identity/i)
+})
+
+test('Yunzai request adapter rejects crossed or non-exact trusted intent input', async () => {
+  const base = {
+    event: {
+      isGroup: false,
+      self_id: 'bot-1',
+      user_id: 'actor-1',
+      sender: { user_id: 'actor-1', role: 'member' },
+      message: []
+    },
+    currentPrompt: 'hello',
+    groupMerge: false,
+    requestId: 'request-crossed',
+    requestRef: '33333333333333333333333333333333',
+    requestKind: 'ordinary_chat' as const,
+    createdAt: '2026-07-14T01:00:00.000Z',
+    deadlineAt: '2026-07-14T01:04:00.000Z',
+    systemInstructions: ['system fixture'],
+    model: {
+      model: 'fixture-model', streaming: false, maxOutputTokens: 256,
+      reasoning: { enabled: false }
+    },
+    contextBudget: {
+      modelContextTokens: 4_096, reservedOutputTokens: 256,
+      reservedToolTokens: 512, safetyMarginTokens: 128,
+      maxItems: 32, maxBytes: 128 * 1_024
+    }
+  }
+  await assert.rejects(adaptYunzaiRequest({
+    ...base,
+    presentationIntent: {
+      schemaVersion: 1,
+      kind: 'proactive',
+      recallAfterMs: null
+    }
+  }), /matrix|intent/i)
+  await assert.rejects(adaptYunzaiRequest({
+    ...base,
+    presentationIntent: {
+      schemaVersion: 1,
+      kind: 'ordinary',
+      forcePicture: false,
+      transportOverride: true
+    } as never
+  }), /unknown|intent/i)
 })
 
 test('uses the private reader and source time for private replies', async () => {

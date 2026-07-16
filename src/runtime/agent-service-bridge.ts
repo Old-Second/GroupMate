@@ -3,7 +3,10 @@ import {
   AgentError,
   serializeAgentError
 } from '../agent/contracts/error.js'
-import type { AgentContentPart, AgentMessage } from '../agent/contracts/content.js'
+import type {
+  PresentationIntentV1,
+  TrustedRequestKind
+} from '../agent/contracts/interaction.js'
 import type { RunAdvanceResult } from '../agent/contracts/result.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
 import type { ContextItem } from '../agent/context/context-item.js'
@@ -20,6 +23,7 @@ import type { ApprovalInterruption } from '../agent/run/interruption.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../agent/run/run-budget.js'
 import { RunEngine } from '../agent/run/run-engine.js'
+import { createRequestRef } from '../agent/run/run-reference.js'
 import type {
   RunApprovalDecisionCommand,
   RunApprovalDisplayCommand,
@@ -55,6 +59,7 @@ import {
 import {
   adaptYunzaiRequest,
   type YunzaiAgentRequest,
+  type YunzaiAgentRequestDraft,
   type YunzaiRequestEvent
 } from './yunzai-request-adapter.js'
 
@@ -93,6 +98,7 @@ export interface YunzaiAgentServiceBridgeOptions extends Omit<
   }
   readonly now?: () => Date
   readonly generateId?: () => string
+  readonly createRequestRef?: () => string
 }
 
 export interface YunzaiAgentHandleOptions {
@@ -102,6 +108,7 @@ export interface YunzaiAgentHandleOptions {
   readonly reasoningEffort?: unknown
   readonly progress?: ProgressDelivery
   readonly sessionTtlSeconds?: number
+  readonly presentationIntent: PresentationIntentV1
 }
 
 type ShutdownSignal = 'SIGINT' | 'SIGTERM'
@@ -137,14 +144,14 @@ export class AgentServiceBridge {
   }
 
   async handle (
-    request: YunzaiAgentRequest,
+    request: YunzaiAgentRequestDraft,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#service.handle(request, options)
   }
 
   async handleEphemeral (
-    request: YunzaiAgentRequest,
+    request: YunzaiAgentRequestDraft,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope> {
     return await this.#service.handleEphemeral(request, options)
@@ -368,7 +375,7 @@ function groupContextItem (
 }
 
 function runtimeIdentityItem (
-  request: YunzaiAgentRequest,
+  request: YunzaiAgentRequestDraft,
   event: YunzaiMessageEvent
 ): ContextItem {
   const eventValue = event as YunzaiRecord
@@ -449,22 +456,6 @@ async function loadGroupContext (
   }
 }
 
-function contentPartText (part: AgentContentPart): string {
-  switch (part.type) {
-    case 'text': return part.text
-    case 'resource_ref': return `[${part.resourceType}: ${part.resourceId}]`
-    case 'mention': return `@${part.displayName ?? part.userId}`
-    case 'tool_call': return `[工具调用: ${part.name}]`
-    case 'tool_result': return `[工具结果: ${part.status}] ${part.content}`
-  }
-}
-
-function outputText (message: AgentMessage | null): string | null {
-  if (message === null) return null
-  const text = message.parts.map(contentPartText).filter(Boolean).join('\n').trim()
-  return text === '' ? null : text
-}
-
 function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
   const normalized = error instanceof AgentError
     ? error
@@ -480,6 +471,7 @@ function failedEnvelope (runId: string, error: unknown): ChatReplyEnvelope {
   return Object.freeze({
     kind: 'failed',
     runId,
+    runRef: 'unavailable',
     error: serializeAgentError(normalized)
   })
 }
@@ -576,6 +568,7 @@ export class YunzaiAgentServiceBridge {
   readonly #approvalTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #now: () => Date
   readonly #generateId: () => string
+  readonly #createRequestRef: () => string
 
   constructor (input: Readonly<{
     options: YunzaiAgentServiceBridgeOptions
@@ -591,6 +584,7 @@ export class YunzaiAgentServiceBridge {
     this.#prepared = input.prepared
     this.#now = input.options.now ?? (() => new Date())
     this.#generateId = input.options.generateId ?? randomUUID
+    this.#createRequestRef = input.options.createRequestRef ?? createRequestRef
   }
 
   get conversations (): ConversationSessionPort {
@@ -609,17 +603,17 @@ export class YunzaiAgentServiceBridge {
   async handle (
     event: YunzaiMessageEvent,
     prompt: string,
-    options: YunzaiAgentHandleOptions = {}
+    options: YunzaiAgentHandleOptions
   ): Promise<ChatReplyEnvelope> {
-    return await this.#execute(event, prompt, options, false)
+    return await this.#execute(event, prompt, options, 'ordinary_chat')
   }
 
   async handleEphemeral (
     event: YunzaiMessageEvent,
     prompt: string,
-    options: YunzaiAgentHandleOptions = {}
+    options: YunzaiAgentHandleOptions
   ): Promise<ChatReplyEnvelope> {
-    return await this.#execute(event, prompt, options, true)
+    return await this.#execute(event, prompt, options, 'proactive_chat')
   }
 
   async routeApprovalReply (event: YunzaiMessageEvent): Promise<boolean> {
@@ -640,8 +634,9 @@ export class YunzaiAgentServiceBridge {
     event: YunzaiMessageEvent,
     prompt: string,
     options: YunzaiAgentHandleOptions,
-    ephemeral: boolean
+    requestKind: TrustedRequestKind
   ): Promise<ChatReplyEnvelope> {
+    const requestRef = this.#createRequestRef()
     const requestId = this.#generateId()
     let runId = requestId
     try {
@@ -666,6 +661,9 @@ export class YunzaiAgentServiceBridge {
         currentPrompt: `${prompt}${toolRun.promptAddition}`,
         groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
         requestId,
+        requestRef,
+        requestKind,
+        presentationIntent: options.presentationIntent,
         createdAt,
         deadlineAt: new Date(new Date(createdAt).getTime() + RUN_DEADLINE_MS).toISOString(),
         systemInstructions: requestSystemInstructions(this.#options.config, options, toolRun),
@@ -681,7 +679,7 @@ export class YunzaiAgentServiceBridge {
         groupContext,
         ...(options.progress === undefined ? {} : { progress: options.progress })
       }))
-      const result = ephemeral
+      const result = requestKind === 'proactive_chat'
         ? await this.#bridge.handleEphemeral(request)
         : await this.#bridge.handle(request)
       runId = result.runId
@@ -780,7 +778,9 @@ export class YunzaiAgentServiceBridge {
     }
     try {
       if (result.kind === 'completed') {
-        const text = outputText(result.output)
+        const text = result.completion.kind === 'reply_text'
+          ? result.completion.text
+          : null
         if (text !== null && event.reply !== undefined) {
           await event.reply(text, event.isGroup === true, { recallMsg: 0 })
         }
@@ -969,6 +969,7 @@ function createYunzaiAgentServiceBridge (
     },
     now,
     generateId,
+    observationLevel: () => options.config.observabilityLevel,
     onRunLog: entry => options.logger?.info?.(entry),
     onObserverFailure: entry => options.logger?.error?.(entry)
   })

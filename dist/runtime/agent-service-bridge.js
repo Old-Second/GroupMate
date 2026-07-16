@@ -7,6 +7,7 @@ import { OpenAICompatibleAdapter } from '../agent/model/openai-compatible-adapte
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { RunEngine } from '../agent/run/run-engine.js';
+import { createRequestRef } from '../agent/run/run-reference.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { ToolScheduler } from '../agent/run/tool-scheduler.js';
 import { RedisAgentSessionStore } from '../agent/session/redis-agent-session-store.js';
@@ -257,21 +258,6 @@ async function loadGroupContext(options, event, requestId, createdAt, enabled) {
         return Object.freeze([]);
     }
 }
-function contentPartText(part) {
-    switch (part.type) {
-        case 'text': return part.text;
-        case 'resource_ref': return `[${part.resourceType}: ${part.resourceId}]`;
-        case 'mention': return `@${part.displayName ?? part.userId}`;
-        case 'tool_call': return `[工具调用: ${part.name}]`;
-        case 'tool_result': return `[工具结果: ${part.status}] ${part.content}`;
-    }
-}
-function outputText(message) {
-    if (message === null)
-        return null;
-    const text = message.parts.map(contentPartText).filter(Boolean).join('\n').trim();
-    return text === '' ? null : text;
-}
 function failedEnvelope(runId, error) {
     const normalized = error instanceof AgentError
         ? error
@@ -287,6 +273,7 @@ function failedEnvelope(runId, error) {
     return Object.freeze({
         kind: 'failed',
         runId,
+        runRef: 'unavailable',
         error: serializeAgentError(normalized)
     });
 }
@@ -378,6 +365,7 @@ export class YunzaiAgentServiceBridge {
     #approvalTimers = new Map();
     #now;
     #generateId;
+    #createRequestRef;
     constructor(input) {
         this.#options = input.options;
         this.#bridge = input.bridge;
@@ -386,6 +374,7 @@ export class YunzaiAgentServiceBridge {
         this.#prepared = input.prepared;
         this.#now = input.options.now ?? (() => new Date());
         this.#generateId = input.options.generateId ?? randomUUID;
+        this.#createRequestRef = input.options.createRequestRef ?? createRequestRef;
     }
     get conversations() {
         return this.#bridge.conversations;
@@ -399,11 +388,11 @@ export class YunzaiAgentServiceBridge {
         this.#prepared.clear();
         return shutdown;
     }
-    async handle(event, prompt, options = {}) {
-        return await this.#execute(event, prompt, options, false);
+    async handle(event, prompt, options) {
+        return await this.#execute(event, prompt, options, 'ordinary_chat');
     }
-    async handleEphemeral(event, prompt, options = {}) {
-        return await this.#execute(event, prompt, options, true);
+    async handleEphemeral(event, prompt, options) {
+        return await this.#execute(event, prompt, options, 'proactive_chat');
     }
     async routeApprovalReply(event) {
         const masters = await this.#options.getMasterIds();
@@ -419,7 +408,8 @@ export class YunzaiAgentServiceBridge {
             await this.#presentRunResultSafely(event, result);
         });
     }
-    async #execute(event, prompt, options, ephemeral) {
+    async #execute(event, prompt, options, requestKind) {
+        const requestRef = this.#createRequestRef();
         const requestId = this.#generateId();
         let runId = requestId;
         try {
@@ -438,6 +428,9 @@ export class YunzaiAgentServiceBridge {
                 currentPrompt: `${prompt}${toolRun.promptAddition}`,
                 groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
                 requestId,
+                requestRef,
+                requestKind,
+                presentationIntent: options.presentationIntent,
                 createdAt,
                 deadlineAt: new Date(new Date(createdAt).getTime() + RUN_DEADLINE_MS).toISOString(),
                 systemInstructions: requestSystemInstructions(this.#options.config, options, toolRun),
@@ -453,7 +446,7 @@ export class YunzaiAgentServiceBridge {
                 groupContext,
                 ...(options.progress === undefined ? {} : { progress: options.progress })
             }));
-            const result = ephemeral
+            const result = requestKind === 'proactive_chat'
                 ? await this.#bridge.handleEphemeral(request)
                 : await this.#bridge.handle(request);
             runId = result.runId;
@@ -527,7 +520,9 @@ export class YunzaiAgentServiceBridge {
         }
         try {
             if (result.kind === 'completed') {
-                const text = outputText(result.output);
+                const text = result.completion.kind === 'reply_text'
+                    ? result.completion.text
+                    : null;
                 if (text !== null && event.reply !== undefined) {
                     await event.reply(text, event.isGroup === true, { recallMsg: 0 });
                 }
@@ -690,6 +685,7 @@ function createYunzaiAgentServiceBridge(options) {
         },
         now,
         generateId,
+        observationLevel: () => options.config.observabilityLevel,
         onRunLog: entry => options.logger?.info?.(entry),
         onObserverFailure: entry => options.logger?.error?.(entry)
     });
