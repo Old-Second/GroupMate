@@ -229,6 +229,8 @@ test('createRunTerminalSnapshot projects exact safe terminal fields and text len
     assert.equal(snapshot.cancellationReason, null)
     assert.equal(snapshot.engineDurationMs, 13)
     assert.equal(snapshot.engineDurationMs, snapshot.counters.engineActiveDurationMs)
+    assert.equal(Object.hasOwn(checkpoint, 'traceMetricSummary'), false)
+    assert.equal(Object.hasOwn(snapshot, 'traceMetricSummary'), false)
     const encoded = JSON.stringify(snapshot)
     assert.equal(encoded.includes(text), false)
     assert.equal(encoded.includes('run-private-id'), false)

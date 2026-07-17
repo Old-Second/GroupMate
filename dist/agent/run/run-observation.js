@@ -355,8 +355,7 @@ export function createFrozenObservationPolicy(input) {
     });
 }
 export function parseFrozenObservationPolicy(value) {
-    const policy = record(value, 'observation policy');
-    exactKeys(policy, ['schemaVersion', 'levelAtStart', 'sampledSuccess'], 'observation policy');
+    const policy = exactOwnData(value, ['schemaVersion', 'levelAtStart', 'sampledSuccess'], 'observation policy');
     if (policy.schemaVersion !== 1 ||
         (policy.levelAtStart !== 'off' && policy.levelAtStart !== 'basic' &&
             policy.levelAtStart !== 'diagnostic') ||

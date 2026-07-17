@@ -1,6 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
+import { parseProviderAttemptEventPayload } from '../contracts/event.js';
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js';
 import { canonicalSessionKey } from '../session/conversation-scope.js';
 import { completedPreparedCall } from '../tools/prepared-capability.js';
@@ -14,6 +15,7 @@ import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
 import { isTerminalRunStatus } from './run-state.js';
 import { RunReferenceConflictError, RunStoreConflictError } from './run-store.js';
+import { createTraceCandidate } from './run-trace.js';
 import { applyToolPreflight, cancelToolExecutionLedger, countScheduledToolAttempts, completeToolExecutionLedger, createToolExecutionLedger, failRecoveredToolExecutionLedger, failToolExecutionLedger, resetToolExecutionLedgerForRecovery, resolveToolApproval, toolLedgerHasIndeterminate, toolLedgerHasUnresolvedNonRead, toolLedgerHasVisibleOutput, toolLedgerModelMessages, toolLedgerRequiresToolDisabledFinalResponse } from './tool-ledger.js';
 class ModelAttemptFailure extends Error {
     agentError;
@@ -332,6 +334,33 @@ function asAgentError(error) {
         return checkpointConflict(error);
     return internalError(error);
 }
+function pendingProviderAttemptKind(checkpoint, correction) {
+    if (correction)
+        return 'correction';
+    let observedRetries = 0;
+    let observedRecoveries = 0;
+    for (const event of checkpoint.events) {
+        if (event.type !== 'model.attempted')
+            continue;
+        const attemptKind = parseProviderAttemptEventPayload(event.payload).attemptKind;
+        if (attemptKind === 'retry')
+            observedRetries += 1;
+        if (attemptKind === 'recovery')
+            observedRecoveries += 1;
+    }
+    const pendingRetries = checkpoint.budgetCounters.providerRetries - observedRetries;
+    const pendingRecoveries = checkpoint.budgetCounters.recoveryAttempts - observedRecoveries;
+    if ((pendingRetries !== 0 && pendingRetries !== 1) ||
+        (pendingRecoveries !== 0 && pendingRecoveries !== 1) ||
+        (pendingRetries === 1 && pendingRecoveries === 1)) {
+        throw new TypeError('provider attempt reservation history is inconsistent');
+    }
+    if (pendingRecoveries === 1)
+        return 'recovery';
+    if (pendingRetries === 1)
+        return 'retry';
+    return 'primary';
+}
 export class RunEngine {
     #adapter;
     #profile;
@@ -344,6 +373,8 @@ export class RunEngine {
     #createRunRef;
     #createRequestRef;
     #observer;
+    #onCommittedTraceCandidate;
+    #onTraceCandidateProjectionFailure;
     #runtimeBindings = new Map();
     #controllers = new Map();
     #startedToolCalls = new Map();
@@ -361,6 +392,8 @@ export class RunEngine {
         this.#createRunRef = options.createRunRef ?? createRunRef;
         this.#createRequestRef = options.createRequestRef ?? createRequestRef;
         this.#observer = options.observer;
+        this.#onCommittedTraceCandidate = options.onCommittedTraceCandidate;
+        this.#onTraceCandidateProjectionFailure = options.onTraceCandidateProjectionFailure;
     }
     #terminalResult(checkpoint) {
         return terminalResult(checkpoint, this.#terminalFacts.get(checkpoint) ?? null);
@@ -1105,7 +1138,7 @@ export class RunEngine {
         }, []);
         return Object.freeze({ checkpoint: stored, previousUsage });
     }
-    async #completeProviderDispatch(checkpoint, counters, previousUsage, usage) {
+    async #completeProviderDispatch(checkpoint, counters, previousUsage, usage, drafts = []) {
         const observationCounters = Object.freeze({
             ...checkpoint.observationCounters,
             providerInputTokens: mergedProviderUsage(previousUsage.providerInputTokens, usage?.inputTokens),
@@ -1117,7 +1150,7 @@ export class RunEngine {
             budgetCounters: counters,
             observationCounters,
             providerDispatch: Object.freeze({ state: 'idle' })
-        }, []);
+        }, drafts);
     }
     async #attemptModel(checkpoint, reserved, signal, correction) {
         const runtime = this.#runtime(checkpoint.runId);
@@ -1126,6 +1159,7 @@ export class RunEngine {
         let messages = checkpoint.messages;
         let estimatedInputTokens = checkpoint.estimatedInputTokens;
         let recoveryUsed = checkpoint.recoveryUsed;
+        let nextAttemptKind = pendingProviderAttemptKind(checkpoint, correction);
         let current = checkpoint;
         try {
             while (true) {
@@ -1148,20 +1182,35 @@ export class RunEngine {
                 if (isTerminalRunStatus(current.status)) {
                     return Object.freeze({ terminal: true, checkpoint: current });
                 }
+                const attemptKind = nextAttemptKind;
                 const startedAt = this.#safeMonotonicNow();
                 let turn;
                 try {
                     turn = await this.#providerCall(request, signal, timeoutMs);
                 }
                 catch (error) {
-                    if (isAbortError(error) || signal.aborted)
-                        throw new RunAbortedError();
                     const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
-                    counters = this.#budget.recordUsage(counters, { activeRuntimeMs });
-                    current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage);
+                    const accounted = this.#recordProviderUsage(counters, activeRuntimeMs);
+                    counters = accounted.counters;
+                    const aborted = isAbortError(error) || signal.aborted;
+                    const errorCode = aborted ? 'cancelled' : asAgentError(error).code;
+                    current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, undefined, [{
+                            type: 'model.attempted',
+                            payload: Object.freeze({
+                                observationSchemaVersion: 1,
+                                attemptKind,
+                                outcome: aborted ? 'cancelled' : 'failed',
+                                durationMs: activeRuntimeMs,
+                                errorCode
+                            })
+                        }]);
                     if (isTerminalRunStatus(current.status)) {
                         return Object.freeze({ terminal: true, checkpoint: current });
                     }
+                    if (aborted)
+                        throw new RunAbortedError();
+                    if (accounted.budgetError !== null)
+                        throw accounted.budgetError;
                     if (error instanceof ModelProviderError) {
                         const recoveryHint = this.#profile.recoveryHint(error);
                         const recoveryAllowed = reserved.kind === 'normal' &&
@@ -1179,6 +1228,7 @@ export class RunEngine {
                                 }
                                 counters = this.#budget.recordRecovery(counters);
                                 recoveryUsed = true;
+                                nextAttemptKind = 'recovery';
                                 messages = Object.freeze([...recovered.messages]);
                                 estimatedInputTokens = recovered.estimatedInputTokens;
                                 current = await this.#commit(current, current.status, {
@@ -1193,6 +1243,7 @@ export class RunEngine {
                         if (error.retryable &&
                             counters.providerRetries < checkpoint.budgetLimits.maxProviderRetries) {
                             counters = this.#budget.recordProviderRetry(counters);
+                            nextAttemptKind = correction ? 'correction' : 'retry';
                             current = await this.#commit(current, current.status, {
                                 budgetCounters: counters
                             }, []);
@@ -1203,14 +1254,23 @@ export class RunEngine {
                     throw internalError(error);
                 }
                 const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
-                counters = this.#budget.recordUsage(counters, {
-                    activeRuntimeMs,
-                    providerReportedTokens: turn.usage?.totalTokens ?? 0
-                });
-                current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, turn.usage);
+                const accounted = this.#recordProviderUsage(counters, activeRuntimeMs, turn.usage?.totalTokens ?? 0);
+                counters = accounted.counters;
+                current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, turn.usage, [{
+                        type: 'model.attempted',
+                        payload: Object.freeze({
+                            observationSchemaVersion: 1,
+                            attemptKind,
+                            outcome: 'succeeded',
+                            durationMs: activeRuntimeMs,
+                            errorCode: null
+                        })
+                    }]);
                 if (isTerminalRunStatus(current.status)) {
                     return Object.freeze({ terminal: true, checkpoint: current });
                 }
+                if (accounted.budgetError !== null)
+                    throw accounted.budgetError;
                 return Object.freeze({
                     checkpoint: current,
                     turn,
@@ -1476,7 +1536,17 @@ export class RunEngine {
         const messages = Object.freeze([...checkpoint.messages, ...toolMessages]);
         const estimatedInputTokens = checkpoint.estimatedInputTokens +
             toolMessages.reduce((total, message) => total + estimatedTokensFor(message), 0);
-        const events = completedLedger.calls.map(call => ({
+        const attemptEvents = execution.results.flatMap(result => (result.attemptObservations.map(observation => ({
+            type: 'tool.attempted',
+            payload: Object.freeze({
+                observationSchemaVersion: 1,
+                ordinal: observation.ordinal,
+                outcome: observation.outcome,
+                durationMs: observation.durationMs,
+                resultCode: observation.resultCode
+            })
+        }))));
+        const completionEvents = completedLedger.calls.map((call) => ({
             type: call.result?.status === 'success'
                 ? 'tool.completed'
                 : call.result?.status === 'denied'
@@ -1488,6 +1558,7 @@ export class RunEngine {
                 status: call.status
             }
         }));
+        const events = [...attemptEvents, ...completionEvents];
         const common = {
             messages,
             estimatedInputTokens,
@@ -1597,6 +1668,36 @@ export class RunEngine {
             runSignal.removeEventListener('abort', abort);
         }
     }
+    #recordProviderUsage(counters, activeRuntimeMs, providerReportedTokens = 0) {
+        const boundedActiveRuntimeMs = Math.min(activeRuntimeMs, this.#budget.remainingActiveMs(counters));
+        const boundedProviderReportedTokens = Math.min(providerReportedTokens, Number.MAX_SAFE_INTEGER - counters.providerReportedTokens);
+        let budgetError = null;
+        if (boundedActiveRuntimeMs !== activeRuntimeMs ||
+            boundedProviderReportedTokens !== providerReportedTokens) {
+            try {
+                this.#budget.recordUsage(counters, {
+                    activeRuntimeMs,
+                    providerReportedTokens
+                });
+            }
+            catch (error) {
+                const agentError = asAgentError(error);
+                if (agentError.code !== 'run_budget_exceeded')
+                    throw error;
+                budgetError = agentError;
+            }
+            if (budgetError === null) {
+                throw new TypeError('run budget accepted usage beyond its remaining capacity');
+            }
+        }
+        return Object.freeze({
+            counters: this.#budget.recordUsage(counters, {
+                activeRuntimeMs: boundedActiveRuntimeMs,
+                providerReportedTokens: boundedProviderReportedTokens
+            }),
+            budgetError
+        });
+    }
     #providerTimeout(checkpoint, counters) {
         const deadlineRemaining = new Date(checkpoint.deadlineAt).getTime() - this.#now().getTime();
         const activeRemaining = this.#budget.remainingActiveMs(counters);
@@ -1628,9 +1729,33 @@ export class RunEngine {
             let stored;
             if (isTerminalRunStatus(next.status)) {
                 const snapshot = createRunTerminalSnapshot(next);
+                let candidate = null;
+                let projectionFailed = false;
+                try {
+                    candidate = createTraceCandidate({ checkpoint: next, snapshot });
+                }
+                catch {
+                    projectionFailed = true;
+                }
                 const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot);
                 const terminal = Object.freeze({ snapshot, receipt });
                 this.#terminalFacts.set(next, terminal);
+                if (projectionFailed) {
+                    try {
+                        this.#onTraceCandidateProjectionFailure?.('projection_rejected');
+                    }
+                    catch {
+                        // Trace diagnostics must never change the committed terminal result.
+                    }
+                }
+                if (candidate !== null) {
+                    try {
+                        this.#onCommittedTraceCandidate?.(candidate);
+                    }
+                    catch {
+                        // A committed terminal result is authoritative even if its trace sink fails.
+                    }
+                }
                 stored = next;
             }
             else {

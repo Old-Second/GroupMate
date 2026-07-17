@@ -118,6 +118,20 @@ test('progress presenter ignores model-like text and isolates delivery failures'
     stage: 'tool_started', toolName: 'website', text: 'model supplied private progress'
   }))
   presenter.handle(event(1, 'tool.started', { toolName: 'weather' }))
+  presenter.handle(event(2, 'model.attempted', {
+    observationSchemaVersion: 1,
+    attemptKind: 'primary',
+    outcome: 'succeeded',
+    durationMs: 1,
+    errorCode: null
+  }))
+  presenter.handle(event(3, 'tool.attempted', {
+    observationSchemaVersion: 1,
+    ordinal: 1,
+    outcome: 'succeeded',
+    durationMs: 1,
+    resultCode: null
+  }))
   await presenter.drain('run-private-value')
 
   assert.deepEqual(sent, ['正在查询天气'])

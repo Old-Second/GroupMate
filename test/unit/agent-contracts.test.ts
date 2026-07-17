@@ -231,6 +231,72 @@ test('event parser accepts only stable events with primitive payloads', () => {
   assert.throws(() => parseAgentEvent({ ...event, payload: { nested: { secret: true } } }))
 })
 
+test('attempt events use exact body-free payloads without invoking accessors', () => {
+  const base = {
+    eventVersion: 1,
+    eventId: 'event-attempt',
+    runId: 'run-private',
+    sessionId: 'session-private',
+    sequence: 1,
+    occurredAt: '2026-07-13T00:00:00.000Z'
+  } as const
+  const provider = {
+    ...base,
+    type: 'model.attempted',
+    payload: {
+      observationSchemaVersion: 1,
+      attemptKind: 'retry',
+      outcome: 'failed',
+      durationMs: 20,
+      errorCode: 'provider_unavailable'
+    }
+  } as const
+  const tool = {
+    ...base,
+    type: 'tool.attempted',
+    payload: {
+      observationSchemaVersion: 1,
+      ordinal: 2,
+      outcome: 'denied',
+      durationMs: 11,
+      resultCode: 'permission_denied'
+    }
+  } as const
+  assert.deepEqual(parseAgentEvent(provider), provider)
+  assert.deepEqual(parseAgentEvent(tool), tool)
+  for (const value of [
+    { ...provider, payload: { ...provider.payload, callId: 'private-call' } },
+    { ...provider, payload: { ...provider.payload, durationMs: -1 } },
+    { ...provider, payload: { ...provider.payload, outcome: 'succeeded' } },
+    { ...tool, payload: { ...tool.payload, toolName: 'private-tool' } },
+    { ...tool, payload: { ...tool.payload, ordinal: 3 } },
+    { ...tool, payload: { ...tool.payload, resultCode: null } }
+  ]) {
+    assert.throws(() => parseAgentEvent(value), TypeError)
+  }
+
+  let getterCalls = 0
+  const hostilePayload = Object.create(null)
+  Object.defineProperties(hostilePayload, {
+    observationSchemaVersion: { value: 1, enumerable: true },
+    attemptKind: {
+      enumerable: true,
+      get () {
+        getterCalls += 1
+        return 'primary'
+      }
+    },
+    outcome: { value: 'succeeded', enumerable: true },
+    durationMs: { value: 1, enumerable: true },
+    errorCode: { value: null, enumerable: true }
+  })
+  assert.throws(() => parseAgentEvent({
+    ...provider,
+    payload: hostilePayload
+  }), TypeError)
+  assert.equal(getterCalls, 0)
+})
+
 test('result parser rejects unsafe failed-result details', () => {
   assert.throws(() => parseAgentResult({
     status: 'failed',

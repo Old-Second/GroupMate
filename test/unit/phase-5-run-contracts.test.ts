@@ -432,6 +432,8 @@ test('cross-validates terminal result kind, payload and exact receipt identity',
   assert.equal(parseRunAdvanceResult(completed).kind, 'completed')
   assert.equal(parseRunAdvanceResult(failed).kind, 'failed')
   assert.equal(parseRunAdvanceResult(cancelled).kind, 'cancelled')
+  assert.equal(Object.hasOwn(completed.terminal.snapshot, 'traceMetricSummary'), false)
+  assert.equal(Object.hasOwn(completed.terminal, 'traceCandidate'), false)
 
   for (const valid of [
     { ...failed, runRef: 'unavailable', terminal: null },

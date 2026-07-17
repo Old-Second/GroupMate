@@ -8,10 +8,16 @@ import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-pro
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import {
   nextRunCheckpoint,
+  parseRunCheckpoint,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
-import { RunEngine, type StartRunInput } from '../../src/agent/run/run-engine.js'
+import {
+  RunEngine,
+  type RunEngineOptions,
+  type StartRunInput
+} from '../../src/agent/run/run-engine.js'
 import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
+import type { TraceCandidateV1 } from '../../src/agent/run/run-trace.js'
 import {
   RunReferenceConflictError,
   RunStoreConflictError,
@@ -181,6 +187,77 @@ class ActivityOrderStore extends InMemoryRunStore {
   }
 }
 
+class TraceProjectionFailureStore extends InMemoryRunStore {
+  override async create (checkpoint: RunCheckpoint): Promise<RunCheckpoint> {
+    const first = checkpoint.events[0]
+    if (first === undefined) throw new TypeError('initial event is missing')
+    const incompatible = parseRunCheckpoint({
+      ...checkpoint,
+      events: Object.freeze([
+        Object.freeze({ ...first, type: 'run.started' as const }),
+        ...checkpoint.events.slice(1)
+      ])
+    })
+    return await super.create(incompatible)
+  }
+}
+
+class TraceProjectionTerminalRaceStore extends TraceProjectionFailureStore {
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    _next: RunCheckpoint,
+    _snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    const terminal = nextRunCheckpoint(expected, 'cancelled', {
+      modelTurn: null,
+      preparedBatch: null,
+      interruption: null,
+      providerDispatch: Object.freeze({ state: 'idle' }),
+      engineActivity: Object.freeze({ state: 'idle' }),
+      cancellationReason: 'concurrent_terminal'
+    }, [], timestamp)
+    await super.commitTerminal(
+      expected,
+      terminal,
+      createRunTerminalSnapshot(terminal)
+    )
+    throw new RunStoreConflictError()
+  }
+}
+
+class SimulatedProcessCrash extends Error {}
+
+class RetryReservationCrashStore extends InMemoryRunStore {
+  #offline = false
+
+  restoreProcess (): void {
+    this.#offline = false
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    const stored = await super.compareAndSet(expected, next)
+    if (next.budgetCounters.providerRetries >
+      expected.budgetCounters.providerRetries) {
+      this.#offline = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
 function definition (name: string, executionClass: ToolDefinition['executionClass'] = 'read_only'): ToolDefinition {
   return Object.freeze({
     name, version: 1, aliases: Object.freeze([]), description: `${name} fixture`,
@@ -294,6 +371,8 @@ interface HarnessOptions {
   readonly store?: RunStore
   readonly monotonicNow?: () => number
   readonly toolMonotonicNow?: () => number
+  readonly onCommittedTraceCandidate?: RunEngineOptions['onCommittedTraceCandidate']
+  readonly onTraceCandidateProjectionFailure?: RunEngineOptions['onTraceCandidateProjectionFailure']
 }
 
 function harness (
@@ -321,7 +400,13 @@ function harness (
       ? {}
       : { monotonicNow: options.monotonicNow }),
     generateId: () => `generated-${++id}`,
-    observer: event => { events.push(event.type) }
+    observer: event => { events.push(event.type) },
+    ...(options.onCommittedTraceCandidate === undefined
+      ? {}
+      : { onCommittedTraceCandidate: options.onCommittedTraceCandidate }),
+    ...(options.onTraceCandidateProjectionFailure === undefined
+      ? {}
+      : { onTraceCandidateProjectionFailure: options.onTraceCandidateProjectionFailure })
   })
   const input: StartRunInput = Object.freeze({
     runId: 'run-1',
@@ -366,9 +451,9 @@ function harness (
 class TerminalRaceRunStore implements RunStore {
   readonly base = new InMemoryRunStore()
   injected = false
-  readonly #phase: 'provider_reservation' | 'dispatch_completion'
+  readonly #phase: 'provider_reservation' | 'dispatch_completion' | 'terminal_commit'
 
-  constructor (phase: 'provider_reservation' | 'dispatch_completion') {
+  constructor (phase: 'provider_reservation' | 'dispatch_completion' | 'terminal_commit') {
     this.#phase = phase
   }
 
@@ -414,9 +499,26 @@ class TerminalRaceRunStore implements RunStore {
     await this.base.appendEvents(expected, events)
   )
 
-  commitTerminal: RunStore['commitTerminal'] = async (expected, next, snapshot) => (
-    await this.base.commitTerminal(expected, next, snapshot)
-  )
+  commitTerminal: RunStore['commitTerminal'] = async (expected, next, snapshot) => {
+    if (!this.injected && this.#phase === 'terminal_commit') {
+      this.injected = true
+      const terminal = nextRunCheckpoint(expected, 'cancelled', {
+        modelTurn: null,
+        preparedBatch: null,
+        interruption: null,
+        providerDispatch: Object.freeze({ state: 'idle' }),
+        engineActivity: Object.freeze({ state: 'idle' }),
+        cancellationReason: 'concurrent_terminal'
+      }, [], timestamp)
+      await this.base.commitTerminal(
+        expected,
+        terminal,
+        createRunTerminalSnapshot(terminal)
+      )
+      throw new RunStoreConflictError()
+    }
+    return await this.base.commitTerminal(expected, next, snapshot)
+  }
 
   loadTombstone: RunStore['loadTombstone'] = async runId => (
     await this.base.loadTombstone(runId)
@@ -502,11 +604,16 @@ function terminalSnapshot (result: RunAdvanceResult) {
 }
 
 test('RunEngine completes one valid pure-text turn and emits ordered events', async () => {
+  const candidates: TraceCandidateV1[] = []
   const fixture = harness([Object.freeze({
     ...modelText('完成'),
     usage: Object.freeze({ inputTokens: 7, outputTokens: 3, totalTokens: 10 })
   })], {
-    monotonicNow: sequenceClock(0, 5, 9, 20)
+    monotonicNow: sequenceClock(0, 5, 9, 20),
+    onCommittedTraceCandidate: candidate => {
+      candidates.push(candidate)
+      throw new Error('private trace sink failure')
+    }
   })
   const result = await fixture.engine.start(fixture.input)
 
@@ -515,8 +622,18 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
   assert.equal(result.kind === 'completed' ? result.completion.kind : null, 'reply_text')
   assert.deepEqual(fixture.events, [
     'run.created', 'run.started', 'context.prepared', 'model.started',
-    'model.completed', 'run.completed'
+    'model.attempted', 'model.completed', 'run.completed'
   ])
+  assert.equal(candidates.length, 1)
+  assert.equal(candidates[0]?.terminal.status, 'completed')
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count,
+    durationCount: row.duration.count
+  })), [{
+    outcome: 'succeeded', attemptKind: 'primary', count: 1, durationCount: 1
+  }])
   assert.equal(await fixture.store.load('run-1'), null)
   const snapshot = terminalSnapshot(result)
   assert.equal(snapshot?.status, 'completed')
@@ -547,6 +664,52 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
   })
 })
 
+test('RunEngine drops a local trace candidate when terminal CAS loses', async () => {
+  const candidates: TraceCandidateV1[] = []
+  const fixture = harness([modelText('本地终态不应提交')], {
+    store: new TerminalRaceRunStore('terminal_commit'),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'cancelled')
+  assert.equal(candidates.length, 0)
+})
+
+test('RunEngine reports one fixed projection failure without changing the terminal result', async () => {
+  const candidates: TraceCandidateV1[] = []
+  const failures: string[] = []
+  const fixture = harness([modelText('轨迹投影失败不影响回复')], {
+    store: new TraceProjectionFailureStore(),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) },
+    onTraceCandidateProjectionFailure: code => {
+      failures.push(code)
+      throw new Error('private projection failure sink body')
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '轨迹投影失败不影响回复')
+  assert.deepEqual(failures, ['projection_rejected'])
+  assert.equal(candidates.length, 0)
+  assert.notEqual(terminalSnapshot(result), null)
+})
+
+test('RunEngine drops a projection rejection signal when terminal CAS loses', async () => {
+  const failures: string[] = []
+  const fixture = harness([modelText('本地投影和本地终态都不应可见')], {
+    store: new TraceProjectionTerminalRaceStore(),
+    onTraceCandidateProjectionFailure: code => { failures.push(code) }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'cancelled')
+  assert.deepEqual(failures, [])
+})
+
 test('RunEngine records the monotonic activity start only after reservation CAS', async () => {
   const store = new ActivityOrderStore()
   let tick = 0
@@ -575,6 +738,54 @@ test('RunEngine keeps actual Provider wire time above one attempt timeout in the
   assert.equal(result.kind, 'completed')
   assert.equal(terminalSnapshot(result)?.counters.providerActiveDurationMs, 130_000)
   assert.equal(await fixture.store.load('run-1'), null)
+})
+
+test('RunEngine caps delayed Provider completion without losing the attempt observation', async () => {
+  const candidates: TraceCandidateV1[] = []
+  const fixture = harness([modelText('延迟完成')], {
+    monotonicNow: sequenceClock(0, 10, 240_011, 240_020),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'run_budget_exceeded')
+  assert.equal(terminalSnapshot(result)?.counters.providerActiveDurationMs, 240_000)
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count,
+    durationSumMs: row.duration.sumMs
+  })), [{
+    outcome: 'succeeded', attemptKind: 'primary', count: 1, durationSumMs: 240_001
+  }])
+})
+
+test('RunEngine records a delayed failed Provider attempt before enforcing the active budget', async () => {
+  const candidates: TraceCandidateV1[] = []
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: false,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const fixture = harness([unavailable], {
+    monotonicNow: sequenceClock(0, 10, 240_011, 240_020),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'run_budget_exceeded')
+  assert.equal(terminalSnapshot(result)?.counters.providerActiveDurationMs, 240_000)
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count,
+    durationSumMs: row.duration.sumMs
+  })), [{
+    outcome: 'failed', attemptKind: 'primary', count: 1, durationSumMs: 240_001
+  }])
 })
 
 test('RunEngine persists Provider dispatch reservation before wire and trusted usage after success', async () => {
@@ -730,7 +941,10 @@ test('RunEngine uses at most five normal turns and one tools-disabled correction
 })
 
 test('RunEngine corrects one empty response but keeps refusal distinct', async () => {
-  const empty = harness([modelText(''), modelText('纠正后的回答')])
+  const correctedCandidates: TraceCandidateV1[] = []
+  const empty = harness([modelText(''), modelText('纠正后的回答')], {
+    onCommittedTraceCandidate: candidate => { correctedCandidates.push(candidate) }
+  })
   const corrected = await empty.engine.start(empty.input)
   assert.equal(outputText(corrected), '纠正后的回答')
   assert.equal(empty.adapter.requests[1]?.toolMode, 'disabled')
@@ -744,6 +958,14 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
     modelTurns: 2,
     correctionTurns: 1
   })
+  assert.deepEqual(correctedCandidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'succeeded', attemptKind: 'correction', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'primary', count: 1 }
+  ])
 
   const correctionFailure = harness([
     modelText(''),
@@ -857,12 +1079,14 @@ test('RunEngine completes visible tool output without asking the Provider for an
 })
 
 test('RunEngine counts actual scheduler attempts instead of inferring from the final tool result', async () => {
+  const candidates: TraceCandidateV1[] = []
   const fixture = harness([
     modelTools([toolCall(0, 'call-retry', 'normalRead')]),
     modelText('重试后完成')
   ], {
     monotonicNow: sequenceClock(0, 1, 3, 8, 11, 20),
-    toolMonotonicNow: sequenceClock(0, 2, 3, 7)
+    toolMonotonicNow: sequenceClock(0, 2, 3, 7),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
   })
   fixture.tools.scriptedOutcomes.set('call-retry', [
     retryableFailure(),
@@ -886,15 +1110,25 @@ test('RunEngine counts actual scheduler attempts instead of inferring from the f
     toolAttempts: 2,
     engineActiveDurationMs: 20
   })
+  assert.deepEqual(candidates[0]?.metricSummary.toolExecutions.map(row => ({
+    outcome: row.outcome,
+    count: row.count,
+    durationCount: row.duration.count
+  })), [
+    { outcome: 'failed', count: 1, durationCount: 1 },
+    { outcome: 'succeeded', count: 1, durationCount: 1 }
+  ])
 })
 
 test('RunEngine preserves exact counters and cumulative engine time across approval pause and resume', async () => {
+  const candidates: TraceCandidateV1[] = []
   const fixture = harness([
     modelTools([toolCall(0, 'call-approved', 'sideEffect')]),
     modelText('审批后完成')
   ], {
     monotonicNow: sequenceClock(0, 1, 2, 10, 20, 21, 23, 30),
-    toolMonotonicNow: sequenceClock(0, 4)
+    toolMonotonicNow: sequenceClock(0, 4),
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
   })
   fixture.tools.approvalCalls.add('call-approved')
 
@@ -939,6 +1173,10 @@ test('RunEngine preserves exact counters and cumulative engine time across appro
     toolDenied: 0,
     engineActiveDurationMs: 20
   })
+  assert.deepEqual(candidates[0]?.metricSummary.approvals, [
+    { decision: 'approved', count: 1 },
+    { decision: 'requested', count: 1 }
+  ])
 })
 
 test('RunEngine engine duration is the invocation wall span, not parallel attempt durations summed', async () => {
@@ -989,7 +1227,10 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     code: 'provider_unavailable', stage: 'model.response', retryable: true,
     userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
   })
-  const retry = harness([retryable, modelText('重试成功')])
+  const retryCandidates: TraceCandidateV1[] = []
+  const retry = harness([retryable, modelText('重试成功')], {
+    onCommittedTraceCandidate: candidate => { retryCandidates.push(candidate) }
+  })
   const retryResult = await retry.engine.start(retry.input)
   assert.equal(outputText(retryResult), '重试成功')
   const retried = terminalSnapshot(retryResult)
@@ -1017,6 +1258,14 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     recoveryAttempts: 0,
     correctionTurns: 0
   })
+  assert.deepEqual(retryCandidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'failed', attemptKind: 'primary', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
 
   const legacyContext = new ModelProviderError({
     code: 'provider_invalid_request', stage: 'model.response', retryable: false,
@@ -1025,8 +1274,15 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     profileCode: 'deepseek_invalid_legacy_context'
   })
   let recoveries = 0
-  const recovered = harness([legacyContext, modelText('恢复成功')], {
+  const recoveredCandidates: TraceCandidateV1[] = []
+  const recovered = harness([
+    legacyContext,
+    modelTools([toolCall(0, 'recovered-tool', 'normalRead')]),
+    retryable,
+    modelText('恢复成功')
+  ], {
     profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    onCommittedTraceCandidate: candidate => { recoveredCandidates.push(candidate) },
     recoverContext: async () => {
       recoveries += 1
       return Object.freeze({
@@ -1043,7 +1299,7 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     provider: checkpoint?.counters.providerRetries,
     recovery: checkpoint?.counters.recoveryAttempts,
     correction: checkpoint?.counters.correctionTurns
-  }, { provider: 0, recovery: 1, correction: 0 })
+  }, { provider: 1, recovery: 1, correction: 0 })
   assert.deepEqual(checkpoint === null ? null : {
     providerAttempts: checkpoint.counters.providerAttempts,
     modelTurns: checkpoint.counters.modelTurns,
@@ -1051,12 +1307,103 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     recoveryAttempts: checkpoint.counters.recoveryAttempts,
     correctionTurns: checkpoint.counters.correctionTurns
   }, {
-    providerAttempts: 2,
-    modelTurns: 1,
-    providerRetries: 0,
+    providerAttempts: 4,
+    modelTurns: 2,
+    providerRetries: 1,
     recoveryAttempts: 1,
     correctionTurns: 0
   })
+  assert.deepEqual(recoveredCandidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'failed', attemptKind: 'primary', count: 2 },
+    { outcome: 'succeeded', attemptKind: 'recovery', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
+})
+
+test('RunEngine preserves a pending retry attempt kind across process restart', async () => {
+  const store = new RetryReservationCrashStore()
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const crashed = harness([unavailable], { store })
+
+  await assert.rejects(
+    crashed.engine.start(crashed.input),
+    SimulatedProcessCrash
+  )
+  store.restoreProcess()
+
+  const candidates: TraceCandidateV1[] = []
+  const resumed = harness([modelText('重启后重试成功')], {
+    store,
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '重启后重试成功')
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'failed', attemptKind: 'primary', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
+})
+
+test('RunEngine preserves recovery then retry attempt kinds across process restart', async () => {
+  const store = new RetryReservationCrashStore()
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const runtimeOptions = {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简后的请求' }]),
+      estimatedInputTokens: 8
+    })
+  }
+  const crashed = harness([legacyContext, unavailable], {
+    ...runtimeOptions,
+    store
+  })
+
+  await assert.rejects(
+    crashed.engine.start(crashed.input),
+    SimulatedProcessCrash
+  )
+  store.restoreProcess()
+
+  const candidates: TraceCandidateV1[] = []
+  const resumed = harness([modelText('重启后恢复重试成功')], {
+    ...runtimeOptions,
+    store,
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '重启后恢复重试成功')
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'failed', attemptKind: 'primary', count: 1 },
+    { outcome: 'failed', attemptKind: 'recovery', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
 })
 
 test('RunEngine preserves the allowed retry count and the final provider error after exhaustion', async () => {

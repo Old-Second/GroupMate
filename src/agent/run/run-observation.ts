@@ -531,9 +531,8 @@ export function createFrozenObservationPolicy (input: {
 export function parseFrozenObservationPolicy (
   value: unknown
 ): FrozenObservationPolicyV1 {
-  const policy = record(value, 'observation policy')
-  exactKeys(
-    policy,
+  const policy = exactOwnData(
+    value,
     ['schemaVersion', 'levelAtStart', 'sampledSuccess'],
     'observation policy'
   )

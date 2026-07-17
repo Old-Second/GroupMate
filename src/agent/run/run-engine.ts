@@ -6,7 +6,11 @@ import {
   serializeAgentError,
   type SerializedAgentError
 } from '../contracts/error.js'
-import type { AgentEvent, AgentEventType } from '../contracts/event.js'
+import {
+  parseProviderAttemptEventPayload,
+  type AgentEvent,
+  type AgentEventType
+} from '../contracts/event.js'
 import type { SessionAddress } from '../contracts/identity.js'
 import type {
   PresentationRouteV1,
@@ -76,6 +80,12 @@ import {
   type NormalizedRunTombstoneV1,
   type RunStore
 } from './run-store.js'
+import {
+  createTraceCandidate,
+  type ProviderAttemptEventPayloadV1,
+  type TraceCandidateProjectionFailureCode,
+  type TraceCandidateV1
+} from './run-trace.js'
 import {
   applyToolPreflight,
   cancelToolExecutionLedger,
@@ -190,6 +200,10 @@ export interface RunEngineOptions {
   readonly createRunRef?: () => string
   readonly createRequestRef?: () => string
   readonly observer?: (event: AgentEvent) => void | Promise<void>
+  readonly onCommittedTraceCandidate?: (candidate: TraceCandidateV1) => void
+  readonly onTraceCandidateProjectionFailure?: (
+    code: TraceCandidateProjectionFailureCode
+  ) => void
 }
 
 interface EventDraft {
@@ -601,6 +615,31 @@ function asAgentError (error: unknown): AgentError {
   return internalError(error)
 }
 
+function pendingProviderAttemptKind (
+  checkpoint: RunCheckpoint,
+  correction: boolean
+): ProviderAttemptEventPayloadV1['attemptKind'] {
+  if (correction) return 'correction'
+  let observedRetries = 0
+  let observedRecoveries = 0
+  for (const event of checkpoint.events) {
+    if (event.type !== 'model.attempted') continue
+    const attemptKind = parseProviderAttemptEventPayload(event.payload).attemptKind
+    if (attemptKind === 'retry') observedRetries += 1
+    if (attemptKind === 'recovery') observedRecoveries += 1
+  }
+  const pendingRetries = checkpoint.budgetCounters.providerRetries - observedRetries
+  const pendingRecoveries = checkpoint.budgetCounters.recoveryAttempts - observedRecoveries
+  if ((pendingRetries !== 0 && pendingRetries !== 1) ||
+    (pendingRecoveries !== 0 && pendingRecoveries !== 1) ||
+    (pendingRetries === 1 && pendingRecoveries === 1)) {
+    throw new TypeError('provider attempt reservation history is inconsistent')
+  }
+  if (pendingRecoveries === 1) return 'recovery'
+  if (pendingRetries === 1) return 'retry'
+  return 'primary'
+}
+
 export class RunEngine {
   readonly #adapter: ModelAdapter
   readonly #profile: OpenAICompatibleProfile
@@ -613,6 +652,10 @@ export class RunEngine {
   readonly #createRunRef: () => string
   readonly #createRequestRef: () => string
   readonly #observer?: (event: AgentEvent) => void | Promise<void>
+  readonly #onCommittedTraceCandidate?: (candidate: TraceCandidateV1) => void
+  readonly #onTraceCandidateProjectionFailure?: (
+    code: TraceCandidateProjectionFailureCode
+  ) => void
   readonly #runtimeBindings = new Map<string, RunRuntimeBinding>()
   readonly #controllers = new Map<string, AbortController>()
   readonly #startedToolCalls = new Map<string, Set<string>>()
@@ -631,6 +674,8 @@ export class RunEngine {
     this.#createRunRef = options.createRunRef ?? createRunRef
     this.#createRequestRef = options.createRequestRef ?? createRequestRef
     this.#observer = options.observer
+    this.#onCommittedTraceCandidate = options.onCommittedTraceCandidate
+    this.#onTraceCandidateProjectionFailure = options.onTraceCandidateProjectionFailure
   }
 
   #terminalResult (checkpoint: RunCheckpoint): RunAdvanceResult {
@@ -1474,7 +1519,8 @@ export class RunEngine {
     RunObservationCountersV1,
     'providerInputTokens' | 'providerOutputTokens' | 'providerTotalTokens'
     >,
-    usage?: ModelTurn['usage']
+    usage?: ModelTurn['usage'],
+    drafts: readonly EventDraft[] = []
   ): Promise<RunCheckpoint> {
     const observationCounters: RunObservationCountersV1 = Object.freeze({
       ...checkpoint.observationCounters,
@@ -1499,7 +1545,7 @@ export class RunEngine {
       budgetCounters: counters,
       observationCounters,
       providerDispatch: Object.freeze({ state: 'idle' })
-    }, [])
+    }, drafts)
   }
 
   async #attemptModel (
@@ -1514,6 +1560,7 @@ export class RunEngine {
     let messages = checkpoint.messages
     let estimatedInputTokens = checkpoint.estimatedInputTokens
     let recoveryUsed = checkpoint.recoveryUsed
+    let nextAttemptKind = pendingProviderAttemptKind(checkpoint, correction)
     let current = checkpoint
 
     try {
@@ -1537,25 +1584,41 @@ export class RunEngine {
         if (isTerminalRunStatus(current.status)) {
           return Object.freeze({ terminal: true, checkpoint: current })
         }
+        const attemptKind = nextAttemptKind
         const startedAt = this.#safeMonotonicNow()
         let turn: ModelTurn
         try {
           turn = await this.#providerCall(request, signal, timeoutMs)
         } catch (error) {
-          if (isAbortError(error) || signal.aborted) throw new RunAbortedError()
           const activeRuntimeMs = boundedMonotonicDurationMs(
             startedAt,
             this.#safeMonotonicNow()
           )
-          counters = this.#budget.recordUsage(counters, { activeRuntimeMs })
+          const accounted = this.#recordProviderUsage(counters, activeRuntimeMs)
+          counters = accounted.counters
+          const aborted = isAbortError(error) || signal.aborted
+          const errorCode = aborted ? 'cancelled' : asAgentError(error).code
           current = await this.#completeProviderDispatch(
             current,
             counters,
-            reservedDispatch.previousUsage
+            reservedDispatch.previousUsage,
+            undefined,
+            [{
+              type: 'model.attempted',
+              payload: Object.freeze({
+                observationSchemaVersion: 1,
+                attemptKind,
+                outcome: aborted ? 'cancelled' : 'failed',
+                durationMs: activeRuntimeMs,
+                errorCode
+              })
+            }]
           )
           if (isTerminalRunStatus(current.status)) {
             return Object.freeze({ terminal: true, checkpoint: current })
           }
+          if (aborted) throw new RunAbortedError()
+          if (accounted.budgetError !== null) throw accounted.budgetError
           if (error instanceof ModelProviderError) {
             const recoveryHint = this.#profile.recoveryHint(error)
             const recoveryAllowed = reserved.kind === 'normal' &&
@@ -1576,6 +1639,7 @@ export class RunEngine {
                 }
                 counters = this.#budget.recordRecovery(counters)
                 recoveryUsed = true
+                nextAttemptKind = 'recovery'
                 messages = Object.freeze([...recovered.messages])
                 estimatedInputTokens = recovered.estimatedInputTokens
                 current = await this.#commit(current, current.status, {
@@ -1590,6 +1654,7 @@ export class RunEngine {
             if (error.retryable &&
               counters.providerRetries < checkpoint.budgetLimits.maxProviderRetries) {
               counters = this.#budget.recordProviderRetry(counters)
+              nextAttemptKind = correction ? 'correction' : 'retry'
               current = await this.#commit(current, current.status, {
                 budgetCounters: counters
               }, [])
@@ -1603,19 +1668,32 @@ export class RunEngine {
           startedAt,
           this.#safeMonotonicNow()
         )
-        counters = this.#budget.recordUsage(counters, {
+        const accounted = this.#recordProviderUsage(
+          counters,
           activeRuntimeMs,
-          providerReportedTokens: turn.usage?.totalTokens ?? 0
-        })
+          turn.usage?.totalTokens ?? 0
+        )
+        counters = accounted.counters
         current = await this.#completeProviderDispatch(
           current,
           counters,
           reservedDispatch.previousUsage,
-          turn.usage
+          turn.usage,
+          [{
+            type: 'model.attempted',
+            payload: Object.freeze({
+              observationSchemaVersion: 1,
+              attemptKind,
+              outcome: 'succeeded',
+              durationMs: activeRuntimeMs,
+              errorCode: null
+            })
+          }]
         )
         if (isTerminalRunStatus(current.status)) {
           return Object.freeze({ terminal: true, checkpoint: current })
         }
+        if (accounted.budgetError !== null) throw accounted.budgetError
         return Object.freeze({
           checkpoint: current,
           turn,
@@ -1911,7 +1989,19 @@ export class RunEngine {
     const messages = Object.freeze([...checkpoint.messages, ...toolMessages])
     const estimatedInputTokens = checkpoint.estimatedInputTokens +
       toolMessages.reduce((total, message) => total + estimatedTokensFor(message), 0)
-    const events: EventDraft[] = completedLedger.calls.map(call => ({
+    const attemptEvents: EventDraft[] = execution.results.flatMap(result => (
+      result.attemptObservations.map(observation => ({
+        type: 'tool.attempted' as const,
+        payload: Object.freeze({
+          observationSchemaVersion: 1,
+          ordinal: observation.ordinal,
+          outcome: observation.outcome,
+          durationMs: observation.durationMs,
+          resultCode: observation.resultCode
+        })
+      }))
+    ))
+    const completionEvents: EventDraft[] = completedLedger.calls.map((call): EventDraft => ({
       type: call.result?.status === 'success'
         ? 'tool.completed'
         : call.result?.status === 'denied'
@@ -1923,6 +2013,7 @@ export class RunEngine {
         status: call.status
       }
     }))
+    const events: EventDraft[] = [...attemptEvents, ...completionEvents]
 
     const common: RunCheckpointChanges = {
       messages,
@@ -2042,6 +2133,48 @@ export class RunEngine {
     }
   }
 
+  #recordProviderUsage (
+    counters: RunBudgetCounters,
+    activeRuntimeMs: number,
+    providerReportedTokens = 0
+  ): Readonly<{
+      counters: RunBudgetCounters
+      budgetError: AgentError | null
+    }> {
+    const boundedActiveRuntimeMs = Math.min(
+      activeRuntimeMs,
+      this.#budget.remainingActiveMs(counters)
+    )
+    const boundedProviderReportedTokens = Math.min(
+      providerReportedTokens,
+      Number.MAX_SAFE_INTEGER - counters.providerReportedTokens
+    )
+    let budgetError: AgentError | null = null
+    if (boundedActiveRuntimeMs !== activeRuntimeMs ||
+      boundedProviderReportedTokens !== providerReportedTokens) {
+      try {
+        this.#budget.recordUsage(counters, {
+          activeRuntimeMs,
+          providerReportedTokens
+        })
+      } catch (error) {
+        const agentError = asAgentError(error)
+        if (agentError.code !== 'run_budget_exceeded') throw error
+        budgetError = agentError
+      }
+      if (budgetError === null) {
+        throw new TypeError('run budget accepted usage beyond its remaining capacity')
+      }
+    }
+    return Object.freeze({
+      counters: this.#budget.recordUsage(counters, {
+        activeRuntimeMs: boundedActiveRuntimeMs,
+        providerReportedTokens: boundedProviderReportedTokens
+      }),
+      budgetError
+    })
+  }
+
   #providerTimeout (
     checkpoint: RunCheckpoint,
     counters: RunBudgetCounters
@@ -2091,9 +2224,30 @@ export class RunEngine {
       let stored: RunCheckpoint
       if (isTerminalRunStatus(next.status)) {
         const snapshot = createRunTerminalSnapshot(next)
+        let candidate: TraceCandidateV1 | null = null
+        let projectionFailed = false
+        try {
+          candidate = createTraceCandidate({ checkpoint: next, snapshot })
+        } catch {
+          projectionFailed = true
+        }
         const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot)
         const terminal = Object.freeze({ snapshot, receipt })
         this.#terminalFacts.set(next, terminal)
+        if (projectionFailed) {
+          try {
+            this.#onTraceCandidateProjectionFailure?.('projection_rejected')
+          } catch {
+            // Trace diagnostics must never change the committed terminal result.
+          }
+        }
+        if (candidate !== null) {
+          try {
+            this.#onCommittedTraceCandidate?.(candidate)
+          } catch {
+            // A committed terminal result is authoritative even if its trace sink fails.
+          }
+        }
         stored = next
       } else {
         stored = await this.#store.compareAndSet(checkpoint, next)
