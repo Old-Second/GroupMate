@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
+import { chmod, mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 export const GROUPMATE_DISK_LOG_LIMITS = Object.freeze({
     maxFileBytes: 32 * 1024 * 1024,
@@ -54,11 +54,11 @@ export class GroupMateDiskLog {
     #onFailure;
     #limits;
     #queue = [];
-    #lastFailureByCode = new Map();
     #sequence = 0;
     #pendingBytes = 0;
     #pendingRecords = 0;
     #lastExpiryCleanupDate = null;
+    #lastFailureAt = null;
     #pump = null;
     constructor(options) {
         this.#directory = options.directory;
@@ -145,6 +145,7 @@ export class GroupMateDiskLog {
     }
     async #write(entry) {
         await mkdir(this.#directory, { recursive: true, mode: 0o700 });
+        await chmod(this.#directory, 0o700);
         if (this.#lastExpiryCleanupDate !== entry.date) {
             await this.#removeExpiredFiles(entry.recordedAt);
             this.#lastExpiryCleanupDate = entry.date;
@@ -154,8 +155,10 @@ export class GroupMateDiskLog {
             this.#reportFailure('directory_cap_exceeded');
             return;
         }
-        const file = await open(path.join(this.#directory, target), 'a', 0o600);
+        const targetPath = path.join(this.#directory, target);
+        const file = await open(targetPath, 'a', 0o600);
         try {
+            await chmod(targetPath, 0o600);
             await file.writeFile(entry.line);
         }
         finally {
@@ -227,10 +230,9 @@ export class GroupMateDiskLog {
     }
     #reportFailure(code) {
         const now = this.#safeNow().getTime();
-        const last = this.#lastFailureByCode.get(code);
-        if (last !== undefined && now - last < FAILURE_LIMIT_MS)
+        if (this.#lastFailureAt !== null && now - this.#lastFailureAt < FAILURE_LIMIT_MS)
             return;
-        this.#lastFailureByCode.set(code, now);
+        this.#lastFailureAt = now;
         try {
             this.#onFailure?.(Object.freeze({ event: 'groupmate.disk_log.failure', code }));
         }

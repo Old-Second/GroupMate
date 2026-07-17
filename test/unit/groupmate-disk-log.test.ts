@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -138,13 +138,14 @@ test('prunes oldest inactive matching files for the projected directory cap', as
   }
 })
 
-test('drops queue and entry overflows without preventing accepted records from draining', async () => {
+test('globally rate limits failure callbacks while allowing the next callback at one minute', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
   try {
+    let now = new Date(FIXED_TIMESTAMP)
     const failures: unknown[] = []
     const log = new GroupMateDiskLog({
       directory,
-      now: () => new Date(FIXED_TIMESTAMP),
+      now: () => now,
       limits: { maxQueueRecords: 2, maxQueueBytes: 600, maxEntryBytes: 300 },
       onFailure: failure => { failures.push(failure) }
     })
@@ -155,11 +156,38 @@ test('drops queue and entry overflows without preventing accepted records from d
 
     await log.drain()
 
+    now = new Date(now.getTime() + 59_999)
+    log.record({ type: 'fixture', payload: { text: 'oversized'.repeat(100) } })
+    now = new Date(now.getTime() + 1)
+    log.record({ type: 'fixture', payload: { text: 'oversized'.repeat(100) } })
+
     assert.deepEqual((await readLogRows(directory)).map(row => row.sequence), [1, 2])
     assert.deepEqual(failures, [
       { event: 'groupmate.disk_log.failure', code: 'queue_overflow' },
       { event: 'groupmate.disk_log.failure', code: 'entry_too_large' }
     ])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('tightens an existing log directory and target file before appending', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const target = path.join(directory, 'groupmate-2026-07-17.0001.jsonl')
+  try {
+    await chmod(directory, 0o755)
+    await writeFile(target, 'existing\n')
+    await chmod(target, 0o644)
+    const log = new GroupMateDiskLog({
+      directory,
+      now: () => new Date(FIXED_TIMESTAMP)
+    })
+
+    log.record({ type: 'fixture', payload: { text: 'current' } })
+    await assert.doesNotReject(log.drain())
+
+    assert.equal((await stat(directory)).mode & 0o777, 0o700)
+    assert.equal((await stat(target)).mode & 0o777, 0o600)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

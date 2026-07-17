@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises'
+import { chmod, mkdir, open, readdir, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
 interface GroupMateDiskLogLimits {
@@ -111,11 +111,11 @@ export class GroupMateDiskLog {
   readonly #onFailure?: (failure: GroupMateDiskLogFailure) => void
   readonly #limits: Readonly<GroupMateDiskLogLimits>
   readonly #queue: DiskLogEntry[] = []
-  readonly #lastFailureByCode = new Map<GroupMateDiskLogFailureCode, number>()
   #sequence = 0
   #pendingBytes = 0
   #pendingRecords = 0
   #lastExpiryCleanupDate: string | null = null
+  #lastFailureAt: number | null = null
   #pump: Promise<void> | null = null
 
   constructor (options: GroupMateDiskLogOptions) {
@@ -200,6 +200,7 @@ export class GroupMateDiskLog {
 
   async #write (entry: DiskLogEntry): Promise<void> {
     await mkdir(this.#directory, { recursive: true, mode: 0o700 })
+    await chmod(this.#directory, 0o700)
     if (this.#lastExpiryCleanupDate !== entry.date) {
       await this.#removeExpiredFiles(entry.recordedAt)
       this.#lastExpiryCleanupDate = entry.date
@@ -209,8 +210,10 @@ export class GroupMateDiskLog {
       this.#reportFailure('directory_cap_exceeded')
       return
     }
-    const file = await open(path.join(this.#directory, target), 'a', 0o600)
+    const targetPath = path.join(this.#directory, target)
+    const file = await open(targetPath, 'a', 0o600)
     try {
+      await chmod(targetPath, 0o600)
       await file.writeFile(entry.line)
     } finally {
       await file.close()
@@ -276,9 +279,8 @@ export class GroupMateDiskLog {
 
   #reportFailure (code: GroupMateDiskLogFailureCode): void {
     const now = this.#safeNow().getTime()
-    const last = this.#lastFailureByCode.get(code)
-    if (last !== undefined && now - last < FAILURE_LIMIT_MS) return
-    this.#lastFailureByCode.set(code, now)
+    if (this.#lastFailureAt !== null && now - this.#lastFailureAt < FAILURE_LIMIT_MS) return
+    this.#lastFailureAt = now
     try {
       this.#onFailure?.(Object.freeze({ event: 'groupmate.disk_log.failure', code }))
     } catch {}
