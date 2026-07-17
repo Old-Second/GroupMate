@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js';
+import { TRACE_STORE_LIMITS } from '../runtime/observability/redis-trace-store.js';
 import { PHASE_6_REDIS_RESOURCE_KINDS, PHASE_6_RESOURCE_SCENARIOS, validatePhase6ResourceSample } from './phase-6-resource-scenario.js';
 export const PHASE_6_RESOURCE_SAMPLES = 5;
 export const PHASE_5_BASELINE_COMMIT = '2b59cad1d944b6835dda541c04616b3673077802';
@@ -12,9 +14,9 @@ export const PHASE_6_RESOURCE_THRESHOLDS = Object.freeze({
     dualTextPeakDeltaBytes: 50 * MIB,
     checkpointResumePeakDeltaBytes: 45 * MIB,
     traceDiagnosticPeakDeltaBytes: 8 * MIB,
-    runStoreBytes: 8 * MIB,
-    traceStoreBytes: 2 * MIB,
-    combinedStoreBytes: 10 * MIB
+    runStoreBytes: RUN_RESOURCE_LIMITS.namespaceBytes,
+    traceStoreBytes: TRACE_STORE_LIMITS.maxBytes,
+    combinedStoreBytes: RUN_RESOURCE_LIMITS.namespaceBytes + TRACE_STORE_LIMITS.maxBytes
 });
 function record(value, label) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {

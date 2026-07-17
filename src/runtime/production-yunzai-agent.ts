@@ -419,7 +419,7 @@ export class ProductionObservabilityRuntime {
   #ensureBarrier (): Promise<'confirmed' | 'failed'> {
     if (this.#barrierPromise !== null) return this.#barrierPromise
     this.#barrierState = 'pending'
-    const bottom = this.traceStore.advanceGenerationAndClear(64).then(
+    const bottom = this.traceStore.advanceGenerationAndClear().then(
       () => {
         this.#barrierState = 'confirmed'
         return 'confirmed' as const

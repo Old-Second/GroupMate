@@ -8,10 +8,12 @@ export const TRACE_FAILURE_INDEX_KEY = 'GROUPMATE:OBS:TRACE_FAILURE_INDEX:v1';
 export const TRACE_BYTES_KEY = 'GROUPMATE:OBS:TRACE_BYTES:v1';
 export const TRACE_GENERATION_KEY = 'GROUPMATE:OBS:TRACE_GENERATION:v1';
 export const TRACE_STORE_LUA_MARKER = '-- GROUPMATE_TRACE_STORE_V1';
-const MAX_RECORDS = 64;
-const MAX_BYTES = 2 * 1024 * 1024;
-const MAX_CLEAR = 64;
-const MAX_STALE_CLEANUP = 64;
+export const TRACE_STORE_LIMITS = Object.freeze({
+    maxRecords: 2_048,
+    maxBytes: 16 * 1_024 * 1_024,
+    maxListRecords: 64,
+    cleanupBatchRecords: 64
+});
 export const TRACE_STORE_LUA_SCRIPT = `${TRACE_STORE_LUA_MARKER}
 local operation = ARGV[1]
 local successIndex = KEYS[2]
@@ -76,7 +78,7 @@ local function removeKey(key)
 end
 
 local function cleanupExpired(nowMs)
-  local remaining = ${MAX_STALE_CLEANUP}
+  local remaining = ${TRACE_STORE_LIMITS.cleanupBatchRecords}
   local removedBytes = 0
   local dataBytes = currentDataBytes()
   for _, index in ipairs({ successIndex, failureIndex }) do
@@ -92,9 +94,9 @@ local function cleanupExpired(nowMs)
 end
 
 local function oldestEvictable(skip)
-  local successes = redis.call('ZRANGE', successIndex, 0, -1)
+  local successes = redis.call('ZRANGE', successIndex, 0, 1)
   for _, key in ipairs(successes) do if key ~= skip then return key end end
-  local failures = redis.call('ZRANGE', failureIndex, 0, -1)
+  local failures = redis.call('ZRANGE', failureIndex, 0, 1)
   for _, key in ipairs(failures) do if key ~= skip then return key end end
   return nil
 end
@@ -113,8 +115,8 @@ end
 
 local function ensureCapacity(key, oldLength, newLength, additionalRecords, skip)
   local records = redis.call('ZCARD', successIndex) + redis.call('ZCARD', failureIndex)
-  local guard = ${MAX_RECORDS}
-  while (records + additionalRecords > ${MAX_RECORDS} or projectedNamespaceBytes(key, oldLength, newLength) > ${MAX_BYTES}) and guard > 0 do
+  local guard = ${TRACE_STORE_LIMITS.maxRecords}
+  while (records + additionalRecords > ${TRACE_STORE_LIMITS.maxRecords} or projectedNamespaceBytes(key, oldLength, newLength) > ${TRACE_STORE_LIMITS.maxBytes}) and guard > 0 do
     local victim = oldestEvictable(skip)
     if not victim then return false end
     local dataBytes = math.max(0, currentDataBytes() - removeKey(victim))
@@ -122,8 +124,8 @@ local function ensureCapacity(key, oldLength, newLength, additionalRecords, skip
     records = records - 1
     guard = guard - 1
   end
-  return records + additionalRecords <= ${MAX_RECORDS} and
-    projectedNamespaceBytes(key, oldLength, newLength) <= ${MAX_BYTES}
+  return records + additionalRecords <= ${TRACE_STORE_LIMITS.maxRecords} and
+    projectedNamespaceBytes(key, oldLength, newLength) <= ${TRACE_STORE_LIMITS.maxBytes}
 end
 
 local function generationCheck(expected)
@@ -425,7 +427,7 @@ export class RedisTraceStore {
         return Object.freeze({ kind: 'found', record });
     }
     async listRecent(limit) {
-        const bounded = this.#boundedLimit(limit, MAX_RECORDS, 'trace list limit');
+        const bounded = this.#boundedLimit(limit, TRACE_STORE_LIMITS.maxListRecords, 'trace list limit');
         try {
             const result = await this.#eval('list', [String(finiteNow(this.#now)), String(bounded)]);
             const rawRows = tuple(result, 0, 'trace list result');
@@ -479,22 +481,42 @@ export class RedisTraceStore {
             return Object.freeze({ schemaVersion: 1, records: 0, bytes: 0 });
         }
     }
-    async clear(maxRecords = 64) {
-        const bounded = this.#boundedLimit(maxRecords, MAX_CLEAR, 'trace clear limit');
+    async clear(maxRecords = TRACE_STORE_LIMITS.cleanupBatchRecords) {
+        const bounded = this.#boundedLimit(maxRecords, TRACE_STORE_LIMITS.cleanupBatchRecords, 'trace clear limit');
         return this.#clearReceipt(await this.#eval('clear', [String(bounded)]));
     }
-    async advanceGenerationAndClear(maxRecords = 64) {
-        const bounded = this.#boundedLimit(maxRecords, MAX_CLEAR, 'trace clear limit');
+    async advanceGenerationAndClear(maxRecords = TRACE_STORE_LIMITS.maxRecords) {
+        const bounded = this.#boundedLimit(maxRecords, TRACE_STORE_LIMITS.maxRecords, 'trace clear limit');
         this.#barrierInProgress = true;
         try {
-            const result = tuple(await this.#eval('advance_clear', [String(bounded)]), 5, 'trace barrier result');
+            const firstLimit = Math.min(bounded, TRACE_STORE_LIMITS.cleanupBatchRecords);
+            const result = tuple(await this.#eval('advance_clear', [String(firstLimit)]), 5, 'trace barrier result');
             const generation = numeric(result[0], 'trace generation');
             this.#generation = generation;
             this.#generationKnown = true;
+            let clear = this.#clearReceipt(result.slice(1));
+            let removedRecords = clear.removedRecords;
+            let removedBytes = clear.removedBytes;
+            while (clear.remainingRecords > 0 && removedRecords < bounded) {
+                const batchLimit = Math.min(TRACE_STORE_LIMITS.cleanupBatchRecords, bounded - removedRecords);
+                const batch = this.#clearReceipt(await this.#eval('clear', [String(batchLimit)]));
+                if (batch.removedRecords < 1) {
+                    throw new Error('trace clear made no progress');
+                }
+                removedRecords += batch.removedRecords;
+                removedBytes += batch.removedBytes;
+                clear = batch;
+            }
             return Object.freeze({
                 schemaVersion: 1,
                 generation,
-                clear: this.#clearReceipt(result.slice(1))
+                clear: Object.freeze({
+                    schemaVersion: 1,
+                    removedRecords,
+                    removedBytes,
+                    remainingRecords: clear.remainingRecords,
+                    remainingBytes: clear.remainingBytes
+                })
             });
         }
         finally {

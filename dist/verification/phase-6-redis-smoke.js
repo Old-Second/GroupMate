@@ -1,10 +1,11 @@
 import { createConnection } from 'node:net';
 import { connect as connectTls } from 'node:tls';
-import { RedisTraceStore, TRACE_KEY_PREFIX } from '../runtime/observability/redis-trace-store.js';
+import { TRACE_RETENTION_MS } from '../agent/run/run-trace.js';
+import { RedisTraceStore, TRACE_KEY_PREFIX, TRACE_STORE_LIMITS } from '../runtime/observability/redis-trace-store.js';
 import { createPhase6SmallTraceCandidate } from './phase-6-resource-scenario.js';
 const REDIS_TIMEOUT_MS = 5_000;
 const REDIS_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-const TRACE_TTL_SECONDS = 24 * 60 * 60;
+const TRACE_TTL_SECONDS = TRACE_RETENTION_MS / 1_000;
 class IncompleteRespError extends Error {
 }
 function decodeComponent(value) {
@@ -294,7 +295,7 @@ export async function runPhase6RedisSmoke(options = {}) {
         const after = await traceStore.usage();
         const records = positiveDelta(after.records, before.records);
         const bytes = positiveDelta(after.bytes, before.bytes);
-        if (records !== 2 || bytes <= 0 || bytes > 2 * 1024 * 1024) {
+        if (records !== 2 || bytes <= 0 || bytes > TRACE_STORE_LIMITS.maxBytes) {
             throw new Error('Redis smoke usage check failed');
         }
         const ttls = await Promise.all(candidates.map(async (candidate) => (await connection.client.ttl(`${TRACE_KEY_PREFIX}${candidate.runRef}`))));

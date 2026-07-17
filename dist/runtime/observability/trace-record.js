@@ -1,9 +1,8 @@
-import { MAX_TRACE_RECORD_BYTES, internalExactTraceArray, internalExactTraceData, internalFinalizeSerialized, internalParseTraceEvent, internalSelectTraceEvents, internalValidateTraceEvents, parseTraceCandidate } from '../../agent/run/run-trace.js';
+import { MAX_TRACE_RECORD_BYTES, internalExactTraceArray, internalExactTraceData, internalFinalizeSerialized, internalParseTraceEvent, internalSelectTraceEvents, internalValidateTraceEvents, isSupportedTraceExpiry, parseTraceCandidate } from '../../agent/run/run-trace.js';
 import { parseFrozenObservationPolicy, parseRunTerminalSnapshot, parseRunTraceMetricSummary } from '../../agent/run/run-observation.js';
 import { RUN_REF_PATTERN } from '../../agent/run/run-reference.js';
 import { parsePresentationObservation } from './observation-event.js';
 const OBSERVATION_ID_PATTERN = /^[0-9a-f]{64}$/;
-const TRACE_TTL_MS = 24 * 60 * 60 * 1_000;
 function nonNegativeInteger(value, label) {
     if (!Number.isSafeInteger(value) || Number(value) < 0) {
         throw new TypeError(`${label} is invalid`);
@@ -22,9 +21,6 @@ function timestamp(value, label) {
         throw new TypeError(`${label} is invalid`);
     }
     return value;
-}
-function expiryFor(finishedAt) {
-    return new Date(new Date(finishedAt).getTime() + TRACE_TTL_MS).toISOString();
 }
 function parsePresentation(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -95,8 +91,9 @@ function parseRecord(value, allowUnknownOptional) {
         throw new TypeError('trace presentation correlation is invalid');
     }
     const expiresAt = timestamp(input.expiresAt, 'trace expiry');
-    if (expiresAt !== expiryFor(terminal.finishedAt))
+    if (!isSupportedTraceExpiry(terminal.finishedAt, expiresAt)) {
         throw new TypeError('trace expiry is invalid');
+    }
     const serializedBytes = nonNegativeInteger(input.serializedBytes, 'trace serialized bytes');
     const canonical = internalFinalizeSerialized(bytes => buildRecord({
         runRef: input.runRef,

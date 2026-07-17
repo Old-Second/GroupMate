@@ -9,7 +9,7 @@ import { RUN_STORE_LUA_MARKER, RUN_STORE_METADATA_KEY, RUN_STORE_NAMESPACE } fro
 import { createFrozenObservationPolicy, createRunTerminalSnapshot } from '../agent/run/run-observation.js';
 import { createTraceCandidate } from '../agent/run/run-trace.js';
 import { createProductionYunzaiAgent } from '../runtime/production-yunzai-agent.js';
-import { TRACE_BYTES_KEY, TRACE_FAILURE_INDEX_KEY, TRACE_GENERATION_KEY, TRACE_KEY_PREFIX, TRACE_STORE_LUA_MARKER, TRACE_SUCCESS_INDEX_KEY } from '../runtime/observability/redis-trace-store.js';
+import { TRACE_BYTES_KEY, TRACE_FAILURE_INDEX_KEY, TRACE_GENERATION_KEY, TRACE_KEY_PREFIX, TRACE_STORE_LUA_MARKER, TRACE_STORE_LIMITS, TRACE_SUCCESS_INDEX_KEY } from '../runtime/observability/redis-trace-store.js';
 export const PHASE_6_RESOURCE_SCENARIOS = Object.freeze([
     'idle',
     'singleTextRun',
@@ -517,21 +517,24 @@ class Phase6ResourceRedis {
     }
     #ensureTraceCapacity(key, oldLength, newLength, addedRecords, skip) {
         let usage = this.#traceUsage();
-        let guard = 64;
-        while ((usage.records + addedRecords > 64 ||
-            this.#projectedTraceBytes(key, oldLength, newLength) > 2 * 1024 * 1024) && guard > 0) {
-            const victim = [
-                ...this.#zrange(TRACE_SUCCESS_INDEX_KEY),
-                ...this.#zrange(TRACE_FAILURE_INDEX_KEY)
-            ].find(key => key !== skip);
+        let guard = TRACE_STORE_LIMITS.maxRecords;
+        while ((usage.records + addedRecords > TRACE_STORE_LIMITS.maxRecords ||
+            this.#projectedTraceBytes(key, oldLength, newLength) > TRACE_STORE_LIMITS.maxBytes) &&
+            guard > 0) {
+            let victim;
+            for (const index of [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]) {
+                victim = this.#zrange(index).slice(0, 2).find(key => key !== skip);
+                if (victim !== undefined)
+                    break;
+            }
             if (victim === undefined)
                 return false;
             this.#removeTrace(victim);
             usage = this.#traceUsage();
             guard -= 1;
         }
-        return usage.records + addedRecords <= 64 &&
-            this.#projectedTraceBytes(key, oldLength, newLength) <= 2 * 1024 * 1024;
+        return usage.records + addedRecords <= TRACE_STORE_LIMITS.maxRecords &&
+            this.#projectedTraceBytes(key, oldLength, newLength) <= TRACE_STORE_LIMITS.maxBytes;
     }
     #projectedTraceBytes(key, oldLength, newLength) {
         const dataBytes = Math.max(0, this.#traceDataBytes() - oldLength + newLength);
@@ -565,7 +568,7 @@ class Phase6ResourceRedis {
         return utf8Bytes(this.#entries.get(TRACE_GENERATION_KEY)?.value);
     }
     #cleanupTrace(nowMs) {
-        let remaining = 64;
+        let remaining = TRACE_STORE_LIMITS.cleanupBatchRecords;
         for (const index of [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]) {
             for (const key of this.#zrange(index)) {
                 if (remaining <= 0)

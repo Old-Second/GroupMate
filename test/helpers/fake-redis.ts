@@ -10,6 +10,7 @@ import {
   TRACE_FAILURE_INDEX_KEY,
   TRACE_GENERATION_KEY,
   TRACE_STORE_LUA_MARKER,
+  TRACE_STORE_LIMITS,
   TRACE_SUCCESS_INDEX_KEY
 } from '../../src/runtime/observability/redis-trace-store.js'
 
@@ -465,7 +466,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   private cleanupTrace (nowMs: number): void {
-    let remaining = 64
+    let remaining = TRACE_STORE_LIMITS.cleanupBatchRecords
     for (const index of [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]) {
       for (const key of this.zrange(index)) {
         if (remaining <= 0) break
@@ -486,21 +487,22 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     skip?: string
   ): boolean {
     let usage = this.traceUsage()
-    let guard = 64
-    while ((usage.records + addedRecords > 64 ||
-      this.projectedTraceBytes(key, oldLength, newLength) > 2 * 1024 * 1024) &&
+    let guard = TRACE_STORE_LIMITS.maxRecords
+    while ((usage.records + addedRecords > TRACE_STORE_LIMITS.maxRecords ||
+      this.projectedTraceBytes(key, oldLength, newLength) > TRACE_STORE_LIMITS.maxBytes) &&
       guard > 0) {
-      const victim = [
-        ...this.zrange(TRACE_SUCCESS_INDEX_KEY),
-        ...this.zrange(TRACE_FAILURE_INDEX_KEY)
-      ].find(key => key !== skip)
+      let victim: string | undefined
+      for (const index of [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]) {
+        victim = this.zrange(index).slice(0, 2).find(key => key !== skip)
+        if (victim !== undefined) break
+      }
       if (victim === undefined) return false
       this.removeTrace(victim)
       usage = this.traceUsage()
       guard -= 1
     }
-    return usage.records + addedRecords <= 64 &&
-      this.projectedTraceBytes(key, oldLength, newLength) <= 2 * 1024 * 1024
+    return usage.records + addedRecords <= TRACE_STORE_LIMITS.maxRecords &&
+      this.projectedTraceBytes(key, oldLength, newLength) <= TRACE_STORE_LIMITS.maxBytes
   }
 
   private clearTrace (limit: number): [number, number, number, number] {

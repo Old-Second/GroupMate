@@ -31,7 +31,8 @@ export type {
 } from './run-observation.js'
 
 export const MAX_TRACE_RECORD_BYTES = 32 * 1_024
-const TRACE_TTL_MS = 24 * 60 * 60 * 1_000
+export const LEGACY_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000
+export const TRACE_RETENTION_MS = 7 * LEGACY_TRACE_RETENTION_MS
 const OBSERVATION_ID_PATTERN = /^[0-9a-f]{64}$/
 const OPTIONAL_EVENT_TYPE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/
 const PROVIDER_OUTCOMES = new Set<ProviderTraceEventV1['outcome']>([
@@ -721,8 +722,20 @@ function metricSummary (
   })
 }
 
+export function isSupportedTraceExpiry (
+  finishedAt: string,
+  expiresAt: string
+): boolean {
+  const finishedAtMs = new Date(finishedAt).getTime()
+  const expiresAtMs = new Date(expiresAt).getTime()
+  return expiresAtMs === finishedAtMs + TRACE_RETENTION_MS ||
+    expiresAtMs === finishedAtMs + LEGACY_TRACE_RETENTION_MS
+}
+
 function traceExpiry (terminal: RunTerminalSnapshotV2): string {
-  return new Date(new Date(terminal.finishedAt).getTime() + TRACE_TTL_MS).toISOString()
+  return new Date(
+    new Date(terminal.finishedAt).getTime() + TRACE_RETENTION_MS
+  ).toISOString()
 }
 
 function buildCandidate (input: {
@@ -822,7 +835,9 @@ export function parseTraceCandidate (value: unknown): TraceCandidateV1 {
     throw new TypeError('trace candidate presentation is invalid')
   }
   const expiresAt = timestamp(input.expiresAt, 'trace expiry')
-  if (expiresAt !== traceExpiry(terminal)) throw new TypeError('trace expiry is invalid')
+  if (!isSupportedTraceExpiry(terminal.finishedAt, expiresAt)) {
+    throw new TypeError('trace expiry is invalid')
+  }
   const serializedBytes = nonNegativeInteger(input.serializedBytes, 'trace serialized bytes')
   const canonical = internalFinalizeSerialized(bytes => buildCandidate({
     runRef: input.runRef as string,

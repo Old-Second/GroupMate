@@ -376,6 +376,16 @@ test('Guoba explains the retired legacy approval behavior', () => {
   assert.match(fields.get('toolApprovalTtlSeconds')?.bottomHelpMessage ?? '', /新审批流程预留/)
 })
 
+test('Guoba explains the current bounded Redis trace retention', () => {
+  const field = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).find(schema => schema.field === 'observabilityLevel')
+
+  assert.match(field?.bottomHelpMessage ?? '', /7 天/)
+  assert.match(field?.bottomHelpMessage ?? '', /2048 条/)
+  assert.match(field?.bottomHelpMessage ?? '', /16 MiB/)
+})
+
 test('Guoba exposes only explicit standard and DeepSeek compatibility profiles', () => {
   const field = buildGuobaSchemas({
     vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []

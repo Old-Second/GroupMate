@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js'
+import { TRACE_STORE_LIMITS } from '../runtime/observability/redis-trace-store.js'
 import {
   PHASE_6_REDIS_RESOURCE_KINDS,
   PHASE_6_RESOURCE_SCENARIOS,
@@ -22,9 +24,9 @@ export const PHASE_6_RESOURCE_THRESHOLDS = Object.freeze({
   dualTextPeakDeltaBytes: 50 * MIB,
   checkpointResumePeakDeltaBytes: 45 * MIB,
   traceDiagnosticPeakDeltaBytes: 8 * MIB,
-  runStoreBytes: 8 * MIB,
-  traceStoreBytes: 2 * MIB,
-  combinedStoreBytes: 10 * MIB
+  runStoreBytes: RUN_RESOURCE_LIMITS.namespaceBytes,
+  traceStoreBytes: TRACE_STORE_LIMITS.maxBytes,
+  combinedStoreBytes: RUN_RESOURCE_LIMITS.namespaceBytes + TRACE_STORE_LIMITS.maxBytes
 })
 
 export interface Phase6ProcessSample {

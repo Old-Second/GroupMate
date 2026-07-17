@@ -64,7 +64,7 @@ export function buildGuobaSchemas ({
     divider('网络与调试'),
     field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；普通网络请求立即生效，Chromium 启动参数需重启后生效。'),
     field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),
-    field('observabilityLevel', '可观测性级别', '关闭时不采集运行事实并同步清理已保留轨迹；基础模式仅保留脱敏的失败、异常和 5% 成功样本；诊断模式保留更多脱敏轨迹。轨迹最长保留 24h，总量硬上限 2MiB。', 'Select', {
+    field('observabilityLevel', '可观测性级别', '关闭时不采集运行事实并同步清理已保留轨迹；基础模式仅保留脱敏的失败、异常和 5% 成功样本；诊断模式保留更多脱敏轨迹。Redis 轨迹最长保留 7 天，最多 2048 条且总量硬上限 16 MiB。', 'Select', {
       options: [
         { label: '完全关闭', value: 'off' },
         { label: '基础', value: 'basic' },

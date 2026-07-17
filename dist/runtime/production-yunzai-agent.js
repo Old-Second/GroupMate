@@ -262,7 +262,7 @@ export class ProductionObservabilityRuntime {
         if (this.#barrierPromise !== null)
             return this.#barrierPromise;
         this.#barrierState = 'pending';
-        const bottom = this.traceStore.advanceGenerationAndClear(64).then(() => {
+        const bottom = this.traceStore.advanceGenerationAndClear().then(() => {
             this.#barrierState = 'confirmed';
             return 'confirmed';
         }, () => {

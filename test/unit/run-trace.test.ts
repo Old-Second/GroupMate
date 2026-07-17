@@ -14,7 +14,9 @@ import {
   createRunTerminalSnapshot
 } from '../../src/agent/run/run-observation.js'
 import {
+  LEGACY_TRACE_RETENTION_MS,
   MAX_TRACE_RECORD_BYTES,
+  TRACE_RETENTION_MS,
   createTraceCandidate,
   internalSelectTraceEvents,
   parseTraceCandidate,
@@ -250,7 +252,10 @@ test('trace candidate projects safe attempts and aggregates metrics before trunc
   assert.equal(candidate.runRef, runRef)
   assert.equal(candidate.observationId, candidate.terminal.observationId)
   assert.deepEqual(candidate.presentation, { kind: 'unavailable' })
-  assert.equal(candidate.expiresAt, '2026-07-17T00:00:00.000Z')
+  assert.equal(
+    candidate.expiresAt,
+    new Date(Date.parse(timestamp) + TRACE_RETENTION_MS).toISOString()
+  )
   assert.equal(candidate.serializedBytes, Buffer.byteLength(JSON.stringify(candidate), 'utf8'))
   assert.ok(candidate.serializedBytes <= 32 * 1_024)
   assert.deepEqual(candidate.metricSummary.providerRequests.map(row => (
@@ -276,6 +281,37 @@ test('trace candidate projects safe attempts and aggregates metrics before trunc
   assert.deepEqual(parseTraceCandidate(JSON.parse(encoded)), candidate)
   assert.throws(() => parseTraceCandidate({ ...candidate, runRef: '3'.repeat(32) }), TypeError)
   assert.throws(() => parseTraceCandidate({ ...candidate, privateBody: 'secret' }), TypeError)
+})
+
+test('trace readers accept only the exact legacy or current retention window', () => {
+  const checkpoint = completed([])
+  const candidate = createTraceCandidate({
+    checkpoint,
+    snapshot: createRunTerminalSnapshot(checkpoint)
+  })
+  const legacy = fixedPointBytes({
+    ...candidate,
+    expiresAt: new Date(
+      Date.parse(candidate.terminal.finishedAt) + LEGACY_TRACE_RETENTION_MS
+    ).toISOString()
+  })
+
+  assert.equal(parseTraceCandidate(legacy).expiresAt, legacy.expiresAt)
+  assert.equal(parseStoredTraceRecord(legacy).expiresAt, legacy.expiresAt)
+
+  for (const retentionMs of [
+    2 * LEGACY_TRACE_RETENTION_MS,
+    TRACE_RETENTION_MS + LEGACY_TRACE_RETENTION_MS
+  ]) {
+    const invalid = fixedPointBytes({
+      ...candidate,
+      expiresAt: new Date(
+        Date.parse(candidate.terminal.finishedAt) + retentionMs
+      ).toISOString()
+    })
+    assert.throws(() => parseTraceCandidate(invalid), TypeError)
+    assert.throws(() => parseStoredTraceRecord(invalid), TypeError)
+  }
 })
 
 test('candidate keeps required failures and full metrics at the Phase 5 event limit', () => {

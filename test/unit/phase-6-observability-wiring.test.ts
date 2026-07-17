@@ -6,6 +6,7 @@ import { RunAdmission } from '../../src/agent/run/run-admission.js'
 import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
 import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
 import {
+  TRACE_KEY_PREFIX,
   TRACE_STORE_LUA_MARKER
 } from '../../src/runtime/observability/redis-trace-store.js'
 import {
@@ -92,6 +93,25 @@ class RejectOnceBarrierRedis extends FakeRedis {
   }
 }
 
+class RejectSecondBatchOnceRedis extends FakeRedis {
+  advanceCalls = 0
+  clearCalls = 0
+
+  override async eval (script: string, options: {
+    keys: string[]
+    arguments: string[]
+  }): Promise<unknown> {
+    if (script.startsWith(TRACE_STORE_LUA_MARKER)) {
+      if (options.arguments[0] === 'advance_clear') this.advanceCalls += 1
+      if (options.arguments[0] === 'clear') {
+        this.clearCalls += 1
+        if (this.clearCalls === 1) throw new Error('private second batch failure')
+      }
+    }
+    return await super.eval(script, options)
+  }
+}
+
 test('off is synchronous while the bounded acknowledgement reuses one bottom barrier', async () => {
   const redis = new DeferredBarrierRedis(() => NOW)
   const root = runtime(redis)
@@ -122,6 +142,30 @@ test('a failed off barrier blocks re-enable and a later off save retries once', 
   assert.deepEqual(await root.updateLevel('off'), { kind: 'applied' })
   assert.equal(redis.advanceCalls, 2)
   assert.deepEqual(await root.updateLevel('diagnostic'), { kind: 'applied' })
+})
+
+test('a failed later clear batch keeps off active until a retry empties the namespace', async () => {
+  const redis = new RejectSecondBatchOnceRedis(() => NOW)
+  const candidate = traceCandidateFixture({ runRef: traceRunRef(true, 315_000) })
+  const expiresAtMs = Date.parse(candidate.expiresAt)
+  for (let index = 0; index < 130; index += 1) {
+    redis.seedTraceForTest({
+      key: `${TRACE_KEY_PREFIX}f${index.toString(16).padStart(31, '0')}`,
+      value: '{}',
+      expiresAtMs: expiresAtMs + index,
+      index: 'success',
+      logicalBytes: 128
+    })
+  }
+  const root = runtime(redis)
+
+  assert.deepEqual(await root.updateLevel('off'), { kind: 'barrier_failed' })
+  assert.equal((await root.traceStore.usage()).records, 66)
+  assert.deepEqual(await root.updateLevel('diagnostic'), { kind: 'barrier_failed' })
+  assert.deepEqual(await root.updateLevel('off'), { kind: 'applied' })
+  assert.equal((await root.traceStore.usage()).records, 0)
+  assert.equal(redis.advanceCalls, 2)
+  assert.equal(redis.clearCalls, 2)
 })
 
 test('progress publishes one redacted fact with full run correlation per delivery', async () => {

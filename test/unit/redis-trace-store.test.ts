@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { TRACE_RETENTION_MS } from '../../src/agent/run/run-trace.js'
 import {
   RedisTraceStore,
-  TRACE_KEY_PREFIX
+  TRACE_KEY_PREFIX,
+  TRACE_STORE_LIMITS
 } from '../../src/runtime/observability/redis-trace-store.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 import {
@@ -11,7 +13,6 @@ import {
   traceRunRef
 } from '../helpers/trace-fixture.js'
 
-const DAY_MS = 24 * 60 * 60 * 1_000
 const START = Date.parse('2026-07-16T00:00:00.000Z')
 
 test('Redis trace store is idempotent and presentation is first-write-wins', async () => {
@@ -62,7 +63,7 @@ test('Redis trace store is idempotent and presentation is first-write-wins', asy
   }
   assert.equal(redis.scanCalls.length, 0)
 
-  now += DAY_MS
+  now += TRACE_RETENTION_MS
   assert.deepEqual(await store.load(candidate.runRef), { kind: 'expired' })
 })
 
@@ -168,32 +169,105 @@ test('capacity pressure evicts an existing success before any failure', async ()
   redis.seedTraceForTest({
     key: otherSuccessKey,
     value: '{}',
-    expiresAtMs: expiresAtMs - 63,
+    expiresAtMs: expiresAtMs - TRACE_STORE_LIMITS.maxRecords + 1,
     index: 'success',
-    logicalBytes: 32 * 1024
+    logicalBytes: 128
   })
   const failureKey = `${TRACE_KEY_PREFIX}${'d'.repeat(32)}`
   redis.seedTraceForTest({
     key: failureKey,
     value: '{}',
-    expiresAtMs: expiresAtMs - 62,
+    expiresAtMs: expiresAtMs - TRACE_STORE_LIMITS.maxRecords + 2,
     index: 'failure',
-    logicalBytes: 32 * 1024
+    logicalBytes: 128
   })
-  for (let index = 0; index < 62; index += 1) {
+  for (let index = 0; index < TRACE_STORE_LIMITS.maxRecords - 2; index += 1) {
     const key = `${TRACE_KEY_PREFIX}${index.toString(16).padStart(32, '0')}`
     redis.seedTraceForTest({
       key,
       value: '{}',
-      expiresAtMs: expiresAtMs - 61 + index,
+      expiresAtMs: expiresAtMs - TRACE_STORE_LIMITS.maxRecords + 3 + index,
       index: 'failure',
-      logicalBytes: 32 * 1024
+      logicalBytes: 128
     })
   }
 
   assert.equal((await store.upsertEngine(current)).kind, 'stored')
   assert.equal(await redis.get(otherSuccessKey), null)
   assert.equal(await redis.get(failureKey), '{}')
+  assert.equal((await store.usage()).records, TRACE_STORE_LIMITS.maxRecords)
+})
+
+test('trace capacity allows more than 2 MiB and enforces the 16 MiB namespace cap', async () => {
+  const allowedRedis = new FakeRedis(() => START)
+  const allowedStore = new RedisTraceStore({ client: allowedRedis, now: () => START })
+  const candidate = traceCandidateFixture({ runRef: traceRunRef(true, 135_000) })
+  const expiresAtMs = Date.parse(candidate.expiresAt)
+  let oldestAllowedKey = ''
+  for (let index = 0; index < 96; index += 1) {
+    const key = `${TRACE_KEY_PREFIX}a${index.toString(16).padStart(31, '0')}`
+    if (index === 0) oldestAllowedKey = key
+    allowedRedis.seedTraceForTest({
+      key,
+      value: '{}',
+      expiresAtMs: expiresAtMs - 96 + index,
+      index: 'success',
+      logicalBytes: 32 * 1024
+    })
+  }
+
+  assert.equal((await allowedStore.upsertEngine(candidate)).kind, 'stored')
+  assert.equal(await allowedRedis.get(oldestAllowedKey), '{}')
+  const allowedUsage = await allowedStore.usage()
+  assert.ok(allowedUsage.bytes > 2 * 1024 * 1024)
+  assert.ok(allowedUsage.bytes <= TRACE_STORE_LIMITS.maxBytes)
+
+  const boundedRedis = new FakeRedis(() => START)
+  const boundedStore = new RedisTraceStore({ client: boundedRedis, now: () => START })
+  let oldestBoundedKey = ''
+  for (let index = 0; index < 512; index += 1) {
+    const key = `${TRACE_KEY_PREFIX}b${index.toString(16).padStart(31, '0')}`
+    if (index === 0) oldestBoundedKey = key
+    boundedRedis.seedTraceForTest({
+      key,
+      value: '{}',
+      expiresAtMs: expiresAtMs - 512 + index,
+      index: 'success',
+      logicalBytes: 32 * 1024
+    })
+  }
+
+  assert.ok((await boundedStore.usage()).bytes > TRACE_STORE_LIMITS.maxBytes)
+  assert.equal((await boundedStore.upsertEngine(candidate)).kind, 'stored')
+  assert.equal(await boundedRedis.get(oldestBoundedKey), null)
+  assert.ok((await boundedStore.usage()).bytes <= TRACE_STORE_LIMITS.maxBytes)
+})
+
+test('off barrier advances once and clears the full 2048-record namespace in batches', async () => {
+  const redis = new FakeRedis(() => START)
+  const store = new RedisTraceStore({ client: redis, now: () => START })
+  const candidate = traceCandidateFixture({ runRef: traceRunRef(true, 140_000) })
+  const expiresAtMs = Date.parse(candidate.expiresAt)
+  for (let index = 0; index < 130; index += 1) {
+    const key = `${TRACE_KEY_PREFIX}c${index.toString(16).padStart(31, '0')}`
+    redis.seedTraceForTest({
+      key,
+      value: '{}',
+      expiresAtMs: expiresAtMs + index,
+      index: 'success',
+      logicalBytes: 128
+    })
+  }
+
+  const receipt = await store.advanceGenerationAndClear()
+  assert.equal(receipt.generation, 1)
+  assert.equal(receipt.clear.removedRecords, 130)
+  assert.equal(receipt.clear.remainingRecords, 0)
+  assert.equal(
+    redis.evalCalls.filter(call => call.operation === 'advance_clear').length,
+    1
+  )
+  assert.equal(redis.evalCalls.filter(call => call.operation === 'clear').length, 2)
 })
 
 test('listRecent atomically removes corrupt indexed records', async () => {

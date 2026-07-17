@@ -6,6 +6,7 @@ import {
   internalParseTraceEvent,
   internalSelectTraceEvents,
   internalValidateTraceEvents,
+  isSupportedTraceExpiry,
   parseTraceCandidate,
   type RunTraceEventV1,
   type StoredRunTraceEventV1,
@@ -42,7 +43,6 @@ export interface StoredTraceRecordV1 extends Omit<TraceRecordV1, 'events'> {
 }
 
 const OBSERVATION_ID_PATTERN = /^[0-9a-f]{64}$/
-const TRACE_TTL_MS = 24 * 60 * 60 * 1_000
 
 function nonNegativeInteger (value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || Number(value) < 0) {
@@ -61,10 +61,6 @@ function timestamp (value: unknown, label: string): string {
     throw new TypeError(`${label} is invalid`)
   }
   return value
-}
-
-function expiryFor (finishedAt: string): string {
-  return new Date(new Date(finishedAt).getTime() + TRACE_TTL_MS).toISOString()
 }
 
 function parsePresentation (
@@ -158,7 +154,9 @@ function parseRecord (
     throw new TypeError('trace presentation correlation is invalid')
   }
   const expiresAt = timestamp(input.expiresAt, 'trace expiry')
-  if (expiresAt !== expiryFor(terminal.finishedAt)) throw new TypeError('trace expiry is invalid')
+  if (!isSupportedTraceExpiry(terminal.finishedAt, expiresAt)) {
+    throw new TypeError('trace expiry is invalid')
+  }
   const serializedBytes = nonNegativeInteger(input.serializedBytes, 'trace serialized bytes')
   const canonical = internalFinalizeSerialized(bytes => buildRecord({
     runRef: input.runRef as string,

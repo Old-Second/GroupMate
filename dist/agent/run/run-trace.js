@@ -4,7 +4,8 @@ import { parseRunCheckpoint } from './run-checkpoint.js';
 import { DURATION_BUCKET_BOUNDS_MS, parseFrozenObservationPolicy, parseRunTerminalSnapshot, parseRunTraceMetricSummary } from './run-observation.js';
 import { RUN_REF_PATTERN } from './run-reference.js';
 export const MAX_TRACE_RECORD_BYTES = 32 * 1_024;
-const TRACE_TTL_MS = 24 * 60 * 60 * 1_000;
+export const LEGACY_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
+export const TRACE_RETENTION_MS = 7 * LEGACY_TRACE_RETENTION_MS;
 const OBSERVATION_ID_PATTERN = /^[0-9a-f]{64}$/;
 const OPTIONAL_EVENT_TYPE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
 const PROVIDER_OUTCOMES = new Set([
@@ -549,8 +550,14 @@ function metricSummary(events) {
         })).sort((left, right) => (left.decision < right.decision ? -1 : left.decision > right.decision ? 1 : 0))
     });
 }
+export function isSupportedTraceExpiry(finishedAt, expiresAt) {
+    const finishedAtMs = new Date(finishedAt).getTime();
+    const expiresAtMs = new Date(expiresAt).getTime();
+    return expiresAtMs === finishedAtMs + TRACE_RETENTION_MS ||
+        expiresAtMs === finishedAtMs + LEGACY_TRACE_RETENTION_MS;
+}
 function traceExpiry(terminal) {
-    return new Date(new Date(terminal.finishedAt).getTime() + TRACE_TTL_MS).toISOString();
+    return new Date(new Date(terminal.finishedAt).getTime() + TRACE_RETENTION_MS).toISOString();
 }
 function buildCandidate(input, serializedBytes) {
     return Object.freeze({
@@ -627,8 +634,9 @@ export function parseTraceCandidate(value) {
         throw new TypeError('trace candidate presentation is invalid');
     }
     const expiresAt = timestamp(input.expiresAt, 'trace expiry');
-    if (expiresAt !== traceExpiry(terminal))
+    if (!isSupportedTraceExpiry(terminal.finishedAt, expiresAt)) {
         throw new TypeError('trace expiry is invalid');
+    }
     const serializedBytes = nonNegativeInteger(input.serializedBytes, 'trace serialized bytes');
     const canonical = internalFinalizeSerialized(bytes => buildCandidate({
         runRef: input.runRef,
