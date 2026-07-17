@@ -82,7 +82,7 @@ test('chat BYM and approval shells preserve metadata rules and delegate one-for-
   assert.match(chat.source, /name:\s*'ChatGpt 对话'/)
   assert.match(chat.source, /event:\s*'message'/)
   assert.match(chat.source, /priority:\s*1144/)
-  assert.match(chat.source, /rule:\s*getProductionYunzaiAgent\(\)\.chatController\.rules/)
+  assert.match(chat.source, /rule:\s*getProductionYunzaiAgent\(\)\.chatController\.hostRules\(\)/)
   for (const method of CHAT_METHODS) {
     assertSingleDelegate(chat.source, 'chatgpt', method, 'chatController')
   }

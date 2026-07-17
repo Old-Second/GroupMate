@@ -418,6 +418,9 @@ export function createYunzaiChatController(options, conversationModePrefixes) {
     const rules = buildYunzaiChatRules(options.policy.entryMode(), conversationModePrefixes);
     const controller = {
         rules,
+        hostRules() {
+            return rules.map(rule => ({ ...rule }));
+        },
         async chatgpt(event) {
             const current = await options.policy.snapshot(event);
             const parsed = current.toggleMode === 'at'

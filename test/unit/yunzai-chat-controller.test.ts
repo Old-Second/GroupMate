@@ -347,9 +347,24 @@ function fixture (input: Readonly<{
   }
 }
 
+test('chat controller gives the Yunzai loader mutable rule clones', () => {
+  const controller = fixture().controller
+  const hostRules = controller.hostRules()
+
+  assert.notEqual(hostRules, controller.rules)
+  assert.equal(Object.isFrozen(hostRules), false)
+  for (const rule of hostRules) {
+    assert.equal(Object.isFrozen(rule), false)
+    if (!(rule.reg instanceof RegExp)) rule.reg = new RegExp(rule.reg)
+  }
+  assert.equal(hostRules.every(rule => rule.reg instanceof RegExp), true)
+  assert.equal(typeof controller.rules[0]?.reg, 'string')
+  assert.equal(Object.isFrozen(controller.rules[0]), true)
+})
+
 test('chat and chat1 preserve every command at permission OCR quote and force-picture gate', async () => {
   const expectedMethods = [
-    'chatgpt', 'chatgpt1', 'getAllConversations', 'destroyConversations',
+    'hostRules', 'chatgpt', 'chatgpt1', 'getAllConversations', 'destroyConversations',
     'endAllConversations', 'switch2Picture', 'switch2Text', 'switch2Audio',
     'switchTTSSource', 'setDefaultRole', 'totalAvailable', 'joinConversation'
   ]

@@ -8,7 +8,7 @@ export class chatgpt extends plugin {
       dsc: '与人工智能对话，畅聊无限可能~',
       event: 'message',
       priority: 1144,
-      rule: getProductionYunzaiAgent().chatController.rules
+      rule: getProductionYunzaiAgent().chatController.hostRules()
     })
   }
 

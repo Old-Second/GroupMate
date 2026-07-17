@@ -122,6 +122,11 @@ export interface YunzaiPluginRule {
   readonly priority?: '-1000000'
 }
 
+export type YunzaiHostPluginRule = {
+  -readonly [Key in keyof YunzaiPluginRule]:
+  Key extends 'reg' ? string | RegExp : YunzaiPluginRule[Key]
+}
+
 export interface PreparedChatRequest {
   readonly route: PresentationRouteV1
   readonly evidence: PreparedYunzaiMessageEvidenceV1
@@ -191,6 +196,7 @@ export interface ChatDiagnosticsPort {
 
 export interface YunzaiChatController {
   readonly rules: readonly YunzaiPluginRule[]
+  hostRules(): YunzaiHostPluginRule[]
   chatgpt(event: YunzaiMessageEvent): Promise<false | void>
   chatgpt1(event: YunzaiMessageEvent): Promise<boolean>
   getAllConversations(event: YunzaiMessageEvent): Promise<void>
@@ -701,6 +707,10 @@ export function createYunzaiChatController (
   const rules = buildYunzaiChatRules(options.policy.entryMode(), conversationModePrefixes)
   const controller: YunzaiChatController = {
     rules,
+
+    hostRules (): YunzaiHostPluginRule[] {
+      return rules.map(rule => ({ ...rule }))
+    },
 
     async chatgpt (event: YunzaiMessageEvent): Promise<false | void> {
       const current = await options.policy.snapshot(event)
