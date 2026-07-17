@@ -19,6 +19,8 @@
     "test:unit": "pnpm run build && node --test --test-concurrency=1 test/unit/*.test.js && pnpm run test:ts",
     "test:ts": "tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*.test.js",
     "test:characterization": "node --test --test-concurrency=1 test/characterization/*.test.js",
+    "test:resources:phase6": "pnpm run build && node scripts/measure-phase-6-resources.mjs",
+    "test:redis:phase6": "pnpm run build && node scripts/smoke-phase-6-redis.mjs",
     "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
   "dependencies": {
