@@ -931,7 +931,10 @@ test('production presentation covers ordinary proactive approval and all termina
     }, host)), true)
     const visible = dispatches.slice(visibleStart)
     assert.deepEqual(visible.map(item => item.part.media), ['text', 'forward'])
-    assert.deepEqual(visible.map(item => deliveredText(item.part)), ['正在执行任务步骤', ''])
+    assert.deepEqual(visible.map(item => deliveredText(item.part)), [
+      '正在执行任务步骤（步骤 1）',
+      ''
+    ])
     assert.equal(visible[1]?.part.media === 'forward' ? visible[1].part.title : null, '工具执行详情')
     assert.match(JSON.stringify(visible[1]?.part), /工具执行：sendDice|结果已通过工具发送/)
     assert.equal(host.visibleMessages.length, 1)
@@ -1031,7 +1034,7 @@ test('production presentation preserves session-save failure across text visible
       msg: '#chat1 骰子请求，请投掷 1 个骰子'
     }, host)), true)
     assert.deepEqual(dispatches.slice(visibleStart).map(item => deliveredText(item.part)), [
-      '正在执行任务步骤',
+      '正在执行任务步骤（步骤 1）',
       SESSION_PERSISTENCE_FAILED_MESSAGE
     ])
     assert.equal(host.visibleMessages.length, 1)
@@ -1183,7 +1186,7 @@ test('production approval deferral retains reference and later retry finalizes o
     )
     assert.equal(
       deliveredText(recovery.dispatches[finalStart]?.part as OutboundPart),
-      '正在执行任务步骤'
+      '正在执行任务步骤（步骤 1）'
     )
     const resumedPicture = recovery.dispatches[finalStart + 1]
     assert.equal(resumedPicture?.part.media, 'picture')

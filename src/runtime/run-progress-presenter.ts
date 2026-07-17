@@ -69,9 +69,14 @@ interface ProgressState extends Omit<ProgressAttachment, 'resume'> {
 }
 
 const MAX_PROGRESS_MESSAGES = 5
+const MAX_PROGRESS_DELIVERY_ATTEMPTS = MAX_PROGRESS_MESSAGES * 2
 const MAX_PROGRESS_CODE_POINTS = 200
+const OCCURRENCE_ID = /^(?:0|[1-9]\d{0,9}):(?:0|[1-9]\d{0,2})$/
+const CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/
 
 const TOOL_PROGRESS: Readonly<Record<string, string>> = Object.freeze({
+  search: '正在搜索网络',
   website: '正在读取网页',
   weather: '正在查询天气',
   github: '正在查询 GitHub',
@@ -92,12 +97,23 @@ function progressFor (event: AgentEvent): Readonly<{ key: string; text: string }
   if (event.type !== 'tool.started' && event.type !== 'run.progress') return null
   if (event.type === 'run.progress' && event.payload.stage !== 'tool_started') return null
   const toolName = typeof event.payload.toolName === 'string' &&
-    /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(event.payload.toolName)
+    TOOL_NAME.test(event.payload.toolName)
     ? event.payload.toolName
     : 'unknown'
   const text = normalizedProgress(TOOL_PROGRESS[toolName] ?? '正在执行任务步骤')
+  const occurrenceId = typeof event.payload.occurrenceId === 'string' &&
+    OCCURRENCE_ID.test(event.payload.occurrenceId)
+    ? event.payload.occurrenceId
+    : null
+  const callId = typeof event.payload.callId === 'string' && CALL_ID.test(event.payload.callId)
+    ? event.payload.callId
+    : null
   return text.length === 0 ? null : Object.freeze({
-    key: `tool_started:${text}`,
+    key: occurrenceId !== null
+      ? `tool_started:${occurrenceId}`
+      : callId !== null
+        ? `tool_started:call:${callId}`
+        : `tool_started:tool:${toolName}`,
     text
   })
 }
@@ -150,7 +166,7 @@ export function progressResumeStateFromEvents (
     // A definite host rejection may have caused two physical deliveries. The
     // checkpoint deliberately persists no outbound receipts, so recovery
     // reserves the worst case for every historical stage.
-    attempts: Math.min(MAX_PROGRESS_MESSAGES, stages.length * 2),
+    attempts: Math.min(MAX_PROGRESS_DELIVERY_ATTEMPTS, stages.length * 2),
     seenStages: stages
   })
 }
@@ -178,8 +194,10 @@ export class RunProgressPresenter {
     }
     const requestKind = progressRequestKind(input.requestKind)
     if (!Number.isSafeInteger(input.resume.attempts) || input.resume.attempts < 0 ||
-      input.resume.attempts > MAX_PROGRESS_MESSAGES || !Array.isArray(input.resume.seenStages) ||
+      input.resume.attempts > MAX_PROGRESS_DELIVERY_ATTEMPTS ||
+      !Array.isArray(input.resume.seenStages) ||
       input.resume.seenStages.length > MAX_PROGRESS_MESSAGES ||
+      input.resume.attempts < input.resume.seenStages.length ||
       input.resume.seenStages.some(stage => typeof stage !== 'string' ||
         !stage.startsWith('tool_started:') || stage.length > 256) ||
       new Set(input.resume.seenStages).size !== input.resume.seenStages.length) {
@@ -236,9 +254,13 @@ export class RunProgressPresenter {
       })
       return
     }
-    if (state.terminal || state.attempts >= MAX_PROGRESS_MESSAGES) return
+    if (state.terminal || state.seenStages.size >= MAX_PROGRESS_MESSAGES ||
+      state.attempts >= MAX_PROGRESS_DELIVERY_ATTEMPTS) return
     const progress = progressFor(event)
     if (progress === null || state.seenStages.has(progress.key)) return
+    const step = state.seenStages.size + 1
+    const text = normalizedProgress(`${progress.text}（步骤 ${step}）`)
+    if (text.length === 0) return
     state.seenStages.add(progress.key)
     state.attempts += 1
     state.queue = state.queue.then(async () => {
@@ -247,15 +269,15 @@ export class RunProgressPresenter {
       const startedAt = this.#readMonotonic()
       const deliveries: SafeDeliveryObservationV1[] = []
       try {
-        let final = await state.outbound.deliver(plainTextPart(progress.text), 1)
+        let final = await state.outbound.deliver(plainTextPart(text), 1)
         deliveries.push(this.#safeDelivery(final))
         if (final.kind === 'failed_definite' && final.code === 'host_rejected' &&
-          state.attempts < MAX_PROGRESS_MESSAGES) {
+          state.attempts < MAX_PROGRESS_DELIVERY_ATTEMPTS) {
           state.attempts += 1
-          final = await state.outbound.deliver(plainTextPart(progress.text), 2)
+          final = await state.outbound.deliver(plainTextPart(text), 2)
           deliveries.push(this.#safeDelivery(final))
         }
-        this.#publishProgress(state, progress.text, deliveries, startedAt)
+        this.#publishProgress(state, text, deliveries, startedAt)
         if (final?.kind === 'sent') return
         resultCode = final?.kind ?? resultCode
       } catch {
@@ -267,7 +289,7 @@ export class RunProgressPresenter {
           outcome: 'outcome_unknown',
           code: 'unknown_host_result'
         }))
-        this.#publishProgress(state, progress.text, deliveries, startedAt)
+        this.#publishProgress(state, text, deliveries, startedAt)
       }
       this.#reportFailure(state, event, resultCode)
     })

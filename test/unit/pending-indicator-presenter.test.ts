@@ -239,5 +239,5 @@ test('pending indicator dismisses once on progress paused and terminal', async (
   await new Promise(resolve => setImmediate(resolve))
 
   assert.equal(recalls, 1)
-  assert.deepEqual(sent, [PENDING_INDICATOR_TEXT, '正在读取网页'])
+  assert.deepEqual(sent, [PENDING_INDICATOR_TEXT, '正在读取网页（步骤 1）'])
 })

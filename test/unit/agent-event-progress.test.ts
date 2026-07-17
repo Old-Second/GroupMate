@@ -86,9 +86,74 @@ test('progress presenter sends deterministic bounded tool milestones at most fiv
   names.forEach((toolName, index) => presenter.handle(event(index, 'tool.started', { toolName })))
   await presenter.drain('run-private-value')
 
-  assert.deepEqual(sent.slice(0, 2), ['正在读取网页', '正在查询天气'])
+  assert.deepEqual(sent.slice(0, 2), [
+    '正在读取网页（步骤 1）',
+    '正在查询天气（步骤 2）'
+  ])
   assert.equal(sent.length, 5)
   assert.equal(sent.every(text => [...text.normalize('NFC').trim()].length <= 200), true)
+})
+
+test('progress presenter keeps repeated search occurrences distinct and replay-safe', async () => {
+  const sent: string[] = []
+  const presenter = new RunProgressPresenter()
+  presenter.attach(attachment({ sent }))
+
+  for (let index = 0; index < 3; index += 1) {
+    presenter.handle(event(index, 'tool.started', {
+      callId: `call-${index}`,
+      toolName: 'search',
+      occurrenceId: `${index}:0`
+    }))
+  }
+  presenter.handle(event(3, 'tool.started', {
+    callId: 'call-replayed-occurrence',
+    toolName: 'search',
+    occurrenceId: '1:0'
+  }))
+  presenter.handle(event(4, 'tool.started', {
+    callId: 'call-3',
+    toolName: 'search',
+    occurrenceId: '3:0'
+  }))
+  presenter.handle(event(5, 'tool.started', {
+    callId: 'call-4',
+    toolName: 'search',
+    occurrenceId: '4:0'
+  }))
+  presenter.handle(event(6, 'tool.started', {
+    callId: 'call-over-limit',
+    toolName: 'search',
+    occurrenceId: '5:0'
+  }))
+  await presenter.drain('run-private-value')
+
+  assert.deepEqual(sent, [
+    '正在搜索网络（步骤 1）',
+    '正在搜索网络（步骤 2）',
+    '正在搜索网络（步骤 3）',
+    '正在搜索网络（步骤 4）',
+    '正在搜索网络（步骤 5）'
+  ])
+})
+
+test('progress presenter falls back to legacy call identity before tool name', async () => {
+  const sent: string[] = []
+  const presenter = new RunProgressPresenter()
+  presenter.attach(attachment({ sent }))
+
+  presenter.handle(event(0, 'tool.started', { callId: 'legacy-1', toolName: 'search' }))
+  presenter.handle(event(1, 'tool.started', { callId: 'legacy-2', toolName: 'search' }))
+  presenter.handle(event(2, 'tool.started', { callId: 'legacy-2', toolName: 'search' }))
+  presenter.handle(event(3, 'tool.started', { toolName: 'search' }))
+  presenter.handle(event(4, 'tool.started', { toolName: 'search' }))
+  await presenter.drain('run-private-value')
+
+  assert.deepEqual(sent, [
+    '正在搜索网络（步骤 1）',
+    '正在搜索网络（步骤 2）',
+    '正在搜索网络（步骤 3）'
+  ])
 })
 
 test('progress presenter deduplicates persisted events and suppresses terminal late delivery', async () => {
@@ -134,7 +199,7 @@ test('progress presenter ignores model-like text and isolates delivery failures'
   }))
   await presenter.drain('run-private-value')
 
-  assert.deepEqual(sent, ['正在查询天气'])
+  assert.deepEqual(sent, ['正在查询天气（步骤 2）'])
   assert.doesNotMatch(JSON.stringify(logs), /private delivery body|model supplied/)
   assert.deepEqual(logs, [{
     event: 'run.progress.delivery_failed',
@@ -169,7 +234,7 @@ test('progress presenter isolates every pending dismiss failure from queued deli
   presenter.handle(event(2, 'run.completed', { completionKind: 'reply_text' }))
 
   await assert.doesNotReject(presenter.drain('run-private-value'))
-  assert.deepEqual(sent, ['正在读取网页', '正在查询天气'])
+  assert.deepEqual(sent, ['正在读取网页（步骤 1）', '正在查询天气（步骤 2）'])
   assert.deepEqual(dismissReasons, ['progress', 'progress', 'terminal'])
   assert.deepEqual(logs, [])
   assert.doesNotMatch(JSON.stringify(sent), /private|recall|failure/)
@@ -192,7 +257,7 @@ test('progress presenter isolates a paused dismissal failure from drain', async 
   presenter.handle(event(1, 'run.paused', { reason: 'approval_required' }))
 
   await assert.doesNotReject(presenter.drain('run-private-value'))
-  assert.deepEqual(sent, ['正在读取网页'])
+  assert.deepEqual(sent, ['正在读取网页（步骤 1）'])
   assert.deepEqual(dismissReasons, ['progress', 'paused'])
 })
 
@@ -225,7 +290,7 @@ test('progress freezes request kind and checkpoint observation policy outside pr
   }))
   await presenter.drain('run-private-value')
 
-  assert.deepEqual(sent, ['正在读取网页'])
+  assert.deepEqual(sent, ['正在读取网页（步骤 2）'])
   assert.doesNotMatch(JSON.stringify(sent), /secret|proactive|observation/)
   assert.deepEqual(observed, [Object.freeze({
     runId: 'run-private-value',
@@ -284,16 +349,27 @@ test('progress attachment rejects forged request kind reference and observation 
   assert.deepEqual(observed, [])
 })
 
-test('progress resumes from persisted events without repeating stages or exceeding five physical attempts', async () => {
+test('progress resumes from persisted occurrences at the next step within bounded retries', async () => {
   const historical = Object.freeze([
-    event(0, 'tool.started', { toolName: 'website' }),
-    event(1, 'tool.started', { toolName: 'weather' }),
-    event(2, 'run.paused', { reason: 'approval_required' })
+    event(0, 'tool.started', {
+      callId: 'call-0', toolName: 'search', occurrenceId: '0:0'
+    }),
+    event(1, 'tool.started', {
+      callId: 'call-1', toolName: 'search', occurrenceId: '1:0'
+    }),
+    event(2, 'tool.started', {
+      callId: 'call-2', toolName: 'search', occurrenceId: '2:0'
+    }),
+    event(3, 'run.paused', { reason: 'approval_required' })
   ])
   const resume = progressResumeStateFromEvents(historical)
   assert.deepEqual(resume, {
-    attempts: 4,
-    seenStages: ['tool_started:正在读取网页', 'tool_started:正在查询天气']
+    attempts: 6,
+    seenStages: [
+      'tool_started:0:0',
+      'tool_started:1:0',
+      'tool_started:2:0'
+    ]
   })
 
   const physicalAttempts: Array<{ text: string; attempt: number }> = []
@@ -322,11 +398,61 @@ test('progress resumes from persisted events without repeating stages or exceedi
     outbound,
     indicator: null
   }))
-  presenter.handle(event(3, 'tool.started', { toolName: 'website' }))
-  presenter.handle(event(4, 'tool.started', { toolName: 'github' }))
-  presenter.handle(event(5, 'tool.started', { toolName: 'github' }))
+  presenter.handle(event(4, 'tool.started', {
+    callId: 'call-2-replay', toolName: 'search', occurrenceId: '2:0'
+  }))
+  presenter.handle(event(5, 'tool.started', {
+    callId: 'call-3', toolName: 'search', occurrenceId: '3:0'
+  }))
+  presenter.handle(event(6, 'tool.started', {
+    callId: 'call-4', toolName: 'search', occurrenceId: '4:0'
+  }))
+  presenter.handle(event(7, 'tool.started', {
+    callId: 'call-over-limit', toolName: 'search', occurrenceId: '5:0'
+  }))
   await presenter.drain('run-private-value')
 
-  assert.deepEqual(physicalAttempts, [{ text: '正在查询 GitHub', attempt: 1 }])
+  assert.deepEqual(physicalAttempts, [
+    { text: '正在搜索网络（步骤 4）', attempt: 1 },
+    { text: '正在搜索网络（步骤 4）', attempt: 2 },
+    { text: '正在搜索网络（步骤 5）', attempt: 1 },
+    { text: '正在搜索网络（步骤 5）', attempt: 2 }
+  ])
   presenter.detach('run-private-value')
+})
+
+test('progress replay accepts bounded primitive occurrence and ignores hostile payloads', () => {
+  const valid = event(0, 'tool.started', {
+    callId: 'call-safe', toolName: 'search', occurrenceId: '7:3'
+  })
+  let getterCalls = 0
+  const hostilePayload = Object.create(null)
+  Object.defineProperties(hostilePayload, {
+    callId: { value: 'call-hostile', enumerable: true },
+    toolName: { value: 'search', enumerable: true },
+    occurrenceId: {
+      enumerable: true,
+      get () {
+        getterCalls += 1
+        return '8:0'
+      }
+    }
+  })
+  const hostile = Object.freeze({ ...event(1, 'tool.started'), payload: hostilePayload })
+  const nested = Object.freeze({
+    ...event(2, 'tool.started'),
+    payload: Object.freeze({
+      callId: 'call-nested', toolName: 'search', occurrenceId: { step: 9, index: 0 }
+    })
+  })
+
+  assert.deepEqual(progressResumeStateFromEvents([
+    valid,
+    hostile as never,
+    nested as never
+  ]), {
+    attempts: 2,
+    seenStages: ['tool_started:7:3']
+  })
+  assert.equal(getterCalls, 0)
 })

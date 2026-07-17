@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
+import type { AgentEvent } from '../../src/agent/contracts/event.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
@@ -432,6 +433,7 @@ function harness (
   const tools = new ScriptedToolRuntime()
   const store = options.store ?? new InMemoryRunStore()
   const events: string[] = []
+  const observedEvents: AgentEvent[] = []
   let id = 0
   const engine = new RunEngine({
     adapter,
@@ -449,7 +451,10 @@ function harness (
       ? {}
       : { monotonicNow: options.monotonicNow }),
     generateId: () => `generated-${++id}`,
-    observer: event => { events.push(event.type) },
+    observer: event => {
+      events.push(event.type)
+      observedEvents.push(event)
+    },
     ...(options.onCommittedTraceCandidate === undefined
       ? {}
       : { onCommittedTraceCandidate: options.onCommittedTraceCandidate }),
@@ -497,7 +502,7 @@ function harness (
       ...(options.recoverContext === undefined ? {} : { recoverContext: options.recoverContext })
     })
   })
-  return { adapter, tools, store, events, engine, input }
+  return { adapter, tools, store, events, observedEvents, engine, input }
 }
 
 class TerminalRaceRunStore implements RunStore {
@@ -1310,6 +1315,12 @@ test('RunEngine feeds every tool result in Provider index order before the next 
   const toolMessages = fixture.adapter.requests[1]?.messages.filter(message => message.role === 'tool') ?? []
   assert.deepEqual(toolMessages.map(message => message.role === 'tool' && message.toolCallId), [
     'call-0', 'call-1'
+  ])
+  assert.deepEqual(fixture.observedEvents
+    .filter(event => event.type === 'tool.started')
+    .map(event => event.payload), [
+    { callId: 'call-0', toolName: 'fastRead', occurrenceId: '0:0' },
+    { callId: 'call-1', toolName: 'slowRead', occurrenceId: '0:1' }
   ])
   assert.equal(outputText(result), '全部完成')
   assert.equal(fixture.events.includes('run.progress'), false)

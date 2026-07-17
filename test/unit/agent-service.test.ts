@@ -1363,7 +1363,7 @@ test('AgentService owns context, progress, run execution and terminal session wr
   )
   assert.deepEqual(terminalOrder, ['snapshot', 'receipt', 'session_save'])
   assert.equal(adapter.requests.length, 2)
-  assert.deepEqual(progress, ['正在读取网页', '正在查询天气'])
+  assert.deepEqual(progress, ['正在读取网页（步骤 1）', '正在查询天气（步骤 2）'])
   assert.equal(adapter.requests[1]?.messages.some(message => (
     message.role === 'user' && message.content === 'internal companion text'
   )), false)

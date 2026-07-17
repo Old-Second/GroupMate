@@ -212,14 +212,18 @@ test('progress publishes one redacted fact with full run correlation per deliver
     sequence: 1,
     occurredAt: new Date(NOW).toISOString(),
     type: 'tool.started',
-    payload: Object.freeze({ toolName: 'website' })
+    payload: Object.freeze({
+      callId: 'private-progress-call',
+      toolName: 'website',
+      occurrenceId: '3:0'
+    })
   }))
   await presenter.drain('run-id')
   assert.equal(observations.length, 1)
   const encoded = JSON.stringify(observations[0])
   assert.match(encoded, new RegExp(runRef))
   assert.match(encoded, /"terminalObservationId":"not_attempted"/)
-  assert.doesNotMatch(encoded, /正在读取网页/)
+  assert.doesNotMatch(encoded, /正在读取网页|private-progress-call|website|3:0/)
 })
 
 test('production source has no discard publisher and every terminal fact uses the gated port', async () => {

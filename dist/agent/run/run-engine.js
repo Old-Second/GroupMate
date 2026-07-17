@@ -2212,7 +2212,11 @@ export class RunEngine {
             if (call.status === 'ready') {
                 return [requested, {
                         type: 'tool.started',
-                        payload: { callId: call.callId, toolName: call.toolName }
+                        payload: {
+                            callId: call.callId,
+                            toolName: call.toolName,
+                            occurrenceId: call.occurrenceId
+                        }
                     }];
             }
             if (call.status === 'succeeded') {

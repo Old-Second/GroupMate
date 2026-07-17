@@ -226,19 +226,24 @@ test('trace candidate projects safe attempts and aggregates metrics before trunc
   const checkpoint = completed([
     event(1, 'model.attempted', providerPayload('failed', 'primary', 20, 'provider_unavailable')),
     event(2, 'model.attempted', providerPayload('succeeded', 'retry', 5, null)),
-    event(3, 'tool.attempted', Object.freeze({
+    event(3, 'tool.started', Object.freeze({
+      callId: 'private-progress-call',
+      toolName: 'privateProgressTool',
+      occurrenceId: '42:7'
+    })),
+    event(4, 'tool.attempted', Object.freeze({
       observationSchemaVersion: 1,
       ordinal: 1,
       outcome: 'failed',
       durationMs: 11,
       resultCode: 'tool_execution_failed'
     })),
-    event(4, 'approval.requested', Object.freeze({
+    event(5, 'approval.requested', Object.freeze({
       approvalId: 'private-approval-id',
       callId: 'private-call-id',
       ttlSeconds: 60
     })),
-    event(5, 'approval.decided', Object.freeze({
+    event(6, 'approval.decided', Object.freeze({
       approvalId: 'private-approval-id',
       callId: 'private-call-id',
       decision: 'rejected'
@@ -274,7 +279,8 @@ test('trace candidate projects safe attempts and aggregates metrics before trunc
   const encoded = JSON.stringify(candidate)
   for (const secret of [
     'private-run-id', 'private-session-id', 'private-model',
-    'private-call-id', 'private-approval-id', 'toolName'
+    'private-call-id', 'private-approval-id', 'private-progress-call',
+    'privateProgressTool', '42:7', 'toolName', 'occurrenceId'
   ]) {
     assert.equal(encoded.includes(secret), false)
   }
