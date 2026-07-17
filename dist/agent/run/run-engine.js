@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
 import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
@@ -9,7 +10,9 @@ import { parseToolResult } from '../tools/tool-result.js';
 import { decideApprovalInterruption, displayApprovalInterruption, isApprovalActorEligible, parseApprovalInterruption } from './interruption.js';
 import { boundedMonotonicDurationMs } from './run-budget.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
+import { snapshotModelRequestForJournal, snapshotModelTurnForJournal, snapshotRunCheckpointForJournal, snapshotTerminalReceiptForJournal } from './run-content-journal.js';
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js';
+import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
@@ -108,6 +111,80 @@ function internalError(cause) {
         retryable: false,
         userMessage: '处理请求时出现异常，请稍后重试。',
         cause
+    });
+}
+function boundedUtf8(value, maxBytes) {
+    const pieces = [];
+    let bytes = 0;
+    for (const character of value) {
+        const characterBytes = Buffer.byteLength(character, 'utf8');
+        if (bytes + characterBytes > maxBytes)
+            break;
+        pieces.push(character);
+        bytes += characterBytes;
+    }
+    return pieces.join('');
+}
+function boundedSerializedAgentError(error) {
+    const stage = boundedUtf8(error.stage, 256);
+    const userMessage = boundedUtf8(error.userMessage, 2_048);
+    let details = Object.freeze({});
+    let considered = 0;
+    for (const unboundedKey in error.details) {
+        if (!Object.prototype.hasOwnProperty.call(error.details, unboundedKey))
+            continue;
+        if (++considered > 32)
+            break;
+        const key = boundedUtf8(unboundedKey, 256);
+        if (key.length === 0 || Object.prototype.hasOwnProperty.call(details, key))
+            continue;
+        const unboundedValue = error.details[unboundedKey];
+        if (unboundedValue !== null &&
+            typeof unboundedValue !== 'string' &&
+            typeof unboundedValue !== 'boolean' &&
+            (typeof unboundedValue !== 'number' || !Number.isFinite(unboundedValue))) {
+            continue;
+        }
+        const value = typeof unboundedValue === 'string'
+            ? boundedUtf8(unboundedValue, 2_048)
+            : unboundedValue;
+        const candidateDetails = Object.freeze({ ...details, [key]: value });
+        const candidate = Object.freeze({
+            code: error.code,
+            stage,
+            retryable: error.retryable,
+            userMessage,
+            details: candidateDetails
+        });
+        if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <=
+            RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes) {
+            details = candidateDetails;
+        }
+    }
+    return Object.freeze({
+        code: error.code,
+        stage,
+        retryable: error.retryable,
+        userMessage,
+        details
+    });
+}
+function canonicalProviderCallError(error, aborted) {
+    const classified = aborted
+        ? new AgentError({
+            code: 'cancelled',
+            stage: 'model.response',
+            retryable: false,
+            userMessage: '请求已取消。',
+            cause: error
+        })
+        : error instanceof ModelProviderError
+            ? error
+            : internalError(error);
+    const serialized = boundedSerializedAgentError(classified);
+    return Object.freeze({
+        error: new AgentError({ ...serialized, cause: error }),
+        serialized
     });
 }
 function checkpointConflict(cause) {
@@ -1140,7 +1217,7 @@ export class RunEngine {
         }, []);
         return Object.freeze({ checkpoint: stored, previousUsage });
     }
-    async #completeProviderDispatch(checkpoint, counters, previousUsage, usage, drafts = []) {
+    async #completeProviderDispatch(checkpoint, counters, previousUsage, occurredAt, usage, drafts = []) {
         const observationCounters = Object.freeze({
             ...checkpoint.observationCounters,
             providerInputTokens: mergedProviderUsage(previousUsage.providerInputTokens, usage?.inputTokens),
@@ -1152,7 +1229,7 @@ export class RunEngine {
             budgetCounters: counters,
             observationCounters,
             providerDispatch: Object.freeze({ state: 'idle' })
-        }, drafts);
+        }, drafts, true, occurredAt);
     }
     async #attemptModel(checkpoint, reserved, signal, correction) {
         const runtime = this.#runtime(checkpoint.runId);
@@ -1187,12 +1264,12 @@ export class RunEngine {
                 const attemptKind = nextAttemptKind;
                 this.#recordContentJournal(() => Object.freeze({
                     type: 'provider.request',
-                    occurredAt: this.#timestamp(),
+                    occurredAt: current.updatedAt,
                     runRef: current.runRef,
                     requestRef: current.requestRef,
                     ordinal: this.#providerAttemptOrdinal(current),
                     attemptKind,
-                    request
+                    request: snapshotModelRequestForJournal(request)
                 }));
                 const startedAt = this.#safeMonotonicNow();
                 let turn;
@@ -1204,26 +1281,19 @@ export class RunEngine {
                     const accounted = this.#recordProviderUsage(counters, activeRuntimeMs);
                     counters = accounted.counters;
                     const aborted = isAbortError(error) || signal.aborted;
-                    const classifiedError = aborted
-                        ? new AgentError({
-                            code: 'cancelled',
-                            stage: 'model.response',
-                            retryable: false,
-                            userMessage: '请求已取消。',
-                            cause: error
-                        })
-                        : asAgentError(error);
-                    const errorCode = classifiedError.code;
+                    const classified = canonicalProviderCallError(error, aborted);
+                    const errorCode = classified.error.code;
+                    const completionOccurredAt = this.#timestamp();
                     this.#recordContentJournal(() => Object.freeze({
                         type: 'provider.failure',
-                        occurredAt: this.#timestamp(),
+                        occurredAt: completionOccurredAt,
                         runRef: current.runRef,
                         requestRef: current.requestRef,
                         ordinal: this.#providerAttemptOrdinal(current),
                         attemptKind,
-                        error: serializeAgentError(classifiedError)
+                        error: classified.serialized
                     }));
-                    current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, undefined, [{
+                    current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, completionOccurredAt, undefined, [{
                             type: 'model.attempted',
                             payload: Object.freeze({
                                 observationSchemaVersion: 1,
@@ -1278,23 +1348,24 @@ export class RunEngine {
                             }, []);
                             continue;
                         }
-                        throw error;
+                        throw classified.error;
                     }
-                    throw internalError(error);
+                    throw classified.error;
                 }
+                const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
+                const accounted = this.#recordProviderUsage(counters, activeRuntimeMs, turn.usage?.totalTokens ?? 0);
+                counters = accounted.counters;
+                const completionOccurredAt = this.#timestamp();
                 this.#recordContentJournal(() => Object.freeze({
                     type: 'provider.response',
-                    occurredAt: this.#timestamp(),
+                    occurredAt: completionOccurredAt,
                     runRef: current.runRef,
                     requestRef: current.requestRef,
                     ordinal: this.#providerAttemptOrdinal(current),
                     attemptKind,
-                    turn
+                    turn: snapshotModelTurnForJournal(turn)
                 }));
-                const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
-                const accounted = this.#recordProviderUsage(counters, activeRuntimeMs, turn.usage?.totalTokens ?? 0);
-                counters = accounted.counters;
-                current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, turn.usage, [{
+                current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, completionOccurredAt, turn.usage, [{
                         type: 'model.attempted',
                         payload: Object.freeze({
                             observationSchemaVersion: 1,
@@ -1760,8 +1831,8 @@ export class RunEngine {
                 signal.removeEventListener('abort', onAbort);
         }
     }
-    async #commit(checkpoint, status, changes, drafts, closeActivityBoundary = true) {
-        const next = this.#next(checkpoint, status, changes, drafts, closeActivityBoundary);
+    async #commit(checkpoint, status, changes, drafts, closeActivityBoundary = true, occurredAt) {
+        const next = this.#next(checkpoint, status, changes, drafts, closeActivityBoundary, occurredAt);
         const closesActivity = closeActivityBoundary !== false &&
             (isTerminalRunStatus(status) || status === 'waiting_approval');
         try {
@@ -1776,14 +1847,14 @@ export class RunEngine {
                 catch {
                     projectionFailed = true;
                 }
-                const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot);
+                const receipt = snapshotTerminalReceiptForJournal(await this.#store.commitTerminal(checkpoint, next, snapshot));
                 this.#recordContentJournal(() => Object.freeze({
                     type: 'run.terminal_committed',
-                    occurredAt: this.#timestamp(),
+                    occurredAt: next.updatedAt,
                     runRef: next.runRef,
                     requestRef: next.requestRef,
-                    checkpoint: next,
-                    receipt
+                    checkpoint: snapshotRunCheckpointForJournal(next),
+                    receipt: snapshotTerminalReceiptForJournal(receipt)
                 }));
                 const terminal = Object.freeze({ snapshot, receipt });
                 this.#terminalFacts.set(next, terminal);
@@ -1825,9 +1896,8 @@ export class RunEngine {
             throw error;
         }
     }
-    #next(checkpoint, status, changes, drafts, activityBoundary = 'degrade') {
+    #next(checkpoint, status, changes, drafts, activityBoundary = 'degrade', occurredAt = this.#timestamp()) {
         const boundedChanges = this.#boundaryObservationChanges(checkpoint, status, changes, activityBoundary);
-        const occurredAt = this.#timestamp();
         const events = drafts.map((draft, offset) => createRunEvent({
             eventId: this.#generateId(),
             runId: checkpoint.runId,

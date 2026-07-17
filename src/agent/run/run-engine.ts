@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { performance } from 'node:perf_hooks'
 import type { AgentMessage } from '../contracts/content.js'
 import { completionFromTerminalOutput } from '../contracts/completion.js'
@@ -63,11 +64,16 @@ import {
   type RunCheckpointChanges,
   type RunModelConfig
 } from './run-checkpoint.js'
-import type {
-  RunContentJournal,
-  RunContentJournalEvent
+import {
+  snapshotModelRequestForJournal,
+  snapshotModelTurnForJournal,
+  snapshotRunCheckpointForJournal,
+  snapshotTerminalReceiptForJournal,
+  type RunContentJournal,
+  type RunContentJournalEvent
 } from './run-content-journal.js'
 import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js'
+import { RUN_RESOURCE_LIMITS } from './run-limits.js'
 import {
   createRunTerminalSnapshot,
   parseFrozenObservationPolicy,
@@ -370,6 +376,84 @@ function internalError (cause?: unknown): AgentError {
     retryable: false,
     userMessage: '处理请求时出现异常，请稍后重试。',
     cause
+  })
+}
+
+function boundedUtf8 (value: string, maxBytes: number): string {
+  const pieces: string[] = []
+  let bytes = 0
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (bytes + characterBytes > maxBytes) break
+    pieces.push(character)
+    bytes += characterBytes
+  }
+  return pieces.join('')
+}
+
+function boundedSerializedAgentError (
+  error: AgentError
+): SerializedAgentError {
+  const stage = boundedUtf8(error.stage, 256)
+  const userMessage = boundedUtf8(error.userMessage, 2_048)
+  let details: Readonly<Record<string, string | number | boolean | null>> = Object.freeze({})
+  let considered = 0
+  for (const unboundedKey in error.details) {
+    if (!Object.prototype.hasOwnProperty.call(error.details, unboundedKey)) continue
+    if (++considered > 32) break
+    const key = boundedUtf8(unboundedKey, 256)
+    if (key.length === 0 || Object.prototype.hasOwnProperty.call(details, key)) continue
+    const unboundedValue = error.details[unboundedKey]
+    if (unboundedValue !== null &&
+      typeof unboundedValue !== 'string' &&
+      typeof unboundedValue !== 'boolean' &&
+      (typeof unboundedValue !== 'number' || !Number.isFinite(unboundedValue))) {
+      continue
+    }
+    const value = typeof unboundedValue === 'string'
+      ? boundedUtf8(unboundedValue, 2_048)
+      : unboundedValue
+    const candidateDetails = Object.freeze({ ...details, [key]: value })
+    const candidate: SerializedAgentError = Object.freeze({
+      code: error.code,
+      stage,
+      retryable: error.retryable,
+      userMessage,
+      details: candidateDetails
+    })
+    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <=
+      RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes) {
+      details = candidateDetails
+    }
+  }
+  return Object.freeze({
+    code: error.code,
+    stage,
+    retryable: error.retryable,
+    userMessage,
+    details
+  })
+}
+
+function canonicalProviderCallError (
+  error: unknown,
+  aborted: boolean
+): Readonly<{ error: AgentError, serialized: SerializedAgentError }> {
+  const classified = aborted
+    ? new AgentError({
+        code: 'cancelled',
+        stage: 'model.response',
+        retryable: false,
+        userMessage: '请求已取消。',
+        cause: error
+      })
+    : error instanceof ModelProviderError
+      ? error
+      : internalError(error)
+  const serialized = boundedSerializedAgentError(classified)
+  return Object.freeze({
+    error: new AgentError({ ...serialized, cause: error }),
+    serialized
   })
 }
 
@@ -1526,6 +1610,7 @@ export class RunEngine {
     RunObservationCountersV1,
     'providerInputTokens' | 'providerOutputTokens' | 'providerTotalTokens'
     >,
+    occurredAt: string,
     usage?: ModelTurn['usage'],
     drafts: readonly EventDraft[] = []
   ): Promise<RunCheckpoint> {
@@ -1552,7 +1637,7 @@ export class RunEngine {
       budgetCounters: counters,
       observationCounters,
       providerDispatch: Object.freeze({ state: 'idle' })
-    }, drafts)
+    }, drafts, true, occurredAt)
   }
 
   async #attemptModel (
@@ -1594,12 +1679,12 @@ export class RunEngine {
         const attemptKind = nextAttemptKind
         this.#recordContentJournal(() => Object.freeze({
           type: 'provider.request',
-          occurredAt: this.#timestamp(),
+          occurredAt: current.updatedAt,
           runRef: current.runRef,
           requestRef: current.requestRef,
           ordinal: this.#providerAttemptOrdinal(current),
           attemptKind,
-          request
+          request: snapshotModelRequestForJournal(request)
         }))
         const startedAt = this.#safeMonotonicNow()
         let turn: ModelTurn
@@ -1613,29 +1698,23 @@ export class RunEngine {
           const accounted = this.#recordProviderUsage(counters, activeRuntimeMs)
           counters = accounted.counters
           const aborted = isAbortError(error) || signal.aborted
-          const classifiedError = aborted
-            ? new AgentError({
-                code: 'cancelled',
-                stage: 'model.response',
-                retryable: false,
-                userMessage: '请求已取消。',
-                cause: error
-              })
-            : asAgentError(error)
-          const errorCode = classifiedError.code
+          const classified = canonicalProviderCallError(error, aborted)
+          const errorCode = classified.error.code
+          const completionOccurredAt = this.#timestamp()
           this.#recordContentJournal(() => Object.freeze({
             type: 'provider.failure',
-            occurredAt: this.#timestamp(),
+            occurredAt: completionOccurredAt,
             runRef: current.runRef,
             requestRef: current.requestRef,
             ordinal: this.#providerAttemptOrdinal(current),
             attemptKind,
-            error: serializeAgentError(classifiedError)
+            error: classified.serialized
           }))
           current = await this.#completeProviderDispatch(
             current,
             counters,
             reservedDispatch.previousUsage,
+            completionOccurredAt,
             undefined,
             [{
               type: 'model.attempted',
@@ -1694,19 +1773,10 @@ export class RunEngine {
               }, [])
               continue
             }
-            throw error
+            throw classified.error
           }
-          throw internalError(error)
+          throw classified.error
         }
-        this.#recordContentJournal(() => Object.freeze({
-          type: 'provider.response',
-          occurredAt: this.#timestamp(),
-          runRef: current.runRef,
-          requestRef: current.requestRef,
-          ordinal: this.#providerAttemptOrdinal(current),
-          attemptKind,
-          turn
-        }))
         const activeRuntimeMs = boundedMonotonicDurationMs(
           startedAt,
           this.#safeMonotonicNow()
@@ -1717,10 +1787,21 @@ export class RunEngine {
           turn.usage?.totalTokens ?? 0
         )
         counters = accounted.counters
+        const completionOccurredAt = this.#timestamp()
+        this.#recordContentJournal(() => Object.freeze({
+          type: 'provider.response',
+          occurredAt: completionOccurredAt,
+          runRef: current.runRef,
+          requestRef: current.requestRef,
+          ordinal: this.#providerAttemptOrdinal(current),
+          attemptKind,
+          turn: snapshotModelTurnForJournal(turn)
+        }))
         current = await this.#completeProviderDispatch(
           current,
           counters,
           reservedDispatch.previousUsage,
+          completionOccurredAt,
           turn.usage,
           [{
             type: 'model.attempted',
@@ -2253,14 +2334,16 @@ export class RunEngine {
     status: RunStatus,
     changes: RunCheckpointChanges,
     drafts: readonly EventDraft[],
-    closeActivityBoundary: boolean | 'degrade' = true
+    closeActivityBoundary: boolean | 'degrade' = true,
+    occurredAt?: string
   ): Promise<RunCheckpoint> {
     const next = this.#next(
       checkpoint,
       status,
       changes,
       drafts,
-      closeActivityBoundary
+      closeActivityBoundary,
+      occurredAt
     )
     const closesActivity = closeActivityBoundary !== false &&
       (isTerminalRunStatus(status) || status === 'waiting_approval')
@@ -2275,14 +2358,16 @@ export class RunEngine {
         } catch {
           projectionFailed = true
         }
-        const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot)
+        const receipt = snapshotTerminalReceiptForJournal(
+          await this.#store.commitTerminal(checkpoint, next, snapshot)
+        )
         this.#recordContentJournal(() => Object.freeze({
           type: 'run.terminal_committed',
-          occurredAt: this.#timestamp(),
+          occurredAt: next.updatedAt,
           runRef: next.runRef,
           requestRef: next.requestRef,
-          checkpoint: next,
-          receipt
+          checkpoint: snapshotRunCheckpointForJournal(next),
+          receipt: snapshotTerminalReceiptForJournal(receipt)
         }))
         const terminal = Object.freeze({ snapshot, receipt })
         this.#terminalFacts.set(next, terminal)
@@ -2324,7 +2409,8 @@ export class RunEngine {
     status: RunStatus,
     changes: RunCheckpointChanges,
     drafts: readonly EventDraft[],
-    activityBoundary: boolean | 'degrade' = 'degrade'
+    activityBoundary: boolean | 'degrade' = 'degrade',
+    occurredAt = this.#timestamp()
   ): RunCheckpoint {
     const boundedChanges = this.#boundaryObservationChanges(
       checkpoint,
@@ -2332,7 +2418,6 @@ export class RunEngine {
       changes,
       activityBoundary
     )
-    const occurredAt = this.#timestamp()
     const events = drafts.map((draft, offset) => createRunEvent({
       eventId: this.#generateId(),
       runId: checkpoint.runId,

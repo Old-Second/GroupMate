@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { AgentError } from '../../src/agent/contracts/error.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
@@ -21,6 +22,7 @@ import {
   type StartRunInput
 } from '../../src/agent/run/run-engine.js'
 import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
+import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 import type { TraceCandidateV1 } from '../../src/agent/run/run-trace.js'
 import {
   RunReferenceConflictError,
@@ -68,6 +70,17 @@ const intent = Object.freeze({
   mentionUserIds: Object.freeze([]), currentMessageId: 'message-current',
   replyMessageId: null
 })
+
+type ProviderJournalEvent = Exclude<
+  RunContentJournalEvent,
+  { readonly type: 'run.terminal_committed' }
+>
+
+function isProviderJournalEvent (
+  event: RunContentJournalEvent
+): event is ProviderJournalEvent {
+  return event.type !== 'run.terminal_committed'
+}
 
 function success (text: string, effect: 'none' | 'background' | 'visible' = 'none'): ToolResult {
   return Object.freeze({
@@ -173,6 +186,17 @@ function sequenceClock (...values: number[]): () => number {
     if (value === undefined) throw new Error('monotonic clock script exhausted')
     return value
   }
+}
+
+function incrementalWallClock (): Readonly<{
+  now: () => Date
+  reads: () => number
+}> {
+  let reads = 0
+  return Object.freeze({
+    now: () => new Date(new Date(timestamp).getTime() + reads++),
+    reads: () => reads
+  })
 }
 
 class ActivityOrderStore extends InMemoryRunStore {
@@ -713,7 +737,7 @@ test('RunEngine journals the full Provider request before wire and response afte
     requestRef: fixture.input.requestRef,
     ordinal: 1,
     attemptKind: 'primary',
-    request: fixture.adapter.requests[0]
+    request: JSON.parse(JSON.stringify(fixture.adapter.requests[0])) as unknown
   })
   assert.deepEqual(providerEvents[1], {
     type: 'provider.response',
@@ -772,6 +796,189 @@ test('RunEngine journals only the classified bounded Provider error and ignores 
     Object.keys(failure?.type === 'provider.failure' ? failure.error : {}).sort(),
     ['code', 'details', 'retryable', 'stage', 'userMessage']
   )
+})
+
+test('RunEngine rejects untrusted non-Provider AgentError fields at the Provider boundary', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([new AgentError({
+    code: 'invalid_request',
+    stage: 'untrusted.provider.stage',
+    retryable: true,
+    userMessage: '不应泄漏的 Provider 文本',
+    details: Object.freeze({ secret: '不应泄漏的 Provider 细节' })
+  })], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+  const expectedError = {
+    code: 'internal_error',
+    stage: 'run.engine',
+    retryable: false,
+    userMessage: '处理请求时出现异常，请稍后重试。',
+    details: {}
+  }
+
+  assert.equal(result.kind, 'failed')
+  assert.deepEqual(result.kind === 'failed' ? result.error : null, expectedError)
+  assert.deepEqual(failure?.type === 'provider.failure' ? failure.error : null, expectedError)
+  assert.equal(JSON.stringify(result).includes('不应泄漏'), false)
+  assert.equal(JSON.stringify(failure).includes('不应泄漏'), false)
+})
+
+test('RunEngine keeps the canonical Provider failure within the total error byte limit', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([new ModelProviderError({
+    code: 'provider_unavailable',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: 'AI 服务暂时不可用。',
+    details: Object.freeze({ body: 'x'.repeat(100_000) })
+  })], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+  const journalError = failure?.type === 'provider.failure' ? failure.error : null
+  const finalError = result.kind === 'failed' ? result.error : null
+
+  assert.notEqual(journalError, null)
+  assert.deepEqual(finalError, journalError)
+  assert.equal(journalError?.code, 'provider_unavailable')
+  assert.ok(Buffer.byteLength(JSON.stringify(journalError), 'utf8') <=
+    RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes)
+})
+
+test('RunEngine journals Provider timeout classification before returning the same failure', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([new ModelProviderError({
+    code: 'provider_timeout',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: 'AI 服务响应超时，请稍后重试。',
+    details: Object.freeze({ timeoutMs: 120_000 })
+  })], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(failure?.type, 'provider.failure')
+  assert.equal(failure?.type === 'provider.failure' ? failure.error.code : null, 'provider_timeout')
+  assert.deepEqual(
+    result.kind === 'failed' ? result.error : null,
+    failure?.type === 'provider.failure' ? failure.error : null
+  )
+})
+
+test('RunEngine journal hooks consume no extra wall-clock reads or authoritative timestamps', async () => {
+  const withoutJournalClock = incrementalWallClock()
+  const withJournalClock = incrementalWallClock()
+  const withoutJournal = harness([modelText('时钟一致')], {
+    now: withoutJournalClock.now,
+    monotonicNow: (() => {
+      let value = 0
+      return () => ++value
+    })()
+  })
+  const withJournal = harness([modelText('时钟一致')], {
+    now: withJournalClock.now,
+    monotonicNow: (() => {
+      let value = 0
+      return () => ++value
+    })(),
+    contentJournal: { record: () => undefined }
+  })
+
+  const [withoutResult, withResult] = await Promise.all([
+    withoutJournal.engine.start(withoutJournal.input),
+    withJournal.engine.start(withJournal.input)
+  ])
+
+  assert.equal(withJournalClock.reads(), withoutJournalClock.reads())
+  assert.deepEqual(withResult, withoutResult)
+})
+
+test('RunEngine samples successful Provider duration before synchronous journal work', async () => {
+  let monotonic = 0
+  const fixture = harness([modelText('日志耗时不属于 Provider')], {
+    monotonicNow: () => monotonic,
+    contentJournal: {
+      record: event => {
+        if (event.type === 'provider.response') monotonic = 240_001
+      }
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '日志耗时不属于 Provider')
+  assert.equal(terminalSnapshot(result)?.counters.providerActiveDurationMs, 0)
+})
+
+test('RunEngine gives Provider journal callbacks detached deep-frozen request and turn snapshots', async () => {
+  const mutableTurn = {
+    text: '权威响应',
+    toolCalls: [] as ModelTurn['toolCalls'][number][],
+    finishReason: 'stop' as const,
+    usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 }
+  }
+  let wireRequestText: string | null = null
+  let journalRequest: ModelRequest | undefined
+  let journalTurn: ModelTurn | undefined
+  const fixture = harness([
+    async request => {
+      const first = request.messages[0]
+      wireRequestText = first !== undefined && 'content' in first ? first.content : null
+      return mutableTurn
+    }
+  ], {
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([
+        { role: 'user' as const, content: '权威请求' }
+      ]),
+      estimatedInputTokens: 16
+    }),
+    contentJournal: {
+      record: event => {
+        if (event.type === 'provider.request') {
+          journalRequest = event.request
+          const first = event.request.messages[0] as { content?: string } | undefined
+          if (first !== undefined) first.content = '污染请求'
+        }
+        if (event.type === 'provider.response') {
+          journalTurn = event.turn
+          const mutable = event.turn as {
+            text: string
+            usage?: { inputTokens: number; outputTokens: number; totalTokens: number }
+          }
+          mutable.text = '污染响应'
+          if (mutable.usage !== undefined) {
+            mutable.usage.inputTokens = 700
+            mutable.usage.totalTokens = 703
+          }
+        }
+      }
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(wireRequestText, '权威请求')
+  assert.equal(outputText(result), '权威响应')
+  assert.equal(terminalSnapshot(result)?.counters.providerInputTokens, 7)
+  assert.equal(terminalSnapshot(result)?.counters.providerTotalTokens, 10)
+  assert.notStrictEqual(journalRequest, fixture.adapter.requests[0])
+  assert.notStrictEqual(journalTurn, mutableTurn)
+  assert.equal(Object.isFrozen(journalRequest), true)
+  assert.equal(Object.isFrozen(journalRequest?.messages), true)
+  assert.equal(Object.isFrozen(journalRequest?.messages[0]), true)
+  assert.equal(Object.isFrozen(journalTurn), true)
+  assert.equal(Object.isFrozen(journalTurn?.usage), true)
 })
 
 test('RunEngine drops a local trace candidate when terminal CAS loses', async () => {
@@ -965,7 +1172,6 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
 
 test('RunEngine stops model completion evaluation when dispatch-completion CAS loses to a terminal', async () => {
   const store = new TerminalRaceRunStore('dispatch_completion')
-  const journalEvents: RunContentJournalEvent[] = []
   let modelEvaluationReads = 0
   const providerTurn: ModelTurn = Object.freeze({
     text: 'wire 已完成但不应继续求值',
@@ -975,10 +1181,7 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
       return 'stop'
     }
   })
-  const fixture = harness([providerTurn], {
-    store,
-    contentJournal: { record: event => { journalEvents.push(event) } }
-  })
+  const fixture = harness([providerTurn], { store })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -994,11 +1197,27 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
   assert.equal(modelEvaluationReads, 0)
   assert.equal(fixture.tools.preparations, 0)
   assert.equal(fixture.tools.executions, 0)
+  assert.equal(fixture.events.includes('model.completed'), false)
+  assert.equal(fixture.events.some(event => event.startsWith('tool.')), false)
+})
+
+test('RunEngine journals a real Provider return before dispatch-completion CAS loss', async () => {
+  const store = new TerminalRaceRunStore('dispatch_completion')
+  const journalEvents: RunContentJournalEvent[] = []
+  const turn = modelText('wire return is journaled')
+  const fixture = harness([turn], {
+    store,
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'cancelled')
   assert.deepEqual(journalEvents
     .filter(event => event.type.startsWith('provider.'))
     .map(event => event.type), ['provider.request', 'provider.response'])
-  assert.equal(fixture.events.includes('model.completed'), false)
-  assert.equal(fixture.events.some(event => event.startsWith('tool.')), false)
+  const response = journalEvents.find(event => event.type === 'provider.response')
+  assert.deepEqual(response?.type === 'provider.response' ? response.turn : null, turn)
 })
 
 test('RunEngine feeds every tool result in Provider index order before the next model turn', async () => {
@@ -1064,8 +1283,10 @@ test('RunEngine uses at most five normal turns and one tools-disabled correction
 
 test('RunEngine corrects one empty response but keeps refusal distinct', async () => {
   const correctedCandidates: TraceCandidateV1[] = []
+  const correctionJournal: RunContentJournalEvent[] = []
   const empty = harness([modelText(''), modelText('纠正后的回答')], {
-    onCommittedTraceCandidate: candidate => { correctedCandidates.push(candidate) }
+    onCommittedTraceCandidate: candidate => { correctedCandidates.push(candidate) },
+    contentJournal: { record: event => { correctionJournal.push(event) } }
   })
   const corrected = await empty.engine.start(empty.input)
   assert.equal(outputText(corrected), '纠正后的回答')
@@ -1087,6 +1308,14 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   })), [
     { outcome: 'succeeded', attemptKind: 'correction', count: 1 },
     { outcome: 'succeeded', attemptKind: 'primary', count: 1 }
+  ])
+  assert.deepEqual(correctionJournal
+    .filter(isProviderJournalEvent)
+    .map(event => ({ type: event.type, ordinal: event.ordinal, kind: event.attemptKind })), [
+    { type: 'provider.request', ordinal: 1, kind: 'primary' },
+    { type: 'provider.response', ordinal: 1, kind: 'primary' },
+    { type: 'provider.request', ordinal: 2, kind: 'correction' },
+    { type: 'provider.response', ordinal: 2, kind: 'correction' }
   ])
 
   const correctionFailure = harness([
@@ -1397,6 +1626,7 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
   })
   let recoveries = 0
   const recoveredCandidates: TraceCandidateV1[] = []
+  const recoveryJournal: RunContentJournalEvent[] = []
   const recovered = harness([
     legacyContext,
     modelTools([toolCall(0, 'recovered-tool', 'normalRead')]),
@@ -1405,6 +1635,7 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
   ], {
     profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
     onCommittedTraceCandidate: candidate => { recoveredCandidates.push(candidate) },
+    contentJournal: { record: event => { recoveryJournal.push(event) } },
     recoverContext: async () => {
       recoveries += 1
       return Object.freeze({
@@ -1443,6 +1674,18 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     { outcome: 'failed', attemptKind: 'primary', count: 2 },
     { outcome: 'succeeded', attemptKind: 'recovery', count: 1 },
     { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
+  assert.deepEqual(recoveryJournal
+    .filter(isProviderJournalEvent)
+    .map(event => ({ type: event.type, ordinal: event.ordinal, kind: event.attemptKind })), [
+    { type: 'provider.request', ordinal: 1, kind: 'primary' },
+    { type: 'provider.failure', ordinal: 1, kind: 'primary' },
+    { type: 'provider.request', ordinal: 2, kind: 'recovery' },
+    { type: 'provider.response', ordinal: 2, kind: 'recovery' },
+    { type: 'provider.request', ordinal: 3, kind: 'primary' },
+    { type: 'provider.failure', ordinal: 3, kind: 'primary' },
+    { type: 'provider.request', ordinal: 4, kind: 'retry' },
+    { type: 'provider.response', ordinal: 4, kind: 'retry' }
   ])
 })
 
@@ -1502,6 +1745,41 @@ test('RunEngine preserves a pending retry attempt kind across process restart', 
       attemptKind: 'retry'
     }
   ])
+})
+
+test('RunEngine skips Provider journal attempts when a recovered ordinal is unavailable', async () => {
+  const crashStore = new RetryReservationCrashStore()
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const crashed = harness([unavailable], { store: crashStore })
+  await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
+  const loaded = await crashStore.load('run-1')
+  assert.equal(loaded?.schemaVersion, 2)
+  if (loaded?.schemaVersion !== 2) throw new TypeError('recovered checkpoint is missing')
+
+  const recovered = parseRunCheckpoint({
+    ...loaded,
+    observationCounters: {
+      ...loaded.observationCounters,
+      providerAttempts: 'unavailable'
+    }
+  })
+  const store = new InMemoryRunStore()
+  store.seedLoadedCheckpoint(recovered)
+  const journalEvents: RunContentJournalEvent[] = []
+  const resumed = harness([modelText('不可用序号仍可完成')], {
+    store,
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '不可用序号仍可完成')
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.deepEqual(journalEvents.filter(isProviderJournalEvent), [])
+  assert.equal(journalEvents.filter(event => event.type === 'run.terminal_committed').length, 1)
 })
 
 test('RunEngine preserves recovery then retry attempt kinds across process restart', async () => {
@@ -1653,12 +1931,15 @@ test('RunEngine aborts the run signal when a fatal preparation error wins', asyn
 test('RunEngine cancellation wins over a late Provider result and suppresses terminal callbacks', async () => {
   const pendingTurn = deferred<ModelTurn>()
   const started = deferred<void>()
+  const journalEvents: RunContentJournalEvent[] = []
   const fixture = harness([
     async () => {
       started.resolve()
       return await pendingTurn.promise
     }
-  ])
+  ], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
   const running = fixture.engine.start(fixture.input)
   await started.promise
 
@@ -1702,6 +1983,8 @@ test('RunEngine cancellation wins over a late Provider result and suppresses ter
   })
   assert.equal(fixture.events.includes('run.completed'), false)
   assert.equal(fixture.events.filter(type => type === 'run.cancelled').length, 1)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+  assert.equal(failure?.type === 'provider.failure' ? failure.error.code : null, 'cancelled')
 })
 
 test('RunEngine marks an in-flight side effect indeterminate when cancellation wins', async () => {

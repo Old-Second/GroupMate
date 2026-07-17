@@ -6,6 +6,8 @@ import { ModelProviderError } from '../agent/model/model-adapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { RunEngine } from '../agent/run/run-engine.js';
+import { detachedRunContentSnapshot } from '../agent/run/run-content-journal.js';
+import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js';
 import { createRequestRef } from '../agent/run/run-reference.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { ToolScheduler } from '../agent/run/tool-scheduler.js';
@@ -649,7 +651,7 @@ export class YunzaiAgentServiceBridge {
                     : { sessionTtlSeconds: options.sessionTtlSeconds })
             });
             try {
-                this.#requestJournal?.recordRequest(request);
+                this.#requestJournal?.recordRequest(detachedRunContentSnapshot(request, RUN_RESOURCE_LIMITS.requestBytes));
             }
             catch {
                 // Request journaling must not alter adaptation or run admission.

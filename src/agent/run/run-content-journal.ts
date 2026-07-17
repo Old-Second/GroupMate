@@ -1,7 +1,15 @@
 import type { SerializedAgentError } from '../contracts/error.js'
 import type { ModelRequest, ModelTurn } from '../model/model-adapter.js'
-import type { RunCheckpoint } from './run-checkpoint.js'
-import type { TerminalCommitReceiptV1 } from './run-store.js'
+import { parseJsonValue } from '../model/json-value.js'
+import {
+  parseRunCheckpoint,
+  type RunCheckpoint
+} from './run-checkpoint.js'
+import { RUN_RESOURCE_LIMITS } from './run-limits.js'
+import {
+  parseTerminalCommitReceipt,
+  type TerminalCommitReceiptV1
+} from './run-store.js'
 import type { ProviderAttemptEventPayloadV1 } from './run-trace.js'
 
 interface ProviderContentJournalEventBase {
@@ -48,4 +56,37 @@ export type RunContentJournalEvent =
 export interface RunContentJournal {
   // Synchronous best-effort hook; authoritative run state must never depend on it.
   record(event: RunContentJournalEvent): void
+}
+
+export function detachedRunContentSnapshot<T> (
+  value: T,
+  maxBytes: number
+): T {
+  return parseJsonValue(value, {
+    maxBytes,
+    maxDepth: 32,
+    maxNodes: 8_192
+  }) as unknown as T
+}
+
+export function snapshotModelRequestForJournal (
+  request: ModelRequest
+): ModelRequest {
+  return detachedRunContentSnapshot(request, RUN_RESOURCE_LIMITS.requestBytes)
+}
+
+export function snapshotModelTurnForJournal (turn: ModelTurn): ModelTurn {
+  return detachedRunContentSnapshot(turn, RUN_RESOURCE_LIMITS.providerResponseBytes)
+}
+
+export function snapshotRunCheckpointForJournal (
+  checkpoint: RunCheckpoint
+): RunCheckpoint {
+  return parseRunCheckpoint(checkpoint)
+}
+
+export function snapshotTerminalReceiptForJournal (
+  receipt: TerminalCommitReceiptV1
+): TerminalCommitReceiptV1 {
+  return parseTerminalCommitReceipt(receipt)
 }

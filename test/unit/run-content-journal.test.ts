@@ -13,9 +13,11 @@ import type {
 } from '../../src/agent/run/run-content-journal.js'
 import {
   RunEngine,
+  type RunEngineOptions,
   type StartRunInput
 } from '../../src/agent/run/run-engine.js'
 import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
+import type { TraceCandidateV1 } from '../../src/agent/run/run-trace.js'
 import {
   RunStoreConflictError,
   type TerminalCommitReceiptV1
@@ -122,6 +124,19 @@ class RecordingTerminalStore extends InMemoryRunStore {
   }
 }
 
+class MutableReceiptStore extends RecordingTerminalStore {
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<InMemoryRunStore['commitTerminal']>[2]
+  ): Promise<TerminalCommitReceiptV1> {
+    const receipt = await super.commitTerminal(expected, next, snapshot)
+    const mutable = { ...receipt }
+    this.receipt = mutable
+    return mutable
+  }
+}
+
 class LosingTerminalStore extends InMemoryRunStore {
   override async commitTerminal (
     expected: RunCheckpoint,
@@ -153,7 +168,10 @@ class FailingTerminalStore extends InMemoryRunStore {
 
 function fixture (
   store: InMemoryRunStore,
-  contentJournal: RunContentJournal
+  contentJournal: RunContentJournal,
+  options: Readonly<{
+    onCommittedTraceCandidate?: RunEngineOptions['onCommittedTraceCandidate']
+  }> = {}
 ): Readonly<{
     engine: RunEngine
     input: StartRunInput
@@ -178,7 +196,10 @@ function fixture (
       let id = 0
       return () => `journal-id-${++id}`
     })(),
-    contentJournal
+    contentJournal,
+    ...(options.onCommittedTraceCandidate === undefined
+      ? {}
+      : { onCommittedTraceCandidate: options.onCommittedTraceCandidate })
   })
   const input: StartRunInput = Object.freeze({
     runId: 'run-journal',
@@ -260,15 +281,63 @@ test('RunEngine journals the complete checkpoint and exact receipt only after te
   assert.equal(terminal?.type === 'run.terminal_committed' ? terminal.occurredAt : null, timestamp)
   assert.equal(terminal?.type === 'run.terminal_committed' ? terminal.runRef : null, run.input.runRef)
   assert.equal(terminal?.type === 'run.terminal_committed' ? terminal.requestRef : null, run.input.requestRef)
-  assert.strictEqual(
+  assert.notStrictEqual(
     terminal?.type === 'run.terminal_committed' ? terminal.checkpoint : undefined,
     store.checkpoint
   )
-  assert.strictEqual(
+  assert.notStrictEqual(
     terminal?.type === 'run.terminal_committed' ? terminal.receipt : undefined,
     store.receipt
   )
-  assert.strictEqual(result.kind === 'completed' ? result.terminal.receipt : undefined, store.receipt)
+  assert.deepEqual(
+    terminal?.type === 'run.terminal_committed' ? terminal.checkpoint : undefined,
+    store.checkpoint
+  )
+  assert.deepEqual(
+    terminal?.type === 'run.terminal_committed' ? terminal.receipt : undefined,
+    store.receipt
+  )
+  assert.deepEqual(result.kind === 'completed' ? result.terminal.receipt : undefined, store.receipt)
+  assert.equal(Object.isFrozen(
+    terminal?.type === 'run.terminal_committed' ? terminal.checkpoint : undefined
+  ), true)
+  assert.equal(Object.isFrozen(
+    terminal?.type === 'run.terminal_committed' ? terminal.receipt : undefined
+  ), true)
+})
+
+test('RunEngine canonicalizes mutable terminal receipts and isolates terminal journal from trace and result', async () => {
+  const store = new MutableReceiptStore()
+  const candidates: TraceCandidateV1[] = []
+  let terminalEvent: Extract<RunContentJournalEvent, { type: 'run.terminal_committed' }> | undefined
+  const run = fixture(store, {
+    record: event => {
+      if (event.type !== 'run.terminal_committed') return
+      terminalEvent = event
+      ;(event.receipt as { revision: number }).revision = 99_999
+    }
+  }, {
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+
+  const result = await run.engine.start(run.input)
+  if (result.kind !== 'completed') throw new TypeError('completed result is missing')
+  const committedRevision = result.terminal.snapshot.revision
+  const authoritativeReceipt = result.terminal.receipt
+  if (store.receipt === undefined) throw new TypeError('store receipt is missing')
+  ;(store.receipt as { revision: number }).revision = 88_888
+
+  assert.equal(authoritativeReceipt.revision, committedRevision)
+  assert.equal(result.terminal.receipt.revision, committedRevision)
+  assert.equal(candidates.length, 1)
+  assert.equal(candidates[0]?.terminal.revision, committedRevision)
+  assert.equal(candidates[0]?.terminal.status, 'completed')
+  assert.notStrictEqual(terminalEvent?.checkpoint, store.checkpoint)
+  assert.notStrictEqual(terminalEvent?.receipt, store.receipt)
+  assert.notStrictEqual(terminalEvent?.receipt, authoritativeReceipt)
+  assert.equal(Object.isFrozen(authoritativeReceipt), true)
+  assert.equal(Object.isFrozen(terminalEvent?.checkpoint), true)
+  assert.equal(Object.isFrozen(terminalEvent?.receipt), true)
 })
 
 test('RunEngine emits no terminal journal event when terminal CAS loses or commit fails', async () => {
@@ -295,6 +364,10 @@ test('Yunzai bridge journals the exact normalized request once before run claim 
     recordRequest: request => {
       order.push('journal.request')
       journalRequests.push(request)
+      const first = request.message.parts[0]
+      if (first?.type === 'text') {
+        ;(first as { text: string }).text = '污染 bridge draft'
+      }
       throw new Error('request journal unavailable')
     }
   }
@@ -388,8 +461,7 @@ test('Yunzai bridge journals the exact normalized request once before run claim 
     replySegmentCount: 0,
     ocrTexts: Object.freeze([])
   })
-
-  await assert.rejects(bridge.handle(event, messageEvidence, {
+  const presentationOptions = {
     presentationRoute: Object.freeze({
       schemaVersion: 1,
       requestKind: 'ordinary_chat',
@@ -410,12 +482,36 @@ test('Yunzai bridge journals the exact normalized request once before run claim 
       actorId: 'actor-journal',
       requestMessageId: 'message-journal'
     })
-  }), error => error === stopAfterClaim)
+  }
+  const invalidEvidence = Object.freeze({
+    ...messageEvidence,
+    schemaVersion: 2 as 1
+  })
+  const adaptationFailure = await bridge.handle(
+    event,
+    invalidEvidence,
+    presentationOptions
+  )
+  assert.equal(adaptationFailure.kind, 'failed')
+  assert.deepEqual(order, [])
+  assert.equal(journalRequests.length, 0)
+  assert.equal(claimedRequests.length, 0)
+
+  await assert.rejects(
+    bridge.handle(event, messageEvidence, presentationOptions),
+    error => error === stopAfterClaim
+  )
 
   assert.deepEqual(order, ['journal.request', 'run.claim'])
   assert.equal(journalRequests.length, 1)
   assert.equal(claimedRequests.length, 1)
-  assert.strictEqual(journalRequests[0], claimedRequests[0])
+  assert.notStrictEqual(journalRequests[0], claimedRequests[0])
+  assert.notStrictEqual(journalRequests[0]?.message, claimedRequests[0]?.message)
+  assert.deepEqual(journalRequests[0], claimedRequests[0])
+  assert.equal(Object.isFrozen(journalRequests[0]), true)
+  assert.equal(Object.isFrozen(journalRequests[0]?.message), true)
+  assert.equal(Object.isFrozen(journalRequests[0]?.message.parts), true)
+  assert.equal(Object.isFrozen(journalRequests[0]?.message.parts[0]), true)
   assert.deepEqual(Reflect.ownKeys(journalRequests[0] ?? {}), [
     'requestId', 'requestRef', 'requestKind', 'presentationRoute', 'createdAt',
     'deadlineAt', 'sessionAddress', 'actor', 'channel', 'message', 'references',
