@@ -1,0 +1,817 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import type { SessionAddress } from '../../src/agent/contracts/identity.js'
+import {
+  ModelProviderError,
+  type ModelRequest,
+  type ModelTurn
+} from '../../src/agent/model/model-adapter.js'
+import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
+import { AGENT_SESSION_NAMESPACE } from '../../src/agent/session/redis-agent-session-store.js'
+import type { ToolResource } from '../../src/tools/visible-tool-support.js'
+import type { RequestObservationV1 } from '../../src/runtime/request-observation.js'
+import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
+import {
+  SESSION_PERSISTENCE_FAILED_MESSAGE
+} from '../../src/runtime/presentation/response-presentation-safety.js'
+import type { OutboundPart } from '../../src/runtime/presentation/yunzai-outbound-port.js'
+import {
+  createProductionYunzaiAgent,
+  type ProductionModelPort,
+  type ProductionYunzaiAgentOptions
+} from '../../src/runtime/production-yunzai-agent.js'
+import {
+  APPROVAL_RECOVERY_DEFERRED_MESSAGE,
+  RedisApprovalReferenceIndex
+} from '../../src/runtime/run-approval-router.js'
+import type { YunzaiMessageEvent } from '../../src/runtime/agent-service-bridge.js'
+import type { BymPolicySnapshot } from '../../src/runtime/yunzai-bym-controller.js'
+import { FakeRedis } from '../helpers/fake-redis.js'
+
+const createdAt = '2026-07-17T00:00:00.000Z'
+
+const png: ToolResource = Object.freeze({
+  kind: 'buffer',
+  data: new Uint8Array([
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13,
+    73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1
+  ]),
+  mimeType: 'image/png',
+  byteLength: 24
+})
+
+const audio: ToolResource = Object.freeze({
+  kind: 'buffer',
+  data: new Uint8Array([1, 2, 3]),
+  mimeType: 'audio/mpeg',
+  byteLength: 3
+})
+
+function presentationSettings (overrides: Readonly<{
+  forcePicture?: boolean
+  tts?: boolean
+  alsoSendText?: boolean
+}> = {}): PresentationSettings {
+  return Object.freeze({
+    schemaVersion: 1,
+    quoteReply: true,
+    enableRobotAt: false,
+    enableMarkdown: false,
+    enableSuggestedResponses: false,
+    forwardReasoning: false,
+    blockWords: Object.freeze([]),
+    promptBlockWords: Object.freeze([]),
+    tts: Object.freeze({
+      enabled: overrides.tts === true,
+      mode: 'vits-uma-genshin-honkai' as const,
+      activeVoice: 'fixture',
+      alsoSendText: overrides.alsoSendText === true,
+      autoFallbackThreshold: 299,
+      filter: null,
+      azureEmotionEnabled: false
+    }),
+    picture: Object.freeze({
+      userEnabled: overrides.forcePicture === true,
+      autoEnabled: false,
+      autoThreshold: 1_200,
+      deviceScaleFactor: 1,
+      closeBrowserAfterRender: true,
+      showQRCode: false,
+      live2d: null
+    })
+  })
+}
+
+class SessionSaveFailingRedis extends FakeRedis {
+  sessionSaveFailures = 0
+
+  override async set (
+    key: string,
+    value: string,
+    options?: { EX?: number; NX?: boolean; XX?: boolean }
+  ): Promise<string | null> {
+    if (key.startsWith(AGENT_SESSION_NAMESPACE)) {
+      this.sessionSaveFailures += 1
+      throw new Error('injected session save failure')
+    }
+    return await super.set(key, value, options)
+  }
+}
+
+interface Dispatch {
+  readonly target: SessionAddress
+  readonly part: OutboundPart
+  readonly messageId: string
+  readonly quoteMessageId?: string
+}
+
+interface GraphFixtureOptions {
+  readonly redis?: FakeRedis
+  readonly model: ProductionModelPort
+  readonly bot?: Readonly<Record<string, unknown>>
+  readonly settingsForActor?: (actorId: string) => PresentationSettings
+  readonly bymPolicy?: BymPolicySnapshot
+  readonly toolPolicyProfile?: 'compatible' | 'safe' | 'strict'
+}
+
+const disabledBymPolicy: BymPolicySnapshot = Object.freeze({
+  enabled: false,
+  assistantLabel: 'GroupMate',
+  recognizeLeadingAlias: true,
+  ratePercent: 0,
+  disabledGroupIds: Object.freeze([]),
+  thinkingMode: 'default',
+  reasoningEffort: 'default',
+  preset: '',
+  retaliationWords: Object.freeze([]),
+  retaliationBlacklistActorIds: Object.freeze([]),
+  retaliationPrompt: '',
+  retaliationRecallEnabled: false,
+  retaliationRecallSeconds: 100
+})
+
+function graphFixture (input: GraphFixtureOptions) {
+  const redis = input.redis ?? new FakeRedis()
+  const dispatches: Dispatch[] = []
+  const recalls: string[] = []
+  const observations: RequestObservationV1[] = []
+  let pictureCalls = 0
+  let ttsCalls = 0
+  const botPicker = Object.freeze({
+    pick: async () => (input.bot ?? null) as never
+  })
+  const options: ProductionYunzaiAgentOptions = {
+    bridge: {
+      config: Object.freeze({
+        openAiCompatibilityProfile: 'standard',
+        model: 'fixture-model',
+        toolPolicyProfile: input.toolPolicyProfile ?? 'compatible',
+        toolApprovalTtlSeconds: 120
+      }),
+      redis,
+      getMasterIds: async () => Object.freeze(['7']),
+      getBotId: () => 'bot-1',
+      segment: () => Object.freeze({}),
+      botPicker
+    },
+    botPicker,
+    outboundHost: Object.freeze({
+      async forTarget (currentTarget: SessionAddress) {
+        return Object.freeze({
+          async dispatch (part: OutboundPart, quoteMessageId: string | undefined) {
+            const messageId = `delivery-${dispatches.length + 1}`
+            dispatches.push(Object.freeze({
+              target: currentTarget,
+              part,
+              messageId,
+              ...(quoteMessageId === undefined ? {} : { quoteMessageId })
+            }))
+            return Object.freeze({ message_id: messageId })
+          },
+          async recall (messageId: string) {
+            recalls.push(messageId)
+            return true
+          }
+        })
+      }
+    }),
+    presentationSettings: Object.freeze({
+      load: async (actorId: string) => input.settingsForActor?.(actorId) ?? presentationSettings()
+    }),
+    pendingConfig: Object.freeze({
+      getEnabled: async () => false,
+      setEnabled: async () => undefined
+    }),
+    hooks: Object.freeze({
+      forActiveEvent: () => Object.freeze({
+        postprocess: async ({ text }: { readonly text: string }) => Object.freeze({ text }),
+        convertText: async ({ text }: { readonly text: string }) =>
+          Object.freeze([{ kind: 'text' as const, text }]),
+        notifyResponsePost: () => undefined
+      })
+    }),
+    chatPolicy: Object.freeze({
+      entryMode: () => 'prefix' as const,
+      snapshot: async () => Object.freeze({
+        toggleMode: 'prefix' as const,
+        enablePrivateChat: true,
+        whitelist: Object.freeze([]),
+        blacklist: Object.freeze([]),
+        imgOcr: false,
+        groupMerge: false,
+        enableGroupContext: false,
+        thinkingMode: 'default' as const,
+        reasoningEffort: 'default' as const,
+        assistantLabel: 'GroupMate',
+        promptPrefixOverride: '',
+        actorCastApi: ''
+      }),
+      isMuted: async () => false,
+      ocrText: async () => Object.freeze([]),
+      appendAzureEmotionFeedback: async ({ prompt }: { readonly prompt: string }) => prompt,
+      clearAzureEmotionFeedback: async () => undefined
+    }),
+    chatPreferences: Object.freeze({
+      load: async () => Object.freeze({
+        usePicture: false, useTTS: false, ttsRole: 'fixture',
+        ttsRoleAzure: 'fixture', ttsRoleVoiceVox: 'fixture'
+      }),
+      patch: async () => Object.freeze({
+        usePicture: false, useTTS: false, ttsRole: 'fixture',
+        ttsRoleAzure: 'fixture', ttsRoleVoiceVox: 'fixture'
+      })
+    }),
+    ttsAdministration: Object.freeze({
+      getMode: () => 'vits-uma-genshin-honkai' as const,
+      setMode: () => undefined,
+      isConfigured: () => true,
+      selectVoice: () => Object.freeze({ kind: 'selected' as const, storedVoice: 'fixture', message: 'ok' }),
+      missingConfigurationMessage: () => 'missing'
+    }),
+    billing: Object.freeze({
+      queryLastHundredDays: async () => Object.freeze({
+        hardLimitUsd: 0, totalUsageUsd: 0, expiresAt: new Date(0)
+      })
+    }),
+    bymPolicy: Object.freeze({ snapshot: () => input.bymPolicy ?? disabledBymPolicy }),
+    buttonPolicy: Object.freeze({
+      snapshot: () => Object.freeze({ markdownEnabled: false, openAiConfigured: false })
+    }),
+    requestObservations: Object.freeze({
+      publish: (value: RequestObservationV1) => { observations.push(value) }
+    }),
+    pictureRenderer: Object.freeze({
+      render: async () => {
+        pictureCalls += 1
+        return Object.freeze({ kind: 'rendered' as const, resource: png, source: 'local' as const })
+      }
+    }),
+    tts: Object.freeze({
+      synthesize: async () => {
+        ttsCalls += 1
+        return Object.freeze({ kind: 'ready' as const, audio })
+      }
+    }),
+    modelFactory: () => input.model,
+    random: () => 0.5,
+    now: () => new Date(createdAt),
+    monotonicNow: () => 10
+  }
+  const graph = createProductionYunzaiAgent(options)
+  return {
+    graph,
+    redis,
+    dispatches,
+    recalls,
+    observations,
+    pictureCalls: () => pictureCalls,
+    ttsCalls: () => ttsCalls
+  }
+}
+
+function textTurn (text: string): ModelTurn {
+  return Object.freeze({ text, toolCalls: Object.freeze([]), finishReason: 'stop' })
+}
+
+function toolTurn (
+  callId: string,
+  name: string,
+  args: Readonly<Record<string, string | number>>
+): ModelTurn {
+  return Object.freeze({
+    text: '',
+    toolCalls: Object.freeze([Object.freeze({
+      index: 0,
+      callId,
+      name,
+      argumentsText: JSON.stringify(args),
+      arguments: Object.freeze({ ...args })
+    })]),
+    finishReason: 'tool_calls'
+  })
+}
+
+function requestContains (request: ModelRequest, marker: string): boolean {
+  return JSON.stringify(request.messages).includes(marker)
+}
+
+class ControllerScenarioModel implements ProductionModelPort {
+  readonly requests: ModelRequest[] = []
+  readonly counts = new Map<string, number>()
+  readonly cancelStarted: Promise<void>
+  #resolveCancelStarted: (() => void) | undefined
+
+  constructor () {
+    this.cancelStarted = new Promise(resolve => { this.#resolveCancelStarted = resolve })
+  }
+
+  count (marker: string): number {
+    return this.counts.get(marker) ?? 0
+  }
+
+  async complete (request: ModelRequest, signal: AbortSignal): Promise<ModelTurn> {
+    this.requests.push(request)
+    const marker = [
+      '普通文字请求', '图片请求', '语音请求', '骰子请求',
+      '主动静默请求', '主动拆分坏蛋请求', '失败请求', '取消请求'
+    ].find(value => requestContains(request, value))
+    if (marker === undefined) throw new Error('unexpected controller scenario request')
+    this.counts.set(marker, this.count(marker) + 1)
+    if (marker === '普通文字请求') return textTurn('普通正文')
+    if (marker === '图片请求') return textTurn('图片正文')
+    if (marker === '语音请求') return textTurn('语音正文')
+    if (marker === '骰子请求') return toolTurn('call-dice', 'sendDice', { count: 1 })
+    if (marker === '主动静默请求') return textTurn('<EMPTY>')
+    if (marker === '主动拆分坏蛋请求') return textTurn('一。二。三。')
+    if (marker === '失败请求') {
+      throw new ModelProviderError({
+        code: 'provider_unavailable',
+        stage: 'fixture.provider',
+        retryable: false,
+        userMessage: '不得直接展示的 Provider 细节'
+      })
+    }
+    this.#resolveCancelStarted?.()
+    await new Promise<void>((_resolve, reject) => {
+      const abort = (): void => reject(signal.reason ?? new DOMException('cancelled', 'AbortError'))
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    })
+    throw new Error('cancelled model request unexpectedly resumed')
+  }
+
+  async generate (): Promise<readonly string[]> {
+    return Object.freeze([])
+  }
+}
+
+class ApprovalModel implements ProductionModelPort {
+  readonly requests: ModelRequest[] = []
+
+  async complete (request: ModelRequest): Promise<ModelTurn> {
+    this.requests.push(request)
+    if (!requestContains(request, '审批禁言请求')) {
+      throw new Error('unexpected approval scenario request')
+    }
+    const resumed = request.messages.some(message => message.role === 'tool')
+    return resumed
+      ? textTurn('审批恢复正文')
+      : toolTurn('call-approval-mute', 'jinyan', { userId: '8', seconds: 60 })
+  }
+
+  async generate (): Promise<readonly string[]> {
+    return Object.freeze([])
+  }
+}
+
+class RecoveryPressureModel implements ProductionModelPort {
+  readonly requests: ModelRequest[] = []
+  readonly activeResolvers: Array<() => void> = []
+  #blockingStarted = 0
+
+  async complete (request: ModelRequest): Promise<ModelTurn> {
+    this.requests.push(request)
+    if (requestContains(request, '审批禁言请求')) return textTurn('审批恢复正文')
+    if (!requestContains(request, '阻塞任务')) {
+      throw new Error('unexpected recovery pressure request')
+    }
+    if (this.#blockingStarted < 2) {
+      this.#blockingStarted += 1
+      await new Promise<void>(resolve => { this.activeResolvers.push(resolve) })
+    }
+    return textTurn('阻塞任务完成')
+  }
+
+  releaseActive (): void {
+    for (const resolve of this.activeResolvers.splice(0)) resolve()
+  }
+
+  async generate (): Promise<readonly string[]> {
+    return Object.freeze([])
+  }
+}
+
+interface HostFixture {
+  readonly bot: Readonly<Record<string, unknown>>
+  readonly group: Readonly<Record<string, unknown>>
+  readonly visibleMessages: unknown[]
+  readonly muted: Array<Readonly<{ userId: unknown; seconds: unknown }>>
+}
+
+function hostFixture (): HostFixture {
+  const visibleMessages: unknown[] = []
+  const muted: Array<Readonly<{ userId: unknown; seconds: unknown }>> = []
+  const members = new Map<unknown, Readonly<Record<string, unknown>>>([
+    ['bot-1', Object.freeze({ user_id: 'bot-1', role: 'owner', nickname: 'GroupMate' })],
+    [7, Object.freeze({ user_id: 7, role: 'owner', nickname: '群主' })],
+    [8, Object.freeze({ user_id: 8, role: 'member', nickname: '测试小号' })]
+  ])
+  for (const actor of [
+    'actor-text', 'actor-picture', 'actor-tts', 'actor-dice',
+    'actor-silence', 'actor-split', 'actor-failed', 'actor-cancel',
+    'actor-block-0', 'actor-block-1', 'actor-block-2', 'actor-block-3', 'actor-block-4'
+  ]) {
+    members.set(actor, Object.freeze({ user_id: actor, role: 'member', nickname: actor }))
+  }
+  const group = Object.freeze({
+    getMemberMap: async () => members,
+    sendMsg: async (message: unknown) => {
+      visibleMessages.push(message)
+      return Object.freeze({ message_id: `visible-${visibleMessages.length}` })
+    },
+    recallMsg: async () => true,
+    muteMember: async (userId: unknown, seconds: unknown) => {
+      muted.push(Object.freeze({ userId, seconds }))
+    },
+    kickMember: async () => undefined,
+    setCard: async () => undefined,
+    setTitle: async () => undefined
+  })
+  const friend = Object.freeze({
+    sendMsg: async (message: unknown) => {
+      visibleMessages.push(message)
+      return Object.freeze({ message_id: `visible-${visibleMessages.length}` })
+    },
+    recallMsg: async () => true
+  })
+  const bot = Object.freeze({
+    uin: 'bot-1',
+    pickGroup: () => group,
+    pickFriend: () => friend,
+    getFriendList: async () => Object.freeze(['actor-approval']),
+    setEssenceMessage: async () => undefined,
+    removeEssenceMessage: async () => undefined
+  })
+  return { bot, group, visibleMessages, muted }
+}
+
+function groupEvent (input: Readonly<{
+  marker: string
+  actorId: string
+  message?: readonly Readonly<Record<string, unknown>>[]
+  groupId?: string
+  msg?: string
+  hasAlias?: boolean
+  atme?: boolean
+  isMaster?: boolean
+  role?: 'owner' | 'admin' | 'member'
+  messageId?: string
+  sourceMessageId?: string
+}>, host: HostFixture): YunzaiMessageEvent {
+  const msg = input.msg ?? `#chat1 ${input.marker}`
+  return {
+    isGroup: true,
+    group_id: input.groupId ?? `group-${input.actorId}`,
+    self_id: 'bot-1',
+    user_id: input.actorId,
+    message_id: input.messageId ?? `message-${input.actorId}`,
+    msg,
+    message: input.message ?? Object.freeze([{ type: 'text', text: msg }]),
+    sender: Object.freeze({
+      user_id: input.actorId,
+      role: input.role ?? 'member',
+      nickname: input.actorId
+    }),
+    bot: host.bot as never,
+    group: host.group,
+    ...(input.hasAlias === undefined ? {} : { hasAlias: input.hasAlias }),
+    ...(input.atme === undefined ? {} : { atme: input.atme }),
+    ...(input.isMaster === undefined ? {} : { isMaster: input.isMaster }),
+    ...(input.sourceMessageId === undefined
+      ? {}
+      : { source: Object.freeze({ message_id: input.sourceMessageId }) })
+  } as unknown as YunzaiMessageEvent
+}
+
+async function waitFor (predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3_000
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+function deliveredText (part: OutboundPart): string {
+  return part.media === 'text'
+    ? part.atoms.map(atom => atom.kind === 'text' ? atom.text : '').join('')
+    : ''
+}
+
+test('production presentation covers ordinary proactive approval and all terminal kinds', async () => {
+  const host = hostFixture()
+  const scenario = new ControllerScenarioModel()
+  const activeBymPolicy: BymPolicySnapshot = Object.freeze({
+    ...disabledBymPolicy,
+    enabled: true,
+    retaliationWords: Object.freeze(['坏蛋']),
+    retaliationRecallEnabled: true,
+    retaliationRecallSeconds: 1
+  })
+  const fixture = graphFixture({
+    model: scenario,
+    bot: host.bot,
+    bymPolicy: activeBymPolicy,
+    settingsForActor: actorId => {
+      if (actorId === 'actor-picture') return presentationSettings({ forcePicture: true })
+      if (actorId === 'actor-tts') return presentationSettings({ tts: true, alsoSendText: true })
+      return presentationSettings()
+    }
+  })
+  const { graph, dispatches, observations } = fixture
+  let shutdown = false
+  try {
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '普通文字请求', actorId: 'actor-text'
+    }, host)), true)
+    assert.equal(dispatches.at(-1)?.part.media, 'text')
+    assert.equal(deliveredText(dispatches.at(-1)?.part as OutboundPart), '普通正文')
+
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '图片请求', actorId: 'actor-picture', msg: '#图片chat1 图片请求'
+    }, host)), true)
+    assert.equal(dispatches.at(-1)?.part.media, 'picture')
+
+    const ttsStart = dispatches.length
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '语音请求', actorId: 'actor-tts'
+    }, host)), true)
+    assert.deepEqual(
+      dispatches.slice(ttsStart).map(item => item.part.media),
+      ['text', 'voice']
+    )
+
+    const visibleStart = dispatches.length
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '骰子请求', actorId: 'actor-dice', msg: '#chat1 骰子请求，请投掷 1 个骰子'
+    }, host)), true)
+    assert.deepEqual(
+      dispatches.slice(visibleStart).map(item => deliveredText(item.part)),
+      ['正在执行任务步骤']
+    )
+    assert.equal(host.visibleMessages.length, 1)
+
+    const silenceStart = dispatches.length
+    assert.equal(await graph.bymController.bym(groupEvent({
+      marker: '主动静默请求',
+      actorId: 'actor-silence',
+      msg: '主动静默请求',
+      hasAlias: true
+    }, host)), false)
+    assert.equal(dispatches.length, silenceStart)
+
+    const proactiveStart = dispatches.length
+    const recallStart = fixture.recalls.length
+    assert.equal(await graph.bymController.bym(groupEvent({
+      marker: '主动拆分坏蛋请求',
+      actorId: 'actor-split',
+      msg: '主动拆分坏蛋请求',
+      hasAlias: true
+    }, host)), false)
+    const proactive = dispatches.slice(proactiveStart)
+    assert.deepEqual(proactive.map(item => deliveredText(item.part)), ['一', '二', '三。'])
+    await waitFor(
+      () => fixture.recalls.length - recallStart === proactive.length,
+      'proactive receipt recalls'
+    )
+
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '失败请求', actorId: 'actor-failed'
+    }, host)), true)
+    assert.doesNotMatch(
+      deliveredText(dispatches.at(-1)?.part as OutboundPart),
+      /Provider 细节|fixture\.provider/
+    )
+
+    const cancellation = graph.chatController.chatgpt1(groupEvent({
+      marker: '取消请求', actorId: 'actor-cancel'
+    }, host))
+    await scenario.cancelStarted
+    assert.equal(await graph.shutdown('unit_test_cancel'), 0)
+    shutdown = true
+    assert.equal(await cancellation, true)
+    assert.equal(dispatches.at(-1)?.part.media, 'text')
+
+    assert.equal(fixture.pictureCalls(), 1)
+    assert.equal(fixture.ttsCalls(), 1)
+    for (const marker of [
+      '普通文字请求', '图片请求', '语音请求', '骰子请求',
+      '主动静默请求', '主动拆分坏蛋请求', '失败请求', '取消请求'
+    ]) {
+      assert.equal(scenario.count(marker), 1, marker)
+    }
+    assert.equal(observations.length, 8)
+    assert.equal(new Set(observations.map(item => item.requestRef)).size, 8)
+    assert.deepEqual(
+      observations.map(item => item.requestKind),
+      ['ordinary_chat', 'ordinary_chat', 'ordinary_chat', 'ordinary_chat',
+        'proactive_chat', 'proactive_chat', 'ordinary_chat', 'ordinary_chat']
+    )
+  } finally {
+    if (!shutdown) await graph.shutdown('unit_test')
+  }
+})
+
+test('production presentation preserves session-save failure across text visible and silence', async () => {
+  const redis = new SessionSaveFailingRedis()
+  const host = hostFixture()
+  const scenario = new ControllerScenarioModel()
+  const fixture = graphFixture({
+    redis,
+    model: scenario,
+    bot: host.bot,
+    bymPolicy: Object.freeze({ ...disabledBymPolicy, enabled: true })
+  })
+  const { graph, dispatches, observations } = fixture
+  try {
+    const textStart = dispatches.length
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '普通文字请求', actorId: 'actor-text-save-failure'
+    }, host)), true)
+    assert.deepEqual(dispatches.slice(textStart).map(item => deliveredText(item.part)), [
+      '普通正文',
+      SESSION_PERSISTENCE_FAILED_MESSAGE
+    ])
+
+    const visibleStart = dispatches.length
+    assert.equal(await graph.chatController.chatgpt1(groupEvent({
+      marker: '骰子请求',
+      actorId: 'actor-dice-save-failure',
+      msg: '#chat1 骰子请求，请投掷 1 个骰子'
+    }, host)), true)
+    assert.deepEqual(dispatches.slice(visibleStart).map(item => deliveredText(item.part)), [
+      '正在执行任务步骤',
+      SESSION_PERSISTENCE_FAILED_MESSAGE
+    ])
+    assert.equal(host.visibleMessages.length, 1)
+
+    const silenceStart = dispatches.length
+    assert.equal(await graph.bymController.bym(groupEvent({
+      marker: '主动静默请求',
+      actorId: 'actor-silence-save-failure',
+      msg: '主动静默请求',
+      hasAlias: true
+    }, host)), false)
+    assert.equal(dispatches.length, silenceStart)
+    assert.equal(redis.sessionSaveFailures, 2)
+    assert.equal(scenario.count('普通文字请求'), 1)
+    assert.equal(scenario.count('骰子请求'), 1)
+    assert.equal(scenario.count('主动静默请求'), 1)
+    assert.deepEqual(observations.map(item => item.outcome), [
+      'failed_session_save', 'failed_session_save', 'completed'
+    ])
+  } finally {
+    await graph.shutdown('unit_test')
+  }
+})
+
+test('production approval deferral retains reference and later retry finalizes once', async () => {
+  const redis = new FakeRedis()
+  const host = hostFixture()
+  const initialModel = new ApprovalModel()
+  const initial = graphFixture({
+    redis,
+    model: initialModel,
+    bot: host.bot,
+    toolPolicyProfile: 'safe'
+  })
+  let recovery: ReturnType<typeof graphFixture> | undefined
+  let pressureModel: RecoveryPressureModel | undefined
+  try {
+    const approvalEvent = groupEvent({
+      marker: '审批禁言请求',
+      actorId: '7',
+      groupId: '9',
+      msg: '#图片chat1 审批禁言请求，请禁言 QQ:8 60 秒',
+      message: Object.freeze([
+        Object.freeze({ type: 'text', text: '#图片chat1 审批禁言请求，请禁言 QQ:8 ' }),
+        Object.freeze({ type: 'at', qq: 8, text: '@测试小号' }),
+        Object.freeze({ type: 'text', text: ' 60 秒' })
+      ]),
+      atme: true,
+      isMaster: true,
+      role: 'owner',
+      messageId: 'approval-original-request'
+    }, host)
+    assert.equal(
+      await initial.graph.chatController.chatgpt1(approvalEvent),
+      true,
+      JSON.stringify(initial.dispatches.map(item => item.part))
+    )
+    assert.equal(
+      initialModel.requests.length,
+      1,
+      JSON.stringify(initialModel.requests.at(-1)?.messages.filter(message => message.role === 'tool'))
+    )
+    assert.equal(initial.observations.length, 0)
+    assert.equal(initial.dispatches.length, 1)
+    assert.equal(initial.dispatches[0]?.part.media, 'text')
+
+    const approvalDelivery = initial.dispatches[0]
+    if (approvalDelivery === undefined) assert.fail('approval delivery is missing')
+    const index = new RedisApprovalReferenceIndex(redis)
+    const reference = await index.load(approvalDelivery.target, approvalDelivery.messageId)
+    assert.ok(reference !== null)
+    const store = new RedisRunStore({ client: redis })
+    const paused = await store.load(reference.runId)
+    assert.ok(paused !== null)
+    if (paused.schemaVersion !== 2) assert.fail('approval checkpoint must use schema v2')
+    assert.equal(paused.status, 'waiting_approval')
+    assert.equal(paused.completion, null)
+    assert.equal(paused.output, null)
+    assert.equal(paused.presentationRoute?.requestKind, 'ordinary_chat')
+    const intentBytes = JSON.stringify(paused.presentationRoute?.presentationIntent)
+    assert.equal(intentBytes, JSON.stringify({
+      schemaVersion: 1,
+      kind: 'ordinary',
+      forcePicture: true
+    }))
+
+    const activePressureModel = new RecoveryPressureModel()
+    pressureModel = activePressureModel
+    recovery = graphFixture({
+      redis,
+      model: activePressureModel,
+      bot: host.bot,
+      toolPolicyProfile: 'safe'
+    })
+    const recoveryGraph = recovery
+    const blockers = Array.from({ length: 5 }, (_, indexValue) => (
+      recoveryGraph.graph.chatController.chatgpt1(groupEvent({
+        marker: `阻塞任务-${indexValue}`,
+        actorId: `actor-block-${indexValue}`
+      }, host))
+    ))
+    await waitFor(
+      () => activePressureModel.requests.length === 2 &&
+        activePressureModel.activeResolvers.length === 2,
+      'two active recovery pressure runs'
+    )
+
+    const confirmation = groupEvent({
+      marker: '审批确认',
+      actorId: '7',
+      groupId: '9',
+      msg: '确认',
+      message: Object.freeze([Object.freeze({ type: 'text', text: '确认' })]),
+      isMaster: true,
+      role: 'owner',
+      messageId: 'approval-decision-request',
+      sourceMessageId: approvalDelivery.messageId
+    }, host)
+    assert.equal(await recovery.graph.approvalController.confirmToolOperation(confirmation), true)
+    assert.equal(activePressureModel.requests.length, 2)
+    assert.equal(recovery.observations.length, 0)
+    assert.equal(
+      deliveredText(recovery.dispatches.at(-1)?.part as OutboundPart),
+      APPROVAL_RECOVERY_DEFERRED_MESSAGE
+    )
+    assert.deepEqual(
+      await index.load(approvalDelivery.target, approvalDelivery.messageId),
+      reference
+    )
+    const deferred = await store.load(reference.runId)
+    assert.ok(deferred !== null)
+    if (deferred.schemaVersion !== 2) assert.fail('deferred checkpoint must use schema v2')
+    assert.equal(JSON.stringify(deferred.presentationRoute?.presentationIntent), intentBytes)
+    assert.equal(deferred.completion, null)
+
+    activePressureModel.releaseActive()
+    assert.deepEqual(await Promise.all(blockers), [true, true, true, true, true])
+    assert.equal(activePressureModel.requests.length, 5)
+    assert.equal(recovery.observations.length, 5)
+
+    const finalStart = recovery.dispatches.length
+    assert.equal(await recovery.graph.approvalController.confirmToolOperation(confirmation), true)
+    assert.equal(activePressureModel.requests.length, 6)
+    assert.deepEqual(host.muted, [Object.freeze({ userId: 8, seconds: 60 })])
+    assert.equal(recovery.pictureCalls(), 1)
+    assert.deepEqual(
+      recovery.dispatches.slice(finalStart).map(item => item.part.media),
+      ['text', 'picture']
+    )
+    assert.equal(
+      deliveredText(recovery.dispatches[finalStart]?.part as OutboundPart),
+      '正在执行任务步骤'
+    )
+    const resumedPicture = recovery.dispatches[finalStart + 1]
+    assert.equal(resumedPicture?.part.media, 'picture')
+    const pausedAddress = paused.presentationRoute?.sessionAddress
+    assert.ok(pausedAddress !== undefined && pausedAddress.scope.kind === 'group_user')
+    assert.deepEqual(resumedPicture?.target, {
+      botId: pausedAddress.botId,
+      scope: { kind: 'group', groupId: pausedAddress.scope.groupId }
+    })
+    assert.equal(resumedPicture?.quoteMessageId, 'approval-original-request')
+    assert.notEqual(resumedPicture?.quoteMessageId, 'approval-decision-request')
+    assert.equal(recovery.observations.length, 6)
+    assert.equal(new Set(recovery.observations.map(item => item.requestRef)).size, 6)
+    assert.equal(await index.load(approvalDelivery.target, approvalDelivery.messageId), null)
+    assert.equal(await store.load(reference.runId), null)
+    assert.equal(await recovery.graph.approvalController.confirmToolOperation(confirmation), false)
+    assert.equal(recovery.observations.length, 6)
+  } finally {
+    pressureModel?.releaseActive()
+    await recovery?.graph.shutdown('unit_test')
+    await initial.graph.shutdown('unit_test')
+  }
+})
