@@ -43,6 +43,7 @@ const defaultConfig = {
   chromePath: '',
   proxy: '',
   debug: true,
+  observabilityLevel: 'basic',
   defaultTimeoutMs: 120000,
   chromeTimeoutMS: 120000,
   sunoApiTimeout: 60,

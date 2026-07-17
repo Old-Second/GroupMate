@@ -83,7 +83,9 @@ function completedEnvelope (text: string): ChatReplyEnvelope {
     runRef: '1'.repeat(32),
     completion: Object.freeze({ kind: 'reply_text', text }),
     output: null,
-    terminal: null,
+    terminal: Object.freeze({
+      snapshot: Object.freeze({ observationId: 'a'.repeat(64) })
+    }),
     requestObservationDraft: Object.freeze({}),
     sessionPersistence: 'not_attempted'
   }) as unknown as ChatReplyEnvelope
@@ -113,6 +115,7 @@ function fixture (input: Readonly<{
   }>> = []
   const agentInputs: unknown[] = []
   const presentationInputs: PresentationInput[] = []
+  const diagnostics: Readonly<Record<string, unknown>>[] = []
   let completionCalls = 0
   const controller = createYunzaiBymController({
     policy: {
@@ -194,6 +197,9 @@ function fixture (input: Readonly<{
           sessionPersistence: envelope.sessionPersistence
         }))
       }
+    },
+    diagnostics: {
+      record: entry => { diagnostics.push(entry) }
     }
   })
   return {
@@ -202,6 +208,7 @@ function fixture (input: Readonly<{
     prepared,
     agentInputs,
     presentationInputs,
+    diagnostics,
     completionCalls: () => completionCalls
   }
 }
@@ -353,4 +360,30 @@ test('BYM delegates empty split quote delay and recall semantics to Presenter on
   assert.equal(await paused.controller.bym(event()), false)
   assert.equal(paused.completionCalls(), 0)
   assert.equal(paused.presentationInputs.length, 0)
+})
+
+test('BYM diagnostics correlate request and response with the claimed run', async () => {
+  const active = fixture({
+    policy: Object.freeze({ ...basePolicy, ratePercent: 100 }),
+    result: completedEnvelope('主动回复')
+  })
+  assert.equal(await active.controller.bym(event()), false)
+  assert.equal(active.diagnostics.length, 2)
+  assert.deepEqual(active.diagnostics.map(entry => ({
+    event: entry.event,
+    runRef: entry.runRef,
+    terminalObservationId: entry.terminalObservationId
+  })), [
+    {
+      event: 'chat.request',
+      runRef: '1'.repeat(32),
+      terminalObservationId: 'not_attempted'
+    },
+    {
+      event: 'chat.response',
+      runRef: '1'.repeat(32),
+      terminalObservationId: 'a'.repeat(64)
+    }
+  ])
+  assert.doesNotMatch(JSON.stringify(active.diagnostics), /主动回复|大家今天怎么样/)
 })

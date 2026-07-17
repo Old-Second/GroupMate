@@ -32,6 +32,7 @@
   "assistantLabel": "ChatGPT",
   "proxy": "",
   "debug": true,
+  "observabilityLevel": "basic",
   "enableToolbox": false,
   "defaultTimeoutMs": 120000,
   "headless": false,

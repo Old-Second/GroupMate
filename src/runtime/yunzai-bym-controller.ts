@@ -11,6 +11,10 @@ import type { ReplyPresenter } from './presentation/reply-presenter.js'
 import type { PresentationSettingsPort } from './presentation/presentation-settings.js'
 import type { PresentationCompletionCoordinator } from './request-observation-completion.js'
 import type { RuntimePresentationHooks } from './runtime-presentation-hooks.js'
+import {
+  createChatRequestLog,
+  createChatResponseLog
+} from './safe-chat-logging.js'
 
 export type ConfiguredThinkingMode = 'default' | 'enabled' | 'disabled'
 export type ConfiguredReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'max'
@@ -77,6 +81,10 @@ export interface YunzaiBymController {
   bym(event: YunzaiMessageEvent): Promise<false>
 }
 
+export interface BymDiagnosticsPort {
+  record(entry: Readonly<Record<string, unknown>>): void
+}
+
 export interface YunzaiBymControllerOptions {
   readonly policy: BymPolicyPort
   readonly random: () => number
@@ -87,6 +95,16 @@ export interface YunzaiBymControllerOptions {
   readonly hooks: RuntimePresentationHookFactory
   readonly presenter: Pick<ReplyPresenter, 'present'>
   readonly completionCoordinator: PresentationCompletionCoordinator
+  readonly diagnostics?: BymDiagnosticsPort
+}
+
+function recordDiagnostic (
+  port: BymDiagnosticsPort | undefined,
+  entry: Readonly<Record<string, unknown>>
+): void {
+  try {
+    port?.record(entry)
+  } catch {}
 }
 
 function eventGroupId (event: YunzaiMessageEvent): string | null {
@@ -232,7 +250,30 @@ async function runBym (
     thinkingMode: policy.thinkingMode,
     reasoningEffort: policy.reasoningEffort
   })
+  recordDiagnostic(options.diagnostics, createChatRequestLog({
+    mode: 'api',
+    stream: false,
+    prompt: prepared.evidence.prompt,
+    correlation: Object.freeze({
+      runRef: envelope.runRef,
+      terminalObservationId: 'not_attempted'
+    })
+  }))
   if (envelope.kind === 'paused') return
+  recordDiagnostic(options.diagnostics, createChatResponseLog({
+    mode: 'api',
+    correlation: Object.freeze({
+      runRef: envelope.runRef,
+      terminalObservationId: envelope.runRef === 'unavailable'
+        ? 'not_attempted'
+        : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+    }),
+    response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+      ? { text: envelope.completion.text }
+      : envelope.kind === 'failed'
+        ? { error: true }
+        : {}
+  }))
   await completeProactive(options, event, prepared, envelope)
 }
 

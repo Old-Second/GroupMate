@@ -111,6 +111,7 @@ const requiredGuobaFields = [
   'debug',
   'proxy',
   'defaultTimeoutMs',
+  'observabilityLevel',
   'enableToolbox',
   'closeBrowserAfterRender',
   'apiKey',
@@ -219,15 +220,15 @@ const requiredGuobaFields = [
 
 const expectedGuobaGroups = [
   {
-    label: '基础与运行',
+    label: '网络与调试',
     fields: [
-      'toggleMode', 'assistantLabel', 'enablePrivateChat', 'turnConfirm', 'enableRobotAt',
-      'proxy', 'defaultTimeoutMs', 'debug'
+      'proxy', 'defaultTimeoutMs', 'observabilityLevel', 'debug'
     ]
   },
   {
     label: '模型与会话',
     fields: [
+      'toggleMode', 'assistantLabel', 'enablePrivateChat', 'enableRobotAt', 'turnConfirm',
       'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model',
       'promptPrefixOverride', 'temperature',
       'apiStream', 'apiMaxToken', 'apiThinkingMode', 'apiReasoningEffort',

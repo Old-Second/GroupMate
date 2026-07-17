@@ -36,7 +36,8 @@ import type { RuntimePresentationHooks } from './runtime-presentation-hooks.js'
 import {
   createChatErrorLog,
   createChatRequestLog,
-  createChatResponseLog
+  createChatResponseLog,
+  type RuntimeObservationCorrelationV1
 } from './safe-chat-logging.js'
 
 export type ConfiguredThinkingMode = 'default' | 'enabled' | 'disabled'
@@ -522,6 +523,11 @@ async function runOrdinaryChat (
 ): Promise<void> {
   if (!authorized(policy, event)) return
   let prepared: ValidatedPreparedChatRequest | undefined
+  let requestDiagnosticRecorded = false
+  let latestCorrelation: RuntimeObservationCorrelationV1 = Object.freeze({
+    runRef: 'unavailable' as const,
+    terminalObservationId: 'not_attempted' as const
+  })
   try {
     const actor = actorId(event)
     const entryAddress = resolveConversationCommandAddress(
@@ -567,11 +573,6 @@ async function runOrdinaryChat (
       preferences
     })
     const presentationSettings = await options.presentationSettings.load(actor)
-    recordDiagnostic(options.diagnostics, createChatRequestLog({
-      mode: 'api',
-      stream: false,
-      prompt: prepared.evidence.prompt
-    }))
     const profile = ordinaryProfile({
       forcePicture: prepared.route.presentationIntent.forcePicture,
       quoteCurrentRequest: presentationSettings.quoteReply &&
@@ -606,9 +607,27 @@ async function runOrdinaryChat (
       ...(ttl === undefined ? {} : { sessionTtlSeconds: ttl })
     })
     const envelope = await options.agent.handle(event, prepared.evidence, handleOptions)
+    recordDiagnostic(options.diagnostics, createChatRequestLog({
+      mode: 'api',
+      stream: false,
+      prompt: prepared.evidence.prompt,
+      correlation: Object.freeze({
+        runRef: envelope.runRef,
+        terminalObservationId: 'not_attempted'
+      })
+    }))
+    requestDiagnosticRecorded = true
     if (envelope.kind === 'paused') return
+    const responseCorrelation = Object.freeze({
+      runRef: envelope.runRef,
+      terminalObservationId: envelope.runRef === 'unavailable'
+        ? 'not_attempted' as const
+        : envelope.terminal?.snapshot.observationId ?? 'unavailable' as const
+    })
+    latestCorrelation = responseCorrelation
     recordDiagnostic(options.diagnostics, createChatResponseLog({
       mode: 'api',
+      correlation: responseCorrelation,
       response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
         ? { text: envelope.completion.text }
         : envelope.kind === 'failed'
@@ -625,10 +644,22 @@ async function runOrdinaryChat (
     )
   } catch (error) {
     const presentation = getChatErrorPresentation(error)
+    if (!requestDiagnosticRecorded && prepared !== undefined) {
+      recordDiagnostic(options.diagnostics, createChatRequestLog({
+        mode: 'api',
+        stream: false,
+        prompt: prepared.evidence.prompt,
+        correlation: Object.freeze({
+          runRef: 'unavailable',
+          terminalObservationId: 'not_attempted'
+        })
+      }))
+    }
     recordDiagnostic(options.diagnostics, createChatErrorLog({
       mode: 'api',
       error,
-      category: presentation.code
+      category: presentation.code,
+      correlation: latestCorrelation
     }))
     if (prepared !== undefined) {
       await options.controls.presentRouteNotice({

@@ -33,10 +33,18 @@ test('safe chat log summaries expose bounded metadata without message content', 
   const request = createChatRequestLog({
     mode: 'api',
     stream: true,
-    prompt: secretPrompt
+    prompt: secretPrompt,
+    correlation: Object.freeze({
+      runRef: 'c'.repeat(32),
+      terminalObservationId: 'not_attempted'
+    })
   })
   const response = createChatResponseLog({
     mode: 'api',
+    correlation: Object.freeze({
+      runRef: 'c'.repeat(32),
+      terminalObservationId: 'd'.repeat(64)
+    }),
     response: {
       text: secretResponse,
       thinking_text: 'private reasoning',
@@ -46,6 +54,10 @@ test('safe chat log summaries expose bounded metadata without message content', 
   })
   const error = createChatErrorLog({
     mode: 'api',
+    correlation: Object.freeze({
+      runRef: 'unavailable',
+      terminalObservationId: 'not_attempted'
+    }),
     category: 'provider_rate_limited',
     error: {
       name: 'ChatGPTError',
@@ -64,6 +76,10 @@ test('safe chat log summaries expose bounded metadata without message content', 
     replySegmentCount: 3,
     error: new Error('private input error')
   })
+  assert.equal(request.runRef, 'c'.repeat(32))
+  assert.equal(request.terminalObservationId, 'not_attempted')
+  assert.equal(response.terminalObservationId, 'd'.repeat(64))
+  assert.equal(error.runRef, 'unavailable')
   const runRef = 'd'.repeat(32)
   const observationId = terminalObservationId(runRef, 4)
   const agentRun = createAgentRunLog({
@@ -118,7 +134,9 @@ test('safe chat log summaries expose bounded metadata without message content', 
     event: 'chat.request',
     mode: 'api',
     stream: true,
-    promptCharacters: secretPrompt.length
+    promptCharacters: secretPrompt.length,
+    runRef: 'c'.repeat(32),
+    terminalObservationId: 'not_attempted'
   })
   assert.deepEqual(response, {
     event: 'chat.response',
@@ -126,7 +144,9 @@ test('safe chat log summaries expose bounded metadata without message content', 
     textCharacters: secretResponse.length,
     hasThinking: true,
     toolCallCount: 1,
-    failed: false
+    failed: false,
+    runRef: 'c'.repeat(32),
+    terminalObservationId: 'd'.repeat(64)
   })
   assert.deepEqual(error, {
     event: 'chat.error',
@@ -134,7 +154,9 @@ test('safe chat log summaries expose bounded metadata without message content', 
     category: 'provider_rate_limited',
     error: 'ChatGPTError',
     code: 'rate_limit',
-    statusCode: 429
+    statusCode: 429,
+    runRef: 'unavailable',
+    terminalObservationId: 'not_attempted'
   })
   assert.deepEqual(messageInput, {
     event: 'chat.input.context',

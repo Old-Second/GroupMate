@@ -11,6 +11,8 @@ export type ToolAuditEventType =
 
 export interface ToolAuditEvent {
   readonly eventType: ToolAuditEventType
+  readonly runRef: string | 'unavailable'
+  readonly terminalObservationId: 'not_attempted'
   readonly eventIdHash: string
   readonly runIdHash: string
   readonly callIdHash: string

@@ -5,6 +5,13 @@ import {
   type RedisRunClient
 } from '../../src/agent/run/redis-run-store.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
+import {
+  TRACE_BYTES_KEY,
+  TRACE_FAILURE_INDEX_KEY,
+  TRACE_GENERATION_KEY,
+  TRACE_STORE_LUA_MARKER,
+  TRACE_SUCCESS_INDEX_KEY
+} from '../../src/runtime/observability/redis-trace-store.js'
 
 interface FakeRedisEntry {
   readonly value: string
@@ -16,6 +23,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   readonly setCalls: Array<{ key: string; options?: { EX?: number; NX?: boolean; XX?: boolean } }> = []
   readonly evalCalls: Array<{ marker: string; operation: string }> = []
   private readonly entries = new Map<string, FakeRedisEntry>()
+  private readonly sortedSets = new Map<string, Map<string, number>>()
+  private readonly traceLengths = new Map<string, number>()
   private readonly pendingGetFailures = new Set<string>()
   private readonly now: () => number
 
@@ -31,6 +40,26 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
 
   failNextGet (key: string): void {
     this.pendingGetFailures.add(key)
+  }
+
+  seedTraceForTest (input: {
+    readonly key: string
+    readonly value: string
+    readonly expiresAtMs: number
+    readonly index: 'success' | 'failure'
+    readonly logicalBytes: number
+  }): void {
+    this.entries.set(input.key, {
+      value: input.value,
+      expiresAtMs: input.expiresAtMs
+    })
+    this.traceLengths.set(input.key, input.logicalBytes)
+    this.zadd(
+      input.index === 'success' ? TRACE_SUCCESS_INDEX_KEY : TRACE_FAILURE_INDEX_KEY,
+      input.key,
+      input.expiresAtMs
+    )
+    this.saveTraceBytes()
   }
 
   async set (key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }): Promise<string | null> {
@@ -95,6 +124,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     const marker = script.split('\n', 1)[0] ?? ''
     const operation = options.arguments[0] ?? ''
     this.evalCalls.push({ marker, operation })
+    if (marker === TRACE_STORE_LUA_MARKER) {
+      return this.evalTrace(operation, options.keys, options.arguments)
+    }
     if (marker !== RUN_STORE_LUA_MARKER) {
       throw new TypeError('unsupported Lua script')
     }
@@ -319,6 +351,198 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     }
 
     return 'invalid_operation'
+  }
+
+  private evalTrace (
+    operation: string,
+    keys: readonly string[],
+    args: readonly string[]
+  ): unknown {
+    const [traceKey] = keys
+    if (keys[1] !== TRACE_SUCCESS_INDEX_KEY || keys[2] !== TRACE_FAILURE_INDEX_KEY ||
+      keys[3] !== TRACE_BYTES_KEY || keys[4] !== TRACE_GENERATION_KEY) {
+      throw new TypeError('invalid trace keys')
+    }
+    if (operation === 'upsert' || operation === 'append') {
+      const expectedGeneration = Number(args[1])
+      const generation = Number(this.entryValue(TRACE_GENERATION_KEY) ?? '0')
+      if (expectedGeneration !== generation) return ['stale_generation', String(generation)]
+      this.cleanupTrace(Number(args[2]))
+      if (traceKey === undefined) throw new TypeError('trace key is invalid')
+      if (operation === 'upsert') {
+        const raw = args[3]
+        const expiresAtMs = Number(args[4])
+        const index = args[5] === 'failure'
+          ? TRACE_FAILURE_INDEX_KEY
+          : TRACE_SUCCESS_INDEX_KEY
+        if (raw === undefined) throw new TypeError('trace value is invalid')
+        const existing = this.entryValue(traceKey)
+        if (existing !== null) {
+          return [existing === raw ? 'unchanged' : 'conflict', String(generation)]
+        }
+        if (!this.ensureTraceCapacity(this.bytes(raw), 1)) {
+          return ['capacity', String(generation)]
+        }
+        this.entries.set(traceKey, { value: raw, expiresAtMs })
+        this.traceLengths.set(traceKey, this.bytes(raw))
+        this.zadd(index, traceKey, expiresAtMs)
+        this.saveTraceBytes()
+        return ['stored', String(generation)]
+      }
+      const expected = args[3]
+      const replacement = args[4]
+      const expiresAtMs = Number(args[5])
+      if (expected === undefined || replacement === undefined) {
+        throw new TypeError('trace append value is invalid')
+      }
+      const existing = this.entryValue(traceKey)
+      if (existing === null) return ['not_found', String(generation)]
+      if (existing !== expected) return ['conflict', String(generation)]
+      if (existing === replacement) return ['unchanged', String(generation)]
+      const delta = this.bytes(replacement) - this.bytes(existing)
+      if (delta > 0 && !this.ensureTraceCapacity(delta, 0, traceKey)) {
+        return ['capacity', String(generation)]
+      }
+      this.entries.set(traceKey, { value: replacement, expiresAtMs })
+      this.traceLengths.set(traceKey, this.bytes(replacement))
+      if (args[6] === 'failure') {
+        this.zrem(TRACE_SUCCESS_INDEX_KEY, traceKey)
+        this.zadd(TRACE_FAILURE_INDEX_KEY, traceKey, expiresAtMs)
+      }
+      this.saveTraceBytes()
+      return ['stored', String(generation)]
+    }
+    if (operation === 'delete_corrupt') {
+      if (traceKey !== undefined && this.entryValue(traceKey) === args[1]) {
+        this.removeTrace(traceKey)
+      }
+      return 'ok'
+    }
+    if (operation === 'missing_state') {
+      if (traceKey === undefined) throw new TypeError('trace key is invalid')
+      const score = this.sortedSets.get(TRACE_SUCCESS_INDEX_KEY)?.get(traceKey) ??
+        this.sortedSets.get(TRACE_FAILURE_INDEX_KEY)?.get(traceKey)
+      if (score !== undefined && score <= Number(args[1])) {
+        this.removeTrace(traceKey)
+        this.saveTraceBytes()
+        return 'expired'
+      }
+      return 'not_retained'
+    }
+    if (operation === 'list') {
+      this.cleanupTrace(Number(args[1]))
+      const limit = Number(args[2])
+      return [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]
+        .flatMap(index => this.zrange(index, true).slice(0, limit))
+        .flatMap(key => {
+          const raw = this.entryValue(key)
+          return raw === null ? [] : [key, raw]
+        })
+    }
+    if (operation === 'usage') {
+      this.cleanupTrace(Number(args[1]))
+      const usage = this.traceUsage()
+      return [usage.records, usage.bytes]
+    }
+    if (operation === 'clear') return this.clearTrace(Number(args[1]))
+    if (operation === 'advance_clear') {
+      const generation = Number(this.entryValue(TRACE_GENERATION_KEY) ?? '0') + 1
+      this.entries.set(TRACE_GENERATION_KEY, { value: String(generation) })
+      return [generation, ...this.clearTrace(Number(args[1]))]
+    }
+    return 'invalid_operation'
+  }
+
+  private cleanupTrace (nowMs: number): void {
+    let remaining = 64
+    for (const index of [TRACE_SUCCESS_INDEX_KEY, TRACE_FAILURE_INDEX_KEY]) {
+      for (const key of this.zrange(index)) {
+        if (remaining <= 0) break
+        const score = this.sortedSets.get(index)?.get(key)
+        if (score === undefined || score > nowMs) break
+        this.removeTrace(key)
+        remaining -= 1
+      }
+    }
+    this.saveTraceBytes()
+  }
+
+  private ensureTraceCapacity (
+    addedBytes: number,
+    addedRecords: number,
+    skip?: string
+  ): boolean {
+    let usage = this.traceUsage()
+    let guard = 64
+    while ((usage.records + addedRecords > 64 || usage.bytes + addedBytes > 2 * 1024 * 1024) &&
+      guard > 0) {
+      const victim = [
+        ...this.zrange(TRACE_SUCCESS_INDEX_KEY),
+        ...this.zrange(TRACE_FAILURE_INDEX_KEY)
+      ].find(key => key !== skip)
+      if (victim === undefined) return false
+      this.removeTrace(victim)
+      usage = this.traceUsage()
+      guard -= 1
+    }
+    return usage.records + addedRecords <= 64 && usage.bytes + addedBytes <= 2 * 1024 * 1024
+  }
+
+  private clearTrace (limit: number): [number, number, number, number] {
+    const before = this.traceUsage()
+    const keys = [
+      ...this.zrange(TRACE_SUCCESS_INDEX_KEY),
+      ...this.zrange(TRACE_FAILURE_INDEX_KEY)
+    ].slice(0, limit)
+    for (const key of keys) this.removeTrace(key)
+    const after = this.traceUsage()
+    this.saveTraceBytes()
+    return [keys.length, before.bytes - after.bytes, after.records, after.bytes]
+  }
+
+  private traceUsage (): { records: number; bytes: number } {
+    const keys = new Set([
+      ...this.zrange(TRACE_SUCCESS_INDEX_KEY),
+      ...this.zrange(TRACE_FAILURE_INDEX_KEY)
+    ])
+    return {
+      records: keys.size,
+      bytes: [...keys].reduce((total, key) => total + (this.traceLengths.get(key) ?? 0), 0)
+    }
+  }
+
+  private saveTraceBytes (): void {
+    const bytes = this.traceUsage().bytes
+    if (bytes === 0) this.entries.delete(TRACE_BYTES_KEY)
+    else this.entries.set(TRACE_BYTES_KEY, { value: String(bytes) })
+  }
+
+  private removeTrace (key: string): void {
+    this.entries.delete(key)
+    this.traceLengths.delete(key)
+    this.zrem(TRACE_SUCCESS_INDEX_KEY, key)
+    this.zrem(TRACE_FAILURE_INDEX_KEY, key)
+  }
+
+  private zadd (index: string, member: string, score: number): void {
+    const set = this.sortedSets.get(index) ?? new Map<string, number>()
+    set.set(member, score)
+    this.sortedSets.set(index, set)
+  }
+
+  private zrem (index: string, member: string): void {
+    this.sortedSets.get(index)?.delete(member)
+  }
+
+  private zrange (index: string, reverse = false): string[] {
+    return [...(this.sortedSets.get(index)?.entries() ?? [])]
+      .sort((left, right) => {
+        const score = left[1] - right[1]
+        if (score !== 0) return reverse ? -score : score
+        const lexical = left[0].localeCompare(right[0])
+        return reverse ? -lexical : lexical
+      })
+      .map(([member]) => member)
   }
 
   private entryValue (key: string | undefined): string | null {

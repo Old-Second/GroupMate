@@ -6,6 +6,7 @@ import {
 } from '../agent/run/run-store.js'
 import { readChatErrorMetadata } from './chat-error-presentation.js'
 import { parseObservationEvent } from './observability/observation-event.js'
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js'
 
 export {
   SafeObservationFailureLogLimiter,
@@ -45,17 +46,44 @@ interface ChatRequestLogInput {
   mode?: unknown
   stream?: unknown
   prompt?: unknown
+  correlation?: RuntimeObservationCorrelationV1
 }
 
 interface ChatResponseLogInput {
   mode?: unknown
   response?: unknown
+  correlation?: RuntimeObservationCorrelationV1
 }
 
 interface ChatErrorLogInput {
   mode?: unknown
   error?: unknown
   category?: unknown
+  correlation?: RuntimeObservationCorrelationV1
+}
+
+export interface RuntimeObservationCorrelationV1 {
+  readonly runRef: string | 'unavailable'
+  readonly terminalObservationId: string | 'unavailable' | 'not_attempted'
+}
+
+const OBSERVATION_ID_PATTERN = /^[0-9a-f]{64}$/
+
+function safeCorrelation (
+  value: RuntimeObservationCorrelationV1 | undefined
+): RuntimeObservationCorrelationV1 | null {
+  if (value === undefined) return null
+  const runRef = value.runRef
+  const terminalObservationId = value.terminalObservationId
+  const validRun = runRef === 'unavailable' || RUN_REF_PATTERN.test(runRef)
+  const validTerminal = terminalObservationId === 'unavailable' ||
+    terminalObservationId === 'not_attempted' ||
+    OBSERVATION_ID_PATTERN.test(terminalObservationId)
+  if (!validRun || !validTerminal ||
+    (runRef === 'unavailable' && terminalObservationId !== 'not_attempted') ||
+    (runRef !== 'unavailable' && terminalObservationId === 'not_attempted' &&
+      !RUN_REF_PATTERN.test(runRef))) return null
+  return Object.freeze({ runRef, terminalObservationId })
 }
 
 interface MessageInputLogInput {
@@ -118,16 +146,18 @@ function getSafeToken (value: unknown): string {
     : 'unknown'
 }
 
-export function createChatRequestLog ({ mode, stream, prompt }: ChatRequestLogInput) {
+export function createChatRequestLog ({ mode, stream, prompt, correlation }: ChatRequestLogInput) {
+  const safe = safeCorrelation(correlation)
   return {
     event: 'chat.request',
     mode: getSafeMode(mode),
     stream: stream === true,
-    promptCharacters: getStringLength(prompt)
+    promptCharacters: getStringLength(prompt),
+    ...(safe === null ? {} : safe)
   } as const
 }
 
-export function createChatResponseLog ({ mode, response }: ChatResponseLogInput) {
+export function createChatResponseLog ({ mode, response, correlation }: ChatResponseLogInput) {
   const value = isRecord(response) ? response : {}
   const toolCalls = Array.isArray(value.toolCalls) ? value.toolCalls.length : 0
   const hasFunctionCall = isRecord(value.functionCall)
@@ -135,18 +165,21 @@ export function createChatResponseLog ({ mode, response }: ChatResponseLogInput)
     ? value.thinking_segments.length
     : 0
 
+  const safe = safeCorrelation(correlation)
   return {
     event: 'chat.response',
     mode: getSafeMode(mode),
     textCharacters: getStringLength(value.text),
     hasThinking: getStringLength(value.thinking_text) > 0 || thinkingSegments > 0,
     toolCallCount: toolCalls || (hasFunctionCall ? 1 : 0),
-    failed: Boolean(value.error)
+    failed: Boolean(value.error),
+    ...(safe === null ? {} : safe)
   } as const
 }
 
-export function createChatErrorLog ({ mode, error, category }: ChatErrorLogInput) {
+export function createChatErrorLog ({ mode, error, category, correlation }: ChatErrorLogInput) {
   const metadata = readChatErrorMetadata(error)
+  const safe = safeCorrelation(correlation)
 
   return {
     event: 'chat.error',
@@ -154,7 +187,8 @@ export function createChatErrorLog ({ mode, error, category }: ChatErrorLogInput
     category: getSafeToken(category),
     error: getSafeToken(metadata.name),
     code: getSafeToken(metadata.code),
-    statusCode: metadata.statusCode
+    statusCode: metadata.statusCode,
+    ...(safe === null ? {} : safe)
   } as const
 }
 

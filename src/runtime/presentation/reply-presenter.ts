@@ -43,7 +43,19 @@ import {
 import type { TtsReplyPort } from './yunzai-tts-reply-port.js'
 import type { PresentationInput } from '../runtime-presentation-hooks.js'
 import { presentPictureReply } from '../picture-reply.js'
+import {
+  preprocessTtsText,
+  shouldFallbackVitsToText
+} from '../tts-presentation.js'
 import type { GroupMatePictureRenderer } from './groupmate-picture-renderer.js'
+import {
+  createPresentationObservationId,
+  parseObservationEvent,
+  type ObservationEventV1,
+  type PresentationFallbackReasonV1,
+  type PresentationReducerInputV1,
+  type SafeDeliveryObservationV1
+} from '../observability/observation-event.js'
 
 export interface ReplyPresenterDependencies {
   readonly outboundFactory: YunzaiOutboundPortFactory
@@ -56,6 +68,21 @@ export interface ReplyPresenterDependencies {
     callback: () => void,
     milliseconds: number
   ) => ReturnType<typeof setTimeout>
+  readonly publishObservation?: (event: ObservationEventV1) => void
+  readonly monotonicNow?: () => number | 'unavailable'
+}
+
+interface PresentationDecisionDraft {
+  textLengthBucket: PresentationReducerInputV1['textLengthBucket']
+  hasReasoning: boolean
+  hasCitation: boolean
+  buttonsEligible: boolean
+  ttsEligibility: PresentationReducerInputV1['ttsEligibility']
+  pictureEligibility: PresentationReducerInputV1['pictureEligibility']
+  quotePolicy: PresentationReducerInputV1['quotePolicy']
+  selectedMode: PresentationReducerInputV1['selectedMode']
+  fallbackReason: PresentationFallbackReasonV1
+  postprocessAnomaly: boolean
 }
 
 function frozenResult (
@@ -352,34 +379,52 @@ async function presentRecoveredLegacy (
 
 export class ReplyPresenter {
   readonly #dependencies: ReplyPresenterDependencies
+  readonly #monotonicNow: () => number | 'unavailable'
 
   constructor (dependencies: ReplyPresenterDependencies) {
     this.#dependencies = dependencies
+    this.#monotonicNow = dependencies.monotonicNow ?? (() => Math.trunc(performance.now()))
   }
 
   async present (input: PresentationInput): Promise<PresentationResult> {
+    const startedAt = this.#readMonotonic()
+    const decision = this.#createDecisionDraft(input)
+    const result = await this.#present(input, decision)
+    this.#completeDeliveryDecision(decision, result)
+    this.#publishObservation(input, result, decision, startedAt)
+    return result
+  }
+
+  async #present (
+    input: PresentationInput,
+    decision: PresentationDecisionDraft
+  ): Promise<PresentationResult> {
     if (!validPresentationMatrix(input)) return failedWithoutDelivery()
     if (input.result.kind === 'completed') {
       if (input.result.completion.kind === 'allowed_silence') {
+        decision.selectedMode = 'silent'
         return skipped('allowed_silence')
       }
       if (input.result.completion.kind === 'already_visible') {
         if (input.profile.kind === 'ordinary' && input.sessionPersistence === 'failed') {
+          decision.textLengthBucket = this.#lengthBucket(SESSION_PERSISTENCE_FAILED_MESSAGE)
           return await presentFixedText(
             this.#dependencies,
             input,
             SESSION_PERSISTENCE_FAILED_MESSAGE
           )
         }
+        decision.selectedMode = 'silent'
         return skipped('already_visible')
       }
-      return await this.#presentReplyText(input, input.result.completion.text)
+      return await this.#presentReplyText(input, input.result.completion.text, decision)
     }
 
     if (input.profile.kind === 'proactive') return failedWithoutDelivery()
     const text = input.result.kind === 'failed'
       ? getChatErrorPresentation(input.result.error).message
       : CANCELLED_MESSAGE
+    decision.textLengthBucket = this.#lengthBucket(text)
     return await presentFixedText(
       this.#dependencies,
       input,
@@ -391,15 +436,18 @@ export class ReplyPresenter {
 
   async #presentReplyText (
     input: PresentationInput,
-    canonicalText: string
+    canonicalText: string,
+    decision: PresentationDecisionDraft
   ): Promise<PresentationResult> {
     const normalizedCanonical = canonicalText.trim().normalize('NFC')
     if (input.profile.kind === 'recovered_legacy_plain_text' &&
       normalizedCanonical === '<EMPTY>') {
+      const text = getChatErrorPresentation({ code: 'legacy_entry_kind_unavailable' }).message
+      decision.textLengthBucket = this.#lengthBucket(text)
       return await presentFixedText(
         this.#dependencies,
         input,
-        getChatErrorPresentation({ code: 'legacy_entry_kind_unavailable' }).message
+        text
       )
     }
     const processed = await input.hooks.postprocess({
@@ -409,6 +457,9 @@ export class ReplyPresenter {
       ? processed.text.trim().normalize('NFC')
       : ''
     if (normalized === '') {
+      decision.textLengthBucket = 'none'
+      decision.fallbackReason = 'postprocess_empty'
+      decision.postprocessAnomaly = true
       const main = input.profile.kind === 'proactive'
         ? failedWithoutDelivery()
         : await presentFixedText(
@@ -421,12 +472,15 @@ export class ReplyPresenter {
       return await this.#appendPersistenceNotice(input, main)
     }
     if (input.profile.kind === 'recovered_legacy_plain_text' && normalized === '<EMPTY>') {
+      const text = getChatErrorPresentation({ code: 'legacy_entry_kind_unavailable' }).message
+      decision.textLengthBucket = this.#lengthBucket(text)
       return await presentFixedText(
         this.#dependencies,
         input,
-        getChatErrorPresentation({ code: 'legacy_entry_kind_unavailable' }).message
+        text
       )
     }
+    decision.textLengthBucket = this.#lengthBucket(normalized)
     if (responseIsBlocked(normalized, input.settings.blockWords)) {
       const main = await presentFixedText(
         this.#dependencies,
@@ -442,13 +496,18 @@ export class ReplyPresenter {
     const reasoningView = input.profile.kind === 'ordinary' && input.settings.forwardReasoning
       ? normalizeReasoningView(processed.reasoningView)
       : undefined
+    decision.hasReasoning = reasoningView !== undefined
     fireNotification(input, finalText, reasoningView !== undefined)
 
-    const main = input.profile.kind === 'ordinary'
-      ? await presentOrdinary(this.#dependencies, input, finalText, reasoningView)
-      : input.profile.kind === 'proactive'
+    let main: PresentationResult
+    if (input.profile.kind === 'ordinary') {
+      main = await presentOrdinary(this.#dependencies, input, finalText, reasoningView)
+      this.#captureOrdinaryMode(input, finalText, main, decision)
+    } else {
+      main = input.profile.kind === 'proactive'
         ? await presentProactive(this.#dependencies, input, finalText)
         : await presentRecoveredLegacy(this.#dependencies, input, finalText)
+    }
     return await this.#appendPersistenceNotice(input, main)
   }
 
@@ -466,5 +525,200 @@ export class ReplyPresenter {
       SESSION_PERSISTENCE_FAILED_MESSAGE
     )
     return aggregatePresentationResults(Object.freeze([main, notice]))
+  }
+
+  #publishObservation (
+    input: PresentationInput,
+    result: PresentationResult,
+    decision: PresentationDecisionDraft,
+    startedAt: number | 'unavailable'
+  ): void {
+    if (this.#dependencies.publishObservation === undefined) return
+    const finishedAt = this.#readMonotonic()
+    const totalDurationMs = startedAt === 'unavailable' || finishedAt === 'unavailable' ||
+      finishedAt < startedAt
+      ? 'unavailable' as const
+      : finishedAt - startedAt
+    const runRef = input.result.runRef
+    const terminalObservationId = runRef === 'unavailable'
+      ? 'not_attempted' as const
+      : input.result.terminal?.snapshot.observationId ?? 'unavailable' as const
+    const requestKind = input.route.requestKind === 'legacy_unknown'
+      ? 'recovered_legacy_plain_text' as const
+      : input.route.requestKind
+    const profile = input.profile.kind
+    const deliveries = Object.freeze(result.deliveries.map(delivery => (
+      this.#safeDelivery(delivery)
+    )))
+    const reducerInput: PresentationReducerInputV1 = Object.freeze({
+      schemaVersion: 1,
+      reducerVersion: 1,
+      requestKind,
+      profile,
+      textLengthBucket: decision.textLengthBucket,
+      hasReasoning: decision.hasReasoning,
+      hasCitation: decision.hasCitation,
+      buttonsEligible: decision.buttonsEligible,
+      ttsEligibility: decision.ttsEligibility,
+      pictureEligibility: decision.pictureEligibility,
+      quotePolicy: decision.quotePolicy,
+      selectedMode: decision.selectedMode,
+      fallbackReason: decision.fallbackReason,
+      configEnumVersion: 1
+    })
+    try {
+      this.#dependencies.publishObservation(parseObservationEvent({
+        schemaVersion: 1,
+        type: 'presentation',
+        value: {
+          schemaVersion: 1,
+          presentationObservationId: createPresentationObservationId(),
+          runRef,
+          terminalObservationId,
+          profile,
+          outcome: result.outcome,
+          postprocessAnomaly: decision.postprocessAnomaly,
+          deliveries,
+          totalDurationMs,
+          reducerInput
+        }
+      }))
+    } catch {
+      // Presentation facts are outside the delivery control plane.
+    }
+  }
+
+  #safeDelivery (
+    delivery: PresentationResult['deliveries'][number]
+  ): SafeDeliveryObservationV1 {
+    if (delivery.kind === 'sent') {
+      return Object.freeze({
+        schemaVersion: 1,
+        media: delivery.media,
+        attempt: delivery.attempt,
+        outcome: 'sent',
+        code: null
+      })
+    }
+    return delivery.kind === 'failed_definite'
+      ? Object.freeze({
+          schemaVersion: 1,
+          media: delivery.media,
+          attempt: delivery.attempt,
+          outcome: 'failed_definite',
+          code: delivery.code
+        })
+      : Object.freeze({
+          schemaVersion: 1,
+          media: delivery.media,
+          attempt: delivery.attempt,
+          outcome: 'outcome_unknown',
+          code: delivery.code
+        })
+  }
+
+  #createDecisionDraft (input: PresentationInput): PresentationDecisionDraft {
+    const ordinary = input.profile.kind === 'ordinary'
+    const hasCitation = ordinary && normalizeCitationForwards(input.citationForwards).length > 0
+    const pictureRequested = input.settings.picture.userEnabled ||
+      input.settings.picture.autoEnabled ||
+      (input.profile.kind === 'ordinary' && input.profile.forcePicture)
+    const mediaRestricted = !ordinary && (input.settings.tts.enabled || pictureRequested)
+    return {
+      textLengthBucket: 'none',
+      hasReasoning: false,
+      hasCitation,
+      buttonsEligible: ordinary && input.settings.enableSuggestedResponses &&
+        normalizeSuggestions(input.suggestions).length > 0,
+      ttsEligibility: ordinary
+        ? input.settings.tts.enabled ? 'eligible' : 'disabled'
+        : input.settings.tts.enabled ? 'unsupported' : 'disabled',
+      pictureEligibility: ordinary
+        ? pictureRequested ? 'eligible' : 'disabled'
+        : pictureRequested ? 'unsupported' : 'disabled',
+      quotePolicy: ordinary && quoteMessageId(input, input.profile) !== undefined
+        ? 'current_request'
+        : hasCitation ? 'citation_forward' : 'none',
+      selectedMode: 'text',
+      fallbackReason: mediaRestricted ? 'profile_restricted' : 'none',
+      postprocessAnomaly: false
+    }
+  }
+
+  #captureOrdinaryMode (
+    input: PresentationInput,
+    text: string,
+    result: PresentationResult,
+    decision: PresentationDecisionDraft
+  ): void {
+    const pictureSelected = (input.profile.kind === 'ordinary' && input.profile.forcePicture) ||
+      input.settings.picture.userEnabled ||
+      (input.settings.picture.autoEnabled &&
+        codePointLength(text) >= input.settings.picture.autoThreshold)
+    if (input.settings.tts.enabled) {
+      const prepared = preprocessTtsText({
+        text,
+        mode: input.settings.tts.mode,
+        filter: input.settings.tts.filter,
+        azureEmotionEnabled: input.settings.tts.azureEmotionEnabled
+      })
+      const contentTooLarge = shouldFallbackVitsToText({
+        ttsMode: input.settings.tts.mode,
+        textCharacters: codePointLength(prepared.spokenText),
+        threshold: input.settings.tts.autoFallbackThreshold
+      })
+      const voice = result.deliveries.filter(delivery => delivery.media === 'voice')
+      const hasSentVoice = voice.some(delivery => delivery.kind === 'sent')
+      const hasSentText = result.deliveries.some(delivery =>
+        delivery.media === 'text' && delivery.kind === 'sent')
+      decision.selectedMode = hasSentVoice ? 'tts' : hasSentText ? 'text' : 'tts'
+      if (contentTooLarge) decision.fallbackReason = 'content_too_large'
+      else if (voice.length === 0) decision.fallbackReason = 'synthesis_failed'
+      return
+    }
+    if (!pictureSelected) {
+      decision.selectedMode = 'text'
+      return
+    }
+    const picture = result.deliveries.filter(delivery => delivery.media === 'picture')
+    const hasSentPicture = picture.some(delivery => delivery.kind === 'sent')
+    const hasSentText = result.deliveries.some(delivery =>
+      delivery.media === 'text' && delivery.kind === 'sent')
+    decision.selectedMode = hasSentPicture ? 'picture' : hasSentText ? 'text' : 'picture'
+    if (picture.length === 0) decision.fallbackReason = 'render_failed'
+  }
+
+  #completeDeliveryDecision (
+    decision: PresentationDecisionDraft,
+    result: PresentationResult
+  ): void {
+    if (decision.fallbackReason !== 'none') return
+    if (result.deliveries.some(delivery => delivery.kind === 'outcome_unknown')) {
+      decision.fallbackReason = 'delivery_unknown'
+    } else if (result.deliveries.some(delivery => delivery.kind === 'failed_definite')) {
+      decision.fallbackReason = 'delivery_definite_failure'
+    }
+  }
+
+  #lengthBucket (text: string): PresentationReducerInputV1['textLengthBucket'] {
+    const length = [...text].length
+    if (length === 0) return 'none'
+    if (length <= 40) return '1_40'
+    if (length <= 200) return '41_200'
+    if (length <= 1_000) return '201_1000'
+    if (length <= 4_000) return '1001_4000'
+    return 'over_4000'
+  }
+
+  #readMonotonic (): number | 'unavailable' {
+    try {
+      const value = this.#monotonicNow()
+      return value === 'unavailable' ||
+        (Number.isSafeInteger(value) && value >= 0)
+        ? value
+        : 'unavailable'
+    } catch {
+      return 'unavailable'
+    }
   }
 }

@@ -6,6 +6,7 @@ import { normalizeGuobaConfigValue } from './dist/runtime/guoba-config.js'
 import { buildGuobaSchemas } from './dist/runtime/guoba-schema.js'
 import { createPendingIndicatorConfigPort } from './dist/runtime/presentation/pending-indicator-config.js'
 import { pluginId, repositoryUrl } from './dist/runtime/plugin-context.js'
+import { updateProductionObservabilityLevel } from './dist/runtime/production-yunzai-agent.js'
 
 const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
 const RESTART_REQUIRED_CONFIG_FIELDS = new Set([
@@ -62,9 +63,22 @@ export function supportGuoba () {
           normalizeGuobaConfigValue(keyPath, rawValue)
         ])
         let restartRequired = false
+        let observabilityResult = null
         for (const [keyPath, value] of normalized) {
           if (keyPath === 'turnConfirm') {
             await pendingIndicatorConfig.setEnabled(value)
+            continue
+          }
+          if (keyPath === 'observabilityLevel') {
+            if (value === 'off') {
+              Config.observabilityLevel = 'off'
+              observabilityResult = await updateProductionObservabilityLevel('off')
+            } else {
+              observabilityResult = await updateProductionObservabilityLevel(value)
+              if (observabilityResult.kind === 'applied') {
+                Config.observabilityLevel = value
+              }
+            }
             continue
           }
           if (Config[keyPath] !== value) {
@@ -79,9 +93,14 @@ export function supportGuoba () {
         if (azureSpeaker) {
           Config.azureTTSSpeaker = azureSpeaker.code
         }
-        return Result.ok({}, restartRequired
+        const observabilityMessage = observabilityResult?.kind === 'barrier_pending'
+          ? '可观测性已保持关闭；轨迹清理仍在进行，完成前无法重新开启。'
+          : observabilityResult?.kind === 'barrier_failed'
+            ? '可观测性已保持关闭；轨迹清理失败，请再次保存“完全关闭”后重试。'
+            : null
+        return Result.ok({}, observabilityMessage ?? (restartRequired
           ? '保存成功；部分模型传输、运行入口或 Chromium 配置将在重启后生效~'
-          : '保存成功~')
+          : '保存成功~'))
       }
     }
   }

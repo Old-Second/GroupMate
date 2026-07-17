@@ -883,7 +883,11 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         redis: options.redis,
         logger: options.logger
     });
-    const runStore = new RedisRunStore({ client: options.redis });
+    const runStore = dependencies.runStore ?? new RedisRunStore({ client: options.redis });
+    const admission = dependencies.admission ?? new RunAdmission({
+        client: options.redis,
+        generateId
+    });
     const sessions = new RedisAgentSessionStore({
         redis: options.redis,
         now,
@@ -897,13 +901,18 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
     });
     const terminalFacts = new TerminalFactCollector({
         onCommitted: (snapshot, receipt) => {
-            options.logger?.info?.(createAgentRunLog(snapshot, receipt));
+            try {
+                options.logger?.info?.(createAgentRunLog(snapshot, receipt));
+            }
+            catch {
+                // Safe logging is independent from the terminal observation publishers.
+            }
         }
     });
     const service = new AgentService({
         sessions,
         runStore,
-        admission: new RunAdmission({ client: options.redis, generateId }),
+        admission,
         contextEngine: new ContextEngine({
             estimator: {
                 estimate: message => Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(message), 'utf8') / 4)),
@@ -923,7 +932,23 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             }),
             now,
             generateId,
-            observer
+            observer,
+            onCommittedTraceCandidate: candidate => {
+                try {
+                    dependencies.observations?.acceptCommittedTraceCandidate(candidate);
+                }
+                catch {
+                    // Observation projection cannot affect a committed terminal run.
+                }
+            },
+            onTraceCandidateProjectionFailure: code => {
+                try {
+                    dependencies.observations?.acceptTraceProjectionFailure(code);
+                }
+                catch {
+                    // A fixed diagnostic signal cannot affect the engine.
+                }
+            }
         }),
         createRuntime: async (request) => {
             const runtime = prepared.get(request.requestId);
@@ -972,8 +997,34 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         generateId,
         observationLevel: () => options.config.observabilityLevel,
         monotonicNow: options.monotonicNow,
-        onTerminalSnapshot: snapshot => terminalFacts.acceptSnapshot(snapshot),
-        onTerminalCommitReceipt: receipt => terminalFacts.acceptCommitReceipt(receipt),
+        onTerminalSnapshot: snapshot => {
+            try {
+                terminalFacts.acceptSnapshot(snapshot);
+            }
+            catch { }
+            try {
+                dependencies.observations?.publish(Object.freeze({
+                    schemaVersion: 1,
+                    type: 'terminal_snapshot',
+                    value: snapshot
+                }));
+            }
+            catch { }
+        },
+        onTerminalCommitReceipt: receipt => {
+            try {
+                terminalFacts.acceptCommitReceipt(receipt);
+            }
+            catch { }
+            try {
+                dependencies.observations?.publish(Object.freeze({
+                    schemaVersion: 1,
+                    type: 'terminal_commit',
+                    value: receipt
+                }));
+            }
+            catch { }
+        },
         onObserverFailure: entry => options.logger?.error?.(entry)
     });
     const bridge = new AgentServiceBridge(service);

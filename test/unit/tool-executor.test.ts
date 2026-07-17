@@ -178,6 +178,7 @@ function harness (options: HarnessOptions = {}) {
   })
   const call = (overrides: Readonly<Record<string, unknown>> = {}) => Object.freeze({
     runId: 'run-1',
+    runRef: 'a'.repeat(32),
     callId: 'call-1',
     snapshotId: 'snapshot-1',
     requestedName: 'fixtureTool',
@@ -186,6 +187,7 @@ function harness (options: HarnessOptions = {}) {
   }) as Parameters<ToolExecutor['prepare']>[0]
   const preparationContext = (runId = 'run-1'): ToolPreparationContext => Object.freeze({
     runId,
+    runRef: 'a'.repeat(32),
     profile: 'compatible',
     facts,
     intent: extractIntentEvidence({ text: '执行操作', mentions: ['8'], reply: null }),
@@ -240,6 +242,8 @@ test('executor prepares without dispatch and executes only the frozen capability
   assert.deepEqual(fixture.audits.map(event => event.eventType), [
     'requested', 'started', 'completed'
   ])
+  assert.ok(fixture.audits.every(event => event.runRef === 'a'.repeat(32)))
+  assert.ok(fixture.audits.every(event => event.terminalObservationId === 'not_attempted'))
   assert.ok(fixture.calls.indexOf('audit.started') < fixture.calls.indexOf('handler.execute'))
 })
 

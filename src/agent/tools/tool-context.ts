@@ -37,6 +37,7 @@ export interface AuthorizedToolContext {
 
 export interface ToolPreparationContext {
   readonly runId: string
+  readonly runRef?: string
   readonly profile: ToolPolicyProfile
   readonly facts: ToolRuntimeFacts
   readonly intent: IntentEvidence

@@ -17,6 +17,7 @@ const QQ_IDENTIFIER_FIELDS = new Set([
 const TOOL_POLICY_PROFILES = new Set(['compatible', 'safe', 'strict']);
 const CROSS_CHANNEL_POLICIES = new Set(['disabled', 'master', 'everyone']);
 const OPENAI_COMPATIBILITY_PROFILES = new Set(['standard', 'deepseek']);
+const OBSERVABILITY_LEVELS = new Set(['off', 'basic', 'diagnostic']);
 function splitList(value, separator) {
     const values = Array.isArray(value) ? value : String(value ?? '').split(separator);
     const seen = new Set();
@@ -30,6 +31,12 @@ function splitList(value, separator) {
     }, []);
 }
 export function normalizeGuobaConfigValue(key, value) {
+    if (key === 'observabilityLevel') {
+        if (typeof value !== 'string' || !OBSERVABILITY_LEVELS.has(value)) {
+            throw new TypeError('可观测性级别配置无效。');
+        }
+        return value;
+    }
     if (key === 'turnConfirm') {
         if (typeof value !== 'boolean') {
             throw new TypeError('正在思考提示配置无效。');

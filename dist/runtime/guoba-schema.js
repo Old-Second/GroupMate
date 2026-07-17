@@ -27,7 +27,18 @@ const crossChannelPolicyOptions = [
 ];
 export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureRoleOptions }) {
     return [
-        divider('基础与运行'),
+        divider('网络与调试'),
+        field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；普通网络请求立即生效，Chromium 启动参数需重启后生效。'),
+        field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),
+        field('observabilityLevel', '可观测性级别', '关闭时不采集运行事实并同步清理已保留轨迹；基础模式仅保留脱敏的失败、异常和 5% 成功样本；诊断模式保留更多脱敏轨迹。轨迹最长保留 24h，总量硬上限 2MiB。', 'Select', {
+            options: [
+                { label: '完全关闭', value: 'off' },
+                { label: '基础', value: 'basic' },
+                { label: '诊断', value: 'diagnostic' }
+            ]
+        }),
+        field('debug', '调试日志', '独立控制旧业务调试日志，不会改变脱敏观测级别、轨迹采样或清理屏障。', 'Switch'),
+        divider('模型与会话'),
         field('toggleMode', '触发方式', 'at 模式仅在机器人被提及时回复；前缀模式使用 #chat 触发。修改后需重启以重建入口规则。', 'Select', {
             options: [
                 { label: 'at', value: 'at' },
@@ -36,12 +47,8 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         }),
         field('assistantLabel', '群内名字', '模型使用的自称，也用于主动群聊判断是否有人点名机器人。'),
         field('enablePrivateChat', '允许私聊', '开启后允许用户在 QQ 私聊中触发普通对话。', 'Switch'),
-        field('turnConfirm', '显示正在思考提示', '普通聊天开始后显示一次提示，并在首条进度、审批暂停、终态或最多 8 秒后撤回；主动群聊不显示。', 'Switch'),
         field('enableRobotAt', '允许真实 @ 群友', '开启后，回复文本中的群成员提及会转换成真正的 QQ @。', 'Switch'),
-        field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；普通网络请求立即生效，Chromium 启动参数需重启后生效。'),
-        field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),
-        field('debug', '调试日志', '输出脱敏的请求、响应和工具元数据；排障时开启，日常运行可关闭。', 'Switch'),
-        divider('模型与会话'),
+        field('turnConfirm', '显示正在思考提示', '普通聊天开始后显示一次提示，并在首条进度、审批暂停、终态或最多 8 秒后撤回；主动群聊不显示。', 'Switch'),
         field('apiKey', 'API Key', 'OpenAI-compatible Chat Completions 服务的访问密钥，只会保存到本机真实配置；修改后必须重启，重启前新请求会安全拒绝。', 'InputPassword'),
         field('openAiBaseUrl', 'API Base URL', '填写兼容 Chat Completions 的 /v1 地址，例如 https://api.example.com/v1；修改后必须重启，重启前新请求会安全拒绝。'),
         field('openAiCompatibilityProfile', 'API 兼容配置', '显式选择标准 OpenAI-compatible 或 DeepSeek 方言；不会根据 API 地址或模型名自动猜测。使用 DeepSeek 官方 API 时请选择 DeepSeek；修改后必须重启，重启前新请求会安全拒绝而不会混用两种协议。', 'Select', {

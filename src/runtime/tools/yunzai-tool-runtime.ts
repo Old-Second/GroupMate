@@ -1241,6 +1241,7 @@ export function createYunzaiToolRuntimeBridge (
         signal: AbortSignal
       ): Promise<ToolPreparationContext> => Object.freeze({
         runId: checkpoint.runId,
+        runRef: checkpoint.runRef,
         profile,
         facts: await captured.refreshFacts(Object.freeze({ kind: 'none' }), signal),
         intent: recoveredIntent ?? captured.intent,
@@ -1252,6 +1253,7 @@ export function createYunzaiToolRuntimeBridge (
         signal: AbortSignal
       ): Promise<ToolExecutionContext> => Object.freeze({
         runId: checkpoint.runId,
+        runRef: checkpoint.runRef,
         profile,
         facts: await captured.refreshFacts(capability.target, signal),
         intent: recoveredIntent ?? captured.intent,

@@ -1453,6 +1453,7 @@ export class RunEngine {
         const preparationContext = await this.#raceAbort(runtime.prepareToolContext(checkpoint, signal), signal);
         const calls = Object.freeze(ledger.calls.map(call => Object.freeze({
             runId: checkpoint.runId,
+            runRef: checkpoint.runRef,
             callId: call.callId,
             snapshotId: checkpoint.toolSnapshot.id,
             requestedName: call.toolName,
@@ -1896,6 +1897,7 @@ export class RunEngine {
             return null;
         const call = Object.freeze({
             runId: checkpoint.runId,
+            runRef: checkpoint.runRef,
             callId: capability.callId,
             snapshotId: checkpoint.toolSnapshot.id,
             requestedName: capability.toolName,

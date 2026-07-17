@@ -1891,6 +1891,7 @@ export class RunEngine {
     )
     const calls: readonly ToolCall[] = Object.freeze(ledger.calls.map(call => Object.freeze({
       runId: checkpoint.runId,
+      runRef: checkpoint.runRef,
       callId: call.callId,
       snapshotId: checkpoint.toolSnapshot.id,
       requestedName: call.toolName,
@@ -2437,6 +2438,7 @@ export class RunEngine {
 
     const call: ToolCall = Object.freeze({
       runId: checkpoint.runId,
+      runRef: checkpoint.runRef,
       callId: capability.callId,
       snapshotId: checkpoint.toolSnapshot.id,
       requestedName: capability.toolName,

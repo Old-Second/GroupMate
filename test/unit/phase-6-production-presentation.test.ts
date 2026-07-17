@@ -606,6 +606,12 @@ test('production presentation covers ordinary proactive approval and all termina
       ['ordinary_chat', 'ordinary_chat', 'ordinary_chat', 'ordinary_chat',
         'proactive_chat', 'proactive_chat', 'ordinary_chat', 'ordinary_chat']
     )
+    await graph.observability.hub.drain()
+    const metrics = await graph.observability.metrics.snapshot()
+    assert.ok(metrics.counters.some(point => (
+      point.name === 'groupmate.presentation.deliveries' && point.value > 0
+    )))
+    assert.ok((await graph.observability.traceStore.usage()).records >= 2)
   } finally {
     if (!shutdown) await graph.shutdown('unit_test')
   }

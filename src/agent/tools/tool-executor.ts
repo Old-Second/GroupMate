@@ -1,4 +1,5 @@
 import type { ToolAuditEvent, ToolAuditEventType, ToolAuditSink } from './audit.js'
+import { RUN_REF_PATTERN } from '../run/run-reference.js'
 import type { ToolCall } from './tool-call.js'
 import type {
   ToolExecutionContext,
@@ -151,6 +152,11 @@ export class ToolExecutor implements ToolRuntime {
     const now = this.#options.now()
     const event: ToolAuditEvent = Object.freeze({
       eventType,
+      runRef: typeof request.call.runRef === 'string' &&
+        RUN_REF_PATTERN.test(request.call.runRef)
+        ? request.call.runRef
+        : 'unavailable',
+      terminalObservationId: 'not_attempted',
       eventIdHash: this.#options.hash(this.#options.generateId()),
       runIdHash: this.#options.hash(request.call.runId),
       callIdHash: this.#options.hash(request.call.callId),
@@ -352,6 +358,7 @@ export class ToolExecutor implements ToolRuntime {
     }
     const call: ToolCall = Object.freeze({
       runId: freshContext.runId,
+      ...(freshContext.runRef === undefined ? {} : { runRef: freshContext.runRef }),
       callId: prepared.callId,
       snapshotId: prepared.snapshotId,
       requestedName: prepared.toolName,
@@ -429,6 +436,7 @@ export class ToolExecutor implements ToolRuntime {
     if (signal.aborted) return failedResult('tool_cancelled')
     const call: ToolCall = Object.freeze({
       runId: context.runId,
+      ...(context.runRef === undefined ? {} : { runRef: context.runRef }),
       callId: prepared.callId,
       snapshotId: prepared.snapshotId,
       requestedName: prepared.toolName,

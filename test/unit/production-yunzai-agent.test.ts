@@ -202,7 +202,8 @@ test('production initializer owns one complete graph and rejects every reinitial
   assert.deepEqual(Reflect.ownKeys(graph), [
     'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
-    'buttonPolicy', 'chatController', 'bymController', 'approvalController', 'shutdown'
+    'buttonPolicy', 'chatController', 'bymController', 'approvalController',
+    'observability', 'shutdown'
   ])
   for (const key of [
     'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',

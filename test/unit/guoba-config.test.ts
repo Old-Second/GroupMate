@@ -67,3 +67,13 @@ test('normalizes pending indicator compatibility as a boolean-only field', () =>
     /正在思考提示配置无效/
   )
 })
+
+test('normalizes the three observability levels fail closed', () => {
+  assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'off'), 'off')
+  assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'basic'), 'basic')
+  assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'diagnostic'), 'diagnostic')
+  assert.throws(
+    () => normalizeGuobaConfigValue('observabilityLevel', 'debug'),
+    /可观测性级别配置无效/
+  )
+})

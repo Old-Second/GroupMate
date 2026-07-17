@@ -25,7 +25,6 @@ import {
 import { ModelProviderError } from './dist/agent/model/model-adapter.js'
 import { OpenAICompatibleAdapter } from './dist/agent/model/openai-compatible-adapter.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './dist/runtime/model-runtime-config.js'
-import { parseRequestObservation } from './dist/runtime/request-observation.js'
 import {
   createPendingIndicatorConfigPort
 } from './dist/runtime/presentation/pending-indicator-config.js'
@@ -743,14 +742,6 @@ const hooks = Object.freeze({
   }
 })
 
-function createPlan2DiscardingRequestObservationPublisher () {
-  return Object.freeze({
-    publish (observation) {
-      parseRequestObservation(observation)
-    }
-  })
-}
-
 function createProductionModelPort () {
   const selected = resolveOpenAICompatibleModelRuntimeConfig({
     openAiCompatibilityProfile: Config.openAiCompatibilityProfile
@@ -1390,8 +1381,6 @@ configureTranslationService({
   fetch: newFetch,
   logger: runtimeLogger
 })
-const requestObservations = createPlan2DiscardingRequestObservationPublisher()
-
 initializeProductionYunzaiAgent({
   bridge: Object.freeze({
     config: Config,
@@ -1424,7 +1413,6 @@ initializeProductionYunzaiAgent({
   billing,
   bymPolicy,
   buttonPolicy,
-  requestObservations,
   pictureRenderer,
   tts,
   modelFactory: () => modelPort

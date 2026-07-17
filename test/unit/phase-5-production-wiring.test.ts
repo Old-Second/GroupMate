@@ -91,8 +91,14 @@ test('Task 2 host entries hand off one exact presentation intent scalar', async 
   assert.match(bym, /recallAfterMs/)
   assert.match(bym, /Math\.min\(\s*Math\.max\(Math\.trunc\(/)
   assert.doesNotMatch(bridge, /bymFuckRecallTime|forcePictureMode/)
-  assert.match(bridge, /onTerminalSnapshot:\s*snapshot\s*=>\s*terminalFacts\.acceptSnapshot\(snapshot\)/)
-  assert.match(bridge, /onTerminalCommitReceipt:\s*receipt\s*=>\s*terminalFacts\.acceptCommitReceipt\(receipt\)/)
+  assert.match(
+    bridge,
+    /onTerminalSnapshot:\s*snapshot\s*=>\s*\{[\s\S]*?terminalFacts\.acceptSnapshot\(snapshot\)[\s\S]*?type:\s*'terminal_snapshot'/
+  )
+  assert.match(
+    bridge,
+    /onTerminalCommitReceipt:\s*receipt\s*=>\s*\{[\s\S]*?terminalFacts\.acceptCommitReceipt\(receipt\)[\s\S]*?type:\s*'terminal_commit'/
+  )
 })
 
 test('Task 5 contracts have one canonical owner and consumers import those types', async () => {
@@ -139,16 +145,17 @@ test('index initializes the graph before importing apps', async () => {
   assert.equal((index.match(/initializeProductionYunzaiAgent\(/g) ?? []).length, 1)
 })
 
-test('Plan 2 bootstrap discards only exact request observations without retaining data', async () => {
-  const index = await source('index.js')
-  const match = /function createPlan2DiscardingRequestObservationPublisher \(\) \{([\s\S]*?)\n\}/.exec(index)
-  assert.notEqual(match, null)
-  const body = match?.[1] ?? ''
-  assert.match(body, /Object\.freeze/)
-  assert.match(body, /parseRequestObservation\(observation\)/)
-  assert.doesNotMatch(body, /new Map|new Set|\[\]|\.push\(|redis|fetch|logger|console/)
-  assert.match(index, /const requestObservations = createPlan2DiscardingRequestObservationPublisher\(\)/)
-  assert.match(index, /requestObservations,/)
+test('Phase 6 bootstrap removes the Plan 2 discard edge and gates request facts', async () => {
+  const [index, production] = await Promise.all([
+    source('index.js'),
+    source('src/runtime/production-yunzai-agent.ts')
+  ])
+  for (const value of [index, production]) {
+    assert.doesNotMatch(value, /createPlan2DiscardingRequestObservationPublisher/)
+  }
+  assert.doesNotMatch(index, /parseRequestObservation|requestObservations/)
+  assert.match(production, /publisher:\s*Object\.freeze\(\{[\s\S]*?observability\.publish\(Object\.freeze\(\{[\s\S]*?type:\s*'request'/)
+  assert.match(production, /new RunObservationPolicyGate/)
 })
 
 function inspectProductionTtsSource (file: string, contents: string): void {

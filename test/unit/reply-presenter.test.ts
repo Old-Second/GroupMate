@@ -49,6 +49,7 @@ import type {
   TtsSynthesisErrorCode,
   TtsSynthesisResult
 } from '../../src/runtime/presentation/yunzai-tts-reply-port.js'
+import type { ObservationEventV1 } from '../../src/runtime/observability/observation-event.js'
 
 const createdAt = '2026-07-16T00:00:00.000Z'
 const runRef = '2'.repeat(32)
@@ -245,6 +246,7 @@ function fixture (input: {
   const ttsCalls: object[] = []
   const ttsDiagnosticCalls: TtsSynthesisErrorCode[] = []
   const pictureCalls: object[] = []
+  const observations: ObservationEventV1[] = []
   const random = [...(input.random ?? [])]
   const port: YunzaiOutboundPort = {
     target: groupAddress,
@@ -315,7 +317,8 @@ function fixture (input: {
     schedule: (callback, milliseconds) => {
       schedules.push({ callback, milliseconds })
       return undefined as unknown as ReturnType<typeof setTimeout>
-    }
+    },
+    publishObservation: event => { observations.push(event) }
   })
   return {
     presenter,
@@ -329,6 +332,7 @@ function fixture (input: {
     ttsCalls,
     ttsDiagnosticCalls,
     pictureCalls,
+    observations,
     hooks
   }
 }
@@ -412,6 +416,76 @@ test('postprocessor empty never falls back to the original response', async () =
   ))
   assert.deepEqual(proactiveResult, { schemaVersion: 1, outcome: 'failed', deliveries: [] })
   assert.equal(proactive.calls.length, 0)
+})
+
+test('presentation observation records the actual reducer decision and fallback', async () => {
+  const empty = fixture({ hooks: { postprocess: async () => ({ text: '' }) } })
+  await empty.presenter.present(input(completed({ kind: 'reply_text', text: 'secret' }), {
+    hooks: empty.hooks
+  }))
+  const emptyFact = empty.observations.at(-1)
+  assert.equal(emptyFact?.type, 'presentation')
+  if (emptyFact?.type === 'presentation') {
+    assert.equal(emptyFact.value.postprocessAnomaly, true)
+    assert.equal(emptyFact.value.reducerInput.textLengthBucket, 'none')
+    assert.equal(emptyFact.value.reducerInput.fallbackReason, 'postprocess_empty')
+    assert.equal(emptyFact.value.reducerInput.selectedMode, 'text')
+  }
+
+  const renderFallback = fixture({
+    pictureResult: Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+  })
+  await renderFallback.presenter.present(input(completed({ kind: 'reply_text', text: '图片正文' }), {
+    settings: settings({
+      picture: Object.freeze({ ...settings().picture, userEnabled: true })
+    }),
+    hooks: renderFallback.hooks
+  }))
+  const renderFact = renderFallback.observations.at(-1)
+  assert.equal(renderFact?.type, 'presentation')
+  if (renderFact?.type === 'presentation') {
+    assert.equal(renderFact.value.reducerInput.selectedMode, 'text')
+    assert.equal(renderFact.value.reducerInput.fallbackReason, 'render_failed')
+  }
+
+  const synthesisFallback = fixture({
+    synthesis: Object.freeze({ kind: 'failed_definite', code: 'synthesis_rejected' })
+  })
+  await synthesisFallback.presenter.present(input(completed({
+    kind: 'reply_text', text: '语音失败转文本'
+  }), {
+    settings: settings({
+      tts: Object.freeze({ ...settings().tts, enabled: true, mode: 'azure' })
+    }),
+    hooks: synthesisFallback.hooks
+  }))
+  const synthesisFact = synthesisFallback.observations.at(-1)
+  assert.equal(synthesisFact?.type, 'presentation')
+  if (synthesisFact?.type === 'presentation') {
+    assert.equal(synthesisFact.value.reducerInput.selectedMode, 'text')
+    assert.equal(synthesisFact.value.reducerInput.fallbackReason, 'synthesis_failed')
+  }
+
+  const textFirstVoice = fixture({ deliveries: [sent('text'), sent('voice')] })
+  await textFirstVoice.presenter.present(input(completed({
+    kind: 'reply_text', text: '文本和语音都发送'
+  }), {
+    settings: settings({
+      tts: Object.freeze({
+        ...settings().tts,
+        enabled: true,
+        mode: 'azure',
+        alsoSendText: true
+      })
+    }),
+    hooks: textFirstVoice.hooks
+  }))
+  const textFirstFact = textFirstVoice.observations.at(-1)
+  assert.equal(textFirstFact?.type, 'presentation')
+  if (textFirstFact?.type === 'presentation') {
+    assert.equal(textFirstFact.value.reducerInput.selectedMode, 'tts')
+    assert.equal(textFirstFact.value.reducerInput.fallbackReason, 'none')
+  }
 })
 
 test('presenter accepts completed failed and cancelled final run results', async () => {

@@ -251,6 +251,11 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
     if (!authorized(policy, event))
         return;
     let prepared;
+    let requestDiagnosticRecorded = false;
+    let latestCorrelation = Object.freeze({
+        runRef: 'unavailable',
+        terminalObservationId: 'not_attempted'
+    });
     try {
         const actor = actorId(event);
         const entryAddress = resolveConversationCommandAddress(conversationEvent(event), policy.groupMerge);
@@ -294,11 +299,6 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
             preferences
         });
         const presentationSettings = await options.presentationSettings.load(actor);
-        recordDiagnostic(options.diagnostics, createChatRequestLog({
-            mode: 'api',
-            stream: false,
-            prompt: prepared.evidence.prompt
-        }));
         const profile = ordinaryProfile({
             forcePicture: prepared.route.presentationIntent.forcePicture,
             quoteCurrentRequest: presentationSettings.quoteReply &&
@@ -333,10 +333,28 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
             ...(ttl === undefined ? {} : { sessionTtlSeconds: ttl })
         });
         const envelope = await options.agent.handle(event, prepared.evidence, handleOptions);
+        recordDiagnostic(options.diagnostics, createChatRequestLog({
+            mode: 'api',
+            stream: false,
+            prompt: prepared.evidence.prompt,
+            correlation: Object.freeze({
+                runRef: envelope.runRef,
+                terminalObservationId: 'not_attempted'
+            })
+        }));
+        requestDiagnosticRecorded = true;
         if (envelope.kind === 'paused')
             return;
+        const responseCorrelation = Object.freeze({
+            runRef: envelope.runRef,
+            terminalObservationId: envelope.runRef === 'unavailable'
+                ? 'not_attempted'
+                : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+        });
+        latestCorrelation = responseCorrelation;
         recordDiagnostic(options.diagnostics, createChatResponseLog({
             mode: 'api',
+            correlation: responseCorrelation,
             response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
                 ? { text: envelope.completion.text }
                 : envelope.kind === 'failed'
@@ -347,10 +365,22 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
     }
     catch (error) {
         const presentation = getChatErrorPresentation(error);
+        if (!requestDiagnosticRecorded && prepared !== undefined) {
+            recordDiagnostic(options.diagnostics, createChatRequestLog({
+                mode: 'api',
+                stream: false,
+                prompt: prepared.evidence.prompt,
+                correlation: Object.freeze({
+                    runRef: 'unavailable',
+                    terminalObservationId: 'not_attempted'
+                })
+            }));
+        }
         recordDiagnostic(options.diagnostics, createChatErrorLog({
             mode: 'api',
             error,
-            category: presentation.code
+            category: presentation.code,
+            correlation: latestCorrelation
         }));
         if (prepared !== undefined) {
             await options.controls.presentRouteNotice({

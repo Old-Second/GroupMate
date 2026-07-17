@@ -2,6 +2,7 @@ import { parseAgentEvent } from '../agent/contracts/event.js';
 import { parseFrozenObservationPolicy } from '../agent/run/run-observation.js';
 import { RUN_REF_PATTERN } from '../agent/run/run-reference.js';
 import { plainTextPart } from './presentation/text-presentation.js';
+import { createPresentationObservationId, createProgressPresentationReducerInput, parseObservationEvent } from './observability/observation-event.js';
 const MAX_PROGRESS_MESSAGES = 5;
 const MAX_PROGRESS_CODE_POINTS = 200;
 const TOOL_PROGRESS = Object.freeze({
@@ -85,9 +86,13 @@ export class RunProgressPresenter {
     #states = new Map();
     #onDeliveryFailure;
     #onAttachment;
+    #publishObservation;
+    #monotonicNow;
     constructor(options = {}) {
         this.#onDeliveryFailure = options.onDeliveryFailure;
         this.#onAttachment = options.onAttachment;
+        this.#publishObservation = options.publishObservation;
+        this.#monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()));
     }
     attach(input) {
         if (typeof input.runId !== 'string' || input.runId.length === 0 || input.runId.length > 128 ||
@@ -108,6 +113,19 @@ export class RunProgressPresenter {
             attempts: input.resume.attempts,
             seenStages: Object.freeze([...input.resume.seenStages])
         });
+        const metadata = Object.freeze({
+            runId: input.runId,
+            runRef: input.runRef,
+            requestKind,
+            observationPolicy,
+            resume
+        });
+        try {
+            this.#onAttachment?.(metadata);
+        }
+        catch {
+            // Registration is fail-closed in the observation gate and cannot block the run.
+        }
         const state = {
             runId: input.runId,
             runRef: input.runRef,
@@ -122,18 +140,6 @@ export class RunProgressPresenter {
             queue: Promise.resolve()
         };
         this.#states.set(input.runId, state);
-        try {
-            this.#onAttachment?.(Object.freeze({
-                runId: state.runId,
-                runRef: state.runRef,
-                requestKind: state.requestKind,
-                observationPolicy,
-                resume
-            }));
-        }
-        catch {
-            // A safe observation seam cannot affect presentation.
-        }
     }
     handle(rawEvent) {
         let event;
@@ -165,19 +171,32 @@ export class RunProgressPresenter {
         state.queue = state.queue.then(async () => {
             await dismissIndicatorBestEffort(state.indicator, 'progress');
             let resultCode = 'no_result';
+            const startedAt = this.#readMonotonic();
+            const deliveries = [];
             try {
                 let final = await state.outbound.deliver(plainTextPart(progress.text), 1);
+                deliveries.push(this.#safeDelivery(final));
                 if (final.kind === 'failed_definite' && final.code === 'host_rejected' &&
                     state.attempts < MAX_PROGRESS_MESSAGES) {
                     state.attempts += 1;
                     final = await state.outbound.deliver(plainTextPart(progress.text), 2);
+                    deliveries.push(this.#safeDelivery(final));
                 }
+                this.#publishProgress(state, progress.text, deliveries, startedAt);
                 if (final?.kind === 'sent')
                     return;
                 resultCode = final?.kind ?? resultCode;
             }
             catch {
                 resultCode = 'exception';
+                deliveries.push(Object.freeze({
+                    schemaVersion: 1,
+                    media: 'text',
+                    attempt: deliveries.length === 0 ? 1 : 2,
+                    outcome: 'outcome_unknown',
+                    code: 'unknown_host_result'
+                }));
+                this.#publishProgress(state, progress.text, deliveries, startedAt);
             }
             this.#reportFailure(state, event, resultCode);
         });
@@ -200,6 +219,86 @@ export class RunProgressPresenter {
         }
         catch {
             // Logging cannot affect a run or another progress delivery.
+        }
+    }
+    #safeDelivery(value) {
+        if (value.kind === 'sent') {
+            return Object.freeze({
+                schemaVersion: 1,
+                media: 'text',
+                attempt: value.attempt,
+                outcome: 'sent',
+                code: null
+            });
+        }
+        return value.kind === 'failed_definite'
+            ? Object.freeze({
+                schemaVersion: 1,
+                media: 'text',
+                attempt: value.attempt,
+                outcome: 'failed_definite',
+                code: value.code
+            })
+            : Object.freeze({
+                schemaVersion: 1,
+                media: 'text',
+                attempt: value.attempt,
+                outcome: 'outcome_unknown',
+                code: value.code
+            });
+    }
+    #publishProgress(state, text, deliveries, startedAt) {
+        if (this.#publishObservation === undefined)
+            return;
+        const sent = deliveries.some(delivery => delivery.outcome === 'sent');
+        const failed = deliveries.some(delivery => delivery.outcome === 'failed_definite');
+        const unknown = deliveries.some(delivery => delivery.outcome === 'outcome_unknown');
+        const outcome = sent
+            ? failed || unknown ? 'partial' : 'complete'
+            : unknown ? 'unknown' : 'failed';
+        const finishedAt = this.#readMonotonic();
+        const totalDurationMs = startedAt === 'unavailable' || finishedAt === 'unavailable' ||
+            finishedAt < startedAt
+            ? 'unavailable'
+            : finishedAt - startedAt;
+        try {
+            this.#publishObservation(parseObservationEvent({
+                schemaVersion: 1,
+                type: 'presentation',
+                value: {
+                    schemaVersion: 1,
+                    presentationObservationId: createPresentationObservationId(),
+                    runRef: state.runRef,
+                    terminalObservationId: 'not_attempted',
+                    profile: 'progress',
+                    outcome,
+                    postprocessAnomaly: false,
+                    deliveries,
+                    totalDurationMs,
+                    reducerInput: {
+                        ...createProgressPresentationReducerInput({
+                            requestKind: state.requestKind,
+                            text
+                        }),
+                        fallbackReason: 'none'
+                    }
+                }
+            }));
+        }
+        catch {
+            // Observation projection and publication cannot affect progress delivery.
+        }
+    }
+    #readMonotonic() {
+        try {
+            const value = this.#monotonicNow();
+            return value === 'unavailable' ||
+                (Number.isSafeInteger(value) && value >= 0)
+                ? value
+                : 'unavailable';
+        }
+        catch {
+            return 'unavailable';
         }
     }
 }

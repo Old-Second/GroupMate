@@ -1,3 +1,5 @@
+import { RunAdmission } from '../agent/run/run-admission.js';
+import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { bindYunzaiShutdownSignals, createYunzaiAgentServiceBridge } from './agent-service-bridge.js';
 import { prepareYunzaiMessageEvidence } from './message-input.js';
 import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
@@ -15,6 +17,12 @@ import { createApprovalControlPresenter, createApprovalOutcomeHandler, createYun
 import { createYunzaiBymController } from './yunzai-bym-controller.js';
 import { createYunzaiChatController } from './yunzai-chat-controller.js';
 import { prepareYunzaiPresentationRequest } from './yunzai-request-adapter.js';
+import { MetricsRegistry } from './observability/metrics-registry.js';
+import { ObservationHub } from './observability/observation-hub.js';
+import { RedisTraceStore } from './observability/redis-trace-store.js';
+import { RunObservationPolicyGate } from './observability/run-observation-policy-gate.js';
+import { SafeObservationFailureLogLimiter, createPresentationObservationLog, createRequestObservationLog } from './observability/safe-observation-logging.js';
+import { TraceRecorder } from './observability/trace-recorder.js';
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API']);
 const RECOVERED_LEGACY_SETTINGS = Object.freeze({
     schemaVersion: 1,
@@ -58,6 +66,247 @@ export class ProductionYunzaiAgentNotInitializedError extends Error {
 }
 const graphLifecycles = new WeakMap();
 let productionSingleton;
+let activeObservabilityRuntime;
+let preInitializationLevel;
+const OBSERVABILITY_LEVELS = new Set(['off', 'basic', 'diagnostic']);
+const OFF_BARRIER_ACK_MS = 500;
+function configuredObservabilityLevel(value) {
+    return typeof value === 'string' && OBSERVABILITY_LEVELS.has(value)
+        ? value
+        : 'basic';
+}
+function sinkFailure(sink, code, now) {
+    let occurredAt = new Date(0).toISOString();
+    try {
+        occurredAt = now().toISOString();
+    }
+    catch { }
+    return Object.freeze({ schemaVersion: 1, sink, code, occurredAt });
+}
+export class ProductionObservabilityRuntime {
+    hub;
+    gate;
+    metrics;
+    traceRecorder;
+    traceStore;
+    #now;
+    #logger;
+    #requestObservationMonitor;
+    #currentLevel;
+    #barrierState = 'idle';
+    #barrierPromise = null;
+    constructor(options) {
+        this.#now = options.now;
+        this.#logger = options.logger;
+        this.#requestObservationMonitor = options.requestObservationMonitor;
+        this.#currentLevel = options.initialLevel;
+        this.traceStore = new RedisTraceStore({
+            client: options.redis,
+            now: () => {
+                try {
+                    return options.now().getTime();
+                }
+                catch {
+                    return 0;
+                }
+            }
+        });
+        this.gate = new RunObservationPolicyGate({
+            now: () => {
+                try {
+                    return options.now().getTime();
+                }
+                catch {
+                    return 0;
+                }
+            }
+        });
+        this.metrics = new MetricsRegistry({
+            admission: options.admission,
+            runStoreUsage: async () => await options.runStore.observationUsage(),
+            traceStoreUsage: async () => await this.traceStore.usage(),
+            now: options.now
+        });
+        const failureLimiter = new SafeObservationFailureLogLimiter({
+            now: () => {
+                try {
+                    return options.now().getTime();
+                }
+                catch {
+                    return 0;
+                }
+            }
+        });
+        const reportFailure = (failure) => {
+            try {
+                this.metrics.recordSinkFailure(failure);
+            }
+            catch { }
+            try {
+                const log = failureLimiter.create(failure);
+                if (log !== null)
+                    options.logger?.error?.(log);
+            }
+            catch { }
+        };
+        this.traceRecorder = new TraceRecorder({
+            store: this.traceStore,
+            onSinkFailure: reportFailure,
+            now: () => {
+                try {
+                    return options.now().getTime();
+                }
+                catch {
+                    return 0;
+                }
+            }
+        });
+        const logSubscriber = Object.freeze({
+            name: 'log',
+            observe: (event) => {
+                if (event.type === 'request') {
+                    options.logger?.info?.(createRequestObservationLog(event.value));
+                }
+                else if (event.type === 'presentation') {
+                    options.logger?.info?.(createPresentationObservationLog(event.value));
+                }
+            }
+        });
+        this.hub = new ObservationHub({
+            subscribers: Object.freeze([this.metrics, this.traceRecorder, logSubscriber]),
+            onSinkFailure: reportFailure,
+            now: () => {
+                try {
+                    return options.now().getTime();
+                }
+                catch {
+                    return 0;
+                }
+            }
+        });
+        this.#setLevel(options.initialLevel);
+        if (options.initialLevel === 'off')
+            void this.#ensureBarrier();
+    }
+    publish(event) {
+        if (!this.gate.allow(event))
+            return;
+        this.hub.publish(event);
+        if (event.type === 'request' && this.#requestObservationMonitor !== undefined) {
+            try {
+                void Promise.resolve(this.#requestObservationMonitor.publish(event.value)).catch(() => { });
+            }
+            catch { }
+        }
+    }
+    registerPolicy(runRef, policy) {
+        this.gate.register(runRef, policy);
+    }
+    acceptCommittedTraceCandidate(candidate) {
+        if (!this.gate.allowCommittedCandidate(candidate))
+            return;
+        try {
+            this.metrics.observeCommittedTraceCandidate(candidate);
+        }
+        catch {
+            this.#reportDirectFailure('metrics', 'rejected');
+        }
+        try {
+            this.traceRecorder.stageCommittedTraceCandidate(candidate);
+        }
+        catch {
+            this.#reportDirectFailure('trace', 'rejected');
+        }
+    }
+    acceptTraceProjectionFailure(code) {
+        if (code !== 'projection_rejected')
+            return;
+        this.#reportDirectFailure('trace', 'rejected');
+        try {
+            this.#logger?.error?.(Object.freeze({ event: 'trace/projection_rejected' }));
+        }
+        catch { }
+    }
+    async updateLevel(level) {
+        if (level === 'off') {
+            this.#setLevel('off');
+            if (this.#barrierState === 'confirmed')
+                return Object.freeze({ kind: 'applied' });
+            const barrier = this.#ensureBarrier();
+            return await this.#boundedBarrierAck(barrier);
+        }
+        if (this.#currentLevel === 'off') {
+            if (this.#barrierState === 'pending') {
+                return Object.freeze({ kind: 'barrier_pending' });
+            }
+            if (this.#barrierState === 'failed' || this.#barrierState !== 'confirmed') {
+                return Object.freeze({ kind: 'barrier_failed' });
+            }
+        }
+        this.#setLevel(level);
+        this.#barrierState = 'idle';
+        return Object.freeze({ kind: 'applied' });
+    }
+    #setLevel(level) {
+        this.#currentLevel = level;
+        this.gate.setCurrentLevel(level);
+        this.metrics.setCurrentLevel(level);
+        this.traceRecorder.setCurrentLevel(level);
+    }
+    #ensureBarrier() {
+        if (this.#barrierPromise !== null)
+            return this.#barrierPromise;
+        this.#barrierState = 'pending';
+        const bottom = this.traceStore.advanceGenerationAndClear(64).then(() => {
+            this.#barrierState = 'confirmed';
+            return 'confirmed';
+        }, () => {
+            this.#barrierState = 'failed';
+            return 'failed';
+        });
+        this.#barrierPromise = bottom.finally(() => {
+            this.#barrierPromise = null;
+        });
+        return this.#barrierPromise;
+    }
+    async #boundedBarrierAck(barrier) {
+        let timer;
+        const timeout = new Promise(resolve => {
+            timer = setTimeout(() => resolve('pending'), OFF_BARRIER_ACK_MS);
+        });
+        const result = await Promise.race([barrier, timeout]);
+        if (timer !== undefined)
+            clearTimeout(timer);
+        return Object.freeze({
+            kind: result === 'confirmed'
+                ? 'applied'
+                : result === 'failed' ? 'barrier_failed' : 'barrier_pending'
+        });
+    }
+    #reportDirectFailure(sink, code) {
+        const failure = sinkFailure(sink, code, this.#now);
+        try {
+            this.metrics.recordSinkFailure(failure);
+        }
+        catch { }
+    }
+}
+export async function updateProductionObservabilityLevel(level) {
+    if (!OBSERVABILITY_LEVELS.has(level)) {
+        throw new TypeError('production observation level is invalid');
+    }
+    if (activeObservabilityRuntime === undefined) {
+        preInitializationLevel = level;
+        return Object.freeze({
+            kind: level === 'off' ? 'barrier_pending' : 'applied'
+        });
+    }
+    const result = await activeObservabilityRuntime.updateLevel(level);
+    if (level === 'off' || result.kind === 'applied') {
+        preInitializationLevel = level;
+    }
+    return result;
+}
 function eventScalar(value) {
     return typeof value === 'string' || typeof value === 'number'
         ? String(value).normalize('NFC').trim()
@@ -168,8 +417,23 @@ export function createProductionYunzaiAgent(options) {
     const random = options.random ?? Math.random;
     const now = options.now ?? (() => new Date());
     const monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()));
+    const runStore = new RedisRunStore({ client: options.bridge.redis });
+    const admission = new RunAdmission({ client: options.bridge.redis });
+    const observability = new ProductionObservabilityRuntime({
+        redis: options.bridge.redis,
+        runStore,
+        admission,
+        logger: options.bridge.logger,
+        requestObservationMonitor: options.requestObservations,
+        initialLevel: preInitializationLevel ?? configuredObservabilityLevel(options.bridge.config.observabilityLevel),
+        now
+    });
+    activeObservabilityRuntime = observability;
     const outboundFactory = createYunzaiOutboundPortFactory(options.outboundHost);
     const progressPresenter = new RunProgressPresenter({
+        onAttachment: metadata => observability.registerPolicy(metadata.runRef, metadata.observationPolicy),
+        publishObservation: event => observability.publish(event),
+        monotonicNow,
         onDeliveryFailure: failure => options.bridge.logger?.warn?.(`运行进度发送失败：${failure.resultCode}`)
     });
     const pendingIndicator = new PendingIndicatorPresenter({
@@ -182,10 +446,18 @@ export function createProductionYunzaiAgent(options) {
         pictureRenderer: options.pictureRenderer,
         random,
         sleep: interruptibleSleep,
-        schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
+        schedule: (callback, milliseconds) => setTimeout(callback, milliseconds),
+        publishObservation: event => observability.publish(event),
+        monotonicNow
     });
     const completionCoordinator = createPresentationCompletionCoordinator({
-        publisher: options.requestObservations,
+        publisher: Object.freeze({
+            publish: (observation) => observability.publish(Object.freeze({
+                schemaVersion: 1,
+                type: 'request',
+                value: observation
+            }))
+        }),
         monotonicNow,
         onPublishFailure: code => options.bridge.logger?.error?.(Object.freeze({
             event: code
@@ -207,7 +479,14 @@ export function createProductionYunzaiAgent(options) {
         })
     }), {
         progressPresenter,
-        modelAdapter: model
+        modelAdapter: model,
+        runStore,
+        admission,
+        observations: Object.freeze({
+            publish: event => observability.publish(event),
+            acceptCommittedTraceCandidate: candidate => (observability.acceptCommittedTraceCandidate(candidate)),
+            acceptTraceProjectionFailure: code => observability.acceptTraceProjectionFailure(code)
+        })
     });
     const promptScreening = Object.freeze({
         async isBlocked({ event, prompt }) {
@@ -324,7 +603,8 @@ export function createProductionYunzaiAgent(options) {
         presentationSettings: options.presentationSettings,
         hooks: options.hooks,
         presenter,
-        completionCoordinator
+        completionCoordinator,
+        diagnostics
     });
     const approvalBaseOptions = Object.freeze({
         projector: Object.freeze({
@@ -367,6 +647,13 @@ export function createProductionYunzaiAgent(options) {
         chatController,
         bymController,
         approvalController,
+        observability: Object.freeze({
+            hub: observability.hub,
+            gate: observability.gate,
+            metrics: observability.metrics,
+            traceRecorder: observability.traceRecorder,
+            traceStore: observability.traceStore
+        }),
         shutdown: async (reason = 'process_shutdown') => {
             lifecycle.shutdownPromise ??= bridge.shutdown(reason).finally(() => {
                 lifecycle.unbindShutdown?.();

@@ -1,5 +1,12 @@
 import { decideBymTrigger } from './bym-trigger.js';
 import { proactiveProfile } from './presentation/presentation-profile.js';
+import { createChatRequestLog, createChatResponseLog } from './safe-chat-logging.js';
+function recordDiagnostic(port, entry) {
+    try {
+        port?.record(entry);
+    }
+    catch { }
+}
 function eventGroupId(event) {
     const value = event.group_id;
     return typeof value === 'string' || typeof value === 'number'
@@ -120,8 +127,31 @@ async function runBym(options, event) {
         thinkingMode: policy.thinkingMode,
         reasoningEffort: policy.reasoningEffort
     });
+    recordDiagnostic(options.diagnostics, createChatRequestLog({
+        mode: 'api',
+        stream: false,
+        prompt: prepared.evidence.prompt,
+        correlation: Object.freeze({
+            runRef: envelope.runRef,
+            terminalObservationId: 'not_attempted'
+        })
+    }));
     if (envelope.kind === 'paused')
         return;
+    recordDiagnostic(options.diagnostics, createChatResponseLog({
+        mode: 'api',
+        correlation: Object.freeze({
+            runRef: envelope.runRef,
+            terminalObservationId: envelope.runRef === 'unavailable'
+                ? 'not_attempted'
+                : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+        }),
+        response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+            ? { text: envelope.completion.text }
+            : envelope.kind === 'failed'
+                ? { error: true }
+                : {}
+    }));
     await completeProactive(options, event, prepared, envelope);
 }
 export function createYunzaiBymController(options) {

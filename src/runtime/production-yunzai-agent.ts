@@ -1,5 +1,8 @@
 import type { ModelAdapter } from '../agent/model/model-adapter.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
+import { RunAdmission } from '../agent/run/run-admission.js'
+import { RedisRunStore } from '../agent/run/redis-run-store.js'
+import type { TraceCandidateProjectionFailureCode, TraceCandidateV1 } from '../agent/run/run-trace.js'
 import {
   bindYunzaiShutdownSignals,
   createYunzaiAgentServiceBridge,
@@ -46,6 +49,7 @@ import {
   type PresentationCompletionCoordinator,
   type RequestObservationPublisher
 } from './request-observation-completion.js'
+import type { RequestObservationV1 } from './request-observation.js'
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js'
 import { RunProgressPresenter } from './run-progress-presenter.js'
 import {
@@ -92,6 +96,22 @@ import {
   type YunzaiChatController
 } from './yunzai-chat-controller.js'
 import { prepareYunzaiPresentationRequest } from './yunzai-request-adapter.js'
+import { MetricsRegistry } from './observability/metrics-registry.js'
+import {
+  ObservationHub,
+  type ObservationSubscriber,
+  type SafeSinkFailureV1
+} from './observability/observation-hub.js'
+import type { ObservationEventV1 } from './observability/observation-event.js'
+import { RedisTraceStore } from './observability/redis-trace-store.js'
+import { RunObservationPolicyGate } from './observability/run-observation-policy-gate.js'
+import {
+  SafeObservationFailureLogLimiter,
+  createPresentationObservationLog,
+  createRequestObservationLog
+} from './observability/safe-observation-logging.js'
+import { TraceRecorder } from './observability/trace-recorder.js'
+import type { ObservabilityLevel } from './observability/trace-policy.js'
 
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API'])
 
@@ -138,6 +158,13 @@ export interface ProductionYunzaiAgent {
   readonly chatController: YunzaiChatController
   readonly bymController: YunzaiBymController
   readonly approvalController: YunzaiApprovalController
+  readonly observability: Readonly<{
+    hub: ObservationHub
+    gate: RunObservationPolicyGate
+    metrics: MetricsRegistry
+    traceRecorder: TraceRecorder
+    traceStore: RedisTraceStore
+  }>
   shutdown(reason?: string): Promise<number>
 }
 
@@ -154,7 +181,8 @@ export interface ProductionYunzaiAgentOptions {
   readonly billing: OpenAiBillingPort
   readonly bymPolicy: BymPolicyPort
   readonly buttonPolicy: ButtonCompatibilityPort
-  readonly requestObservations: RequestObservationPublisher
+  /** Test-only post-gate monitor; the production entrypoint does not provide it. */
+  readonly requestObservations?: RequestObservationPublisher
   readonly pictureRenderer: GroupMatePictureRenderer
   readonly tts: TtsReplyPort
   readonly modelFactory: () => ProductionModelPort
@@ -184,6 +212,267 @@ interface GraphLifecycle {
 
 const graphLifecycles = new WeakMap<object, GraphLifecycle>()
 let productionSingleton: ProductionYunzaiAgent | undefined
+let activeObservabilityRuntime: ProductionObservabilityRuntime | undefined
+let preInitializationLevel: ObservabilityLevel | undefined
+
+export type ProductionObservabilityLevelUpdateV1 =
+  | { readonly kind: 'applied' }
+  | { readonly kind: 'barrier_pending' }
+  | { readonly kind: 'barrier_failed' }
+
+const OBSERVABILITY_LEVELS = new Set<ObservabilityLevel>(['off', 'basic', 'diagnostic'])
+const OFF_BARRIER_ACK_MS = 500
+
+function configuredObservabilityLevel (value: unknown): ObservabilityLevel {
+  return typeof value === 'string' && OBSERVABILITY_LEVELS.has(value as ObservabilityLevel)
+    ? value as ObservabilityLevel
+    : 'basic'
+}
+
+function sinkFailure (
+  sink: SafeSinkFailureV1['sink'],
+  code: SafeSinkFailureV1['code'],
+  now: () => Date
+): SafeSinkFailureV1 {
+  let occurredAt = new Date(0).toISOString()
+  try {
+    occurredAt = now().toISOString()
+  } catch {}
+  return Object.freeze({ schemaVersion: 1, sink, code, occurredAt })
+}
+
+export class ProductionObservabilityRuntime {
+  readonly hub: ObservationHub
+  readonly gate: RunObservationPolicyGate
+  readonly metrics: MetricsRegistry
+  readonly traceRecorder: TraceRecorder
+  readonly traceStore: RedisTraceStore
+  readonly #now: () => Date
+  readonly #logger?: ProductionYunzaiAgentOptions['bridge']['logger']
+  readonly #requestObservationMonitor?: RequestObservationPublisher
+  #currentLevel: ObservabilityLevel
+  #barrierState: 'idle' | 'pending' | 'confirmed' | 'failed' = 'idle'
+  #barrierPromise: Promise<'confirmed' | 'failed'> | null = null
+
+  constructor (options: {
+    readonly redis: ProductionYunzaiAgentOptions['bridge']['redis']
+    readonly runStore: RedisRunStore
+    readonly admission: RunAdmission
+    readonly logger?: ProductionYunzaiAgentOptions['bridge']['logger']
+    readonly requestObservationMonitor?: RequestObservationPublisher
+    readonly initialLevel: ObservabilityLevel
+    readonly now: () => Date
+  }) {
+    this.#now = options.now
+    this.#logger = options.logger
+    this.#requestObservationMonitor = options.requestObservationMonitor
+    this.#currentLevel = options.initialLevel
+    this.traceStore = new RedisTraceStore({
+      client: options.redis,
+      now: () => {
+        try {
+          return options.now().getTime()
+        } catch {
+          return 0
+        }
+      }
+    })
+    this.gate = new RunObservationPolicyGate({
+      now: () => {
+        try {
+          return options.now().getTime()
+        } catch {
+          return 0
+        }
+      }
+    })
+    this.metrics = new MetricsRegistry({
+      admission: options.admission,
+      runStoreUsage: async () => await options.runStore.observationUsage(),
+      traceStoreUsage: async () => await this.traceStore.usage(),
+      now: options.now
+    })
+    const failureLimiter = new SafeObservationFailureLogLimiter({
+      now: () => {
+        try {
+          return options.now().getTime()
+        } catch {
+          return 0
+        }
+      }
+    })
+    const reportFailure = (failure: SafeSinkFailureV1): void => {
+      try {
+        this.metrics.recordSinkFailure(failure)
+      } catch {}
+      try {
+        const log = failureLimiter.create(failure)
+        if (log !== null) options.logger?.error?.(log)
+      } catch {}
+    }
+    this.traceRecorder = new TraceRecorder({
+      store: this.traceStore,
+      onSinkFailure: reportFailure,
+      now: () => {
+        try {
+          return options.now().getTime()
+        } catch {
+          return 0
+        }
+      }
+    })
+    const logSubscriber: ObservationSubscriber = Object.freeze({
+      name: 'log' as const,
+      observe: (event: ObservationEventV1) => {
+        if (event.type === 'request') {
+          options.logger?.info?.(createRequestObservationLog(event.value))
+        } else if (event.type === 'presentation') {
+          options.logger?.info?.(createPresentationObservationLog(event.value))
+        }
+      }
+    })
+    this.hub = new ObservationHub({
+      subscribers: Object.freeze([this.metrics, this.traceRecorder, logSubscriber]),
+      onSinkFailure: reportFailure,
+      now: () => {
+        try {
+          return options.now().getTime()
+        } catch {
+          return 0
+        }
+      }
+    })
+    this.#setLevel(options.initialLevel)
+    if (options.initialLevel === 'off') void this.#ensureBarrier()
+  }
+
+  publish (event: ObservationEventV1): void {
+    if (!this.gate.allow(event)) return
+    this.hub.publish(event)
+    if (event.type === 'request' && this.#requestObservationMonitor !== undefined) {
+      try {
+        void Promise.resolve(this.#requestObservationMonitor.publish(event.value)).catch(() => {})
+      } catch {}
+    }
+  }
+
+  registerPolicy (runRef: string, policy: TraceCandidateV1['policy']): void {
+    this.gate.register(runRef, policy)
+  }
+
+  acceptCommittedTraceCandidate (candidate: TraceCandidateV1): void {
+    if (!this.gate.allowCommittedCandidate(candidate)) return
+    try {
+      this.metrics.observeCommittedTraceCandidate(candidate)
+    } catch {
+      this.#reportDirectFailure('metrics', 'rejected')
+    }
+    try {
+      this.traceRecorder.stageCommittedTraceCandidate(candidate)
+    } catch {
+      this.#reportDirectFailure('trace', 'rejected')
+    }
+  }
+
+  acceptTraceProjectionFailure (code: TraceCandidateProjectionFailureCode): void {
+    if (code !== 'projection_rejected') return
+    this.#reportDirectFailure('trace', 'rejected')
+    try {
+      this.#logger?.error?.(Object.freeze({ event: 'trace/projection_rejected' }))
+    } catch {}
+  }
+
+  async updateLevel (level: ObservabilityLevel): Promise<ProductionObservabilityLevelUpdateV1> {
+    if (level === 'off') {
+      this.#setLevel('off')
+      if (this.#barrierState === 'confirmed') return Object.freeze({ kind: 'applied' })
+      const barrier = this.#ensureBarrier()
+      return await this.#boundedBarrierAck(barrier)
+    }
+    if (this.#currentLevel === 'off') {
+      if (this.#barrierState === 'pending') {
+        return Object.freeze({ kind: 'barrier_pending' })
+      }
+      if (this.#barrierState === 'failed' || this.#barrierState !== 'confirmed') {
+        return Object.freeze({ kind: 'barrier_failed' })
+      }
+    }
+    this.#setLevel(level)
+    this.#barrierState = 'idle'
+    return Object.freeze({ kind: 'applied' })
+  }
+
+  #setLevel (level: ObservabilityLevel): void {
+    this.#currentLevel = level
+    this.gate.setCurrentLevel(level)
+    this.metrics.setCurrentLevel(level)
+    this.traceRecorder.setCurrentLevel(level)
+  }
+
+  #ensureBarrier (): Promise<'confirmed' | 'failed'> {
+    if (this.#barrierPromise !== null) return this.#barrierPromise
+    this.#barrierState = 'pending'
+    const bottom = this.traceStore.advanceGenerationAndClear(64).then(
+      () => {
+        this.#barrierState = 'confirmed'
+        return 'confirmed' as const
+      },
+      () => {
+        this.#barrierState = 'failed'
+        return 'failed' as const
+      }
+    )
+    this.#barrierPromise = bottom.finally(() => {
+      this.#barrierPromise = null
+    })
+    return this.#barrierPromise
+  }
+
+  async #boundedBarrierAck (
+    barrier: Promise<'confirmed' | 'failed'>
+  ): Promise<ProductionObservabilityLevelUpdateV1> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<'pending'>(resolve => {
+      timer = setTimeout(() => resolve('pending'), OFF_BARRIER_ACK_MS)
+    })
+    const result = await Promise.race([barrier, timeout])
+    if (timer !== undefined) clearTimeout(timer)
+    return Object.freeze({
+      kind: result === 'confirmed'
+        ? 'applied'
+        : result === 'failed' ? 'barrier_failed' : 'barrier_pending'
+    })
+  }
+
+  #reportDirectFailure (
+    sink: SafeSinkFailureV1['sink'],
+    code: SafeSinkFailureV1['code']
+  ): void {
+    const failure = sinkFailure(sink, code, this.#now)
+    try {
+      this.metrics.recordSinkFailure(failure)
+    } catch {}
+  }
+}
+
+export async function updateProductionObservabilityLevel (
+  level: ObservabilityLevel
+): Promise<ProductionObservabilityLevelUpdateV1> {
+  if (!OBSERVABILITY_LEVELS.has(level)) {
+    throw new TypeError('production observation level is invalid')
+  }
+  if (activeObservabilityRuntime === undefined) {
+    preInitializationLevel = level
+    return Object.freeze({
+      kind: level === 'off' ? 'barrier_pending' : 'applied'
+    })
+  }
+  const result = await activeObservabilityRuntime.updateLevel(level)
+  if (level === 'off' || result.kind === 'applied') {
+    preInitializationLevel = level
+  }
+  return result
+}
 
 function eventScalar (value: unknown): string {
   return typeof value === 'string' || typeof value === 'number'
@@ -316,8 +605,28 @@ export function createProductionYunzaiAgent (
   const random = options.random ?? Math.random
   const now = options.now ?? (() => new Date())
   const monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()))
+  const runStore = new RedisRunStore({ client: options.bridge.redis })
+  const admission = new RunAdmission({ client: options.bridge.redis })
+  const observability = new ProductionObservabilityRuntime({
+    redis: options.bridge.redis,
+    runStore,
+    admission,
+    logger: options.bridge.logger,
+    requestObservationMonitor: options.requestObservations,
+    initialLevel: preInitializationLevel ?? configuredObservabilityLevel(
+      options.bridge.config.observabilityLevel
+    ),
+    now
+  })
+  activeObservabilityRuntime = observability
   const outboundFactory = createYunzaiOutboundPortFactory(options.outboundHost)
   const progressPresenter = new RunProgressPresenter({
+    onAttachment: metadata => observability.registerPolicy(
+      metadata.runRef,
+      metadata.observationPolicy
+    ),
+    publishObservation: event => observability.publish(event),
+    monotonicNow,
     onDeliveryFailure: failure => options.bridge.logger?.warn?.(
       `运行进度发送失败：${failure.resultCode}`
     )
@@ -334,10 +643,18 @@ export function createProductionYunzaiAgent (
     pictureRenderer: options.pictureRenderer,
     random,
     sleep: interruptibleSleep,
-    schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
+    schedule: (callback, milliseconds) => setTimeout(callback, milliseconds),
+    publishObservation: event => observability.publish(event),
+    monotonicNow
   })
   const completionCoordinator = createPresentationCompletionCoordinator({
-    publisher: options.requestObservations,
+    publisher: Object.freeze({
+      publish: (observation: RequestObservationV1) => observability.publish(Object.freeze({
+        schemaVersion: 1,
+        type: 'request',
+        value: observation
+      }))
+    }),
     monotonicNow,
     onPublishFailure: code => options.bridge.logger?.error?.(Object.freeze({
       event: code
@@ -363,7 +680,16 @@ export function createProductionYunzaiAgent (
     })
   }), {
     progressPresenter,
-    modelAdapter: model
+    modelAdapter: model,
+    runStore,
+    admission,
+    observations: Object.freeze({
+      publish: event => observability.publish(event),
+      acceptCommittedTraceCandidate: candidate => (
+        observability.acceptCommittedTraceCandidate(candidate)
+      ),
+      acceptTraceProjectionFailure: code => observability.acceptTraceProjectionFailure(code)
+    })
   })
   const promptScreening: ChatPromptScreeningPort & BymPromptScreeningPort = Object.freeze({
     async isBlocked ({ event, prompt }: {
@@ -505,7 +831,8 @@ export function createProductionYunzaiAgent (
     presentationSettings: options.presentationSettings,
     hooks: options.hooks,
     presenter,
-    completionCoordinator
+    completionCoordinator,
+    diagnostics
   })
   const approvalBaseOptions: Omit<
   YunzaiApprovalControllerOptions,
@@ -557,6 +884,13 @@ export function createProductionYunzaiAgent (
     chatController,
     bymController,
     approvalController,
+    observability: Object.freeze({
+      hub: observability.hub,
+      gate: observability.gate,
+      metrics: observability.metrics,
+      traceRecorder: observability.traceRecorder,
+      traceStore: observability.traceStore
+    }),
     shutdown: async (reason = 'process_shutdown'): Promise<number> => {
       lifecycle.shutdownPromise ??= bridge.shutdown(reason).finally(() => {
         lifecycle.unbindShutdown?.()
