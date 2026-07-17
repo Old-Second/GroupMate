@@ -72,7 +72,10 @@ import {
   type RunContentJournal,
   type RunContentJournalEvent
 } from './run-content-journal.js'
-import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js'
+import {
+  upgradeRunCheckpointV1,
+  upgradeRunCheckpointV2
+} from './run-checkpoint-migration.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
 import {
   createRunTerminalSnapshot,
@@ -833,11 +836,13 @@ export class RunEngine {
 
   async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
     const loaded = await this.#store.load(runId)
-    if (loaded === null || loaded.schemaVersion === 2) return loaded
-    const upgraded = upgradeRunCheckpointV1(loaded, {
-      runRef: this.#createRunRef(),
-      requestRef: this.#createRequestRef()
-    })
+    if (loaded === null || loaded.schemaVersion === 3) return loaded
+    const upgraded = loaded.schemaVersion === 1
+      ? upgradeRunCheckpointV1(loaded, {
+          runRef: this.#createRunRef(),
+          requestRef: this.#createRequestRef()
+        })
+      : upgradeRunCheckpointV2(loaded)
     return await this.#store.upgrade(loaded, upgraded)
   }
 

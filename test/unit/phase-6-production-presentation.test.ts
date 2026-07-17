@@ -1089,7 +1089,7 @@ test('production approval deferral retains reference and later retry finalizes o
     const store = new RedisRunStore({ client: redis })
     const paused = await store.load(reference.runId)
     assert.ok(paused !== null)
-    if (paused.schemaVersion !== 2) assert.fail('approval checkpoint must use schema v2')
+    if (paused.schemaVersion !== 3) assert.fail('approval checkpoint must use schema v3')
     assert.equal(paused.status, 'waiting_approval')
     assert.equal(paused.completion, null)
     assert.equal(paused.output, null)
@@ -1146,7 +1146,7 @@ test('production approval deferral retains reference and later retry finalizes o
     )
     const deferred = await store.load(reference.runId)
     assert.ok(deferred !== null)
-    if (deferred.schemaVersion !== 2) assert.fail('deferred checkpoint must use schema v2')
+    if (deferred.schemaVersion !== 3) assert.fail('deferred checkpoint must use schema v3')
     assert.equal(JSON.stringify(deferred.presentationRoute?.presentationIntent), intentBytes)
     assert.equal(deferred.completion, null)
 

@@ -56,7 +56,7 @@ export function upgradeRunCheckpointV1(checkpoint, input) {
     const { schemaVersion: _schemaVersion, visibleOutput: _visibleOutput, ...state } = checkpoint;
     return parseRunCheckpoint({
         ...state,
-        schemaVersion: 2,
+        schemaVersion: 3,
         revision: checkpoint.revision + 1,
         runRef: input.runRef,
         requestRef: input.requestRef,
@@ -70,6 +70,16 @@ export function upgradeRunCheckpointV1(checkpoint, input) {
             schemaVersion: 1,
             levelAtStart: 'off',
             sampledSuccess: false
-        })
+        }),
+        reasoningSegments: Object.freeze([])
+    });
+}
+export function upgradeRunCheckpointV2(checkpoint) {
+    const { schemaVersion: _schemaVersion, ...state } = checkpoint;
+    return parseRunCheckpoint({
+        ...state,
+        schemaVersion: 3,
+        revision: checkpoint.revision + 1,
+        reasoningSegments: Object.freeze([])
     });
 }

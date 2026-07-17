@@ -9,6 +9,7 @@ import {
   type LoadedRunCheckpoint,
   type RunCheckpointV1,
   type RunCheckpointV2,
+  type RunCheckpointV3,
   type RunCheckpoint
 } from './run-checkpoint.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
@@ -709,12 +710,15 @@ export class RedisRunStore implements RunStore {
   }
 
   async upgrade (
-    expected: RunCheckpointV1,
-    next: RunCheckpointV2
-  ): Promise<RunCheckpointV2> {
-    if (expected.schemaVersion !== 1 || next.schemaVersion !== 2 ||
+    expected: RunCheckpointV1 | RunCheckpointV2,
+    next: RunCheckpointV3
+  ): Promise<RunCheckpointV3> {
+    if ((expected.schemaVersion !== 1 && expected.schemaVersion !== 2) ||
+      next.schemaVersion !== 3 ||
       next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
-      next.revision !== expected.revision + 1) {
+      next.revision !== expected.revision + 1 ||
+      (expected.schemaVersion === 2 &&
+        (next.runRef !== expected.runRef || next.requestRef !== expected.requestRef))) {
       throw new RunStoreConflictError()
     }
     const expectedEncoded = this.#encodeLoaded(expected, 'upgrade_expected')
@@ -724,7 +728,8 @@ export class RedisRunStore implements RunStore {
     const activeTtlSeconds = next.status === 'waiting_approval'
       ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
       : this.#activeTtlSeconds
-    const result = await mutate(this.#client, 'upgrade', [
+    const operation = expected.schemaVersion === 1 ? 'upgrade' : 'cas'
+    const result = await mutate(this.#client, operation, [
       keys.checkpoint, keys.events, keys.tombstone, referenceKey
     ], [
       expectedEncoded.checkpoint,
@@ -915,13 +920,13 @@ export class RedisRunStore implements RunStore {
     checkpoint: LoadedRunCheckpoint,
     operation: string
   ): EncodedRunCheckpoint {
-    if (checkpoint.schemaVersion === 2) return this.#encode(checkpoint, operation)
+    if (checkpoint.schemaVersion === 3) return this.#encode(checkpoint, operation)
     try {
       const { events, ...state } = checkpoint
       const encoded = Object.freeze({
         checkpoint: JSON.stringify(state),
         events: JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: checkpoint.schemaVersion,
           revision: checkpoint.revision,
           events
         })

@@ -426,6 +426,7 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     providerDispatch: _providerDispatch,
     engineActivity: _engineActivity,
     observationPolicy: _observationPolicy,
+    reasoningSegments: _reasoningSegments,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
@@ -456,8 +457,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const undisplayed = await source.store.load(paused.runId)
-  assert.equal(undisplayed?.schemaVersion, 2)
-  if (undisplayed?.schemaVersion !== 2) throw new TypeError('approval checkpoint is missing')
+  assert.equal(undisplayed?.schemaVersion, 3)
+  if (undisplayed?.schemaVersion !== 3) throw new TypeError('approval checkpoint is missing')
   await displayCurrent(
     source,
     paused.interruption,
@@ -465,8 +466,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
     '2026-07-14T00:00:01.000Z'
   )
   const displayed = await source.store.load(paused.runId)
-  assert.equal(displayed?.schemaVersion, 2)
-  if (displayed?.schemaVersion !== 2) throw new TypeError('displayed checkpoint is missing')
+  assert.equal(displayed?.schemaVersion, 3)
+  if (displayed?.schemaVersion !== 3) throw new TypeError('displayed checkpoint is missing')
 
   const recovered = (
     legacy: RunCheckpointV1,

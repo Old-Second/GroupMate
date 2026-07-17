@@ -5,7 +5,8 @@ import {
 import {
   parseRunCheckpoint,
   type RunCheckpointV1,
-  type RunCheckpointV2
+  type RunCheckpointV2,
+  type RunCheckpointV3
 } from './run-checkpoint.js'
 import type { RunObservationCountersV1 } from './run-observation.js'
 
@@ -75,11 +76,11 @@ function legacyObservationCounters (
 export function upgradeRunCheckpointV1 (
   checkpoint: RunCheckpointV1,
   input: { readonly runRef: string; readonly requestRef: string }
-): RunCheckpointV2 {
+): RunCheckpointV3 {
   const { schemaVersion: _schemaVersion, visibleOutput: _visibleOutput, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: checkpoint.revision + 1,
     runRef: input.runRef,
     requestRef: input.requestRef,
@@ -93,6 +94,19 @@ export function upgradeRunCheckpointV1 (
       schemaVersion: 1,
       levelAtStart: 'off',
       sampledSuccess: false
-    })
+    }),
+    reasoningSegments: Object.freeze([])
+  })
+}
+
+export function upgradeRunCheckpointV2 (
+  checkpoint: RunCheckpointV2
+): RunCheckpointV3 {
+  const { schemaVersion: _schemaVersion, ...state } = checkpoint
+  return parseRunCheckpoint({
+    ...state,
+    schemaVersion: 3,
+    revision: checkpoint.revision + 1,
+    reasoningSegments: Object.freeze([])
   })
 }

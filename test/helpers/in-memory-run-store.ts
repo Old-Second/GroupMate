@@ -4,7 +4,8 @@ import {
   type LoadedRunCheckpoint,
   type RunCheckpoint,
   type RunCheckpointV1,
-  type RunCheckpointV2
+  type RunCheckpointV2,
+  type RunCheckpointV3
 } from '../../src/agent/run/run-checkpoint.js'
 import type { RunTerminalSnapshotV2 } from '../../src/agent/run/run-observation.js'
 import { isTerminalRunStatus } from '../../src/agent/run/run-state.js'
@@ -31,7 +32,7 @@ export class InMemoryRunStore implements RunStore {
   seedLoadedCheckpoint (checkpoint: LoadedRunCheckpoint): void {
     if (this.#runs.has(checkpoint.runId)) throw new RunStoreConflictError()
     this.#runs.set(checkpoint.runId, checkpoint)
-    if (checkpoint.schemaVersion === 2) {
+    if (checkpoint.schemaVersion === 2 || checkpoint.schemaVersion === 3) {
       if (this.#references.has(checkpoint.runRef)) {
         this.#runs.delete(checkpoint.runId)
         throw new RunReferenceConflictError()
@@ -58,18 +59,23 @@ export class InMemoryRunStore implements RunStore {
   }
 
   async upgrade (
-    expected: RunCheckpointV1,
-    next: RunCheckpointV2
-  ): Promise<RunCheckpointV2> {
-    if (this.#references.has(next.runRef)) throw new RunReferenceConflictError()
+    expected: RunCheckpointV1 | RunCheckpointV2,
+    next: RunCheckpointV3
+  ): Promise<RunCheckpointV3> {
     const current = this.#runs.get(expected.runId)
-    if (current === undefined || current.schemaVersion !== 1 ||
+    if (current === undefined || current.schemaVersion !== expected.schemaVersion ||
       current.revision !== expected.revision || next.runId !== expected.runId ||
-      next.revision !== expected.revision + 1) {
+      next.sessionId !== expected.sessionId || next.revision !== expected.revision + 1) {
+      throw new RunStoreConflictError()
+    }
+    if (expected.schemaVersion === 1) {
+      if (this.#references.has(next.runRef)) throw new RunReferenceConflictError()
+      this.#references.set(next.runRef, next.runId)
+    } else if (next.runRef !== expected.runRef || next.requestRef !== expected.requestRef ||
+      this.#references.get(expected.runRef) !== expected.runId) {
       throw new RunStoreConflictError()
     }
     this.#runs.set(next.runId, next)
-    this.#references.set(next.runRef, next.runId)
     return next
   }
 
@@ -78,7 +84,7 @@ export class InMemoryRunStore implements RunStore {
     next: RunCheckpoint
   ): Promise<RunCheckpoint> {
     const current = this.#runs.get(expected.runId)
-    if (current === undefined || current.schemaVersion !== 2 ||
+    if (current === undefined || current.schemaVersion !== 3 ||
       current.revision !== expected.revision ||
       next.runId !== expected.runId || next.revision !== expected.revision + 1 ||
       next.runRef !== expected.runRef || isTerminalRunStatus(current.status) ||
@@ -96,7 +102,7 @@ export class InMemoryRunStore implements RunStore {
   ): Promise<TerminalCommitReceiptV1> {
     const validated = validateTerminalCommitInput(expected, next, snapshot)
     const current = this.#runs.get(expected.runId)
-    if (current === undefined || current.schemaVersion !== 2 ||
+    if (current === undefined || current.schemaVersion !== 3 ||
       JSON.stringify(current) !== JSON.stringify(expected) ||
       this.#tombstones.has(expected.runId)) {
       throw new RunStoreConflictError()

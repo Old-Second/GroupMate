@@ -11,7 +11,7 @@ import { decideApprovalInterruption, displayApprovalInterruption, isApprovalActo
 import { boundedMonotonicDurationMs } from './run-budget.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { snapshotModelRequestForJournal, snapshotModelTurnForJournal, snapshotRunCheckpointForJournal, snapshotTerminalReceiptForJournal } from './run-content-journal.js';
-import { upgradeRunCheckpointV1 } from './run-checkpoint-migration.js';
+import { upgradeRunCheckpointV1, upgradeRunCheckpointV2 } from './run-checkpoint-migration.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
@@ -506,12 +506,14 @@ export class RunEngine {
     }
     async loadCheckpoint(runId) {
         const loaded = await this.#store.load(runId);
-        if (loaded === null || loaded.schemaVersion === 2)
+        if (loaded === null || loaded.schemaVersion === 3)
             return loaded;
-        const upgraded = upgradeRunCheckpointV1(loaded, {
-            runRef: this.#createRunRef(),
-            requestRef: this.#createRequestRef()
-        });
+        const upgraded = loaded.schemaVersion === 1
+            ? upgradeRunCheckpointV1(loaded, {
+                runRef: this.#createRunRef(),
+                requestRef: this.#createRequestRef()
+            })
+            : upgradeRunCheckpointV2(loaded);
         return await this.#store.upgrade(loaded, upgraded);
     }
     async pendingApproval(runId, approvalId) {

@@ -12,7 +12,8 @@ import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
   type RunCheckpoint,
-  type RunCheckpointV1
+  type RunCheckpointV1,
+  type RunCheckpointV2
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   RunEngine,
@@ -156,9 +157,19 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     providerDispatch: _providerDispatch,
     engineActivity: _engineActivity,
     observationPolicy: _observationPolicy,
+    reasoningSegments: _reasoningSegments,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
+}
+
+function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
+  const {
+    schemaVersion: _schemaVersion,
+    reasoningSegments: _reasoningSegments,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 2 })
 }
 
 async function persistLegacy (
@@ -390,6 +401,42 @@ test('RunEngine resumes a complete calling-model checkpoint exactly once', async
   assert.equal((await store.loadTombstone(source.runId))?.status, 'completed')
 })
 
+test('RunEngine upgrades v2 without allocating or changing its request references', async () => {
+  const store = new InMemoryRunStore()
+  const source = checkpointV2(initial('run-v2-load'))
+  store.seedLoadedCheckpoint(source)
+  let runRefAllocations = 0
+  let requestRefAllocations = 0
+  const engine = new RunEngine({
+    adapter: new ScriptedAdapter(textTurn('unused')),
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: new CountingRuntime() }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    generateId: () => 'unused-id',
+    createRunRef: () => {
+      runRefAllocations += 1
+      return '7'.repeat(32)
+    },
+    createRequestRef: () => {
+      requestRefAllocations += 1
+      return '8'.repeat(32)
+    }
+  })
+
+  const upgraded = await engine.loadCheckpoint(source.runId)
+
+  assert.equal(upgraded?.schemaVersion, 3)
+  assert.equal(upgraded?.runRef, source.runRef)
+  assert.equal(upgraded?.requestRef, source.requestRef)
+  assert.deepEqual(upgraded?.reasoningSegments, [])
+  assert.deepEqual({ runRefAllocations, requestRefAllocations }, {
+    runRefAllocations: 0,
+    requestRefAllocations: 0
+  })
+})
+
 test('RunEngine upgrades v1 before any recovered tool or Provider action', async () => {
   const redis = new FakeRedis(() => Date.parse(timestamp))
   const store = new RedisRunStore({ client: redis })
@@ -411,8 +458,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
     ),
     executePrepared: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 2)
-      if (checkpoint?.schemaVersion !== 2) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 3)
+      if (checkpoint?.schemaVersion !== 3) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       toolObservedUpgrade = true
@@ -422,8 +469,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
   const adapter: ModelAdapter = Object.freeze({
     complete: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 2)
-      if (checkpoint?.schemaVersion !== 2) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 3)
+      if (checkpoint?.schemaVersion !== 3) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       providerObservedUpgrade = true
@@ -730,7 +777,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   )
   assert.equal(paused.kind, 'paused')
   const waiting = await store.load(source.runId)
-  if (waiting?.schemaVersion !== 2 || waiting.status !== 'waiting_approval') {
+  if (waiting?.schemaVersion !== 3 || waiting.status !== 'waiting_approval') {
     throw new TypeError('waiting approval fixture is missing')
   }
   assert.equal(waiting.engineActivity.state, 'idle')
@@ -758,7 +805,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
 
   const recoveredResult = await recoveryEngine.resume(source.runId)
   const recovered = await store.load(source.runId)
-  assert.deepEqual(recovered?.schemaVersion === 2 ? {
+  assert.deepEqual(recovered?.schemaVersion === 3 ? {
     resultKind: recoveredResult.kind,
     revision: recovered.revision,
     providerDispatch: recovered.providerDispatch.state,
@@ -777,7 +824,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
     })
   })
 
-  if (recovered?.schemaVersion !== 2) {
+  if (recovered?.schemaVersion !== 3) {
     throw new TypeError('recovered waiting checkpoint is missing')
   }
   const idleRevision = recovered.revision
@@ -786,7 +833,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   assert.equal(idleResult.kind, 'paused')
   assert.equal(stillIdle?.revision, idleRevision)
   assert.equal(
-    stillIdle?.schemaVersion === 2 ? stillIdle.engineActivity.state : null,
+    stillIdle?.schemaVersion === 3 ? stillIdle.engineActivity.state : null,
     'idle'
   )
   assert.equal(recoveryClockCalls, 0)

@@ -1162,8 +1162,8 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const reserved = await fixture.store.load('run-1')
-    assert.equal(reserved?.schemaVersion, 2)
-    if (reserved?.schemaVersion !== 2) throw new TypeError('reserved checkpoint is missing')
+    assert.equal(reserved?.schemaVersion, 3)
+    if (reserved?.schemaVersion !== 3) throw new TypeError('reserved checkpoint is missing')
     assert.deepEqual(reserved.providerDispatch, { state: 'reserved' })
     assert.equal(reserved.observationCounters.providerAttempts, 1)
     assert.deepEqual({
@@ -1809,8 +1809,8 @@ test('RunEngine skips Provider journal attempts when a recovered ordinal is unav
   const crashed = harness([unavailable], { store: crashStore })
   await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
   const loaded = await crashStore.load('run-1')
-  assert.equal(loaded?.schemaVersion, 2)
-  if (loaded?.schemaVersion !== 2) throw new TypeError('recovered checkpoint is missing')
+  assert.equal(loaded?.schemaVersion, 3)
+  if (loaded?.schemaVersion !== 3) throw new TypeError('recovered checkpoint is missing')
 
   const recovered = parseRunCheckpoint({
     ...loaded,
