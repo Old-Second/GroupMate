@@ -63,8 +63,8 @@ async function withImmediateTimers<T> (operation: () => Promise<T>): Promise<T> 
   }
 }
 
-test('outbound normalizes a NapCat numeric message ID and recalls with its host type', async () => {
-  const fixture = hostTarget([{ message_id: 12_345_678 }], [true])
+test('outbound normalizes a signed NapCat numeric message ID and recalls with its host type', async () => {
+  const fixture = hostTarget([{ message_id: -12_345_678 }], [true])
   const port = await createYunzaiOutboundPortFactory({
     forTarget: async () => fixture.target
   }).forTarget(groupUserTarget)
@@ -74,9 +74,27 @@ test('outbound normalizes a NapCat numeric message ID and recalls with its host 
   if (delivered.kind !== 'sent') return
   assert.equal(delivered.receipt.schemaVersion, 1)
   assert.equal(delivered.receipt.media, 'text')
-  assert.equal(delivered.receipt.messageId, '12345678')
+  assert.equal(delivered.receipt.messageId, '-12345678')
   assert.deepEqual(await port.recall(delivered.receipt), { kind: 'recalled' })
-  assert.deepEqual(fixture.recalls, [12_345_678])
+  assert.deepEqual(fixture.recalls, [-12_345_678])
+})
+
+test('outbound rejects zero fractional and unsafe numeric message IDs', async () => {
+  const fixture = hostTarget([
+    { message_id: 0 },
+    { message_id: -1.5 },
+    { message_id: Number.MAX_SAFE_INTEGER + 1 }
+  ])
+  const port = await createYunzaiOutboundPortFactory({
+    forTarget: async () => fixture.target
+  }).forTarget(groupUserTarget)
+
+  const results = await Promise.all([
+    port.deliver(textPart, 1),
+    port.deliver(textPart, 1),
+    port.deliver(textPart, 1)
+  ])
+  assert.deepEqual(results.map(result => result.kind), Array(3).fill('outcome_unknown'))
 })
 
 test('outbound classifies confirmed host results and never treats unknown as sent', async () => {

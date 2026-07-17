@@ -169,7 +169,7 @@ function validMessageId(value) {
 function normalizedHostMessageId(value) {
     if (validMessageId(value))
         return { messageId: value, hostMessageId: value };
-    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value !== 0) {
         return { messageId: String(value), hostMessageId: value };
     }
     return null;
