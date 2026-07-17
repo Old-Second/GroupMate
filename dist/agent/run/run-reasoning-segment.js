@@ -71,12 +71,24 @@ export function parseRunReasoningSegments(value) {
 }
 export function appendRunReasoningSegment(segments, input) {
     const parsed = parseRunReasoningSegments(segments);
-    if (input.reasoning === null || typeof input.reasoning !== 'object' ||
-        typeof input.reasoning.text !== 'string' ||
-        typeof input.reasoning.truncated !== 'boolean') {
-        throw new TypeError('model reasoning trace is invalid');
+    let reasoning;
+    try {
+        if (input.reasoning === null || typeof input.reasoning !== 'object')
+            return segments;
+        const descriptors = Object.getOwnPropertyDescriptors(input.reasoning);
+        const text = descriptors.text;
+        const truncated = descriptors.truncated;
+        if (text === undefined || truncated === undefined ||
+            !Object.hasOwn(text, 'value') || !Object.hasOwn(truncated, 'value') ||
+            typeof text.value !== 'string' || typeof truncated.value !== 'boolean') {
+            return segments;
+        }
+        reasoning = Object.freeze({ text: text.value, truncated: truncated.value });
     }
-    const text = input.reasoning.text.trim().normalize('NFC');
+    catch {
+        return segments;
+    }
+    const text = reasoning.text.trim().normalize('NFC');
     if (text === '')
         return segments;
     const step = nonNegativeInteger(input.step, 'reasoning segment step');
@@ -99,7 +111,7 @@ export function appendRunReasoningSegment(segments, input) {
         step,
         turn,
         text: points.slice(0, retained).join(''),
-        truncated: input.reasoning.truncated || retained < points.length
+        truncated: reasoning.truncated || retained < points.length
     });
     return Object.freeze([...parsed, segment]);
 }

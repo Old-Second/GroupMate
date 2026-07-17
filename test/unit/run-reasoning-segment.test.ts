@@ -35,6 +35,16 @@ test('reasoning append preserves the frozen input for empty or exhausted content
   assert.equal(appendRunReasoningSegment(empty, {
     step: 0,
     turn: 1,
+    reasoning: undefined
+  }), empty)
+  assert.equal(appendRunReasoningSegment(empty, {
+    step: 0,
+    turn: 1,
+    reasoning: { text: 1, truncated: false } as never
+  }), empty)
+  assert.equal(appendRunReasoningSegment(empty, {
+    step: 0,
+    turn: 1,
     reasoning: { text: '  ', truncated: false }
   }), empty)
 

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import { parseRunAdvanceResult } from '../../src/agent/contracts/result.js'
 import { parseProviderTurnState } from '../../src/agent/run/provider-state.js'
 import {
@@ -330,6 +331,7 @@ test('parses every bounded run advance result branch', () => {
     runRef: terminalRunRef,
     completion: { kind: 'reply_text', text: '完成' },
     output: assistantMessage,
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: terminalFacts()
   })
   assert.equal(completed.kind, 'completed')
@@ -339,6 +341,7 @@ test('parses every bounded run advance result branch', () => {
     runRef: terminalRunRef,
     completion: { kind: 'already_visible', source: 'tool_output' },
     output: null,
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: Object.freeze({
       ...terminalFacts(),
       snapshot: Object.freeze({
@@ -382,6 +385,7 @@ test('parses every bounded run advance result branch', () => {
     runRef: terminalRunRef,
     completion: { kind: 'reply_text', text: '完成' },
     output: null,
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: terminalFacts()
   }), /completed run output/)
   assert.throws(() => parseRunAdvanceResult({
@@ -412,6 +416,7 @@ test('cross-validates terminal result kind, payload and exact receipt identity',
     runRef: terminalRunRef,
     completion: { kind: 'reply_text', text: '完成' },
     output: assistantMessage,
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: terminalFacts()
   } as const
   const failed = {

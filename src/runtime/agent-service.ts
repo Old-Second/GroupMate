@@ -111,6 +111,7 @@ export function projectRunAdvanceResult (
       runRef: envelope.runRef,
       completion: envelope.completion,
       output: envelope.output,
+      presentationTrace: envelope.presentationTrace,
       terminal: envelope.terminal
     }))
   }

@@ -19,6 +19,8 @@ import { createRunEvent } from './run-events.js';
 import { isTerminalRunStatus } from './run-state.js';
 import { RunReferenceConflictError, RunStoreConflictError } from './run-store.js';
 import { createTraceCandidate } from './run-trace.js';
+import { appendRunReasoningSegment } from './run-reasoning-segment.js';
+import { buildPresentationTrace } from './presentation-trace-builder.js';
 import { applyToolPreflight, cancelToolExecutionLedger, countScheduledToolAttempts, completeToolExecutionLedger, createToolExecutionLedger, failRecoveredToolExecutionLedger, failToolExecutionLedger, resetToolExecutionLedgerForRecovery, resolveToolApproval, toolLedgerHasIndeterminate, toolLedgerHasUnresolvedNonRead, toolLedgerHasVisibleOutput, toolLedgerModelMessages, toolLedgerRequiresToolDisabledFinalResponse } from './tool-ledger.js';
 class ModelAttemptFailure extends Error {
     agentError;
@@ -294,6 +296,10 @@ function terminalResult(checkpoint, terminal) {
             runRef: checkpoint.runRef,
             completion: checkpoint.completion,
             output: checkpoint.output,
+            presentationTrace: buildPresentationTrace({
+                reasoningSegments: checkpoint.reasoningSegments,
+                toolLedgers: checkpoint.toolLedgers
+            }),
             terminal
         });
     }
@@ -1443,6 +1449,11 @@ export class RunEngine {
     }
     async #evaluateModelTurn(checkpoint, attempted, correction) {
         const { turn } = attempted;
+        const reasoningSegments = appendRunReasoningSegment(checkpoint.reasoningSegments, {
+            step: checkpoint.step,
+            turn: attempted.counters.modelTurns,
+            reasoning: turn.reasoning
+        });
         const completedEvent = {
             type: 'model.completed',
             payload: {
@@ -1457,6 +1468,7 @@ export class RunEngine {
                 messages: attempted.messages,
                 estimatedInputTokens: attempted.estimatedInputTokens,
                 recoveryUsed: attempted.recoveryUsed,
+                reasoningSegments,
                 modelTurn: null
             }, { reason: 'provider_refusal' });
         }
@@ -1467,6 +1479,7 @@ export class RunEngine {
                     messages: attempted.messages,
                     estimatedInputTokens: attempted.estimatedInputTokens,
                     recoveryUsed: attempted.recoveryUsed,
+                    reasoningSegments,
                     modelTurn: null
                 });
             }
@@ -1480,6 +1493,7 @@ export class RunEngine {
                     messages: attempted.messages,
                     estimatedInputTokens: attempted.estimatedInputTokens,
                     recoveryUsed: attempted.recoveryUsed,
+                    reasoningSegments,
                     modelTurn: null
                 });
             }
@@ -1501,6 +1515,7 @@ export class RunEngine {
                 estimatedInputTokens,
                 budgetCounters: attempted.counters,
                 recoveryUsed: attempted.recoveryUsed,
+                reasoningSegments,
                 modelTurn: null,
                 toolLedgers: Object.freeze([...checkpoint.toolLedgers, ledger]),
                 preparedBatch: null,
@@ -1526,6 +1541,7 @@ export class RunEngine {
                 estimatedInputTokens: attempted.estimatedInputTokens,
                 budgetCounters: attempted.counters,
                 recoveryUsed: attempted.recoveryUsed,
+                reasoningSegments,
                 modelTurn: null,
                 output,
                 completion
@@ -1540,6 +1556,7 @@ export class RunEngine {
                 messages: attempted.messages,
                 estimatedInputTokens: attempted.estimatedInputTokens,
                 recoveryUsed: attempted.recoveryUsed,
+                reasoningSegments,
                 modelTurn: null
             });
         }
@@ -1560,6 +1577,7 @@ export class RunEngine {
                 messages: attempted.messages,
                 estimatedInputTokens: attempted.estimatedInputTokens,
                 recoveryUsed: attempted.recoveryUsed,
+                reasoningSegments,
                 modelTurn: null
             });
         }
@@ -1568,6 +1586,7 @@ export class RunEngine {
             estimatedInputTokens: attempted.estimatedInputTokens,
             budgetCounters: counters,
             recoveryUsed: attempted.recoveryUsed,
+            reasoningSegments,
             modelTurn: Object.freeze({ kind: 'correction', maxOutputTokens })
         }, [
             completedEvent,

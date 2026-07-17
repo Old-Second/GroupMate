@@ -272,6 +272,7 @@ class ApprovalAdapter implements ModelAdapter {
   constructor (calls: number, recovered = false) {
     const planned: ModelTurn = Object.freeze({
         text: '',
+        reasoning: Object.freeze({ text: '审批前思考', truncated: false }),
         toolCalls: Object.freeze(Array.from({ length: calls }, (_, index) => Object.freeze({
           index,
           callId: `call-${index + 1}`,
@@ -283,6 +284,7 @@ class ApprovalAdapter implements ModelAdapter {
       })
     const completed: ModelTurn = Object.freeze({
         text: '任务结果已确认。',
+        reasoning: Object.freeze({ text: '审批后思考', truncated: false }),
         toolCalls: Object.freeze([]),
         finishReason: 'stop' as const
       })
@@ -588,6 +590,52 @@ test('RunEngine resolves ordered approvals in one run without executing an undec
   assert.equal(terminalSnapshot(completed)?.counters.approvalRequests, 2)
   assert.equal(await fixture.store.load('run-approval-1'), null)
   assert.equal(JSON.stringify(fixture.adapter.requests[1]?.messages).includes('approval-generated'), false)
+})
+
+test('RunEngine restores approval reasoning from a V3 checkpoint without duplicating it', async () => {
+  const store = new InMemoryRunStore()
+  const source = approvalHarness({ store })
+  const paused = await source.engine.start(source.input)
+  assert.equal(paused.kind, 'paused')
+  if (paused.kind !== 'paused') return
+  const stored = await store.load(paused.runId)
+  assert.equal(stored?.schemaVersion, 3)
+  if (stored?.schemaVersion !== 3) throw new TypeError('V3 approval checkpoint is missing')
+  assert.deepEqual(stored.reasoningSegments.map(item => item.text), [
+    '审批前思考'
+  ])
+
+  const recovered = approvalHarness({ store, recovered: true })
+  await displayCurrent(
+    recovered,
+    paused.interruption,
+    'approval-message-v3-recovered',
+    '2026-07-14T00:00:01.000Z'
+  )
+  recovered.setNow('2026-07-14T00:00:02.000Z')
+  const completed = await recovered.engine.decideApproval({
+    runId: paused.runId,
+    approvalId: paused.interruption.approvalId,
+    kind: 'approved',
+    decidedAt: '2026-07-14T00:00:02.000Z',
+    sessionAddress: groupAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'group_owner' })
+  }, recovered.binding())
+
+  assert.equal(completed?.kind, 'completed')
+  if (completed?.kind !== 'completed') return
+  assert.deepEqual(completed.presentationTrace.segments.map(segment => (
+    segment.kind === 'reasoning'
+      ? `r:${segment.text}`
+      : `t:${segment.toolName}:${segment.outcome}`
+  )), [
+    'r:审批前思考',
+    't:riskyOne:succeeded',
+    'r:审批后思考'
+  ])
+  assert.equal(completed.presentationTrace.segments.filter(segment => (
+    segment.kind === 'reasoning' && segment.text === '审批前思考'
+  )).length, 1)
 })
 
 test('RunEngine turns rejection and expiry into exact terminal tool results without dispatch', async () => {

@@ -5,6 +5,7 @@ import { parseApprovalInterruption } from '../run/interruption.js';
 import { parseRunTerminalSnapshot } from '../run/run-observation.js';
 import { RUN_REF_PATTERN } from '../run/run-reference.js';
 import { parseTerminalCommitReceipt } from '../run/run-store.js';
+import { parsePresentationTrace } from './presentation-trace.js';
 function parseSerializedAgentError(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError('agent result error is invalid');
@@ -146,7 +147,7 @@ export function parseRunAdvanceResult(value) {
         throw new TypeError('run advance result run ID is invalid');
     }
     const allowed = result.kind === 'completed'
-        ? ['kind', 'runId', 'runRef', 'completion', 'output', 'terminal']
+        ? ['kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal']
         : result.kind === 'paused'
             ? ['kind', 'runId', 'runRef', 'interruption']
             : result.kind === 'failed'
@@ -171,6 +172,7 @@ export function parseRunAdvanceResult(value) {
     }
     if (result.kind === 'completed') {
         const completion = parseCompletionDisposition(result.completion);
+        parsePresentationTrace(result.presentationTrace);
         if (completion.kind === 'already_visible') {
             if (result.output !== null)
                 throw new TypeError('completed run output is invalid');

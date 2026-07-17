@@ -13,6 +13,7 @@ import {
   parseAgentResult,
   parseRunAdvanceResult
 } from '../../src/agent/contracts/result.js'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import {
   createInitialRunObservationCounters,
   terminalObservationId
@@ -161,9 +162,29 @@ test('result parsers use one completion contract and freeze run references on ev
     runRef: terminalRunRef,
     completion: { kind: 'already_visible', source: 'tool_output' },
     output: null,
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: visibleTerminalFacts()
   } as const
   assert.deepEqual(parseRunAdvanceResult(completed), completed)
+  const { presentationTrace: _presentationTrace, ...missingTrace } = completed
+  assert.throws(() => parseRunAdvanceResult(missingTrace), /key|trace/i)
+  assert.throws(() => parseRunAdvanceResult({
+    ...completed,
+    presentationTrace: { schemaVersion: 1, truncated: false, segments: null }
+  }), /trace|segment/i)
+  assert.throws(() => parseRunAdvanceResult({
+    kind: 'failed',
+    runId: 'run-1',
+    runRef: 'unavailable',
+    error: serializeAgentError(new AgentError({
+      code: 'internal_error',
+      stage: 'fixture',
+      retryable: false,
+      userMessage: '失败。'
+    })),
+    terminal: null,
+    presentationTrace: EMPTY_PRESENTATION_TRACE
+  }), /unknown key/i)
   assert.throws(() => parseRunAdvanceResult({
     ...completed,
     terminal: visibleTerminalFacts('3'.repeat(32))

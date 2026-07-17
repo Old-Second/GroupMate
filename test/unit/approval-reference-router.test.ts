@@ -19,6 +19,7 @@ import {
   type RunApprovalControl
 } from '../../src/runtime/run-approval-router.js'
 import { AgentError } from '../../src/agent/contracts/error.js'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import type { ChatReplyEnvelope } from '../../src/runtime/agent-service.js'
 import {
   activateRequestObservation,
@@ -198,6 +199,7 @@ class FakeApprovalControl implements RunApprovalControl {
       runRef: completedRunRef,
       completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
       output: null,
+      presentationTrace: EMPTY_PRESENTATION_TRACE,
       terminal,
       text: null,
       visibleOutput: true,

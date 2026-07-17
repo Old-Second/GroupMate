@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import {
   createInitialRunObservationCounters,
   terminalObservationId
@@ -77,6 +78,7 @@ function envelope (text: string): FinalChatReplyEnvelope {
         createdAt
       })
     }),
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal,
     requestObservationDraft: createRequestObservationDraft({
       context,

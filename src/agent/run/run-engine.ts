@@ -99,6 +99,8 @@ import {
   type TraceCandidateProjectionFailureCode,
   type TraceCandidateV1
 } from './run-trace.js'
+import { appendRunReasoningSegment } from './run-reasoning-segment.js'
+import { buildPresentationTrace } from './presentation-trace-builder.js'
 import {
   applyToolPreflight,
   cancelToolExecutionLedger,
@@ -612,6 +614,10 @@ function terminalResult (
       runRef: checkpoint.runRef,
       completion: checkpoint.completion,
       output: checkpoint.output,
+      presentationTrace: buildPresentationTrace({
+        reasoningSegments: checkpoint.reasoningSegments,
+        toolLedgers: checkpoint.toolLedgers
+      }),
       terminal
     })
   }
@@ -1917,6 +1923,14 @@ export class RunEngine {
     correction: boolean
   ): Promise<RunCheckpoint> {
     const { turn } = attempted
+    const reasoningSegments = appendRunReasoningSegment(
+      checkpoint.reasoningSegments,
+      {
+        step: checkpoint.step,
+        turn: attempted.counters.modelTurns,
+        reasoning: turn.reasoning
+      }
+    )
     const completedEvent: EventDraft = {
       type: 'model.completed',
       payload: {
@@ -1931,6 +1945,7 @@ export class RunEngine {
         messages: attempted.messages,
         estimatedInputTokens: attempted.estimatedInputTokens,
         recoveryUsed: attempted.recoveryUsed,
+        reasoningSegments,
         modelTurn: null
       }, { reason: 'provider_refusal' })
     }
@@ -1944,6 +1959,7 @@ export class RunEngine {
           messages: attempted.messages,
           estimatedInputTokens: attempted.estimatedInputTokens,
           recoveryUsed: attempted.recoveryUsed,
+          reasoningSegments,
           modelTurn: null
         })
       }
@@ -1956,6 +1972,7 @@ export class RunEngine {
           messages: attempted.messages,
           estimatedInputTokens: attempted.estimatedInputTokens,
           recoveryUsed: attempted.recoveryUsed,
+          reasoningSegments,
           modelTurn: null
         })
       }
@@ -1977,6 +1994,7 @@ export class RunEngine {
         estimatedInputTokens,
         budgetCounters: attempted.counters,
         recoveryUsed: attempted.recoveryUsed,
+        reasoningSegments,
         modelTurn: null,
         toolLedgers: Object.freeze([...checkpoint.toolLedgers, ledger]),
         preparedBatch: null,
@@ -2003,6 +2021,7 @@ export class RunEngine {
         estimatedInputTokens: attempted.estimatedInputTokens,
         budgetCounters: attempted.counters,
         recoveryUsed: attempted.recoveryUsed,
+        reasoningSegments,
         modelTurn: null,
         output,
         completion
@@ -2018,6 +2037,7 @@ export class RunEngine {
         messages: attempted.messages,
         estimatedInputTokens: attempted.estimatedInputTokens,
         recoveryUsed: attempted.recoveryUsed,
+        reasoningSegments,
         modelTurn: null
       })
     }
@@ -2037,6 +2057,7 @@ export class RunEngine {
         messages: attempted.messages,
         estimatedInputTokens: attempted.estimatedInputTokens,
         recoveryUsed: attempted.recoveryUsed,
+        reasoningSegments,
         modelTurn: null
       })
     }
@@ -2045,6 +2066,7 @@ export class RunEngine {
       estimatedInputTokens: attempted.estimatedInputTokens,
       budgetCounters: counters,
       recoveryUsed: attempted.recoveryUsed,
+      reasoningSegments,
       modelTurn: Object.freeze({ kind: 'correction', maxOutputTokens })
     }, [
       completedEvent,

@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import type { AgentMessage } from '../../src/agent/contracts/content.js'
 import type { CompletionDisposition } from '../../src/agent/contracts/completion.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
 import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
@@ -394,6 +395,7 @@ function completedResult (
     output: completion.kind === 'already_visible'
       ? null
       : terminalOutput(completion.kind === 'allowed_silence' ? '<EMPTY>' : completion.text),
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: terminalFactsFor(runRef, completion)
   })
 }
@@ -654,13 +656,14 @@ test('chat reply envelope projects exact RunAdvanceResult without text or visibl
   const projected = projectRunAdvanceResult(wrapped)
   if (projected.kind !== 'completed') assert.fail('completed projection changed kind')
   assert.deepEqual(Reflect.ownKeys(projected), [
-    'kind', 'runId', 'runRef', 'completion', 'output', 'terminal'
+    'kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal'
   ])
   assert.equal(Object.hasOwn(projected, 'requestObservationDraft'), false)
   assert.equal(Object.hasOwn(projected, 'sessionPersistence'), false)
   assert.equal(Object.hasOwn(projected, 'text'), false)
   assert.equal(Object.hasOwn(projected, 'visibleOutput'), false)
   assert.equal(projected.completion, result.completion)
+  assert.equal(projected.presentationTrace, result.presentationTrace)
   assert.equal(projected.terminal, result.terminal)
 
   const presentation = projectFinalPresentation(wrapped)

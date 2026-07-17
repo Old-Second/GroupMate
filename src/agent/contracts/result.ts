@@ -18,6 +18,10 @@ import {
   parseTerminalCommitReceipt,
   type TerminalCommitReceiptV1
 } from '../run/run-store.js'
+import {
+  parsePresentationTrace,
+  type PresentationTraceV1
+} from './presentation-trace.js'
 
 export type AgentResult =
   | { readonly status: 'completed'; readonly completion: CompletionDisposition }
@@ -36,6 +40,7 @@ export type RunAdvanceResult =
       readonly runRef: string
       readonly completion: CompletionDisposition
       readonly output: AgentMessage | null
+      readonly presentationTrace: PresentationTraceV1
       readonly terminal: TerminalFactsV1
     }
   | {
@@ -214,7 +219,7 @@ export function parseRunAdvanceResult (value: unknown): RunAdvanceResult {
     throw new TypeError('run advance result run ID is invalid')
   }
   const allowed = result.kind === 'completed'
-    ? ['kind', 'runId', 'runRef', 'completion', 'output', 'terminal']
+    ? ['kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal']
     : result.kind === 'paused'
       ? ['kind', 'runId', 'runRef', 'interruption']
       : result.kind === 'failed'
@@ -242,6 +247,7 @@ export function parseRunAdvanceResult (value: unknown): RunAdvanceResult {
   }
   if (result.kind === 'completed') {
     const completion = parseCompletionDisposition(result.completion)
+    parsePresentationTrace(result.presentationTrace)
     if (completion.kind === 'already_visible') {
       if (result.output !== null) throw new TypeError('completed run output is invalid')
     } else {

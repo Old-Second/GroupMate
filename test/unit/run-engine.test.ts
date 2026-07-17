@@ -124,22 +124,29 @@ function toolCall (
   })
 }
 
-function modelText (text: string): ModelTurn {
+function modelText (text: string, reasoning?: string): ModelTurn {
   return Object.freeze({
     text,
     toolCalls: Object.freeze([]),
-    finishReason: 'stop'
+    finishReason: 'stop',
+    ...(reasoning === undefined
+      ? {}
+      : { reasoning: Object.freeze({ text: reasoning, truncated: false }) })
   })
 }
 
 function modelTools (
   calls: readonly ModelTurn['toolCalls'][number][],
-  text = '内部过程正文'
+  text = '内部过程正文',
+  reasoning?: string
 ): ModelTurn {
   return Object.freeze({
     text,
     toolCalls: Object.freeze([...calls]),
-    finishReason: 'tool_calls'
+    finishReason: 'tool_calls',
+    ...(reasoning === undefined
+      ? {}
+      : { reasoning: Object.freeze({ text: reasoning, truncated: false }) })
   })
 }
 
@@ -212,6 +219,19 @@ class ActivityOrderStore extends InMemoryRunStore {
       this.order.push('engine_reserved')
     }
     return stored
+  }
+}
+
+class TerminalCaptureStore extends InMemoryRunStore {
+  terminalCheckpoint: RunCheckpoint | null = null
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    this.terminalCheckpoint = next
+    return await super.commitTerminal(expected, next, snapshot)
   }
 }
 
@@ -1455,6 +1475,37 @@ test('RunEngine returns one ordered terminal result for unknown, failed and deni
   })
 })
 
+test('RunEngine preserves chronological reasoning and tool presentation traces without feeding them back', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([
+    modelTools([toolCall(0, 'call-1', 'normalRead', 'first')], '', '思考一'),
+    modelTools([toolCall(0, 'call-2', 'normalRead', 'second')], '', '思考二'),
+    modelTools([toolCall(0, 'call-3', 'normalRead', 'third')], '', '思考三'),
+    modelText('全部完成', '思考四')
+  ], { store })
+  fixture.tools.outcomes.set('call-1', success('结果一'))
+  fixture.tools.outcomes.set('call-2', success('结果二'))
+  fixture.tools.outcomes.set('call-3', success('结果三'))
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  if (result.kind !== 'completed') return
+  assert.deepEqual(result.presentationTrace.segments.map(segment => (
+    segment.kind === 'reasoning'
+      ? `r${segment.turn}:${segment.text}`
+      : `t${segment.step}:${segment.index}:${segment.resultSummary}`
+  )), [
+    'r1:思考一', 't0:0:结果一',
+    'r2:思考二', 't1:0:结果二',
+    'r3:思考三', 't2:0:结果三',
+    'r4:思考四'
+  ])
+  assert.equal(store.terminalCheckpoint?.reasoningSegments.length, 4)
+  assert.equal(JSON.stringify(fixture.adapter.requests).includes('思考一'), false)
+  assert.equal(JSON.stringify(fixture.adapter.requests).includes('思考四'), false)
+})
+
 test('RunEngine completes visible tool output without asking the Provider for another reply', async () => {
   const fixture = harness([
     modelTools([toolCall(0, 'call-visible', 'visible')])
@@ -1471,6 +1522,14 @@ test('RunEngine completes visible tool output without asking the Provider for an
     { kind: 'already_visible', source: 'tool_output' }
   )
   assert.equal(result.kind === 'completed' ? result.output : undefined, null)
+  assert.deepEqual(
+    result.kind === 'completed'
+      ? result.presentationTrace.segments.map(segment => segment.kind === 'tool'
+        ? { kind: segment.kind, toolName: segment.toolName, result: segment.resultSummary }
+        : { kind: segment.kind })
+      : null,
+    [{ kind: 'tool', toolName: 'visible', result: '结果已通过工具发送' }]
+  )
   assert.equal(fixture.adapter.requests.length, 1)
   const checkpoint = terminalSnapshot(result)
   assert.notEqual(checkpoint, null)

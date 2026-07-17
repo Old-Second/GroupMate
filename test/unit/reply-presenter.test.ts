@@ -4,6 +4,7 @@ import type { CompletionDisposition } from '../../src/agent/contracts/completion
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
 import type { PresentationRouteV1, RecoveredLegacyPresentationRoute } from '../../src/agent/contracts/interaction.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
+import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
 import { serializeAgentError, AgentError } from '../../src/agent/contracts/error.js'
 import { createInitialRunObservationCounters, terminalObservationId } from '../../src/agent/run/run-observation.js'
 import {
@@ -177,6 +178,7 @@ function completed (completion: CompletionDisposition): Extract<RunAdvanceResult
     output: completion.kind === 'already_visible'
       ? null
       : output(completion.kind === 'allowed_silence' ? '<EMPTY>' : completion.text),
+    presentationTrace: EMPTY_PRESENTATION_TRACE,
     terminal: terminalFacts('completed', completion)
   })
 }
