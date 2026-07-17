@@ -548,6 +548,7 @@ export class YunzaiAgentServiceBridge {
     #generateId;
     #createRequestRef;
     #monotonicNow;
+    #requestJournal;
     constructor(input) {
         this.#options = input.options;
         this.#bridge = input.bridge;
@@ -561,6 +562,7 @@ export class YunzaiAgentServiceBridge {
         this.#generateId = input.options.generateId ?? randomUUID;
         this.#createRequestRef = input.options.createRequestRef ?? createRequestRef;
         this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()));
+        this.#requestJournal = input.requestJournal;
     }
     get conversations() {
         return this.#bridge.conversations;
@@ -646,6 +648,12 @@ export class YunzaiAgentServiceBridge {
                     ? {}
                     : { sessionTtlSeconds: options.sessionTtlSeconds })
             });
+            try {
+                this.#requestJournal?.recordRequest(request);
+            }
+            catch {
+                // Request journaling must not alter adaptation or run admission.
+            }
             this.#prepared.set(requestId, Object.freeze({
                 run: toolRun,
                 runtimeFacts: Object.freeze([runtimeIdentityItem(request, event)]),
@@ -909,6 +917,14 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             }
         }
     });
+    const contentJournal = dependencies.contentJournal;
+    const runContentJournal = contentJournal === undefined
+        ? undefined
+        : Object.freeze({
+            record: (event) => {
+                contentJournal.recordRunEvent(event);
+            }
+        });
     const service = new AgentService({
         sessions,
         runStore,
@@ -933,6 +949,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             now,
             generateId,
             observer,
+            ...(runContentJournal === undefined ? {} : { contentJournal: runContentJournal }),
             onCommittedTraceCandidate: candidate => {
                 try {
                     dependencies.observations?.acceptCommittedTraceCandidate(candidate);
@@ -1045,6 +1062,9 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         prepared,
         outboundFactory,
         onApprovalOutcome: presentation.onApprovalOutcome,
-        rememberBot: botAccess.remember
+        rememberBot: botAccess.remember,
+        ...(contentJournal === undefined
+            ? {}
+            : { requestJournal: contentJournal })
     });
 }

@@ -46,5 +46,6 @@ export type RunContentJournalEvent =
   | RunTerminalCommittedContentJournalEvent
 
 export interface RunContentJournal {
+  // Synchronous best-effort hook; authoritative run state must never depend on it.
   record(event: RunContentJournalEvent): void
 }

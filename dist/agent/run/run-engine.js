@@ -375,6 +375,7 @@ export class RunEngine {
     #observer;
     #onCommittedTraceCandidate;
     #onTraceCandidateProjectionFailure;
+    #contentJournal;
     #runtimeBindings = new Map();
     #controllers = new Map();
     #startedToolCalls = new Map();
@@ -394,6 +395,7 @@ export class RunEngine {
         this.#observer = options.observer;
         this.#onCommittedTraceCandidate = options.onCommittedTraceCandidate;
         this.#onTraceCandidateProjectionFailure = options.onTraceCandidateProjectionFailure;
+        this.#contentJournal = options.contentJournal;
     }
     #terminalResult(checkpoint) {
         return terminalResult(checkpoint, this.#terminalFacts.get(checkpoint) ?? null);
@@ -1183,6 +1185,15 @@ export class RunEngine {
                     return Object.freeze({ terminal: true, checkpoint: current });
                 }
                 const attemptKind = nextAttemptKind;
+                this.#recordContentJournal(() => Object.freeze({
+                    type: 'provider.request',
+                    occurredAt: this.#timestamp(),
+                    runRef: current.runRef,
+                    requestRef: current.requestRef,
+                    ordinal: this.#providerAttemptOrdinal(current),
+                    attemptKind,
+                    request
+                }));
                 const startedAt = this.#safeMonotonicNow();
                 let turn;
                 try {
@@ -1193,7 +1204,25 @@ export class RunEngine {
                     const accounted = this.#recordProviderUsage(counters, activeRuntimeMs);
                     counters = accounted.counters;
                     const aborted = isAbortError(error) || signal.aborted;
-                    const errorCode = aborted ? 'cancelled' : asAgentError(error).code;
+                    const classifiedError = aborted
+                        ? new AgentError({
+                            code: 'cancelled',
+                            stage: 'model.response',
+                            retryable: false,
+                            userMessage: '请求已取消。',
+                            cause: error
+                        })
+                        : asAgentError(error);
+                    const errorCode = classifiedError.code;
+                    this.#recordContentJournal(() => Object.freeze({
+                        type: 'provider.failure',
+                        occurredAt: this.#timestamp(),
+                        runRef: current.runRef,
+                        requestRef: current.requestRef,
+                        ordinal: this.#providerAttemptOrdinal(current),
+                        attemptKind,
+                        error: serializeAgentError(classifiedError)
+                    }));
                     current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, undefined, [{
                             type: 'model.attempted',
                             payload: Object.freeze({
@@ -1253,6 +1282,15 @@ export class RunEngine {
                     }
                     throw internalError(error);
                 }
+                this.#recordContentJournal(() => Object.freeze({
+                    type: 'provider.response',
+                    occurredAt: this.#timestamp(),
+                    runRef: current.runRef,
+                    requestRef: current.requestRef,
+                    ordinal: this.#providerAttemptOrdinal(current),
+                    attemptKind,
+                    turn
+                }));
                 const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
                 const accounted = this.#recordProviderUsage(counters, activeRuntimeMs, turn.usage?.totalTokens ?? 0);
                 counters = accounted.counters;
@@ -1739,6 +1777,14 @@ export class RunEngine {
                     projectionFailed = true;
                 }
                 const receipt = await this.#store.commitTerminal(checkpoint, next, snapshot);
+                this.#recordContentJournal(() => Object.freeze({
+                    type: 'run.terminal_committed',
+                    occurredAt: this.#timestamp(),
+                    runRef: next.runRef,
+                    requestRef: next.requestRef,
+                    checkpoint: next,
+                    receipt
+                }));
                 const terminal = Object.freeze({ snapshot, receipt });
                 this.#terminalFacts.set(next, terminal);
                 if (projectionFailed) {
@@ -2099,6 +2145,21 @@ export class RunEngine {
     }
     #timestamp() {
         return this.#now().toISOString();
+    }
+    #recordContentJournal(createEvent) {
+        try {
+            this.#contentJournal?.record(createEvent());
+        }
+        catch {
+            // Content journaling must never alter authoritative run behavior.
+        }
+    }
+    #providerAttemptOrdinal(checkpoint) {
+        const ordinal = checkpoint.observationCounters.providerAttempts;
+        if (typeof ordinal !== 'number' || !Number.isSafeInteger(ordinal) || ordinal < 1) {
+            throw new TypeError('committed provider attempt ordinal is unavailable');
+        }
+        return ordinal;
     }
     #safeMonotonicNow() {
         try {

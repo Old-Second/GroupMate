@@ -6,6 +6,10 @@ import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import type {
+  RunContentJournal,
+  RunContentJournalEvent
+} from '../../src/agent/run/run-content-journal.js'
 import {
   nextRunCheckpoint,
   parseRunCheckpoint,
@@ -373,6 +377,7 @@ interface HarnessOptions {
   readonly toolMonotonicNow?: () => number
   readonly onCommittedTraceCandidate?: RunEngineOptions['onCommittedTraceCandidate']
   readonly onTraceCandidateProjectionFailure?: RunEngineOptions['onTraceCandidateProjectionFailure']
+  readonly contentJournal?: RunContentJournal
 }
 
 function harness (
@@ -406,7 +411,10 @@ function harness (
       : { onCommittedTraceCandidate: options.onCommittedTraceCandidate }),
     ...(options.onTraceCandidateProjectionFailure === undefined
       ? {}
-      : { onTraceCandidateProjectionFailure: options.onTraceCandidateProjectionFailure })
+      : { onTraceCandidateProjectionFailure: options.onTraceCandidateProjectionFailure }),
+    ...(options.contentJournal === undefined
+      ? {}
+      : { contentJournal: options.contentJournal })
   })
   const input: StartRunInput = Object.freeze({
     runId: 'run-1',
@@ -664,6 +672,108 @@ test('RunEngine completes one valid pure-text turn and emits ordered events', as
   })
 })
 
+test('RunEngine journals the full Provider request before wire and response after return', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const order: string[] = []
+  const turn = Object.freeze({
+    ...modelText('完整响应'),
+    responseId: 'response-full-1',
+    usage: Object.freeze({ inputTokens: 9, outputTokens: 4, totalTokens: 13 })
+  })
+  const fixture = harness([
+    async () => {
+      order.push('provider.complete')
+      return turn
+    }
+  ], {
+    contentJournal: {
+      record: event => {
+        journalEvents.push(event)
+        if (event.type === 'provider.request' || event.type === 'provider.response') {
+          order.push(`journal.${event.type}`)
+        }
+      }
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '完整响应')
+  const providerEvents = journalEvents.filter(event => event.type.startsWith('provider.'))
+  assert.deepEqual(order, [
+    'journal.provider.request',
+    'provider.complete',
+    'journal.provider.response'
+  ])
+  assert.equal(providerEvents.length, 2)
+  assert.deepEqual(providerEvents[0], {
+    type: 'provider.request',
+    occurredAt: timestamp,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary',
+    request: fixture.adapter.requests[0]
+  })
+  assert.deepEqual(providerEvents[1], {
+    type: 'provider.response',
+    occurredAt: timestamp,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary',
+    turn
+  })
+})
+
+test('RunEngine journals only the classified bounded Provider error and ignores journal failures', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const providerError = new ModelProviderError({
+    code: 'provider_authentication',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: '认证失败。',
+    details: Object.freeze({ reason: 'invalid_credential' }),
+    statusCode: 401,
+    providerCode: 'raw_provider_code',
+    profileCode: 'profile_code'
+  })
+  const fixture = harness([providerError], {
+    contentJournal: {
+      record: event => {
+        journalEvents.push(event)
+        throw new Error(`journal failure: ${event.type}`)
+      }
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' ? result.error.code : null, 'provider_authentication')
+  assert.equal(fixture.adapter.requests.length, 1)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+  assert.deepEqual(failure, {
+    type: 'provider.failure',
+    occurredAt: timestamp,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary',
+    error: {
+      code: 'provider_authentication',
+      stage: 'model.response',
+      retryable: false,
+      userMessage: '认证失败。',
+      details: { reason: 'invalid_credential' }
+    }
+  })
+  assert.deepEqual(
+    Object.keys(failure?.type === 'provider.failure' ? failure.error : {}).sort(),
+    ['code', 'details', 'retryable', 'stage', 'userMessage']
+  )
+})
+
 test('RunEngine drops a local trace candidate when terminal CAS loses', async () => {
   const candidates: TraceCandidateV1[] = []
   const fixture = harness([modelText('本地终态不应提交')], {
@@ -828,7 +938,11 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
 
 test('RunEngine returns a concurrent terminal before Provider wire when dispatch reservation CAS loses', async () => {
   const store = new TerminalRaceRunStore('provider_reservation')
-  const fixture = harness([modelText('不应调用 Provider')], { store })
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([modelText('不应调用 Provider')], {
+    store,
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -843,6 +957,7 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
   assert.equal(fixture.adapter.requests.length, 0)
   assert.equal(fixture.tools.preparations, 0)
   assert.equal(fixture.tools.executions, 0)
+  assert.equal(journalEvents.some(event => event.type === 'provider.request'), false)
   assert.deepEqual(fixture.events, [
     'run.created', 'run.started', 'context.prepared', 'model.started'
   ])
@@ -850,6 +965,7 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
 
 test('RunEngine stops model completion evaluation when dispatch-completion CAS loses to a terminal', async () => {
   const store = new TerminalRaceRunStore('dispatch_completion')
+  const journalEvents: RunContentJournalEvent[] = []
   let modelEvaluationReads = 0
   const providerTurn: ModelTurn = Object.freeze({
     text: 'wire 已完成但不应继续求值',
@@ -859,7 +975,10 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
       return 'stop'
     }
   })
-  const fixture = harness([providerTurn], { store })
+  const fixture = harness([providerTurn], {
+    store,
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -875,6 +994,9 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
   assert.equal(modelEvaluationReads, 0)
   assert.equal(fixture.tools.preparations, 0)
   assert.equal(fixture.tools.executions, 0)
+  assert.deepEqual(journalEvents
+    .filter(event => event.type.startsWith('provider.'))
+    .map(event => event.type), ['provider.request', 'provider.response'])
   assert.equal(fixture.events.includes('model.completed'), false)
   assert.equal(fixture.events.some(event => event.startsWith('tool.')), false)
 })
@@ -1339,8 +1461,10 @@ test('RunEngine preserves a pending retry attempt kind across process restart', 
   store.restoreProcess()
 
   const candidates: TraceCandidateV1[] = []
+  const journalEvents: RunContentJournalEvent[] = []
   const resumed = harness([modelText('重启后重试成功')], {
     store,
+    contentJournal: { record: event => { journalEvents.push(event) } },
     onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
   })
   const result = await resumed.engine.resume('run-1', resumed.input.runtime)
@@ -1353,6 +1477,30 @@ test('RunEngine preserves a pending retry attempt kind across process restart', 
   })), [
     { outcome: 'failed', attemptKind: 'primary', count: 1 },
     { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
+  assert.deepEqual(journalEvents
+    .filter(event => event.type === 'provider.request' || event.type === 'provider.response')
+    .map(event => ({
+      type: event.type,
+      runRef: event.runRef,
+      requestRef: event.requestRef,
+      ordinal: event.ordinal,
+      attemptKind: event.attemptKind
+    })), [
+    {
+      type: 'provider.request',
+      runRef: resumed.input.runRef,
+      requestRef: resumed.input.requestRef,
+      ordinal: 2,
+      attemptKind: 'retry'
+    },
+    {
+      type: 'provider.response',
+      runRef: resumed.input.runRef,
+      requestRef: resumed.input.requestRef,
+      ordinal: 2,
+      attemptKind: 'retry'
+    }
   ])
 })
 

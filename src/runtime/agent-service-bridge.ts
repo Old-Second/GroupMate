@@ -45,6 +45,7 @@ import {
   type RequestObservationContextV1
 } from './request-observation.js'
 import { createAgentRunLog } from './safe-chat-logging.js'
+import type { GroupMateContentJournal } from './logging/groupmate-content-journal.js'
 import { TerminalFactCollector } from './terminal-fact-collector.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js'
 import {
@@ -170,6 +171,7 @@ export interface YunzaiAgentServiceBridgeDependencies {
   readonly modelAdapter: ModelAdapter
   readonly runStore?: RedisRunStore
   readonly admission?: RunAdmission
+  readonly contentJournal?: GroupMateContentJournal
   readonly observations?: Readonly<{
     publish(event: ObservationEventV1): void
     acceptCommittedTraceCandidate(candidate: TraceCandidateV1): void
@@ -877,6 +879,7 @@ export class YunzaiAgentServiceBridge {
   readonly #generateId: () => string
   readonly #createRequestRef: () => string
   readonly #monotonicNow: () => number | 'unavailable'
+  readonly #requestJournal?: Pick<GroupMateContentJournal, 'recordRequest'>
 
   constructor (input: Readonly<{
     options: YunzaiAgentServiceBridgeOptions
@@ -887,6 +890,7 @@ export class YunzaiAgentServiceBridge {
     outboundFactory: YunzaiOutboundPortFactory
     onApprovalOutcome: ApprovalRouteResultHandler
     rememberBot: (event: YunzaiMessageEvent) => void
+    requestJournal?: Pick<GroupMateContentJournal, 'recordRequest'>
   }>) {
     this.#options = input.options
     this.#bridge = input.bridge
@@ -900,6 +904,7 @@ export class YunzaiAgentServiceBridge {
     this.#generateId = input.options.generateId ?? randomUUID
     this.#createRequestRef = input.options.createRequestRef ?? createRequestRef
     this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()))
+    this.#requestJournal = input.requestJournal
   }
 
   get conversations (): ConversationSessionPort {
@@ -1019,6 +1024,11 @@ export class YunzaiAgentServiceBridge {
           ? {}
           : { sessionTtlSeconds: options.sessionTtlSeconds })
       })
+      try {
+        this.#requestJournal?.recordRequest(request)
+      } catch {
+        // Request journaling must not alter adaptation or run admission.
+      }
       this.#prepared.set(requestId, Object.freeze({
         run: toolRun,
         runtimeFacts: Object.freeze([runtimeIdentityItem(request, event)]),
@@ -1305,6 +1315,14 @@ export function createYunzaiAgentServiceBridge (
       }
     }
   })
+  const contentJournal = dependencies.contentJournal
+  const runContentJournal = contentJournal === undefined
+    ? undefined
+    : Object.freeze({
+        record: (event: Parameters<GroupMateContentJournal['recordRunEvent']>[0]) => {
+          contentJournal.recordRunEvent(event)
+        }
+      })
   const service = new AgentService({
     sessions,
     runStore,
@@ -1341,6 +1359,7 @@ export function createYunzaiAgentServiceBridge (
       now,
       generateId,
       observer,
+      ...(runContentJournal === undefined ? {} : { contentJournal: runContentJournal }),
       onCommittedTraceCandidate: candidate => {
         try {
           dependencies.observations?.acceptCommittedTraceCandidate(candidate)
@@ -1450,6 +1469,9 @@ export function createYunzaiAgentServiceBridge (
     prepared,
     outboundFactory,
     onApprovalOutcome: presentation.onApprovalOutcome,
-    rememberBot: botAccess.remember
+    rememberBot: botAccess.remember,
+    ...(contentJournal === undefined
+      ? {}
+      : { requestJournal: contentJournal })
   })
 }
