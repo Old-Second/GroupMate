@@ -44,16 +44,47 @@ local function currentGeneration()
   return tonumber(redis.call('GET', generationKey) or '0')
 end
 
-local function currentBytes()
+local totalField = '__total'
+
+local function currentDataBytes()
   return tonumber(redis.call('HGET', bytesKey, '__total') or '0')
 end
 
-local function saveBytes(value)
+local function saveDataBytes(value)
   if value <= 0 then
     redis.call('DEL', bytesKey)
   else
-    redis.call('HSET', bytesKey, '__total', value)
+    redis.call('HSET', bytesKey, totalField, value)
   end
+end
+
+local function entryMetadataBytes()
+  local values = redis.call('HGETALL', bytesKey)
+  local total = 0
+  for index = 1, #values, 2 do
+    if values[index] ~= totalField then
+      total = total + string.len(values[index]) + string.len(values[index + 1])
+    end
+  end
+  return total
+end
+
+local function generationMetadataBytes()
+  local value = redis.call('GET', generationKey)
+  if not value then return 0 end
+  return string.len(value)
+end
+
+local function namespaceBytes(dataBytes, metadataBytes)
+  local counterBytes = 0
+  if dataBytes > 0 then
+    counterBytes = string.len(totalField) + string.len(tostring(dataBytes))
+  end
+  return dataBytes + metadataBytes + counterBytes + generationMetadataBytes()
+end
+
+local function currentNamespaceBytes()
+  return namespaceBytes(currentDataBytes(), entryMetadataBytes())
 end
 
 local function removeKey(key)
@@ -68,6 +99,7 @@ end
 local function cleanupExpired(nowMs)
   local remaining = ${MAX_STALE_CLEANUP}
   local removedBytes = 0
+  local dataBytes = currentDataBytes()
   for _, index in ipairs({ successIndex, failureIndex }) do
     if remaining > 0 then
       local keys = redis.call('ZRANGEBYSCORE', index, '-inf', nowMs, 'LIMIT', 0, remaining)
@@ -77,7 +109,7 @@ local function cleanupExpired(nowMs)
       end
     end
   end
-  saveBytes(math.max(0, currentBytes() - removedBytes))
+  saveDataBytes(math.max(0, dataBytes - removedBytes))
 end
 
 local function oldestEvictable(skip)
@@ -88,19 +120,31 @@ local function oldestEvictable(skip)
   return nil
 end
 
-local function ensureCapacity(additionalBytes, additionalRecords, skip)
-  local bytes = currentBytes()
+local function projectedNamespaceBytes(key, oldLength, newLength)
+  local dataBytes = math.max(0, currentDataBytes() - oldLength + newLength)
+  local metadataBytes = entryMetadataBytes()
+  if oldLength > 0 then
+    metadataBytes = math.max(0, metadataBytes - string.len(key) - string.len(tostring(oldLength)))
+  end
+  if newLength > 0 then
+    metadataBytes = metadataBytes + string.len(key) + string.len(tostring(newLength))
+  end
+  return namespaceBytes(dataBytes, metadataBytes)
+end
+
+local function ensureCapacity(key, oldLength, newLength, additionalRecords, skip)
   local records = redis.call('ZCARD', successIndex) + redis.call('ZCARD', failureIndex)
   local guard = ${MAX_RECORDS}
-  while (records + additionalRecords > ${MAX_RECORDS} or bytes + additionalBytes > ${MAX_BYTES}) and guard > 0 do
+  while (records + additionalRecords > ${MAX_RECORDS} or projectedNamespaceBytes(key, oldLength, newLength) > ${MAX_BYTES}) and guard > 0 do
     local victim = oldestEvictable(skip)
     if not victim then return false end
-    bytes = math.max(0, bytes - removeKey(victim))
+    local dataBytes = math.max(0, currentDataBytes() - removeKey(victim))
+    saveDataBytes(dataBytes)
     records = records - 1
     guard = guard - 1
   end
-  saveBytes(bytes)
-  return records + additionalRecords <= ${MAX_RECORDS} and bytes + additionalBytes <= ${MAX_BYTES}
+  return records + additionalRecords <= ${MAX_RECORDS} and
+    projectedNamespaceBytes(key, oldLength, newLength) <= ${MAX_BYTES}
 end
 
 local function generationCheck(expected)
@@ -110,22 +154,23 @@ local function generationCheck(expected)
 end
 
 local function clearBounded(limit)
-  local beforeBytes = currentBytes()
+  local beforeBytes = currentNamespaceBytes()
+  local dataBytes = currentDataBytes()
   local removed = 0
-  local removedBytes = 0
+  local removedDataBytes = 0
   for _, index in ipairs({ successIndex, failureIndex }) do
     if removed < limit then
       local keys = redis.call('ZRANGE', index, 0, limit - removed - 1)
       for _, key in ipairs(keys) do
-        removedBytes = removedBytes + removeKey(key)
+        removedDataBytes = removedDataBytes + removeKey(key)
         removed = removed + 1
       end
     end
   end
-  local remainingBytes = math.max(0, beforeBytes - removedBytes)
-  saveBytes(remainingBytes)
+  saveDataBytes(math.max(0, dataBytes - removedDataBytes))
+  local remainingBytes = currentNamespaceBytes()
   local remaining = redis.call('ZCARD', successIndex) + redis.call('ZCARD', failureIndex)
-  return { removed, removedBytes, remaining, remainingBytes }
+  return { removed, math.max(0, beforeBytes - remainingBytes), remaining, remainingBytes }
 end
 
 if operation == 'upsert' then
@@ -137,8 +182,8 @@ if operation == 'upsert' then
     if existing == ARGV[4] then return { 'unchanged', ARGV[2] } end
     return { 'conflict', ARGV[2] }
   end
-  local length = string.len(ARGV[4])
-  if not ensureCapacity(length, 1, '') then return { 'capacity', ARGV[2] } end
+  local length = string.len(ARGV[4]) + (2 * string.len(KEYS[1]))
+  if not ensureCapacity(KEYS[1], 0, length, 1, '') then return { 'capacity', ARGV[2] } end
   redis.call('SET', KEYS[1], ARGV[4])
   redis.call('PEXPIREAT', KEYS[1], tonumber(ARGV[5]))
   redis.call('HSET', bytesKey, KEYS[1], length)
@@ -147,7 +192,7 @@ if operation == 'upsert' then
   else
     redis.call('ZADD', successIndex, tonumber(ARGV[5]), KEYS[1])
   end
-  saveBytes(currentBytes() + length)
+  saveDataBytes(currentDataBytes() + length)
   return { 'stored', ARGV[2] }
 end
 
@@ -159,26 +204,30 @@ if operation == 'append' then
   if not existing then return { 'not_found', ARGV[2] } end
   if existing ~= ARGV[4] then return { 'conflict', ARGV[2] } end
   if existing == ARGV[5] then return { 'unchanged', ARGV[2] } end
-  local delta = string.len(ARGV[5]) - string.len(existing)
-  if delta > 0 and not ensureCapacity(delta, 0, KEYS[1]) then
+  local oldLength = tonumber(redis.call('HGET', bytesKey, KEYS[1]) or '0')
+  if oldLength <= 0 then oldLength = string.len(existing) + (2 * string.len(KEYS[1])) end
+  local newLength = string.len(ARGV[5]) + (2 * string.len(KEYS[1]))
+  local delta = newLength - oldLength
+  if delta > 0 and not ensureCapacity(KEYS[1], oldLength, newLength, 0, KEYS[1]) then
     return { 'capacity', ARGV[2] }
   end
   redis.call('SET', KEYS[1], ARGV[5])
   redis.call('PEXPIREAT', KEYS[1], tonumber(ARGV[6]))
-  redis.call('HSET', bytesKey, KEYS[1], string.len(ARGV[5]))
+  redis.call('HSET', bytesKey, KEYS[1], newLength)
   if ARGV[7] == 'failure' then
     redis.call('ZREM', successIndex, KEYS[1])
     redis.call('ZADD', failureIndex, tonumber(ARGV[6]), KEYS[1])
   end
-  saveBytes(math.max(0, currentBytes() + delta))
+  saveDataBytes(math.max(0, currentDataBytes() + delta))
   return { 'stored', ARGV[2] }
 end
 
 if operation == 'delete_corrupt' then
   local existing = redis.call('GET', KEYS[1])
   if existing and existing == ARGV[2] then
+    local dataBytes = currentDataBytes()
     local length = removeKey(KEYS[1])
-    saveBytes(math.max(0, currentBytes() - length))
+    saveDataBytes(math.max(0, dataBytes - length))
   end
   return 'ok'
 end
@@ -189,8 +238,9 @@ if operation == 'missing_state' then
   local failureScore = redis.call('ZSCORE', failureIndex, KEYS[1])
   local score = successScore or failureScore
   if score and tonumber(score) <= nowMs then
+    local dataBytes = currentDataBytes()
     local length = removeKey(KEYS[1])
-    saveBytes(math.max(0, currentBytes() - length))
+    saveDataBytes(math.max(0, dataBytes - length))
     return 'expired'
   end
   return 'not_retained'
@@ -216,7 +266,7 @@ if operation == 'usage' then
   cleanupExpired(tonumber(ARGV[2]))
   return {
     redis.call('ZCARD', successIndex) + redis.call('ZCARD', failureIndex),
-    currentBytes()
+    currentNamespaceBytes()
   }
 end
 

@@ -380,11 +380,12 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         if (existing !== null) {
           return [existing === raw ? 'unchanged' : 'conflict', String(generation)]
         }
-        if (!this.ensureTraceCapacity(this.bytes(raw), 1)) {
+        const length = this.bytes(raw) + 2 * this.bytes(traceKey)
+        if (!this.ensureTraceCapacity(traceKey, 0, length, 1)) {
           return ['capacity', String(generation)]
         }
         this.entries.set(traceKey, { value: raw, expiresAtMs })
-        this.traceLengths.set(traceKey, this.bytes(raw))
+        this.traceLengths.set(traceKey, length)
         this.zadd(index, traceKey, expiresAtMs)
         this.saveTraceBytes()
         return ['stored', String(generation)]
@@ -399,12 +400,21 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       if (existing === null) return ['not_found', String(generation)]
       if (existing !== expected) return ['conflict', String(generation)]
       if (existing === replacement) return ['unchanged', String(generation)]
-      const delta = this.bytes(replacement) - this.bytes(existing)
-      if (delta > 0 && !this.ensureTraceCapacity(delta, 0, traceKey)) {
+      const oldLength = this.traceLengths.get(traceKey) ??
+        this.bytes(existing) + 2 * this.bytes(traceKey)
+      const newLength = this.bytes(replacement) + 2 * this.bytes(traceKey)
+      const delta = newLength - oldLength
+      if (delta > 0 && !this.ensureTraceCapacity(
+        traceKey,
+        oldLength,
+        newLength,
+        0,
+        traceKey
+      )) {
         return ['capacity', String(generation)]
       }
       this.entries.set(traceKey, { value: replacement, expiresAtMs })
-      this.traceLengths.set(traceKey, this.bytes(replacement))
+      this.traceLengths.set(traceKey, newLength)
       if (args[6] === 'failure') {
         this.zrem(TRACE_SUCCESS_INDEX_KEY, traceKey)
         this.zadd(TRACE_FAILURE_INDEX_KEY, traceKey, expiresAtMs)
@@ -415,6 +425,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (operation === 'delete_corrupt') {
       if (traceKey !== undefined && this.entryValue(traceKey) === args[1]) {
         this.removeTrace(traceKey)
+        this.saveTraceBytes()
       }
       return 'ok'
     }
@@ -468,13 +479,16 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   private ensureTraceCapacity (
-    addedBytes: number,
+    key: string,
+    oldLength: number,
+    newLength: number,
     addedRecords: number,
     skip?: string
   ): boolean {
     let usage = this.traceUsage()
     let guard = 64
-    while ((usage.records + addedRecords > 64 || usage.bytes + addedBytes > 2 * 1024 * 1024) &&
+    while ((usage.records + addedRecords > 64 ||
+      this.projectedTraceBytes(key, oldLength, newLength) > 2 * 1024 * 1024) &&
       guard > 0) {
       const victim = [
         ...this.zrange(TRACE_SUCCESS_INDEX_KEY),
@@ -485,7 +499,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       usage = this.traceUsage()
       guard -= 1
     }
-    return usage.records + addedRecords <= 64 && usage.bytes + addedBytes <= 2 * 1024 * 1024
+    return usage.records + addedRecords <= 64 &&
+      this.projectedTraceBytes(key, oldLength, newLength) <= 2 * 1024 * 1024
   }
 
   private clearTrace (limit: number): [number, number, number, number] {
@@ -507,12 +522,45 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     ])
     return {
       records: keys.size,
-      bytes: [...keys].reduce((total, key) => total + (this.traceLengths.get(key) ?? 0), 0)
+      bytes: this.traceNamespaceBytes()
     }
   }
 
+  private projectedTraceBytes (key: string, oldLength: number, newLength: number): number {
+    const dataBytes = Math.max(0, this.traceDataBytes() - oldLength + newLength)
+    let metadataBytes = this.traceEntryMetadataBytes()
+    if (oldLength > 0) metadataBytes -= this.bytes(key) + this.bytes(String(oldLength))
+    if (newLength > 0) metadataBytes += this.bytes(key) + this.bytes(String(newLength))
+    return dataBytes + Math.max(0, metadataBytes) + this.traceCounterMetadataBytes(dataBytes) +
+      this.traceGenerationMetadataBytes()
+  }
+
+  private traceNamespaceBytes (): number {
+    const dataBytes = this.traceDataBytes()
+    return dataBytes + this.traceEntryMetadataBytes() +
+      this.traceCounterMetadataBytes(dataBytes) + this.traceGenerationMetadataBytes()
+  }
+
+  private traceDataBytes (): number {
+    return [...this.traceLengths.values()].reduce((total, value) => total + value, 0)
+  }
+
+  private traceEntryMetadataBytes (): number {
+    return [...this.traceLengths.entries()].reduce((total, [key, length]) => (
+      total + this.bytes(key) + this.bytes(String(length))
+    ), 0)
+  }
+
+  private traceCounterMetadataBytes (dataBytes: number): number {
+    return dataBytes === 0 ? 0 : this.bytes('__total') + this.bytes(String(dataBytes))
+  }
+
+  private traceGenerationMetadataBytes (): number {
+    return this.bytes(this.entries.get(TRACE_GENERATION_KEY)?.value ?? '')
+  }
+
   private saveTraceBytes (): void {
-    const bytes = this.traceUsage().bytes
+    const bytes = this.traceDataBytes()
     if (bytes === 0) this.entries.delete(TRACE_BYTES_KEY)
     else this.entries.set(TRACE_BYTES_KEY, { value: String(bytes) })
   }

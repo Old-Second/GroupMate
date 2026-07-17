@@ -127,22 +127,42 @@ test('trace store returns stable recent summaries, exact usage, and bounded clea
   assert.equal(cleared.remainingRecords, 1)
 })
 
-test('append capacity pressure evicts another success before any failure', async () => {
+test('trace namespace bytes include record keys, index members and metadata payload', async () => {
+  const redis = new FakeRedis(() => START)
+  const store = new RedisTraceStore({ client: redis, now: () => START })
+  const candidate = traceCandidateFixture({ runRef: traceRunRef(true, 125_000) })
+  const key = `${TRACE_KEY_PREFIX}${candidate.runRef}`
+
+  assert.equal((await store.upsertEngine(candidate)).kind, 'stored')
+  const raw = await redis.get(key)
+  assert.notEqual(raw, null)
+  const dataBytes = Buffer.byteLength(key) * 2 + Buffer.byteLength(raw as string)
+  const metadataBytes = Buffer.byteLength(key) + Buffer.byteLength(String(dataBytes)) +
+    Buffer.byteLength('__total') + Buffer.byteLength(String(dataBytes))
+  assert.deepEqual(await store.usage(), {
+    schemaVersion: 1,
+    records: 1,
+    bytes: dataBytes + metadataBytes
+  })
+
+  const barrier = await store.advanceGenerationAndClear()
+  assert.equal(barrier.clear.removedBytes, dataBytes + metadataBytes)
+  assert.equal(barrier.clear.remainingBytes, Buffer.byteLength(String(barrier.generation)))
+  assert.deepEqual(await store.usage(), {
+    schemaVersion: 1,
+    records: 0,
+    bytes: Buffer.byteLength(String(barrier.generation))
+  })
+})
+
+test('capacity pressure evicts an existing success before any failure', async () => {
   const redis = new FakeRedis(() => START)
   const store = new RedisTraceStore({ client: redis, now: () => START })
   const current = traceCandidateFixture({
     runRef: traceRunRef(true, 130_000),
     sampledSuccess: true
   })
-  const currentKey = `${TRACE_KEY_PREFIX}${current.runRef}`
   const expiresAtMs = Date.parse(current.expiresAt)
-  redis.seedTraceForTest({
-    key: currentKey,
-    value: JSON.stringify(current),
-    expiresAtMs: expiresAtMs - 64,
-    index: 'success',
-    logicalBytes: 32 * 1024
-  })
 
   const otherSuccessKey = `${TRACE_KEY_PREFIX}${'e'.repeat(32)}`
   redis.seedTraceForTest({
@@ -160,7 +180,7 @@ test('append capacity pressure evicts another success before any failure', async
     index: 'failure',
     logicalBytes: 32 * 1024
   })
-  for (let index = 0; index < 61; index += 1) {
+  for (let index = 0; index < 62; index += 1) {
     const key = `${TRACE_KEY_PREFIX}${index.toString(16).padStart(32, '0')}`
     redis.seedTraceForTest({
       key,
@@ -171,7 +191,7 @@ test('append capacity pressure evicts another success before any failure', async
     })
   }
 
-  assert.equal((await store.appendPresentation(tracePresentationFixture(current))).kind, 'stored')
+  assert.equal((await store.upsertEngine(current)).kind, 'stored')
   assert.equal(await redis.get(otherSuccessKey), null)
   assert.equal(await redis.get(failureKey), '{}')
 })
