@@ -64,7 +64,7 @@ const FILE_NAME_PATTERN = /^groupmate-(\d{4})-(\d{2})-(\d{2})\.(\d{4})\.jsonl$/
 const FAILURE_LIMIT_MS = 60_000
 const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
 const LOG_FILE_OPEN_FLAGS = constants.O_WRONLY |
-  constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW
+  constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK
 
 function localDate (now: Date): string {
   const year = String(now.getFullYear()).padStart(4, '0')

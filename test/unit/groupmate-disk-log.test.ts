@@ -1,13 +1,74 @@
 import assert from 'node:assert/strict'
+import { execFile, spawn } from 'node:child_process'
+import { constants } from 'node:fs'
 import {
-  chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile
+  chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import { GroupMateDiskLog } from '../../src/runtime/logging/groupmate-disk-log.js'
 
 const FIXED_TIMESTAMP = '2026-07-17T08:09:10.000Z'
+const FIFO_DRAIN_TIMEOUT_MS = 1_000
+const execFileAsync = promisify(execFile)
+
+async function createFifo (filePath: string): Promise<void> {
+  await execFileAsync('mkfifo', [filePath])
+}
+
+async function drainFifoInChild (directory: string): Promise<readonly unknown[]> {
+  const moduleUrl = pathToFileURL(path.join(
+    process.cwd(), 'dist/runtime/logging/groupmate-disk-log.js'
+  )).href
+  const script = [
+    `import { GroupMateDiskLog } from ${JSON.stringify(moduleUrl)}`,
+    'const failures = []',
+    `const log = new GroupMateDiskLog({ directory: ${JSON.stringify(directory)},`,
+    `  now: () => new Date(${JSON.stringify(FIXED_TIMESTAMP)}),`,
+    '  onFailure: failure => failures.push(failure) })',
+    "log.record({ type: 'fixture', payload: { text: 'current' } })",
+    'await log.drain()',
+    'process.stdout.write(JSON.stringify(failures))'
+  ].join('\n')
+  return await new Promise<readonly unknown[]>((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', script], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    child.stdout.on('data', chunk => { stdout += String(chunk) })
+    child.stderr.on('data', chunk => { stderr += String(chunk) })
+    const timeout = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, FIFO_DRAIN_TIMEOUT_MS)
+    child.once('error', error => {
+      clearTimeout(timeout)
+      if (child.exitCode === null) child.kill('SIGKILL')
+      reject(error)
+    })
+    child.once('close', code => {
+      clearTimeout(timeout)
+      if (timedOut) {
+        reject(new Error('FIFO drain did not settle promptly'))
+        return
+      }
+      if (code !== 0) {
+        reject(new Error(`FIFO drain child failed: ${stderr}`))
+        return
+      }
+      try {
+        resolve(JSON.parse(stdout) as readonly unknown[])
+      } catch (error) {
+        reject(error)
+      }
+    })
+  })
+}
 
 async function logFiles (directory: string): Promise<readonly string[]> {
   return (await readdir(directory))
@@ -257,6 +318,33 @@ test('rejects a configured log-directory symlink without changing its target', a
     assert.deepEqual(failures, [
       { event: 'groupmate.disk_log.failure', code: 'write_failed' }
     ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects a matching FIFO target without blocking or writing payload', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const directory = path.join(root, 'logs')
+  const target = path.join(directory, 'groupmate-2026-07-17.0001.jsonl')
+  try {
+    await mkdir(directory)
+    await createFifo(target)
+
+    assert.deepEqual(await drainFifoInChild(directory), [
+      { event: 'groupmate.disk_log.failure', code: 'write_failed' }
+    ])
+
+    const reader = await open(target, constants.O_RDONLY | constants.O_NONBLOCK)
+    try {
+      assert.deepEqual(await drainFifoInChild(directory), [
+        { event: 'groupmate.disk_log.failure', code: 'write_failed' }
+      ])
+      const result = await reader.read(Buffer.alloc(1), 0, 1, null)
+      assert.equal(result.bytesRead, 0)
+    } finally {
+      await reader.close()
+    }
   } finally {
     await rm(root, { recursive: true, force: true })
   }
