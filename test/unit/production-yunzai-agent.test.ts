@@ -203,12 +203,13 @@ test('production initializer owns one complete graph and rejects every reinitial
     'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
     'buttonPolicy', 'chatController', 'bymController', 'approvalController',
+    'diagnosticsController',
     'observability', 'shutdown'
   ])
   for (const key of [
     'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
-    'chatController', 'bymController', 'approvalController'
+    'chatController', 'bymController', 'approvalController', 'diagnosticsController'
   ] as const) {
     assert.ok(graph[key])
   }
@@ -239,6 +240,7 @@ test('agent service bridge factory is non-singleton and production graph binds s
   assert.notEqual(first.progressPresenter, second.progressPresenter)
   assert.notEqual(first.outboundFactory, second.outboundFactory)
   assert.notEqual(first.presenter, second.presenter)
+  assert.notEqual(first.diagnosticsController, second.diagnosticsController)
   assert.equal(modelFactoryCalls, 2)
   assert.equal(process.listenerCount('SIGINT'), beforeSigint)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm)

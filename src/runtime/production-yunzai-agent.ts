@@ -112,6 +112,8 @@ import {
 } from './observability/safe-observation-logging.js'
 import { TraceRecorder } from './observability/trace-recorder.js'
 import type { ObservabilityLevel } from './observability/trace-policy.js'
+import { OwnerDiagnostics } from './observability/owner-diagnostics.js'
+import { YunzaiDiagnosticsController } from './yunzai-diagnostics-controller.js'
 
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API'])
 
@@ -158,6 +160,7 @@ export interface ProductionYunzaiAgent {
   readonly chatController: YunzaiChatController
   readonly bymController: YunzaiBymController
   readonly approvalController: YunzaiApprovalController
+  readonly diagnosticsController: YunzaiDiagnosticsController
   readonly observability: Readonly<{
     hub: ObservationHub
     gate: RunObservationPolicyGate
@@ -354,6 +357,10 @@ export class ProductionObservabilityRuntime {
         void Promise.resolve(this.#requestObservationMonitor.publish(event.value)).catch(() => {})
       } catch {}
     }
+  }
+
+  currentLevel (): ObservabilityLevel {
+    return this.#currentLevel
   }
 
   registerPolicy (runRef: string, policy: TraceCandidateV1['policy']): void {
@@ -867,6 +874,12 @@ export function createProductionYunzaiAgent (
     outcomeHandler: approvalOutcomeHandler
   })
   const approvalController = createYunzaiApprovalController(approvalOptions)
+  const diagnosticsController = new YunzaiDiagnosticsController(new OwnerDiagnostics({
+    metrics: observability.metrics,
+    traceStore: observability.traceStore,
+    currentLevel: () => observability.currentLevel(),
+    logger: options.bridge.logger
+  }))
 
   const lifecycle: GraphLifecycle = {
     unbindShutdown: null,
@@ -884,6 +897,7 @@ export function createProductionYunzaiAgent (
     chatController,
     bymController,
     approvalController,
+    diagnosticsController,
     observability: Object.freeze({
       hub: observability.hub,
       gate: observability.gate,

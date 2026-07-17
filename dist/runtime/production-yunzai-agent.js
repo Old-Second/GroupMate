@@ -23,6 +23,8 @@ import { RedisTraceStore } from './observability/redis-trace-store.js';
 import { RunObservationPolicyGate } from './observability/run-observation-policy-gate.js';
 import { SafeObservationFailureLogLimiter, createPresentationObservationLog, createRequestObservationLog } from './observability/safe-observation-logging.js';
 import { TraceRecorder } from './observability/trace-recorder.js';
+import { OwnerDiagnostics } from './observability/owner-diagnostics.js';
+import { YunzaiDiagnosticsController } from './yunzai-diagnostics-controller.js';
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API']);
 const RECOVERED_LEGACY_SETTINGS = Object.freeze({
     schemaVersion: 1,
@@ -198,6 +200,9 @@ export class ProductionObservabilityRuntime {
             }
             catch { }
         }
+    }
+    currentLevel() {
+        return this.#currentLevel;
     }
     registerPolicy(runRef, policy) {
         this.gate.register(runRef, policy);
@@ -631,6 +636,12 @@ export function createProductionYunzaiAgent(options) {
         outcomeHandler: approvalOutcomeHandler
     });
     const approvalController = createYunzaiApprovalController(approvalOptions);
+    const diagnosticsController = new YunzaiDiagnosticsController(new OwnerDiagnostics({
+        metrics: observability.metrics,
+        traceStore: observability.traceStore,
+        currentLevel: () => observability.currentLevel(),
+        logger: options.bridge.logger
+    }));
     const lifecycle = {
         unbindShutdown: null,
         shutdownPromise: null
@@ -647,6 +658,7 @@ export function createProductionYunzaiAgent(options) {
         chatController,
         bymController,
         approvalController,
+        diagnosticsController,
         observability: Object.freeze({
             hub: observability.hub,
             gate: observability.gate,

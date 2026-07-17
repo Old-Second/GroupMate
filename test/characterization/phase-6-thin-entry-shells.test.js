@@ -111,3 +111,43 @@ test('chat BYM and approval shells preserve metadata rules and delegate one-for-
     'approvalController'
   )
 })
+
+test('owner diagnostics is a thin production-root shell with fixed master rules', async () => {
+  const diagnostics = await parseShell('../../apps/diagnostics.js')
+
+  assert.deepEqual(importsOf(diagnostics.file), [
+    '../../../lib/plugins/plugin.js',
+    '../dist/runtime/production-yunzai-agent.js'
+  ])
+  const declaration = exportedClass(diagnostics.file)
+  assert.equal(declaration.name?.text, 'diagnostics')
+  assert.deepEqual(methodNames(declaration), ['status', 'diagnose'])
+  assert.match(diagnostics.source, /name:\s*'GroupMate 主人诊断'/)
+  assert.match(diagnostics.source, /event:\s*'message'/)
+  assert.match(diagnostics.source, /reg:\s*'\^#GroupMate状态\$'/)
+  assert.match(
+    diagnostics.source,
+    /reg:\s*'\^#GroupMate诊断\\\\s\+\(\[0-9a-f\]\{32\}\)\$'/
+  )
+  assert.equal((diagnostics.source.match(/permission:\s*'master'/g) ?? []).length, 2)
+  assert.match(diagnostics.source, /\.diagnosticsController\.handleStatus\(/)
+  assert.match(diagnostics.source, /\.diagnosticsController\.handleInspect\(/)
+  for (const forbidden of [
+    'Config', 'Redis', 'MetricsRegistry', 'TraceStore', 'OwnerDiagnostics',
+    'initializeProductionYunzaiAgent'
+  ]) {
+    assert.equal(diagnostics.source.includes(forbidden), false, `${forbidden} direct edge`)
+  }
+})
+
+test('production root is initialized before shells load in any filesystem order', async () => {
+  const index = await parseShell('../../index.js')
+  const initialization = index.source.indexOf('initializeProductionYunzaiAgent({')
+  const discovery = index.source.indexOf("fs.readdirSync(resolvePluginPath('apps'))")
+
+  assert.ok(initialization >= 0)
+  assert.ok(discovery >= 0)
+  assert.ok(initialization < discovery)
+  assert.match(index.source, /Promise\.allSettled\(files\.map\(/)
+  assert.doesNotMatch(index.source, /sort\([^)]*(chat|diagnostics)/i)
+})
