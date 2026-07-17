@@ -30,6 +30,7 @@ import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.';
 const RUN_DEADLINE_MS = 240_000;
+const DEFAULT_GROUP_HISTORY_TIMEOUT_MS = 3_000;
 const MAX_GROUP_CONTEXT_ITEMS = 64;
 const MAX_GROUP_CONTEXT_TEXT = 4_096;
 export class AgentServiceBridge {
@@ -74,6 +75,19 @@ function configText(config, key) {
 }
 function configBoolean(config, key, fallback = false) {
     return typeof config[key] === 'boolean' ? config[key] === true : fallback;
+}
+export function resolveYunzaiGroupHistoryCursor(event) {
+    const candidate = event.seq ?? event.message_id;
+    if (typeof candidate === 'number') {
+        return Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : 0;
+    }
+    if (typeof candidate === 'string') {
+        const normalized = candidate.trim();
+        if (normalized === '' || /^-\d+$/.test(normalized))
+            return 0;
+        return normalized;
+    }
+    return 0;
 }
 function configInteger(config, key, fallback, minimum, maximum) {
     const value = config[key];
@@ -435,13 +449,13 @@ function runtimeIdentityItem(request, event) {
         })
     });
 }
-async function loadGroupContext(options, event, requestId, createdAt, enabled) {
-    if (!enabled || event.isGroup !== true || options.loadGroupHistory === undefined) {
+async function loadGroupContext(options, event, requestId, createdAt, enabled, readGroupHistory) {
+    if (!enabled || event.isGroup !== true || readGroupHistory === undefined) {
         return Object.freeze([]);
     }
     const limit = configInteger(options.config, 'groupContextLength', 50, 1, MAX_GROUP_CONTEXT_ITEMS);
     try {
-        const history = await options.loadGroupHistory(event, limit);
+        const history = await readGroupHistory(event, limit);
         const rawCurrentMessageId = event.message_id ?? event.seq;
         const currentMessageId = (typeof rawCurrentMessageId === 'string' ||
             typeof rawCurrentMessageId === 'number') && String(rawCurrentMessageId).length <= 128
@@ -551,6 +565,7 @@ export class YunzaiAgentServiceBridge {
     #createRequestRef;
     #monotonicNow;
     #requestJournal;
+    #groupHistoryInFlight;
     constructor(input) {
         this.#options = input.options;
         this.#bridge = input.bridge;
@@ -633,7 +648,9 @@ export class YunzaiAgentServiceBridge {
                 prompt: messageEvidence.prompt,
                 messageEvidence
             });
-            const groupContext = await loadGroupContext(this.#options, event, requestId, createdAt, options.enableGroupContext === true);
+            const groupContext = await loadGroupContext(this.#options, event, requestId, createdAt, options.enableGroupContext === true, this.#options.loadGroupHistory === undefined
+                ? undefined
+                : async (historyEvent, limit) => await this.#readGroupHistory(historyEvent, limit));
             const requestModel = modelConfig(this.#options.config, options);
             request = await adaptYunzaiRequest({
                 event,
@@ -687,6 +704,38 @@ export class YunzaiAgentServiceBridge {
         }
         finally {
             this.#prepared.delete(requestId);
+        }
+    }
+    async #readGroupHistory(event, limit) {
+        const load = this.#options.loadGroupHistory;
+        if (load === undefined || this.#groupHistoryInFlight !== undefined) {
+            return Object.freeze([]);
+        }
+        const operation = Promise.resolve().then(async () => await load(event, limit));
+        this.#groupHistoryInFlight = operation;
+        void operation.then(() => {
+            if (this.#groupHistoryInFlight === operation)
+                this.#groupHistoryInFlight = undefined;
+        }, () => {
+            if (this.#groupHistoryInFlight === operation)
+                this.#groupHistoryInFlight = undefined;
+        });
+        const configuredTimeout = this.#options.groupHistoryTimeoutMs;
+        const timeoutMs = typeof configuredTimeout === 'number' &&
+            Number.isInteger(configuredTimeout) && configuredTimeout >= 1 && configuredTimeout <= 30_000
+            ? configuredTimeout
+            : DEFAULT_GROUP_HISTORY_TIMEOUT_MS;
+        let timer;
+        try {
+            const timeout = new Promise((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error('group history read timed out')), timeoutMs);
+                timer.unref?.();
+            });
+            return await Promise.race([operation, timeout]);
+        }
+        finally {
+            if (timer !== undefined)
+                clearTimeout(timer);
         }
     }
     async displayApprovalOrCancel(result) {

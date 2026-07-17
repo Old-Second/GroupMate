@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
+import { prepareYunzaiMessageEvidence } from '../../src/runtime/message-input.js'
 import type {
   GroupMateContentJournal,
   GroupMateOutboundJournalEvent
@@ -13,6 +15,8 @@ import type {
 import { resolvePluginPath } from '../../src/runtime/plugin-context.js'
 import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
 import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
+import { prepareYunzaiPresentationRequest } from '../../src/runtime/yunzai-request-adapter.js'
+import { resolveYunzaiGroupHistoryCursor } from '../../src/runtime/agent-service-bridge.js'
 import {
   createProductionYunzaiAgent,
   getProductionYunzaiAgent,
@@ -312,6 +316,154 @@ test('agent service bridge factory is non-singleton and production graph binds s
 
   await first.shutdown('unit_test')
   await second.shutdown('unit_test')
+})
+
+test('group history cursor falls back to zero for signed NapCat message identifiers', () => {
+  assert.equal(resolveYunzaiGroupHistoryCursor({
+    seq: -2_147_483_648,
+    message_id: -2_147_483_648
+  }), 0)
+  assert.equal(resolveYunzaiGroupHistoryCursor({ message_id: '-2147483648' }), 0)
+  assert.equal(resolveYunzaiGroupHistoryCursor({ seq: 42, message_id: -1 }), 42)
+  assert.equal(resolveYunzaiGroupHistoryCursor({ seq: '42' }), '42')
+  assert.equal(
+    resolveYunzaiGroupHistoryCursor({ message_id: 'adapter-opaque-cursor' }),
+    'adapter-opaque-cursor'
+  )
+  assert.equal(resolveYunzaiGroupHistoryCursor({}), 0)
+})
+
+test('legacy entry applies the normalized cursor to group history reads', () => {
+  const entrySource = readFileSync('index.js', 'utf8')
+  assert.match(
+    entrySource,
+    /getChatHistory\(\s*resolveYunzaiGroupHistoryCursor\(event\),\s*limit\s*\)/
+  )
+})
+
+test('ordinary chat proceeds when the host group history reader never settles', async () => {
+  const baseOptions = options(() => undefined)
+  const bridge = {
+    ...baseOptions.bridge,
+    loadGroupHistory: async (): Promise<readonly unknown[]> => await new Promise(() => {})
+  }
+  Reflect.set(bridge, 'groupHistoryTimeoutMs', 10)
+  const graph = createProductionYunzaiAgent({ ...baseOptions, bridge })
+  const event = {
+    isGroup: true,
+    group_id: 'group-1',
+    self_id: 'bot',
+    user_id: 'actor-1',
+    message_id: 'message-1',
+    sender: { user_id: 'actor-1', nickname: 'member', role: 'member' },
+    message: [{ type: 'text', text: 'current request' }],
+    group: {
+      async getChatHistory () {
+        return []
+      },
+      async getMemberMap () {
+        return new Map([
+          ['actor-1', { user_id: 'actor-1', role: 'member' }],
+          ['bot', { user_id: 'bot', role: 'member' }]
+        ])
+      }
+    }
+  }
+  const messageEvidence = await prepareYunzaiMessageEvidence({
+    event,
+    currentPrompt: 'current request',
+    ocrTexts: []
+  })
+  const prepared = prepareYunzaiPresentationRequest({
+    event,
+    evidence: messageEvidence,
+    requestKind: 'ordinary_chat',
+    presentationIntent: Object.freeze({
+      schemaVersion: 1 as const,
+      kind: 'ordinary' as const,
+      forcePicture: false
+    }),
+    getBotId: () => 'bot'
+  })
+
+  const outcome = await Promise.race([
+    graph.bridge.handle(event, messageEvidence, {
+      enableGroupContext: true,
+      presentationRoute: prepared.route
+    }).then(result => result.kind),
+    new Promise<'test_timeout'>(resolve => {
+      const timer = setTimeout(() => resolve('test_timeout'), 100)
+      timer.unref?.()
+    })
+  ])
+
+  await graph.shutdown('unit_test')
+  assert.notEqual(outcome, 'test_timeout')
+})
+
+test('later chats do not multiply an unresolved host group history read', async () => {
+  const baseOptions = options(() => undefined)
+  let historyCalls = 0
+  const bridge = {
+    ...baseOptions.bridge,
+    loadGroupHistory: async (): Promise<readonly unknown[]> => {
+      historyCalls += 1
+      return await new Promise(() => {})
+    }
+  }
+  Reflect.set(bridge, 'groupHistoryTimeoutMs', 10)
+  const graph = createProductionYunzaiAgent({ ...baseOptions, bridge })
+  const event = {
+    isGroup: true,
+    group_id: 'group-1',
+    self_id: 'bot',
+    user_id: 'actor-1',
+    message_id: 'message-1',
+    sender: { user_id: 'actor-1', nickname: 'member', role: 'member' },
+    message: [{ type: 'text', text: 'current request' }],
+    group: {
+      async getChatHistory () {
+        return []
+      },
+      async getMemberMap () {
+        return new Map([
+          ['actor-1', { user_id: 'actor-1', role: 'member' }],
+          ['bot', { user_id: 'bot', role: 'member' }]
+        ])
+      }
+    }
+  }
+  const messageEvidence = await prepareYunzaiMessageEvidence({
+    event,
+    currentPrompt: 'current request',
+    ocrTexts: []
+  })
+  const prepared = prepareYunzaiPresentationRequest({
+    event,
+    evidence: messageEvidence,
+    requestKind: 'ordinary_chat',
+    presentationIntent: Object.freeze({
+      schemaVersion: 1 as const,
+      kind: 'ordinary' as const,
+      forcePicture: false
+    }),
+    getBotId: () => 'bot'
+  })
+  const run = async (): Promise<string> => await Promise.race([
+    graph.bridge.handle(event, messageEvidence, {
+      enableGroupContext: true,
+      presentationRoute: prepared.route
+    }).then(result => result.kind),
+    new Promise<'test_timeout'>(resolve => {
+      const timer = setTimeout(() => resolve('test_timeout'), 100)
+      timer.unref?.()
+    })
+  ])
+
+  assert.notEqual(await run(), 'test_timeout')
+  assert.notEqual(await run(), 'test_timeout')
+  await graph.shutdown('unit_test')
+  assert.equal(historyCalls, 1)
 })
 
 test('default disk journal construction uses plugin data path and fixed failure diagnostics', async () => {

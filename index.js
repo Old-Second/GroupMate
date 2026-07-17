@@ -53,6 +53,9 @@ import {
   initializeProductionYunzaiAgent
 } from './dist/runtime/production-yunzai-agent.js'
 import {
+  resolveYunzaiGroupHistoryCursor
+} from './dist/runtime/agent-service-bridge.js'
+import {
   createBrowserReleaseLog,
   releaseBrowserAfterRender
 } from './dist/runtime/browser-release.js'
@@ -1357,7 +1360,10 @@ async function loadGroupHistory (event, limit) {
     return Object.freeze([])
   }
   try {
-    const history = await event.group.getChatHistory(event.seq ?? event.message_id, limit)
+    const history = await event.group.getChatHistory(
+      resolveYunzaiGroupHistoryCursor(event),
+      limit
+    )
     return Object.freeze(Array.isArray(history) ? history.slice(-limit) : [])
   } catch {
     return Object.freeze([])
