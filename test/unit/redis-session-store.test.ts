@@ -138,7 +138,7 @@ test('invalid canonical data does not fall back to legacy data', async () => {
 })
 
 test('save writes canonical data before cleaning stale legacy data', async () => {
-  const redis = new FakeRedis()
+  const redis = new FakeRedis(() => Date.parse(fixedNow))
   const target = address('7')
   await redis.set(legacySessionKey(target.scope), legacyRaw())
 
