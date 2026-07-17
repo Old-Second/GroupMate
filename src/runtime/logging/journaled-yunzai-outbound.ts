@@ -18,9 +18,10 @@ type OutboundJournalEventDraft = WithoutOccurredAt<GroupMateOutboundJournalEvent
 function recordSafely (
   journal: GroupMateContentJournal,
   now: () => Date,
-  event: OutboundJournalEventDraft
+  createEvent: () => OutboundJournalEventDraft
 ): void {
   try {
+    const event = createEvent()
     journal.recordOutbound(Object.freeze({
       ...event,
       occurredAt: now().toISOString()
@@ -33,32 +34,33 @@ function journaledPort (
   journal: GroupMateContentJournal,
   now: () => Date
 ): YunzaiOutboundPort {
+  const target = delegate.target
   return Object.freeze({
-    target: delegate.target,
+    target,
     async deliver<P extends OutboundPart> (
       part: P,
       attempt: 1 | 2,
       options?: OutboundDeliveryOptions
     ): Promise<DeliveryResult<P['media']>> {
       const result = await delegate.deliver(part, attempt, options)
-      recordSafely(journal, now, {
+      recordSafely(journal, now, () => ({
         type: 'qq.outbound.deliver',
-        target: delegate.target,
+        target,
         part,
         attempt,
         quoteMessageId: options?.quoteMessageId ?? null,
         result
-      })
+      }))
       return result
     },
     async recall (receipt: RuntimeDeliveryReceipt, signal?: AbortSignal) {
       const result = await delegate.recall(receipt, signal)
-      recordSafely(journal, now, {
+      recordSafely(journal, now, () => ({
         type: 'qq.outbound.recall',
-        target: delegate.target,
+        target,
         receipt,
         result
-      })
+      }))
       return result
     }
   })

@@ -1,10 +1,25 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
-import type { ModelRequest } from '../../src/agent/model/model-adapter.js'
+import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
+import type { JsonObject } from '../../src/agent/model/json-value.js'
+import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import {
+  createInitialRunCheckpoint,
+  nextRunCheckpoint,
+  type RunCheckpoint
+} from '../../src/agent/run/run-checkpoint.js'
 import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
+import { createRunEvent } from '../../src/agent/run/run-events.js'
+import {
+  createFrozenObservationPolicy,
+  createRunTerminalSnapshot
+} from '../../src/agent/run/run-observation.js'
+import { parseTerminalCommitReceipt } from '../../src/agent/run/run-store.js'
 import {
   createGroupMateContentJournal
 } from '../../src/runtime/logging/groupmate-content-journal.js'
@@ -12,7 +27,10 @@ import type {
   GroupMateContentJournal,
   GroupMateOutboundJournalEvent
 } from '../../src/runtime/logging/groupmate-content-journal.js'
-import { GroupMateDiskLog } from '../../src/runtime/logging/groupmate-disk-log.js'
+import {
+  GroupMateDiskLog,
+  type GroupMateDiskLogEvent
+} from '../../src/runtime/logging/groupmate-disk-log.js'
 import {
   createJournaledYunzaiOutboundPortFactory
 } from '../../src/runtime/logging/journaled-yunzai-outbound.js'
@@ -59,7 +77,16 @@ function requestFixture (): YunzaiAgentRequestDraft {
     role: 'user' as const,
     parts: Object.freeze([
       Object.freeze({ type: 'text' as const, text: '请完整记录这条消息' }),
-      Object.freeze({ type: 'mention' as const, userId: 'member-2', displayName: '成员二' })
+      Object.freeze({ type: 'mention' as const, userId: 'member-2', displayName: '成员二' }),
+      Object.freeze({
+        type: 'tool_call' as const,
+        toolCallId: 'request-call-1',
+        name: 'business_schema',
+        arguments: Object.freeze({
+          apiKey: '业务字段值',
+          headers: Object.freeze({ display: '业务头信息' })
+        })
+      })
     ]),
     createdAt,
     provenance: Object.freeze({
@@ -109,15 +136,12 @@ function requestFixture (): YunzaiAgentRequestDraft {
     }),
     contextBudget: Object.freeze({
       modelContextTokens: 8_192, reservedOutputTokens: 256,
-      reservedToolTokens: 512, safetyMarginTokens: 128,
+      reservedToolTokens: 0, safetyMarginTokens: 0,
       maxItems: 64, maxBytes: 256 * 1_024
     }),
     sessionTtlSeconds: 3_600
   })
-  return Object.assign({}, request, {
-    Authorization: 'Bearer must-not-be-written',
-    apiKey: 'must-not-be-written'
-  })
+  return request
 }
 
 function modelRequestFixture (): ModelRequest {
@@ -133,7 +157,11 @@ function modelRequestFixture (): ModelRequest {
         description: '查询完整信息',
         parameters: Object.freeze({
           type: 'object',
-          properties: Object.freeze({ query: Object.freeze({ type: 'string' }) })
+          properties: Object.freeze({
+            query: Object.freeze({ type: 'string' }),
+            apiKey: Object.freeze({ type: 'string', description: '业务字段名' }),
+            headers: Object.freeze({ type: 'object', description: '业务字段名' })
+          })
         })
       })
     ]),
@@ -146,7 +174,143 @@ function modelRequestFixture (): ModelRequest {
   })
 }
 
-test('projects complete normalized request and provider content without config bags', async () => {
+function modelTurnFixture (): ModelTurn {
+  return Object.freeze({
+    text: '完整 Provider 回复',
+    refusal: '完整拒绝说明',
+    toolCalls: Object.freeze([Object.freeze({
+      index: 0,
+      callId: 'provider-call-1',
+      name: 'lookup',
+      argumentsText: '{"apiKey":"业务字段值","headers":{"display":"业务头信息"}}',
+      arguments: Object.freeze({
+        apiKey: '业务字段值',
+        headers: Object.freeze({ display: '业务头信息' })
+      })
+    })]),
+    finishReason: 'tool_calls',
+    usage: Object.freeze({ inputTokens: 12, outputTokens: 8, totalTokens: 20 }),
+    providerState: Object.freeze({
+      profileId: 'standard',
+      profileVersion: 1,
+      payload: Object.freeze({ responseCursor: 'cursor-1' })
+    }),
+    responseId: 'response-1'
+  })
+}
+
+function terminalJournalFixture (): Readonly<{
+  checkpoint: RunCheckpoint
+  receipt: ReturnType<typeof parseTerminalCommitReceipt>
+}> {
+  const runRef = '3'.repeat(32)
+  const requestRef = '4'.repeat(32)
+  const runId = 'journal-terminal-run'
+  const sessionId = 'journal-terminal-session'
+  const createdAt = '2026-07-17T08:03:00.000Z'
+  const finishedAt = '2026-07-17T08:03:01.000Z'
+  const sessionAddress = Object.freeze({
+    botId: 'bot-1',
+    scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
+  const initial = createInitialRunCheckpoint({
+    profileId: 'standard',
+    profileVersion: 1,
+    runId,
+    sessionId,
+    sessionAddress,
+    runRef,
+    requestRef,
+    requestKind: 'ordinary_chat',
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1, kind: 'ordinary', forcePicture: false
+      }),
+      sessionAddress,
+      actorId: 'actor-1',
+      requestMessageId: 'message-1'
+    }),
+    observationPolicy: createFrozenObservationPolicy({
+      levelAtStart: 'basic', runRef
+    }),
+    model: Object.freeze({
+      model: 'fixture-model', streaming: false, maxOutputTokens: 256,
+      reasoning: Object.freeze({ enabled: false })
+    }),
+    toolSnapshot: Object.freeze({
+      id: 'snapshot-1',
+      fingerprint: createHash('sha256').update('[]').digest('hex'),
+      manifest: Object.freeze([])
+    }),
+    budgetLimits: budget.limits,
+    budgetCounters: budget.initialCounters,
+    deadlineAt: '2026-07-17T08:07:00.000Z',
+    createdAt,
+    event: createRunEvent({
+      eventId: 'journal-event-0', runId, sessionId, sequence: 0,
+      occurredAt: createdAt, type: 'run.created', payload: Object.freeze({})
+    })
+  })
+  const preparing = nextRunCheckpoint(initial, 'preparing', {}, [], createdAt)
+  const calling = nextRunCheckpoint(preparing, 'calling_model', {}, [], createdAt)
+  const checkpoint = nextRunCheckpoint(calling, 'cancelled', {
+    cancellationReason: 'user_cancelled',
+    observationCounters: Object.freeze({
+      ...calling.observationCounters,
+      engineActiveDurationMs: 13
+    })
+  }, [createRunEvent({
+    eventId: 'journal-event-terminal', runId, sessionId,
+    sequence: calling.nextEventSequence,
+    occurredAt: finishedAt, type: 'run.cancelled',
+    payload: Object.freeze({ reason: 'user_cancelled' })
+  })], finishedAt)
+  const snapshot = createRunTerminalSnapshot(checkpoint)
+  const receipt = parseTerminalCommitReceipt({
+    schemaVersion: 1,
+    observationId: snapshot.observationId,
+    runRef: snapshot.runRef,
+    revision: snapshot.revision,
+    deletedKeyCount: 2,
+    createdKeyCount: 1,
+    checkpointBytesDeleted: 123,
+    eventBytesDeleted: 45,
+    tombstoneBytes: 67
+  })
+  return Object.freeze({ checkpoint, receipt })
+}
+
+function inMemoryContentJournal (): Readonly<{
+  journal: GroupMateContentJournal
+  events: GroupMateDiskLogEvent[]
+}> {
+  const events: GroupMateDiskLogEvent[] = []
+  const journal = createGroupMateContentJournal({
+    record: event => { events.push(event) },
+    drain: async () => undefined
+  })
+  return Object.freeze({ journal, events })
+}
+
+function providerRequestEvent (
+  request: ModelRequest = modelRequestFixture()
+): RunContentJournalEvent {
+  return Object.freeze({
+    type: 'provider.request',
+    occurredAt: '2026-07-17T08:01:00.000Z',
+    runRef: '2'.repeat(32),
+    requestRef: '1'.repeat(32),
+    ordinal: 1,
+    attemptKind: 'primary',
+    request
+  })
+}
+
+test('projects complete normalized request and provider content with legitimate business keys', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-content-journal-'))
   try {
     const diskLog = new GroupMateDiskLog({
@@ -170,23 +334,11 @@ test('projects complete normalized request and provider content without config b
     await journal.drain()
 
     const events = await readLogEvents(directory)
-    const unsafeRequest = request as YunzaiAgentRequestDraft & {
-      readonly Authorization: string
-      readonly apiKey: string
-    }
-    const {
-      Authorization: _authorization,
-      apiKey: _apiKey,
-      ...expectedRequest
-    } = unsafeRequest
     assert.equal(events.length, 2)
     assert.deepEqual(events[0], {
       type: 'request.received',
-      payload: { request: expectedRequest }
+      payload: { request }
     })
-    const serializedRequest = JSON.stringify(events[0])
-    assert.equal(serializedRequest.includes('Authorization'), false)
-    assert.equal(serializedRequest.includes('apiKey'), false)
     assert.deepEqual(events[1], {
       type: 'provider.request',
       payload: {
@@ -201,6 +353,203 @@ test('projects complete normalized request and provider content without config b
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('projects complete provider response failure and committed terminal content', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const turn = modelTurnFixture()
+  const error = serializeAgentError(new AgentError({
+    code: 'provider_unavailable',
+    stage: 'model.response',
+    retryable: true,
+    userMessage: 'Provider 暂时不可用。',
+    details: Object.freeze({ providerCode: 'fixture_unavailable', statusCode: 503 })
+  }))
+  const terminal = terminalJournalFixture()
+  const common = Object.freeze({
+    occurredAt: '2026-07-17T08:03:00.000Z',
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef
+  })
+  const response: RunContentJournalEvent = Object.freeze({
+    type: 'provider.response', ...common,
+    ordinal: 2, attemptKind: 'retry', turn
+  })
+  const failure: RunContentJournalEvent = Object.freeze({
+    type: 'provider.failure', ...common,
+    ordinal: 3, attemptKind: 'recovery', error
+  })
+  const committed: RunContentJournalEvent = Object.freeze({
+    type: 'run.terminal_committed', ...common,
+    checkpoint: terminal.checkpoint,
+    receipt: terminal.receipt
+  })
+
+  journal.recordRunEvent(response)
+  journal.recordRunEvent(failure)
+  journal.recordRunEvent(committed)
+
+  assert.deepEqual(events, [
+    {
+      type: 'provider.response',
+      payload: {
+        ...common, ordinal: 2, attemptKind: 'retry', turn
+      }
+    },
+    {
+      type: 'provider.failure',
+      payload: {
+        ...common, ordinal: 3, attemptKind: 'recovery', error
+      }
+    },
+    {
+      type: 'run.terminal_committed',
+      payload: {
+        ...common, checkpoint: terminal.checkpoint, receipt: terminal.receipt
+      }
+    }
+  ])
+})
+
+test('rejects structural credential and configuration extras with fixed failure evidence', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const extraKeys = [
+    'X-Api-Key', 'config', 'defaultHeaders', 'extraHeaders',
+    'baseURL', 'headers', 'Authorization'
+  ] as const
+  for (const key of extraKeys) {
+    journal.recordRunEvent(Object.assign({}, providerRequestEvent(), {
+      [key]: `forbidden-${key}`
+    }) as RunContentJournalEvent)
+  }
+  const request = requestFixture()
+  journal.recordRequest({
+    ...request,
+    model: Object.assign({}, request.model, {
+      config: Object.freeze({ apiKey: 'nested-model-secret' })
+    })
+  } as YunzaiAgentRequestDraft)
+  journal.recordRunEvent(providerRequestEvent(Object.assign({}, modelRequestFixture(), {
+    headers: Object.freeze({ Authorization: 'nested-provider-secret' })
+  }) as ModelRequest))
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: Object.assign({
+      media: 'text' as const,
+      atoms: Object.freeze([{ kind: 'text' as const, text: '正文' }])
+    }, {
+      extraHeaders: Object.freeze({ Authorization: 'nested-outbound-secret' })
+    }) as OutboundPart,
+    attempt: 1,
+    quoteMessageId: null,
+    result: Object.freeze({
+      kind: 'failed_definite', media: 'text', attempt: 1, code: 'host_rejected'
+    })
+  })
+
+  assert.deepEqual(events, [
+    ...extraKeys.map(() => ({
+      type: 'groupmate.content_journal.projection_failure',
+      payload: { operation: 'run_event', code: 'invalid_content' }
+    })),
+    {
+      type: 'groupmate.content_journal.projection_failure',
+      payload: { operation: 'request', code: 'invalid_content' }
+    },
+    {
+      type: 'groupmate.content_journal.projection_failure',
+      payload: { operation: 'run_event', code: 'invalid_content' }
+    },
+    {
+      type: 'groupmate.content_journal.projection_failure',
+      payload: { operation: 'outbound', code: 'invalid_content' }
+    }
+  ])
+  const serialized = JSON.stringify(events)
+  for (const forbidden of [
+    ...extraKeys,
+    'nested-model-secret', 'nested-provider-secret', 'nested-outbound-secret'
+  ]) {
+    assert.equal(serialized.includes(forbidden), false)
+  }
+})
+
+test('rejects unbounded hostile and binary generic content with fixed failure evidence', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const invalidRequests: ModelRequest[] = []
+
+  const cycle: Record<string, unknown> = {}
+  cycle.self = cycle
+  invalidRequests.push({
+    ...modelRequestFixture(),
+    tools: [{
+      ...modelRequestFixture().tools[0], parameters: cycle as JsonObject
+    }]
+  })
+
+  let deep: JsonObject = Object.freeze({ leaf: true })
+  for (let depth = 0; depth < 40; depth += 1) deep = Object.freeze({ nested: deep })
+  invalidRequests.push({
+    ...modelRequestFixture(),
+    tools: [{ ...modelRequestFixture().tools[0], parameters: deep }]
+  })
+  invalidRequests.push({
+    ...modelRequestFixture(),
+    tools: [{
+      ...modelRequestFixture().tools[0],
+      parameters: { nodes: Array.from({ length: 8_200 }, (_, index) => index) }
+    }]
+  })
+  invalidRequests.push({
+    ...modelRequestFixture(),
+    tools: [{
+      ...modelRequestFixture().tools[0],
+      parameters: { body: 'x'.repeat(600 * 1_024) }
+    }]
+  })
+
+  for (const binary of [
+    new ArrayBuffer(8),
+    new SharedArrayBuffer(8),
+    new DataView(new ArrayBuffer(8)),
+    new Uint16Array([513, 1_027])
+  ]) {
+    invalidRequests.push({
+      ...modelRequestFixture(),
+      tools: [{
+        ...modelRequestFixture().tools[0],
+        parameters: { binary } as unknown as JsonObject
+      }]
+    })
+  }
+
+  let getterReads = 0
+  const accessorRequest = Object.defineProperty({ ...modelRequestFixture() }, 'model', {
+    enumerable: true,
+    get: () => {
+      getterReads += 1
+      return 'hostile-model'
+    }
+  }) as ModelRequest
+  invalidRequests.push(accessorRequest)
+  invalidRequests.push(Object.assign(Object.create({ inherited: true }), modelRequestFixture()))
+
+  for (const request of invalidRequests) journal.recordRunEvent(providerRequestEvent(request))
+
+  assert.equal(getterReads, 0)
+  assert.deepEqual(events, invalidRequests.map(() => ({
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'run_event', code: 'invalid_content' }
+  })))
+  const serialized = JSON.stringify(events)
+  assert.equal(serialized.includes('513'), false)
+  assert.equal(serialized.includes('1027'), false)
+  assert.equal(serialized.includes('hostile-model'), false)
 })
 
 test('projects exact QQ text and forward content while bounding media resources', async () => {
@@ -448,4 +797,92 @@ test('journal and clock exceptions never change QQ delegate outcomes', async () 
 
   assert.strictEqual(await wrapped.deliver(textPart, 1), deliveryResult)
   assert.strictEqual(await wrapped.recall(receipt), recallResult)
+})
+
+test('hostile quote getters after delivery stay inside the swallowed journal boundary', async () => {
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'private' as const, userId: 'user-1' })
+  })
+  const part: OutboundPart = Object.freeze({
+    media: 'text', atoms: Object.freeze([{ kind: 'text' as const, text: '正文' }])
+  })
+  const result = Object.freeze({
+    kind: 'failed_definite' as const,
+    media: 'text' as const,
+    attempt: 1 as const,
+    code: 'host_rejected' as const
+  })
+  let getterReads = 0
+  const options = Object.defineProperty({}, 'quoteMessageId', {
+    enumerable: true,
+    get: () => {
+      getterReads += 1
+      throw new Error('hostile quote getter')
+    }
+  }) as Parameters<YunzaiOutboundPort['deliver']>[2]
+  const delegate: YunzaiOutboundPortFactory = Object.freeze({
+    forTarget: async () => Object.freeze({
+      target,
+      deliver: async () => result,
+      recall: async () => Object.freeze({ kind: 'recalled' as const })
+    })
+  })
+  const wrapped = await createJournaledYunzaiOutboundPortFactory(
+    delegate, collectingJournal([]), () => new Date(FIXED_TIMESTAMP)
+  ).forTarget(target)
+
+  assert.strictEqual(await wrapped.deliver(part, 1, options), result)
+  assert.equal(getterReads, 1)
+})
+
+test('journal wrapping captures delegate target once for delivery and recall', async () => {
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const part: OutboundPart = Object.freeze({
+    media: 'text', atoms: Object.freeze([{ kind: 'text' as const, text: '正文' }])
+  })
+  const receipt = Object.freeze({
+    schemaVersion: 1, media: 'text', messageId: 'message-target-once'
+  }) as RuntimeDeliveryReceipt<'text'>
+  const deliveryResult = Object.freeze({
+    kind: 'failed_definite' as const,
+    media: 'text' as const,
+    attempt: 1 as const,
+    code: 'host_rejected' as const
+  })
+  const recallResult = Object.freeze({ kind: 'recalled' as const })
+
+  async function wrappedPort (): Promise<Readonly<{
+    port: YunzaiOutboundPort
+    targetReads: () => number
+  }>> {
+    let reads = 0
+    const delegatePort = Object.defineProperty({
+      deliver: async () => deliveryResult,
+      recall: async () => recallResult
+    }, 'target', {
+      enumerable: true,
+      get: () => {
+        reads += 1
+        if (reads > 1) throw new Error('delegate target read repeatedly')
+        return target
+      }
+    }) as unknown as YunzaiOutboundPort
+    const delegate: YunzaiOutboundPortFactory = Object.freeze({
+      forTarget: async () => delegatePort
+    })
+    const port = await createJournaledYunzaiOutboundPortFactory(
+      delegate, collectingJournal([]), () => new Date(FIXED_TIMESTAMP)
+    ).forTarget(target)
+    return Object.freeze({ port, targetReads: () => reads })
+  }
+
+  const delivery = await wrappedPort()
+  assert.strictEqual(await delivery.port.deliver(part, 1), deliveryResult)
+  assert.equal(delivery.targetReads(), 1)
+
+  const recall = await wrappedPort()
+  assert.strictEqual(await recall.port.recall(receipt), recallResult)
+  assert.equal(recall.targetReads(), 1)
 })

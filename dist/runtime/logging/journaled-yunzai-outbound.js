@@ -1,5 +1,6 @@
-function recordSafely(journal, now, event) {
+function recordSafely(journal, now, createEvent) {
     try {
+        const event = createEvent();
         journal.recordOutbound(Object.freeze({
             ...event,
             occurredAt: now().toISOString()
@@ -8,28 +9,29 @@ function recordSafely(journal, now, event) {
     catch { }
 }
 function journaledPort(delegate, journal, now) {
+    const target = delegate.target;
     return Object.freeze({
-        target: delegate.target,
+        target,
         async deliver(part, attempt, options) {
             const result = await delegate.deliver(part, attempt, options);
-            recordSafely(journal, now, {
+            recordSafely(journal, now, () => ({
                 type: 'qq.outbound.deliver',
-                target: delegate.target,
+                target,
                 part,
                 attempt,
                 quoteMessageId: options?.quoteMessageId ?? null,
                 result
-            });
+            }));
             return result;
         },
         async recall(receipt, signal) {
             const result = await delegate.recall(receipt, signal);
-            recordSafely(journal, now, {
+            recordSafely(journal, now, () => ({
                 type: 'qq.outbound.recall',
-                target: delegate.target,
+                target,
                 receipt,
                 result
-            });
+            }));
             return result;
         }
     });
