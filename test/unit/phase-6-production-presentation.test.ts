@@ -129,6 +129,7 @@ interface GraphFixtureOptions {
   readonly bymPolicy?: BymPolicySnapshot
   readonly toolPolicyProfile?: 'compatible' | 'safe' | 'strict'
   readonly diskLogEnabled?: boolean
+  readonly observabilityLevel?: 'off' | 'basic' | 'diagnostic'
   readonly contentJournal?: GroupMateContentJournal
   readonly journalNow?: () => Date
   readonly now?: () => Date
@@ -213,6 +214,9 @@ function graphFixture (input: GraphFixtureOptions) {
         model: 'fixture-model',
         toolPolicyProfile: input.toolPolicyProfile ?? 'compatible',
         toolApprovalTtlSeconds: 120,
+        ...(input.observabilityLevel === undefined
+          ? {}
+          : { observabilityLevel: input.observabilityLevel }),
         ...(input.diskLogEnabled === undefined
           ? {}
           : { diskLogEnabled: input.diskLogEnabled })
@@ -839,6 +843,7 @@ test('journal activity consumes only its dedicated clock', async () => {
       model: fixedModel(),
       bot: host.bot,
       diskLogEnabled: enabled,
+      observabilityLevel: 'diagnostic',
       contentJournal: journal,
       generateId: () => `clock-id-${++generatedIds}`,
       createRequestRef: () => 'c'.repeat(32),
