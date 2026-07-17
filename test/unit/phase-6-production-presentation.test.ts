@@ -132,6 +132,8 @@ interface GraphFixtureOptions {
   readonly contentJournal?: GroupMateContentJournal
   readonly journalNow?: () => Date
   readonly now?: () => Date
+  readonly generateId?: () => string
+  readonly createRequestRef?: () => string
   readonly promptPrefixOverride?: string
   readonly logger?: ProductionYunzaiAgentOptions['bridge']['logger']
   readonly diskLogFactory?: (
@@ -220,6 +222,10 @@ function graphFixture (input: GraphFixtureOptions) {
       getBotId: () => 'bot-1',
       segment: () => Object.freeze({}),
       botPicker,
+      ...(input.generateId === undefined ? {} : { generateId: input.generateId }),
+      ...(input.createRequestRef === undefined
+        ? {}
+        : { createRequestRef: input.createRequestRef }),
       ...(input.logger === undefined ? {} : { logger: input.logger })
     },
     botPicker,
@@ -826,6 +832,7 @@ test('journal activity consumes only its dedicated clock', async () => {
   }>> => {
     let authoritativeReads = 0
     let journalReads = 0
+    let generatedIds = 0
     const host = hostFixture()
     const journal = new RecordingContentJournal()
     const fixture = graphFixture({
@@ -833,6 +840,8 @@ test('journal activity consumes only its dedicated clock', async () => {
       bot: host.bot,
       diskLogEnabled: enabled,
       contentJournal: journal,
+      generateId: () => `clock-id-${++generatedIds}`,
+      createRequestRef: () => 'c'.repeat(32),
       now: () => {
         authoritativeReads += 1
         return new Date(Date.parse(createdAt) + authoritativeReads)
@@ -846,6 +855,7 @@ test('journal activity consumes only its dedicated clock', async () => {
       marker: '时钟隔离请求', actorId: 'actor-clock'
     }, host))
     await fixture.graph.shutdown('unit_test')
+    await fixture.graph.observability.hub.drain()
     return { authoritativeReads, journalReads }
   }
 
