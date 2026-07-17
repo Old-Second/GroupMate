@@ -16,6 +16,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   readonly setCalls: Array<{ key: string; options?: { EX?: number; NX?: boolean; XX?: boolean } }> = []
   readonly evalCalls: Array<{ marker: string; operation: string }> = []
   private readonly entries = new Map<string, FakeRedisEntry>()
+  private readonly pendingGetFailures = new Set<string>()
   private readonly now: () => number
 
   constructor (now: () => number = () => Date.now()) {
@@ -23,8 +24,13 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   async get (key: string): Promise<string | null> {
+    if (this.pendingGetFailures.delete(key)) throw new Error('fake redis get failure')
     this.purgeExpired(key)
     return this.entries.get(key)?.value ?? null
+  }
+
+  failNextGet (key: string): void {
+    this.pendingGetFailures.add(key)
   }
 
   async set (key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }): Promise<string | null> {
@@ -110,6 +116,23 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       return 'ok'
     }
     const metadataKey = options.keys.at(-1)
+
+    if (operation === 'tombstone_delete_corrupt') {
+      const key = options.keys[0]
+      const value = this.entryValue(key)
+      if (value === null) {
+        if (metadataKey !== undefined) this.entries.delete(metadataKey)
+        return 'missing'
+      }
+      if (value !== args[1]) {
+        if (metadataKey !== undefined) this.entries.delete(metadataKey)
+        return 'conflict'
+      }
+      if (key !== undefined) this.entries.delete(key)
+      if (metadataKey !== undefined) this.entries.delete(metadataKey)
+      return 'ok'
+    }
+
     const usage = this.parseRunNamespaceUsage(this.entryValue(metadataKey))
     if (metadataKey !== RUN_STORE_METADATA_KEY || usage === null) return 'reconcile'
 
@@ -173,7 +196,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         events: usage.events,
         tombstones: usage.tombstones,
         indexes: usage.indexes,
-        references: usage.references
+        references: usage.references,
+        tombstoneBytes: usage.tombstoneBytes
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
@@ -197,7 +221,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         events: usage.events - 1,
         tombstones: usage.tombstones + 1,
         indexes: usage.indexes,
-        references: usage.references
+        references: usage.references,
+        tombstoneBytes: usage.tombstoneBytes + this.bytes(args[3])
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
@@ -323,14 +348,23 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     tombstones: number
     indexes: number
     references: number
+    tombstoneBytes: number
   } | null {
-    if (raw === null || !/^\d+\|\d+\|\d+\|\d+\|\d+\|\d+$/.test(raw)) return null
-    const [bytes, checkpoints, events, tombstones, indexes, references] = raw
+    if (raw === null || !/^\d+\|\d+\|\d+\|\d+\|\d+\|\d+\|\d+$/.test(raw)) return null
+    const [bytes, checkpoints, events, tombstones, indexes, references, tombstoneBytes] = raw
       .split('|')
       .map(value => Number(value))
-    if ([bytes, checkpoints, events, tombstones, indexes, references]
+    if ([bytes, checkpoints, events, tombstones, indexes, references, tombstoneBytes]
       .some(value => !Number.isSafeInteger(value))) return null
-    return { bytes, checkpoints, events, tombstones, indexes, references }
+    return {
+      bytes,
+      checkpoints,
+      events,
+      tombstones,
+      indexes,
+      references,
+      tombstoneBytes
+    }
   }
 
   private saveRunNamespaceUsage (
@@ -342,6 +376,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       tombstones: number
       indexes: number
       references: number
+      tombstoneBytes: number
     }
   ): void {
     if (key !== RUN_STORE_METADATA_KEY) throw new TypeError('invalid run metadata key')
@@ -352,7 +387,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         usage.events,
         usage.tombstones,
         usage.indexes,
-        usage.references
+        usage.references,
+        usage.tombstoneBytes
       ].join('|')
     })
   }
@@ -364,6 +400,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     tombstones: number
     indexes: number
     references: number
+    tombstoneBytes: number
   }): boolean {
     return Object.values(usage).some(value => !Number.isSafeInteger(value) || value < 0)
   }
@@ -375,6 +412,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     tombstones: number
     indexes: number
     references: number
+    tombstoneBytes: number
   }): boolean {
     return usage.bytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
       usage.checkpoints > RUN_RESOURCE_LIMITS.checkpointKeys ||

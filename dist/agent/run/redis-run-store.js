@@ -24,20 +24,37 @@ if operation == 'reconcile' then
 end
 
 local metadataKey = KEYS[#KEYS]
+
+if operation == 'tombstone_delete_corrupt' then
+  local value = redis.call('GET', KEYS[1])
+  if not value then
+    redis.call('DEL', metadataKey)
+    return 'missing'
+  end
+  if value ~= ARGV[2] then
+    redis.call('DEL', metadataKey)
+    return 'conflict'
+  end
+  redis.call('DEL', KEYS[1])
+  redis.call('DEL', metadataKey)
+  return 'ok'
+end
+
 local metadata = redis.call('GET', metadataKey)
 if not metadata then return 'reconcile' end
-local bytes, checkpoints, events, tombstones, indexes, references = string.match(
+local bytes, checkpoints, events, tombstones, indexes, references, tombstoneBytes = string.match(
   metadata,
-  '^(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)$'
+  '^(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)$'
 )
-if not bytes then return 'reconcile' end
+if not bytes or not tombstoneBytes then return 'reconcile' end
 local current = {
   bytes = tonumber(bytes),
   checkpoints = tonumber(checkpoints),
   events = tonumber(events),
   tombstones = tonumber(tombstones),
   indexes = tonumber(indexes),
-  references = tonumber(references)
+  references = tonumber(references),
+  tombstoneBytes = tonumber(tombstoneBytes)
 }
 
 local function exceeds(value)
@@ -51,7 +68,8 @@ end
 
 local function invalid(value)
   return value.bytes < 0 or value.checkpoints < 0 or value.events < 0 or
-    value.tombstones < 0 or value.indexes < 0 or value.references < 0
+    value.tombstones < 0 or value.indexes < 0 or value.references < 0 or
+    value.tombstoneBytes < 0
 end
 
 local function save(value)
@@ -61,7 +79,8 @@ local function save(value)
     value.events,
     value.tombstones,
     value.indexes,
-    value.references
+    value.references,
+    value.tombstoneBytes
   }, '|'))
 end
 
@@ -75,7 +94,8 @@ if operation == 'create' then
     events = current.events + 1,
     tombstones = current.tombstones,
     indexes = current.indexes,
-    references = current.references + 1
+    references = current.references + 1,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -100,7 +120,8 @@ if operation == 'upgrade' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes,
-    references = current.references + 1
+    references = current.references + 1,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -124,7 +145,8 @@ if operation == 'cas' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -147,7 +169,8 @@ if operation == 'commit_terminal' then
     events = current.events - 1,
     tombstones = current.tombstones + 1,
     indexes = current.indexes,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes + string.len(ARGV[4])
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -173,7 +196,8 @@ if operation == 'admission_acquire' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes + 1,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -191,7 +215,8 @@ if operation == 'admission_recover' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if claim == '' then projected.indexes = projected.indexes + 1 end
   if invalid(projected) then return 'reconcile' end
@@ -210,7 +235,8 @@ if operation == 'admission_release' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes - 1,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   redis.call('DEL', KEYS[1])
@@ -226,7 +252,8 @@ if operation == 'approval_index_create' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes + 1,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
@@ -244,7 +271,8 @@ if operation == 'approval_index_delete' then
     events = current.events,
     tombstones = current.tombstones,
     indexes = current.indexes - 1,
-    references = current.references
+    references = current.references,
+    tombstoneBytes = current.tombstoneBytes
   }
   if invalid(projected) then return 'reconcile' end
   redis.call('DEL', KEYS[1])
@@ -321,7 +349,8 @@ function emptyNamespaceUsage() {
         events: 0,
         tombstones: 0,
         indexes: 0,
-        references: 0
+        references: 0,
+        tombstoneBytes: 0
     };
 }
 function encodeNamespaceUsage(usage) {
@@ -331,7 +360,8 @@ function encodeNamespaceUsage(usage) {
         usage.events,
         usage.tombstones,
         usage.indexes,
-        usage.references
+        usage.references,
+        usage.tombstoneBytes
     ].join('|');
 }
 function namespaceLimitExceeded(usage) {
@@ -368,8 +398,10 @@ async function auditNamespace(client) {
                     usage.checkpoints += 1;
                 else if (key.startsWith(`${RUN_STORE_NAMESPACE}events:`))
                     usage.events += 1;
-                else if (key.startsWith(`${RUN_STORE_NAMESPACE}tombstone:`))
+                else if (key.startsWith(`${RUN_STORE_NAMESPACE}tombstone:`)) {
                     usage.tombstones += 1;
+                    usage.tombstoneBytes += Buffer.byteLength(raw, 'utf8');
+                }
                 else if (key.startsWith(`${RUN_STORE_NAMESPACE}reference:`)) {
                     usage.bytes += Buffer.byteLength(key, 'utf8');
                     usage.references += 1;
@@ -677,6 +709,7 @@ export class RedisRunStore {
         if (raw === null)
             return null;
         if (Buffer.byteLength(raw, 'utf8') > RUN_RESOURCE_LIMITS.tombstoneBytes) {
+            await this.#repairCorruptTombstone(key, raw);
             throw checkpointInvalid('load_tombstone', new TypeError('tombstone byte limit exceeded'));
         }
         try {
@@ -687,7 +720,55 @@ export class RedisRunStore {
             return normalizeRunTombstone(decoded);
         }
         catch (error) {
+            await this.#repairCorruptTombstone(key, raw);
             throw checkpointInvalid('load_tombstone', error);
+        }
+    }
+    async observationUsage() {
+        let raw;
+        try {
+            raw = await this.#client.get(RUN_STORE_METADATA_KEY);
+        }
+        catch {
+            return Object.freeze({
+                schemaVersion: 1,
+                tombstoneRecords: 'unavailable',
+                tombstoneBytes: 'unavailable'
+            });
+        }
+        if (raw === null || !/^\d+\|\d+\|\d+\|\d+\|\d+\|\d+\|\d+$/.test(raw)) {
+            return Object.freeze({
+                schemaVersion: 1,
+                tombstoneRecords: 'unavailable',
+                tombstoneBytes: 'unavailable'
+            });
+        }
+        const values = raw.split('|').map(value => Number(value));
+        if (values.some(value => !Number.isSafeInteger(value) || value < 0)) {
+            return Object.freeze({
+                schemaVersion: 1,
+                tombstoneRecords: 'unavailable',
+                tombstoneBytes: 'unavailable'
+            });
+        }
+        return Object.freeze({
+            schemaVersion: 1,
+            tombstoneRecords: values[3] ?? 'unavailable',
+            tombstoneBytes: values[6] ?? 'unavailable'
+        });
+    }
+    async #repairCorruptTombstone(key, raw) {
+        try {
+            const result = await mutate(this.#client, 'tombstone_delete_corrupt', [key], [raw]);
+            if (result !== 'ok' && result !== 'missing' && result !== 'conflict') {
+                requireMutationSuccess(result, 'tombstone_delete_corrupt');
+            }
+            if (result === 'ok' || result === 'missing' || result === 'conflict') {
+                await reconcileNamespace(this.#client);
+            }
+        }
+        catch {
+            // Corrupt reads remain fail-closed even when best-effort bounded repair is unavailable.
         }
     }
     #encode(checkpoint, operation) {

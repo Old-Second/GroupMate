@@ -83,6 +83,12 @@ export interface NormalizedRunTombstoneV1 {
   readonly engineDurationMs: ObservationCount
 }
 
+export interface RunStoreObservationUsageV1 {
+  readonly schemaVersion: 1
+  readonly tombstoneRecords: ObservationCount
+  readonly tombstoneBytes: ObservationCount
+}
+
 export interface RunStore {
   create(checkpoint: RunCheckpoint): Promise<RunCheckpoint>
   load(runId: string): Promise<LoadedRunCheckpoint | null>
@@ -104,6 +110,7 @@ export interface RunStore {
     events: readonly AgentEvent[]
   ): Promise<RunCheckpoint>
   loadTombstone(runId: string): Promise<NormalizedRunTombstoneV1 | null>
+  observationUsage(): Promise<RunStoreObservationUsageV1>
 }
 
 export class RunStoreConflictError extends AgentError {

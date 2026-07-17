@@ -11,9 +11,12 @@ import {
 } from '../../src/agent/run/run-checkpoint.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import {
+  DURATION_BUCKET_BOUNDS_MS,
   createRunTerminalSnapshot,
+  parseDurationBucketCounts,
   parseCompletionObservation,
   parseRunTerminalSnapshot,
+  parseRunTraceMetricSummary,
   terminalObservationId
 } from '../../src/agent/run/run-observation.js'
 
@@ -271,6 +274,200 @@ test('parseRunTerminalSnapshot enforces exact keys, terminal matrix and identica
   for (const value of hostile) {
     assert.throws(() => parseRunTerminalSnapshot(value), /terminal snapshot|observation|engine duration/i)
   }
+})
+
+test('trace metric summary parser fixes cumulative buckets, row order and bounded domains', () => {
+  const duration = {
+    count: 1,
+    sumMs: 20,
+    unavailableCount: 1,
+    le10: 0,
+    le25: 1,
+    le50: 1,
+    le100: 1,
+    le250: 1,
+    le500: 1,
+    le1000: 1,
+    le2500: 1,
+    le5000: 1,
+    le10000: 1,
+    le30000: 1,
+    le60000: 1,
+    le120000: 1,
+    inf: 1
+  }
+  assert.deepEqual(DURATION_BUCKET_BOUNDS_MS, [
+    10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+    30000, 60000, 120000, 'inf'
+  ])
+  assert.deepEqual(parseDurationBucketCounts(duration), duration)
+
+  const summary = {
+    schemaVersion: 1,
+    providerRequests: [{
+      outcome: 'failed',
+      attemptKind: 'retry',
+      count: 2,
+      duration
+    }, {
+      outcome: 'succeeded',
+      attemptKind: 'primary',
+      count: 1,
+      duration: {
+        ...duration,
+        unavailableCount: 0
+      }
+    }],
+    toolExecutions: [{
+      outcome: 'failed',
+      count: 2,
+      duration
+    }],
+    approvals: [{ decision: 'requested', count: 1 }]
+  }
+  assert.deepEqual(parseRunTraceMetricSummary(summary), summary)
+  assert.equal(Object.isFrozen(parseRunTraceMetricSummary(summary)), true)
+
+  const unavailableOnlyWithSum = {
+    ...duration,
+    count: 0,
+    sumMs: 123,
+    unavailableCount: 1,
+    le10: 0,
+    le25: 0,
+    le50: 0,
+    le100: 0,
+    le250: 0,
+    le500: 0,
+    le1000: 0,
+    le2500: 0,
+    le5000: 0,
+    le10000: 0,
+    le30000: 0,
+    le60000: 0,
+    le120000: 0,
+    inf: 0
+  }
+  assert.throws(() => parseDurationBucketCounts(unavailableOnlyWithSum), TypeError)
+  assert.throws(() => parseRunTraceMetricSummary({
+    ...summary,
+    providerRequests: [{
+      ...summary.providerRequests[0],
+      count: 1,
+      duration: unavailableOnlyWithSum
+    }]
+  }), TypeError)
+
+  const invalid = [
+    { ...summary, secret: true },
+    { ...summary, providerRequests: [...summary.providerRequests].reverse() },
+    { ...summary, providerRequests: [summary.providerRequests[0], summary.providerRequests[0]] },
+    { ...summary, providerRequests: Array(17).fill(summary.providerRequests[0]) },
+    { ...summary, toolExecutions: Array(5).fill(summary.toolExecutions[0]) },
+    { ...summary, approvals: Array(5).fill(summary.approvals[0]) },
+    {
+      ...summary,
+      providerRequests: [{ ...summary.providerRequests[0], count: 0 }]
+    },
+    {
+      ...summary,
+      providerRequests: [{
+        ...summary.providerRequests[0],
+        duration: { ...duration, unavailableCount: 0 }
+      }]
+    },
+    {
+      ...summary,
+      providerRequests: [{ ...summary.providerRequests[0], outcome: 'other' }]
+    },
+    {
+      ...summary,
+      providerRequests: [{ ...summary.providerRequests[0], model: 'private-model' }]
+    },
+    {
+      ...summary,
+      toolExecutions: [{ ...summary.toolExecutions[0], toolName: 'private-tool' }]
+    },
+    {
+      ...summary,
+      toolExecutions: [{ ...summary.toolExecutions[0], outcome: 'unknown' }]
+    },
+    {
+      ...summary,
+      approvals: [{ decision: 'denied', count: 1 }, { decision: 'approved', count: 1 }]
+    },
+    { ...duration, inf: 0 },
+    { ...duration, le10: 2 },
+    { ...duration, sumMs: 'unavailable' }
+  ]
+  for (const value of invalid) {
+    const parse = Object.hasOwn(value, 'schemaVersion')
+      ? () => parseRunTraceMetricSummary(value)
+      : () => parseDurationBucketCounts(value)
+    assert.throws(parse, TypeError)
+  }
+})
+
+test('trace metric summary parser rejects hostile arrays and accessors without invoking them', () => {
+  const summary = {
+    schemaVersion: 1,
+    providerRequests: [] as unknown[],
+    toolExecutions: [],
+    approvals: []
+  }
+  Object.defineProperty(summary.providerRequests, 'secret', {
+    value: 'private',
+    enumerable: true
+  })
+  assert.throws(() => parseRunTraceMetricSummary(summary), TypeError)
+
+  assert.throws(() => parseRunTraceMetricSummary({
+    ...summary,
+    providerRequests: new Array(1)
+  }), TypeError)
+
+  let getterCalls = 0
+  const row = Object.create(null)
+  Object.defineProperties(row, {
+    outcome: {
+      enumerable: true,
+      get () {
+        getterCalls += 1
+        return 'failed'
+      }
+    },
+    attemptKind: { value: 'retry', enumerable: true },
+    count: { value: 1, enumerable: true },
+    duration: {
+      value: {
+        count: 0,
+        sumMs: 0,
+        unavailableCount: 1,
+        le10: 0,
+        le25: 0,
+        le50: 0,
+        le100: 0,
+        le250: 0,
+        le500: 0,
+        le1000: 0,
+        le2500: 0,
+        le5000: 0,
+        le10000: 0,
+        le30000: 0,
+        le60000: 0,
+        le120000: 0,
+        inf: 0
+      },
+      enumerable: true
+    }
+  })
+  assert.throws(() => parseRunTraceMetricSummary({
+    schemaVersion: 1,
+    providerRequests: [row],
+    toolExecutions: [],
+    approvals: []
+  }), TypeError)
+  assert.equal(getterCalls, 0)
 })
 
 test('checkpoint parser rejects every terminal next that still carries a reservation', () => {

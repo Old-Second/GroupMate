@@ -18,6 +18,7 @@ import {
   validateTerminalCommitInput,
   type NormalizedRunTombstoneV1,
   type RunStore,
+  type RunStoreObservationUsageV1,
   type TerminalCommitReceiptV1
 } from '../../src/agent/run/run-store.js'
 
@@ -144,5 +145,17 @@ export class InMemoryRunStore implements RunStore {
       throw new TypeError('run ID does not match its tombstone key')
     }
     return normalizeRunTombstone(parsed)
+  }
+
+  async observationUsage (): Promise<RunStoreObservationUsageV1> {
+    let tombstoneBytes = 0
+    for (const raw of this.#tombstones.values()) {
+      tombstoneBytes += Buffer.byteLength(raw, 'utf8')
+    }
+    return Object.freeze({
+      schemaVersion: 1,
+      tombstoneRecords: this.#tombstones.size,
+      tombstoneBytes
+    })
   }
 }

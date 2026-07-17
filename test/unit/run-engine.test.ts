@@ -421,6 +421,10 @@ class TerminalRaceRunStore implements RunStore {
   loadTombstone: RunStore['loadTombstone'] = async runId => (
     await this.base.loadTombstone(runId)
   )
+
+  observationUsage: RunStore['observationUsage'] = async () => (
+    await this.base.observationUsage()
+  )
 }
 
 function outputText (result: Awaited<ReturnType<RunEngine['start']>>): string | null {
@@ -476,7 +480,8 @@ test('checkpoint-created hook failure and losing runRef collision do not change 
     commitTerminal: async (expected, next, snapshot) => (
       await base.commitTerminal(expected, next, snapshot)
     ),
-    loadTombstone: async runId => await base.loadTombstone(runId)
+    loadTombstone: async runId => await base.loadTombstone(runId),
+    observationUsage: async () => await base.observationUsage()
   }
   const collision = harness([modelText('must not run')], { store: collisionStore })
   let collisionHookCalls = 0

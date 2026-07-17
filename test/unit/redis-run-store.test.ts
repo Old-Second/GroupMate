@@ -13,6 +13,7 @@ import {
 } from '../../src/agent/run/run-checkpoint.js'
 import { upgradeRunCheckpointV1 } from '../../src/agent/run/run-checkpoint-migration.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
+import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 import {
   createFrozenObservationPolicy,
   createRunTerminalSnapshot
@@ -32,6 +33,26 @@ const timestamp = '2026-07-14T00:00:00.000Z'
 const deadlineAt = '2026-07-14T00:04:00.000Z'
 const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
 const emptyManifestFingerprint = createHash('sha256').update('[]').digest('hex')
+
+class RepairRaceRedis extends FakeRedis {
+  #beforeCorruptRepair?: () => Promise<void>
+
+  beforeCorruptRepair (callback: () => Promise<void>): void {
+    this.#beforeCorruptRepair = callback
+  }
+
+  override async eval (script: string, options: {
+    keys: string[]
+    arguments: string[]
+  }): Promise<unknown> {
+    if (options.arguments[0] === 'tombstone_delete_corrupt') {
+      const callback = this.#beforeCorruptRepair
+      this.#beforeCorruptRepair = undefined
+      await callback?.()
+    }
+    return await super.eval(script, options)
+  }
+}
 
 function event (
   runId: string,
@@ -251,6 +272,149 @@ test('RedisRunStore atomically replaces terminal state with one bounded 24-hour 
   assert.equal(await redis.ttl(keys.events), -2)
   assert.equal(await redis.ttl(keys.tombstone), 86_400)
   assert.equal(await redis.ttl(redisRunReferenceKey(created.runRef)), 86_400)
+  const raw = await redis.get(keys.tombstone)
+  assert.deepEqual(await store.observationUsage(), {
+    schemaVersion: 1,
+    tombstoneRecords: 1,
+    tombstoneBytes: Buffer.byteLength(raw ?? '', 'utf8')
+  })
+  assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|').length, 7)
+})
+
+test('RedisRunStore observation usage is metadata-only and upgrades old metadata through bounded reconcile', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  await redis.set(
+    'GROUPMATE:RUN:v1:tombstone:legacy-multibyte',
+    '{"value":"观察-🧪"}',
+    { EX: 300 }
+  )
+  await redis.set(RUN_STORE_METADATA_KEY, '0|0|0|0|0|0')
+  const store = new RedisRunStore({ client: redis })
+  const before = redis.scanCalls.length
+  assert.deepEqual(await store.observationUsage(), {
+    schemaVersion: 1,
+    tombstoneRecords: 'unavailable',
+    tombstoneBytes: 'unavailable'
+  })
+  assert.equal(redis.scanCalls.length, before)
+
+  await store.create(checkpoint('metadata-upgrade'))
+  assert.ok(redis.scanCalls.length > before)
+  const scansAfterUpgrade = redis.scanCalls.length
+  const usage = await store.observationUsage()
+  assert.equal(usage.tombstoneRecords, 1)
+  assert.equal(
+    usage.tombstoneBytes,
+    Buffer.byteLength('{"value":"观察-🧪"}', 'utf8')
+  )
+  assert.equal(redis.scanCalls.length, scansAfterUpgrade)
+  assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|').length, 7)
+})
+
+test('RedisRunStore reports unavailable metadata reads and atomically repairs corrupt tombstones', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  const created = await store.create(checkpoint('corrupt-usage'))
+  const cancelled = nextRunCheckpoint(created, 'cancelled', {
+    cancellationReason: 'user_cancelled'
+  }, [event(created.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+  await store.commitTerminal(created, cancelled, createRunTerminalSnapshot(cancelled))
+  const retained = await store.create(checkpoint('retained-usage'))
+  const retainedCancelled = nextRunCheckpoint(retained, 'cancelled', {
+    cancellationReason: 'user_cancelled'
+  }, [event(retained.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+  await store.commitTerminal(
+    retained,
+    retainedCancelled,
+    createRunTerminalSnapshot(retainedCancelled)
+  )
+  const key = redisRunKeys(created.runId).tombstone
+  const raw = await redis.get(key)
+  const retainedRaw = await redis.get(redisRunKeys(retained.runId).tombstone)
+  assert.notEqual(raw, null)
+  assert.notEqual(retainedRaw, null)
+  const corrupt = '坏'.repeat(
+    Math.floor(RUN_RESOURCE_LIMITS.namespaceBytes / Buffer.byteLength('坏', 'utf8')) + 1
+  )
+  assert.ok(Buffer.byteLength(corrupt, 'utf8') > RUN_RESOURCE_LIMITS.namespaceBytes)
+  assert.notEqual(
+    Buffer.byteLength(corrupt, 'utf8'),
+    Buffer.byteLength(raw ?? '', 'utf8')
+  )
+  await redis.set(key, corrupt, { EX: 86_400 })
+
+  await assert.rejects(store.loadTombstone(created.runId), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.equal((await redis.get(key)) === null, true)
+  assert.deepEqual(await store.observationUsage(), {
+    schemaVersion: 1,
+    tombstoneRecords: 1,
+    tombstoneBytes: Buffer.byteLength(retainedRaw ?? '', 'utf8')
+  })
+
+  redis.failNextGet(RUN_STORE_METADATA_KEY)
+  assert.deepEqual(await store.observationUsage(), {
+    schemaVersion: 1,
+    tombstoneRecords: 'unavailable',
+    tombstoneBytes: 'unavailable'
+  })
+})
+
+test('RedisRunStore invalidates stale metadata when corrupt repair loses a target race', async t => {
+  async function createCorruptTombstone (
+    redis: RepairRaceRedis,
+    runId: string
+  ): Promise<{ store: RedisRunStore; key: string; validRaw: string }> {
+    const store = new RedisRunStore({ client: redis })
+    const created = await store.create(checkpoint(runId))
+    const cancelled = nextRunCheckpoint(created, 'cancelled', {
+      cancellationReason: 'user_cancelled'
+    }, [event(created.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+    await store.commitTerminal(created, cancelled, createRunTerminalSnapshot(cancelled))
+    const key = redisRunKeys(created.runId).tombstone
+    const validRaw = await redis.get(key)
+    assert.notEqual(validRaw, null)
+    await redis.set(key, '{corrupt', { EX: 86_400 })
+    return { store, key, validRaw: validRaw ?? '' }
+  }
+
+  await t.test('a replacement remains while usage is rebuilt from its actual bytes', async () => {
+    const redis = new RepairRaceRedis(() => Date.parse(timestamp))
+    const { store, key, validRaw } = await createCorruptTombstone(redis, 'repair-race-replace')
+    const replacement = ` ${validRaw}`
+    redis.beforeCorruptRepair(async () => {
+      await redis.set(key, replacement, { EX: 86_400 })
+    })
+
+    await assert.rejects(store.loadTombstone('repair-race-replace'), error => (
+      error instanceof AgentError && error.code === 'checkpoint_invalid'
+    ))
+    assert.equal(await redis.get(key), replacement)
+    assert.deepEqual(await store.observationUsage(), {
+      schemaVersion: 1,
+      tombstoneRecords: 1,
+      tombstoneBytes: Buffer.byteLength(replacement, 'utf8')
+    })
+  })
+
+  await t.test('a missing target removes its ghost usage', async () => {
+    const redis = new RepairRaceRedis(() => Date.parse(timestamp))
+    const { store, key } = await createCorruptTombstone(redis, 'repair-race-missing')
+    redis.beforeCorruptRepair(async () => {
+      await redis.del(key)
+    })
+
+    await assert.rejects(store.loadTombstone('repair-race-missing'), error => (
+      error instanceof AgentError && error.code === 'checkpoint_invalid'
+    ))
+    assert.equal((await redis.get(key)) === null, true)
+    assert.deepEqual(await store.observationUsage(), {
+      schemaVersion: 1,
+      tombstoneRecords: 0,
+      tombstoneBytes: 0
+    })
+  })
 })
 
 test('RedisRunStore appends immutable events and uses the only terminal commit port', async () => {

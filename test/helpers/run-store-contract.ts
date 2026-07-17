@@ -246,6 +246,11 @@ export function registerRunStoreContract (
       const terminal = completedCheckpoint(active)
       const snapshot = createRunTerminalSnapshot(terminal)
       const encoded = new RunCheckpointCodec().encode(active)
+      assert.deepEqual(await harness.store.observationUsage(), {
+        schemaVersion: 1,
+        tombstoneRecords: 0,
+        tombstoneBytes: 0
+      })
       assert.notEqual(
         encoded.checkpoint.length,
         Buffer.byteLength(encoded.checkpoint, 'utf8'),
@@ -272,6 +277,11 @@ export function registerRunStoreContract (
 
       const raw = await harness.readRawTombstone(active.runId)
       assert.notEqual(raw, null)
+      assert.deepEqual(await harness.store.observationUsage(), {
+        schemaVersion: 1,
+        tombstoneRecords: 1,
+        tombstoneBytes: Buffer.byteLength(raw ?? '', 'utf8')
+      })
       assert.deepEqual(winner, {
         schemaVersion: 1,
         observationId: snapshot.observationId,

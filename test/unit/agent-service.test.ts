@@ -316,6 +316,10 @@ class InjectedCollisionRunStore implements RunStore {
   loadTombstone: RunStore['loadTombstone'] = async runId => (
     await this.base.loadTombstone(runId)
   )
+
+  observationUsage: RunStore['observationUsage'] = async () => (
+    await this.base.observationUsage()
+  )
 }
 
 function terminalFactsFor (
@@ -1198,7 +1202,8 @@ test('real RunEngine create failure never exposes the unclaimed candidate run re
     compareAndSet: base.compareAndSet.bind(base),
     appendEvents: base.appendEvents.bind(base),
     commitTerminal: base.commitTerminal.bind(base),
-    loadTombstone: base.loadTombstone.bind(base)
+    loadTombstone: base.loadTombstone.bind(base),
+    observationUsage: base.observationUsage.bind(base)
   })
   let providerCalls = 0
   let generated = 0

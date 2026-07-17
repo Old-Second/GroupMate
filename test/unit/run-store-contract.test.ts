@@ -47,6 +47,19 @@ registerRunStoreContract({
   }
 })
 
+test('in-memory observation usage counts raw UTF-8 tombstone bytes', async () => {
+  const store = new InMemoryRunStore()
+  const first = '{"value":"观察-🧪"}'
+  const second = '{"value":"记录-🌏"}'
+  store.seedRawTombstone('usage-first', first)
+  store.seedRawTombstone('usage-second', second)
+  assert.deepEqual(await store.observationUsage(), {
+    schemaVersion: 1,
+    tombstoneRecords: 2,
+    tombstoneBytes: Buffer.byteLength(first, 'utf8') + Buffer.byteLength(second, 'utf8')
+  })
+})
+
 registerRunStoreContract({
   name: 'fake-redis',
   create: () => {

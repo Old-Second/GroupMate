@@ -2,6 +2,22 @@ import { createHash } from 'node:crypto';
 import { isAgentErrorCode } from '../contracts/error.js';
 import { RUN_REF_PATTERN } from './run-reference.js';
 import { isTerminalRunStatus } from './run-state.js';
+export const DURATION_BUCKET_BOUNDS_MS = Object.freeze([
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    30_000,
+    60_000,
+    120_000,
+    'inf'
+]);
 const COUNTER_KEYS = Object.freeze([
     'schemaVersion',
     'providerAttempts',
@@ -52,11 +68,102 @@ const TERMINAL_CANCELLATION_REASONS = new Set([
     'fatal_error',
     'other'
 ]);
+const DURATION_BUCKET_KEYS = Object.freeze([
+    'count',
+    'sumMs',
+    'unavailableCount',
+    'le10',
+    'le25',
+    'le50',
+    'le100',
+    'le250',
+    'le500',
+    'le1000',
+    'le2500',
+    'le5000',
+    'le10000',
+    'le30000',
+    'le60000',
+    'le120000',
+    'inf'
+]);
+const DURATION_CUMULATIVE_KEYS = Object.freeze([
+    'le10',
+    'le25',
+    'le50',
+    'le100',
+    'le250',
+    'le500',
+    'le1000',
+    'le2500',
+    'le5000',
+    'le10000',
+    'le30000',
+    'le60000',
+    'le120000',
+    'inf'
+]);
+const METRIC_SUMMARY_KEYS = Object.freeze([
+    'schemaVersion', 'providerRequests', 'toolExecutions', 'approvals'
+]);
+const PROVIDER_METRIC_ROW_KEYS = Object.freeze([
+    'outcome', 'attemptKind', 'count', 'duration'
+]);
+const TOOL_METRIC_ROW_KEYS = Object.freeze([
+    'outcome', 'count', 'duration'
+]);
+const APPROVAL_METRIC_ROW_KEYS = Object.freeze([
+    'decision', 'count'
+]);
+const PROVIDER_METRIC_OUTCOMES = new Set([
+    'succeeded', 'failed', 'cancelled', 'unknown'
+]);
+const PROVIDER_ATTEMPT_KINDS = new Set([
+    'primary', 'retry', 'recovery', 'correction'
+]);
+const TOOL_METRIC_OUTCOMES = new Set([
+    'succeeded', 'failed', 'denied', 'indeterminate'
+]);
+const APPROVAL_METRIC_DECISIONS = new Set([
+    'requested', 'approved', 'denied', 'expired'
+]);
 function record(value, label) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError(`${label} is invalid`);
     }
     return value;
+}
+function exactOwnData(value, keys, label) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    const input = value;
+    let actual;
+    try {
+        actual = Reflect.ownKeys(input);
+    }
+    catch {
+        throw new TypeError(`${label} is invalid`);
+    }
+    if (actual.length !== keys.length || actual.some(key => (typeof key !== 'string' || !keys.includes(key)))) {
+        throw new TypeError(`${label} keys are invalid`);
+    }
+    const output = {};
+    for (const key of keys) {
+        let descriptor;
+        try {
+            descriptor = Object.getOwnPropertyDescriptor(input, key);
+        }
+        catch {
+            throw new TypeError(`${label} is invalid`);
+        }
+        if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+            descriptor.enumerable !== true) {
+            throw new TypeError(`${label} field is invalid`);
+        }
+        output[key] = descriptor.value;
+    }
+    return output;
 }
 function exactKeys(value, keys, label) {
     const unknown = Object.keys(value).find(key => !keys.includes(key));
@@ -85,6 +192,147 @@ function parseCount(value, key, allowNotAttempted) {
         throw new TypeError(`${key} observation count is invalid`);
     }
     return Number(value);
+}
+function nonNegativeSafeInteger(value, label) {
+    if (!Number.isSafeInteger(value) || Number(value) < 0) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    return Number(value);
+}
+function positiveSafeInteger(value, label) {
+    const parsed = nonNegativeSafeInteger(value, label);
+    if (parsed === 0)
+        throw new TypeError(`${label} is invalid`);
+    return parsed;
+}
+function exactArray(value, maximum, label) {
+    if (!Array.isArray(value))
+        throw new TypeError(`${label} is invalid`);
+    let keys;
+    let lengthDescriptor;
+    try {
+        keys = Reflect.ownKeys(value);
+        lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    }
+    catch {
+        throw new TypeError(`${label} is invalid`);
+    }
+    const length = lengthDescriptor?.value;
+    if (!Number.isSafeInteger(length) || Number(length) < 0 || Number(length) > maximum ||
+        keys.length !== Number(length) + 1 || !keys.includes('length')) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    return Object.freeze(Array.from({ length: Number(length) }, (_, index) => {
+        const key = String(index);
+        if (!keys.includes(key))
+            throw new TypeError(`${label} is sparse`);
+        let descriptor;
+        try {
+            descriptor = Object.getOwnPropertyDescriptor(value, key);
+        }
+        catch {
+            throw new TypeError(`${label} is invalid`);
+        }
+        if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+            descriptor.enumerable !== true) {
+            throw new TypeError(`${label} item is invalid`);
+        }
+        return descriptor.value;
+    }));
+}
+function assertSortedUnique(values, label) {
+    for (let index = 1; index < values.length; index += 1) {
+        if ((values[index - 1] ?? '') >= (values[index] ?? '')) {
+            throw new TypeError(`${label} order is invalid`);
+        }
+    }
+}
+export function parseDurationBucketCounts(value) {
+    const input = exactOwnData(value, DURATION_BUCKET_KEYS, 'duration bucket counts');
+    const count = nonNegativeSafeInteger(input.count, 'duration count');
+    const sumMs = nonNegativeSafeInteger(input.sumMs, 'duration sum');
+    const unavailableCount = nonNegativeSafeInteger(input.unavailableCount, 'duration unavailable count');
+    if (count === 0 && sumMs !== 0) {
+        throw new TypeError('duration sum requires a measured sample');
+    }
+    let previous = 0;
+    const cumulative = Object.fromEntries(DURATION_CUMULATIVE_KEYS.map(key => {
+        const current = nonNegativeSafeInteger(input[key], `duration ${key}`);
+        if (current < previous || current > count) {
+            throw new TypeError('duration cumulative buckets are invalid');
+        }
+        previous = current;
+        return [key, current];
+    }));
+    if (cumulative.inf !== count) {
+        throw new TypeError('duration infinity bucket is invalid');
+    }
+    return Object.freeze({
+        count,
+        sumMs,
+        unavailableCount,
+        ...cumulative
+    });
+}
+export function parseRunTraceMetricSummary(value) {
+    const input = exactOwnData(value, METRIC_SUMMARY_KEYS, 'run trace metric summary');
+    if (input.schemaVersion !== 1) {
+        throw new TypeError('run trace metric summary schema is invalid');
+    }
+    const providerRequests = Object.freeze(exactArray(input.providerRequests, 16, 'provider metric rows').map(value => {
+        const row = exactOwnData(value, PROVIDER_METRIC_ROW_KEYS, 'provider metric row');
+        if (typeof row.outcome !== 'string' || !PROVIDER_METRIC_OUTCOMES.has(row.outcome) ||
+            typeof row.attemptKind !== 'string' || !PROVIDER_ATTEMPT_KINDS.has(row.attemptKind)) {
+            throw new TypeError('provider metric row fields are invalid');
+        }
+        const count = positiveSafeInteger(row.count, 'provider metric count');
+        const duration = parseDurationBucketCounts(row.duration);
+        if (duration.count + duration.unavailableCount !== count) {
+            throw new TypeError('provider metric duration count is invalid');
+        }
+        return Object.freeze({
+            outcome: row.outcome,
+            attemptKind: row.attemptKind,
+            count,
+            duration
+        });
+    }));
+    assertSortedUnique(providerRequests.map(row => `${row.outcome}\0${row.attemptKind}`), 'provider metric rows');
+    const toolExecutions = Object.freeze(exactArray(input.toolExecutions, 4, 'tool metric rows').map(value => {
+        const row = exactOwnData(value, TOOL_METRIC_ROW_KEYS, 'tool metric row');
+        if (typeof row.outcome !== 'string' ||
+            !TOOL_METRIC_OUTCOMES.has(row.outcome)) {
+            throw new TypeError('tool metric row fields are invalid');
+        }
+        const count = positiveSafeInteger(row.count, 'tool metric count');
+        const duration = parseDurationBucketCounts(row.duration);
+        if (duration.count + duration.unavailableCount !== count) {
+            throw new TypeError('tool metric duration count is invalid');
+        }
+        return Object.freeze({
+            outcome: row.outcome,
+            count,
+            duration
+        });
+    }));
+    assertSortedUnique(toolExecutions.map(row => row.outcome), 'tool metric rows');
+    const approvals = Object.freeze(exactArray(input.approvals, 4, 'approval metric rows').map(value => {
+        const row = exactOwnData(value, APPROVAL_METRIC_ROW_KEYS, 'approval metric row');
+        if (typeof row.decision !== 'string' || !APPROVAL_METRIC_DECISIONS.has(row.decision)) {
+            throw new TypeError('approval metric row fields are invalid');
+        }
+        return Object.freeze({
+            decision: row.decision,
+            count: positiveSafeInteger(row.count, 'approval metric count')
+        });
+    }));
+    assertSortedUnique(approvals.map(row => row.decision), 'approval metric rows');
+    return Object.freeze({
+        schemaVersion: 1,
+        providerRequests,
+        toolExecutions,
+        approvals
+    });
 }
 export function createFrozenObservationPolicy(input) {
     if (!['off', 'basic', 'diagnostic'].includes(input.levelAtStart)) {

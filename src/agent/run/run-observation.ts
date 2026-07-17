@@ -4,8 +4,65 @@ import type { CompletionDisposition } from '../contracts/completion.js'
 import type { RunCheckpoint } from './run-checkpoint.js'
 import { RUN_REF_PATTERN } from './run-reference.js'
 import { isTerminalRunStatus, type TerminalRunStatus } from './run-state.js'
+import type { ToolAttemptOutcome } from './tool-scheduler.js'
 
 export type ObservationCount = number | 'unavailable' | 'not_attempted'
+
+export const DURATION_BUCKET_BOUNDS_MS = Object.freeze([
+  10,
+  25,
+  50,
+  100,
+  250,
+  500,
+  1_000,
+  2_500,
+  5_000,
+  10_000,
+  30_000,
+  60_000,
+  120_000,
+  'inf'
+] as const)
+
+export interface DurationBucketCountsV1 {
+  readonly count: number
+  readonly sumMs: number
+  readonly unavailableCount: number
+  readonly le10: number
+  readonly le25: number
+  readonly le50: number
+  readonly le100: number
+  readonly le250: number
+  readonly le500: number
+  readonly le1000: number
+  readonly le2500: number
+  readonly le5000: number
+  readonly le10000: number
+  readonly le30000: number
+  readonly le60000: number
+  readonly le120000: number
+  readonly inf: number
+}
+
+export interface RunTraceMetricSummaryV1 {
+  readonly schemaVersion: 1
+  readonly providerRequests: readonly {
+    readonly outcome: 'succeeded' | 'failed' | 'cancelled' | 'unknown'
+    readonly attemptKind: 'primary' | 'retry' | 'recovery' | 'correction'
+    readonly count: number
+    readonly duration: DurationBucketCountsV1
+  }[]
+  readonly toolExecutions: readonly {
+    readonly outcome: ToolAttemptOutcome
+    readonly count: number
+    readonly duration: DurationBucketCountsV1
+  }[]
+  readonly approvals: readonly {
+    readonly decision: 'requested' | 'approved' | 'denied' | 'expired'
+    readonly count: number
+  }[]
+}
 
 export interface FrozenObservationPolicyV1 {
   readonly schemaVersion: 1
@@ -124,12 +181,108 @@ const TERMINAL_CANCELLATION_REASONS = new Set([
   'fatal_error',
   'other'
 ])
+const DURATION_BUCKET_KEYS = Object.freeze([
+  'count',
+  'sumMs',
+  'unavailableCount',
+  'le10',
+  'le25',
+  'le50',
+  'le100',
+  'le250',
+  'le500',
+  'le1000',
+  'le2500',
+  'le5000',
+  'le10000',
+  'le30000',
+  'le60000',
+  'le120000',
+  'inf'
+])
+const DURATION_CUMULATIVE_KEYS = Object.freeze([
+  'le10',
+  'le25',
+  'le50',
+  'le100',
+  'le250',
+  'le500',
+  'le1000',
+  'le2500',
+  'le5000',
+  'le10000',
+  'le30000',
+  'le60000',
+  'le120000',
+  'inf'
+] as const)
+const METRIC_SUMMARY_KEYS = Object.freeze([
+  'schemaVersion', 'providerRequests', 'toolExecutions', 'approvals'
+])
+const PROVIDER_METRIC_ROW_KEYS = Object.freeze([
+  'outcome', 'attemptKind', 'count', 'duration'
+])
+const TOOL_METRIC_ROW_KEYS = Object.freeze([
+  'outcome', 'count', 'duration'
+])
+const APPROVAL_METRIC_ROW_KEYS = Object.freeze([
+  'decision', 'count'
+])
+const PROVIDER_METRIC_OUTCOMES = new Set([
+  'succeeded', 'failed', 'cancelled', 'unknown'
+])
+const PROVIDER_ATTEMPT_KINDS = new Set([
+  'primary', 'retry', 'recovery', 'correction'
+])
+const TOOL_METRIC_OUTCOMES = new Set<ToolAttemptOutcome>([
+  'succeeded', 'failed', 'denied', 'indeterminate'
+])
+const APPROVAL_METRIC_DECISIONS = new Set([
+  'requested', 'approved', 'denied', 'expired'
+])
 
 function record (value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError(`${label} is invalid`)
   }
   return value as Record<string, unknown>
+}
+
+function exactOwnData (
+  value: unknown,
+  keys: readonly string[],
+  label: string
+): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  const input = value as Record<PropertyKey, unknown>
+  let actual: readonly PropertyKey[]
+  try {
+    actual = Reflect.ownKeys(input)
+  } catch {
+    throw new TypeError(`${label} is invalid`)
+  }
+  if (actual.length !== keys.length || actual.some(key => (
+    typeof key !== 'string' || !keys.includes(key)
+  ))) {
+    throw new TypeError(`${label} keys are invalid`)
+  }
+  const output: Record<string, unknown> = {}
+  for (const key of keys) {
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(input, key)
+    } catch {
+      throw new TypeError(`${label} is invalid`)
+    }
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+      descriptor.enumerable !== true) {
+      throw new TypeError(`${label} field is invalid`)
+    }
+    output[key] = descriptor.value
+  }
+  return output
 }
 
 function exactKeys (
@@ -168,6 +321,187 @@ function parseCount (
     throw new TypeError(`${key} observation count is invalid`)
   }
   return Number(value)
+}
+
+function nonNegativeSafeInteger (value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  return Number(value)
+}
+
+function positiveSafeInteger (value: unknown, label: string): number {
+  const parsed = nonNegativeSafeInteger(value, label)
+  if (parsed === 0) throw new TypeError(`${label} is invalid`)
+  return parsed
+}
+
+function exactArray (
+  value: unknown,
+  maximum: number,
+  label: string
+): readonly unknown[] {
+  if (!Array.isArray(value)) throw new TypeError(`${label} is invalid`)
+  let keys: readonly PropertyKey[]
+  let lengthDescriptor: PropertyDescriptor | undefined
+  try {
+    keys = Reflect.ownKeys(value)
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
+  } catch {
+    throw new TypeError(`${label} is invalid`)
+  }
+  const length = lengthDescriptor?.value
+  if (!Number.isSafeInteger(length) || Number(length) < 0 || Number(length) > maximum ||
+    keys.length !== Number(length) + 1 || !keys.includes('length')) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  return Object.freeze(Array.from({ length: Number(length) }, (_, index) => {
+    const key = String(index)
+    if (!keys.includes(key)) throw new TypeError(`${label} is sparse`)
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key)
+    } catch {
+      throw new TypeError(`${label} is invalid`)
+    }
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+      descriptor.enumerable !== true) {
+      throw new TypeError(`${label} item is invalid`)
+    }
+    return descriptor.value
+  }))
+}
+
+function assertSortedUnique (
+  values: readonly string[],
+  label: string
+): void {
+  for (let index = 1; index < values.length; index += 1) {
+    if ((values[index - 1] ?? '') >= (values[index] ?? '')) {
+      throw new TypeError(`${label} order is invalid`)
+    }
+  }
+}
+
+export function parseDurationBucketCounts (
+  value: unknown
+): DurationBucketCountsV1 {
+  const input = exactOwnData(value, DURATION_BUCKET_KEYS, 'duration bucket counts')
+  const count = nonNegativeSafeInteger(input.count, 'duration count')
+  const sumMs = nonNegativeSafeInteger(input.sumMs, 'duration sum')
+  const unavailableCount = nonNegativeSafeInteger(
+    input.unavailableCount,
+    'duration unavailable count'
+  )
+  if (count === 0 && sumMs !== 0) {
+    throw new TypeError('duration sum requires a measured sample')
+  }
+  let previous = 0
+  const cumulative = Object.fromEntries(DURATION_CUMULATIVE_KEYS.map(key => {
+    const current = nonNegativeSafeInteger(input[key], `duration ${key}`)
+    if (current < previous || current > count) {
+      throw new TypeError('duration cumulative buckets are invalid')
+    }
+    previous = current
+    return [key, current]
+  })) as Pick<DurationBucketCountsV1, typeof DURATION_CUMULATIVE_KEYS[number]>
+  if (cumulative.inf !== count) {
+    throw new TypeError('duration infinity bucket is invalid')
+  }
+  return Object.freeze({
+    count,
+    sumMs,
+    unavailableCount,
+    ...cumulative
+  })
+}
+
+export function parseRunTraceMetricSummary (
+  value: unknown
+): RunTraceMetricSummaryV1 {
+  const input = exactOwnData(value, METRIC_SUMMARY_KEYS, 'run trace metric summary')
+  if (input.schemaVersion !== 1) {
+    throw new TypeError('run trace metric summary schema is invalid')
+  }
+
+  const providerRequests = Object.freeze(exactArray(
+    input.providerRequests,
+    16,
+    'provider metric rows'
+  ).map(value => {
+    const row = exactOwnData(value, PROVIDER_METRIC_ROW_KEYS, 'provider metric row')
+    if (typeof row.outcome !== 'string' || !PROVIDER_METRIC_OUTCOMES.has(row.outcome) ||
+      typeof row.attemptKind !== 'string' || !PROVIDER_ATTEMPT_KINDS.has(row.attemptKind)) {
+      throw new TypeError('provider metric row fields are invalid')
+    }
+    const count = positiveSafeInteger(row.count, 'provider metric count')
+    const duration = parseDurationBucketCounts(row.duration)
+    if (duration.count + duration.unavailableCount !== count) {
+      throw new TypeError('provider metric duration count is invalid')
+    }
+    return Object.freeze({
+      outcome: row.outcome as RunTraceMetricSummaryV1['providerRequests'][number]['outcome'],
+      attemptKind: row.attemptKind as RunTraceMetricSummaryV1['providerRequests'][number]['attemptKind'],
+      count,
+      duration
+    })
+  }))
+  assertSortedUnique(
+    providerRequests.map(row => `${row.outcome}\0${row.attemptKind}`),
+    'provider metric rows'
+  )
+
+  const toolExecutions = Object.freeze(exactArray(
+    input.toolExecutions,
+    4,
+    'tool metric rows'
+  ).map(value => {
+    const row = exactOwnData(value, TOOL_METRIC_ROW_KEYS, 'tool metric row')
+    if (typeof row.outcome !== 'string' ||
+      !TOOL_METRIC_OUTCOMES.has(row.outcome as ToolAttemptOutcome)) {
+      throw new TypeError('tool metric row fields are invalid')
+    }
+    const count = positiveSafeInteger(row.count, 'tool metric count')
+    const duration = parseDurationBucketCounts(row.duration)
+    if (duration.count + duration.unavailableCount !== count) {
+      throw new TypeError('tool metric duration count is invalid')
+    }
+    return Object.freeze({
+      outcome: row.outcome as ToolAttemptOutcome,
+      count,
+      duration
+    })
+  }))
+  assertSortedUnique(
+    toolExecutions.map(row => row.outcome),
+    'tool metric rows'
+  )
+
+  const approvals = Object.freeze(exactArray(
+    input.approvals,
+    4,
+    'approval metric rows'
+  ).map(value => {
+    const row = exactOwnData(value, APPROVAL_METRIC_ROW_KEYS, 'approval metric row')
+    if (typeof row.decision !== 'string' || !APPROVAL_METRIC_DECISIONS.has(row.decision)) {
+      throw new TypeError('approval metric row fields are invalid')
+    }
+    return Object.freeze({
+      decision: row.decision as RunTraceMetricSummaryV1['approvals'][number]['decision'],
+      count: positiveSafeInteger(row.count, 'approval metric count')
+    })
+  }))
+  assertSortedUnique(
+    approvals.map(row => row.decision),
+    'approval metric rows'
+  )
+
+  return Object.freeze({
+    schemaVersion: 1,
+    providerRequests,
+    toolExecutions,
+    approvals
+  })
 }
 
 export function createFrozenObservationPolicy (input: {
