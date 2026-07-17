@@ -210,6 +210,8 @@ export interface ProductionYunzaiAgentOptions {
   readonly diskLogFactory?: (
     options: GroupMateDiskLogOptions
   ) => Pick<GroupMateDiskLog, 'record' | 'drain'>
+  /** Test-only seam for proving journal-wrapper construction is fail-open. */
+  readonly journaledOutboundFactory?: typeof createJournaledYunzaiOutboundPortFactory
 }
 
 export class ProductionYunzaiAgentAlreadyInitializedError extends Error {
@@ -229,6 +231,51 @@ export class ProductionYunzaiAgentNotInitializedError extends Error {
 interface GraphLifecycle {
   unbindShutdown: (() => void) | null
   shutdownPromise: Promise<number> | null
+}
+
+interface ProductionJournalRuntime {
+  readonly contentJournal?: GroupMateContentJournal
+  readonly outboundFactory: YunzaiOutboundPortFactory
+}
+
+const JOURNAL_INITIALIZATION_FAILURE = Object.freeze({
+  event: 'groupmate.disk_log.initialization_failure',
+  code: 'construction_failed'
+})
+
+function createProductionJournalRuntime (
+  options: ProductionYunzaiAgentOptions,
+  rawOutboundFactory: YunzaiOutboundPortFactory,
+  journalNow: () => Date
+): ProductionJournalRuntime {
+  try {
+    if (options.bridge.config.diskLogEnabled !== true) {
+      return Object.freeze({ outboundFactory: rawOutboundFactory })
+    }
+    const contentJournal = options.contentJournal ?? createGroupMateContentJournal(
+      (options.diskLogFactory ?? (diskLogOptions => new GroupMateDiskLog(diskLogOptions)))({
+        directory: resolvePluginPath('data', 'logs', 'groupmate'),
+        now: journalNow,
+        onFailure: failure => {
+          try {
+            options.bridge.logger?.error?.(Object.freeze({
+              event: failure.event,
+              code: failure.code
+            }))
+          } catch {}
+        }
+      })
+    )
+    const outboundFactory = (
+      options.journaledOutboundFactory ?? createJournaledYunzaiOutboundPortFactory
+    )(rawOutboundFactory, contentJournal, journalNow)
+    return Object.freeze({ contentJournal, outboundFactory })
+  } catch {
+    try {
+      options.bridge.logger?.error?.(JOURNAL_INITIALIZATION_FAILURE)
+    } catch {}
+    return Object.freeze({ outboundFactory: rawOutboundFactory })
+  }
 }
 
 const graphLifecycles = new WeakMap<object, GraphLifecycle>()
@@ -644,27 +691,12 @@ export function createProductionYunzaiAgent (
     ),
     now
   })
-  activeObservabilityRuntime = observability
-  const contentJournal = options.bridge.config.diskLogEnabled === true
-    ? options.contentJournal ?? createGroupMateContentJournal(
-      (options.diskLogFactory ?? (diskLogOptions => new GroupMateDiskLog(diskLogOptions)))({
-        directory: resolvePluginPath('data', 'logs', 'groupmate'),
-        now: journalNow,
-        onFailure: failure => {
-          try {
-            options.bridge.logger?.error?.(Object.freeze({
-              event: failure.event,
-              code: failure.code
-            }))
-          } catch {}
-        }
-      })
-    )
-    : undefined
   const rawOutboundFactory = createYunzaiOutboundPortFactory(options.outboundHost)
-  const outboundFactory = contentJournal === undefined
-    ? rawOutboundFactory
-    : createJournaledYunzaiOutboundPortFactory(rawOutboundFactory, contentJournal, journalNow)
+  const { contentJournal, outboundFactory } = createProductionJournalRuntime(
+    options,
+    rawOutboundFactory,
+    journalNow
+  )
   const progressPresenter = new RunProgressPresenter({
     onAttachment: metadata => observability.registerPolicy(
       metadata.runRef,
@@ -961,6 +993,7 @@ export function createProductionYunzaiAgent (
     }
   })
   graphLifecycles.set(graph, lifecycle)
+  activeObservabilityRuntime = observability
   return graph
 }
 

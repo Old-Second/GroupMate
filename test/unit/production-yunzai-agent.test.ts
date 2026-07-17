@@ -19,6 +19,7 @@ import {
   initializeProductionYunzaiAgent,
   ProductionYunzaiAgentAlreadyInitializedError,
   ProductionYunzaiAgentNotInitializedError,
+  updateProductionObservabilityLevel,
   type ProductionModelPort,
   type ProductionYunzaiAgentOptions
 } from '../../src/runtime/production-yunzai-agent.js'
@@ -205,6 +206,31 @@ function journalStub (drain: () => Promise<void>): GroupMateContentJournal {
   })
 }
 
+test('a graph construction failure never publishes a half initialized observability runtime', async () => {
+  const baseOptions = options(() => undefined)
+  const poisonedConfig = new Proxy(baseOptions.bridge.config, {
+    get (target, property, receiver) {
+      if (property === 'openAiCompatibilityProfile') {
+        throw new Error('injected post-observability graph failure')
+      }
+      return Reflect.get(target, property, receiver)
+    }
+  })
+
+  assert.throws(() => createProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: { ...baseOptions.bridge, config: poisonedConfig }
+  }), /injected post-observability graph failure/)
+  assert.deepEqual(
+    await updateProductionObservabilityLevel('off'),
+    { kind: 'barrier_pending' }
+  )
+  assert.deepEqual(
+    await updateProductionObservabilityLevel('basic'),
+    { kind: 'applied' }
+  )
+})
+
 test('production initializer owns one complete graph and rejects every reinitialization', async () => {
   assert.throws(
     () => getProductionYunzaiAgent(),
@@ -213,26 +239,31 @@ test('production initializer owns one complete graph and rejects every reinitial
   const beforeSigint = process.listenerCount('SIGINT')
   const beforeSigterm = process.listenerCount('SIGTERM')
   let modelFactoryCalls = 0
-  let drainCalls = 0
-  let releaseDrain: (() => void) | undefined
-  const blockedDrain = new Promise<void>(resolve => { releaseDrain = resolve })
+  const failures: Array<Readonly<Record<string, unknown>>> = []
+  let diskFactoryCalls = 0
   const baseOptions = options(() => { modelFactoryCalls += 1 })
   const graph = initializeProductionYunzaiAgent({
     ...baseOptions,
     bridge: {
       ...baseOptions.bridge,
-      config: Object.freeze({ ...baseOptions.bridge.config, diskLogEnabled: true })
+      config: Object.freeze({ ...baseOptions.bridge.config, diskLogEnabled: true }),
+      logger: Object.freeze({ error: event => { failures.push(event) } })
     },
-    contentJournal: journalStub(async () => {
-      drainCalls += 1
-      await blockedDrain
-    })
+    diskLogFactory: () => {
+      diskFactoryCalls += 1
+      throw new Error('injected disk factory failure')
+    }
   })
 
   assert.equal(getProductionYunzaiAgent(), graph)
   assert.equal(modelFactoryCalls, 1)
   assert.equal(process.listenerCount('SIGINT'), beforeSigint + 1)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm + 1)
+  assert.equal(diskFactoryCalls, 1)
+  assert.deepEqual(failures, [Object.freeze({
+    event: 'groupmate.disk_log.initialization_failure',
+    code: 'construction_failed'
+  })])
   assert.deepEqual(Reflect.ownKeys(graph), [
     'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
@@ -257,13 +288,7 @@ test('production initializer owns one complete graph and rejects every reinitial
   assert.equal(process.listenerCount('SIGINT'), beforeSigint + 1)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm + 1)
 
-  const shutdown = graph.shutdown('unit_test')
-  while (drainCalls === 0) await new Promise(resolve => setTimeout(resolve, 1))
-  assert.equal(process.listenerCount('SIGINT'), beforeSigint + 1)
-  assert.equal(process.listenerCount('SIGTERM'), beforeSigterm + 1)
-  releaseDrain?.()
-  await shutdown
-  assert.equal(drainCalls, 1)
+  await graph.shutdown('unit_test')
   assert.equal(process.listenerCount('SIGINT'), beforeSigint)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm)
 })

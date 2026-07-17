@@ -23,6 +23,31 @@ const CROSS_CHANNEL_POLICIES = new Set(['disabled', 'master', 'everyone'])
 const OPENAI_COMPATIBILITY_PROFILES = new Set(['standard', 'deepseek'])
 const OBSERVABILITY_LEVELS = new Set(['off', 'basic', 'diagnostic'])
 
+export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
+  'toggleMode',
+  'apiKey',
+  'openAiBaseUrl',
+  'openAiCompatibilityProfile',
+  'proxy',
+  'headless',
+  'chromePath',
+  'diskLogEnabled'
+])
+
+const SAVED_MESSAGE = '保存成功~'
+const RESTART_REQUIRED_MESSAGE = '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
+
+export function guobaConfigSaveMessage (
+  changedFields: Iterable<string>,
+  priorityMessage: string | null = null
+): string {
+  if (priorityMessage !== null) return priorityMessage
+  for (const field of changedFields) {
+    if (RESTART_REQUIRED_CONFIG_FIELDS.has(field)) return RESTART_REQUIRED_MESSAGE
+  }
+  return SAVED_MESSAGE
+}
+
 function splitList (value: unknown, separator: RegExp): string[] {
   const values = Array.isArray(value) ? value : String(value ?? '').split(separator)
   const seen = new Set<string>()

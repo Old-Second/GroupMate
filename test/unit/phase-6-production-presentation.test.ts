@@ -15,7 +15,10 @@ import type { PresentationSettings } from '../../src/runtime/presentation/presen
 import {
   SESSION_PERSISTENCE_FAILED_MESSAGE
 } from '../../src/runtime/presentation/response-presentation-safety.js'
-import type { OutboundPart } from '../../src/runtime/presentation/yunzai-outbound-port.js'
+import type {
+  OutboundPart,
+  YunzaiOutboundPortFactory
+} from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import {
   createProductionYunzaiAgent,
   type ProductionModelPort,
@@ -30,6 +33,10 @@ import type {
   GroupMateContentJournal,
   GroupMateOutboundJournalEvent
 } from '../../src/runtime/logging/groupmate-content-journal.js'
+import type {
+  GroupMateDiskLogEvent,
+  GroupMateDiskLogOptions
+} from '../../src/runtime/logging/groupmate-disk-log.js'
 import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import type { BymPolicySnapshot } from '../../src/runtime/yunzai-bym-controller.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
@@ -123,6 +130,18 @@ interface GraphFixtureOptions {
   readonly journalNow?: () => Date
   readonly now?: () => Date
   readonly promptPrefixOverride?: string
+  readonly logger?: ProductionYunzaiAgentOptions['bridge']['logger']
+  readonly diskLogFactory?: (
+    options: GroupMateDiskLogOptions
+  ) => Readonly<{
+    record(event: GroupMateDiskLogEvent): void
+    drain(): Promise<void>
+  }>
+  readonly journaledOutboundFactory?: (
+    delegate: YunzaiOutboundPortFactory,
+    journal: GroupMateContentJournal,
+    now: () => Date
+  ) => YunzaiOutboundPortFactory
 }
 
 class RecordingContentJournal implements GroupMateContentJournal {
@@ -197,7 +216,8 @@ function graphFixture (input: GraphFixtureOptions) {
       getMasterIds: async () => Object.freeze(['7']),
       getBotId: () => 'bot-1',
       segment: () => Object.freeze({}),
-      botPicker
+      botPicker,
+      ...(input.logger === undefined ? {} : { logger: input.logger })
     },
     botPicker,
     outboundHost: Object.freeze({
@@ -302,7 +322,11 @@ function graphFixture (input: GraphFixtureOptions) {
     now: input.now ?? (() => new Date(createdAt)),
     monotonicNow: () => 10,
     ...(input.contentJournal === undefined ? {} : { contentJournal: input.contentJournal }),
-    ...(input.journalNow === undefined ? {} : { journalNow: input.journalNow })
+    ...(input.journalNow === undefined ? {} : { journalNow: input.journalNow }),
+    ...(input.diskLogFactory === undefined ? {} : { diskLogFactory: input.diskLogFactory }),
+    ...(input.journaledOutboundFactory === undefined
+      ? {}
+      : { journaledOutboundFactory: input.journaledOutboundFactory })
   }
   const graph = createProductionYunzaiAgent(options)
   return {
@@ -578,6 +602,74 @@ function fixedModel (text = '日志正文'): ProductionModelPort & {
     }
   })
 }
+
+const journalInitializationFailure = Object.freeze({
+  event: 'groupmate.disk_log.initialization_failure',
+  code: 'construction_failed'
+})
+
+test('disk journal construction failure falls back to the raw production graph', async () => {
+  const host = hostFixture()
+  const failures: Array<Readonly<Record<string, unknown>>> = []
+  let factoryCalls = 0
+  const fixture = graphFixture({
+    model: fixedModel('构造失败仍可回复'),
+    bot: host.bot,
+    diskLogEnabled: true,
+    diskLogFactory: () => {
+      factoryCalls += 1
+      throw new Error('sensitive disk path and content')
+    },
+    logger: Object.freeze({
+      error: event => {
+        failures.push(event)
+        throw new Error('injected logger failure')
+      }
+    })
+  })
+
+  assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+    marker: '落盘构造失败', actorId: 'actor-disk-failure'
+  }, host)), true)
+  assert.equal(deliveredText(fixture.dispatches[0]?.part as OutboundPart), '构造失败仍可回复')
+  assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  assert.equal(factoryCalls, 1)
+  assert.equal(failures.length, 1)
+  assert.deepEqual(failures[0], journalInitializationFailure)
+  assert.deepEqual(Reflect.ownKeys(failures[0] ?? {}), ['event', 'code'])
+  assert.equal(Object.isFrozen(failures[0]), true)
+  assert.doesNotMatch(JSON.stringify(failures), /sensitive|path|content|target|config/i)
+})
+
+test('outbound journal wrapper construction failure discards the journal and falls back once', async () => {
+  const host = hostFixture()
+  const journal = new RecordingContentJournal()
+  const failures: Array<Readonly<Record<string, unknown>>> = []
+  let wrapperCalls = 0
+  const fixture = graphFixture({
+    model: fixedModel('包装失败仍可回复'),
+    bot: host.bot,
+    diskLogEnabled: true,
+    contentJournal: journal,
+    journaledOutboundFactory: () => {
+      wrapperCalls += 1
+      throw new Error('hostile journal wrapper')
+    },
+    logger: Object.freeze({ error: event => { failures.push(event) } })
+  })
+
+  assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+    marker: '日志包装失败', actorId: 'actor-wrapper-failure'
+  }, host)), true)
+  assert.equal(deliveredText(fixture.dispatches[0]?.part as OutboundPart), '包装失败仍可回复')
+  assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  assert.equal(wrapperCalls, 1)
+  assert.deepEqual(failures, [journalInitializationFailure])
+  assert.equal(journal.requests.length, 0)
+  assert.equal(journal.runEvents.length, 0)
+  assert.equal(journal.outboundEvents.length, 0)
+  assert.equal(journal.drainCalls, 0)
+})
 
 test('enabled production journal receives one complete request, provider run and outbound flow', async () => {
   const host = hostFixture()

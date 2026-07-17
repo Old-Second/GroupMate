@@ -430,7 +430,7 @@ test('Guoba accurately marks restart-only and deferred rendering settings', asyn
 
   for (const field of [
     'toggleMode', 'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile',
-    'proxy', 'headless', 'chromePath'
+    'proxy', 'headless', 'chromePath', 'diskLogEnabled'
   ]) {
     assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
   }
@@ -444,8 +444,7 @@ test('Guoba accurately marks restart-only and deferred rendering settings', asyn
   }
 
   const support = await readSource('guoba.support.js')
-  assert.match(support, /RESTART_REQUIRED_CONFIG_FIELDS/)
-  assert.match(support, /部分模型传输、运行入口或 Chromium 配置将在重启后生效/)
+  assert.match(support, /guobaConfigSaveMessage/)
 })
 
 test('Guoba configures leading name recognition as an enabled-by-default switch', async () => {

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { normalizeGuobaConfigValue } from '../../src/runtime/guoba-config.js'
+import {
+  guobaConfigSaveMessage,
+  normalizeGuobaConfigValue
+} from '../../src/runtime/guoba-config.js'
 
 test('normalizes editable Guoba list fields into unique trimmed values', () => {
   assert.deepEqual(
@@ -75,5 +78,18 @@ test('normalizes the three observability levels fail closed', () => {
   assert.throws(
     () => normalizeGuobaConfigValue('observabilityLevel', 'debug'),
     /可观测性级别配置无效/
+  )
+})
+
+test('disk log saves require restart while ordinary live fields keep the normal result', () => {
+  assert.equal(
+    guobaConfigSaveMessage(['diskLogEnabled']),
+    '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
+  )
+  assert.equal(guobaConfigSaveMessage(['debug']), '保存成功~')
+  assert.equal(guobaConfigSaveMessage([]), '保存成功~')
+  assert.equal(
+    guobaConfigSaveMessage(['diskLogEnabled'], '观测屏障优先'),
+    '观测屏障优先'
   )
 })
