@@ -1,8 +1,53 @@
-import { parseRunTerminalSnapshot } from '../agent/run/run-observation.js';
-import { parseTerminalCommitReceipt } from '../agent/run/run-store.js';
 import { readChatErrorMetadata } from './chat-error-presentation.js';
+import { parseObservationEvent } from './observability/observation-event.js';
+export { SafeObservationFailureLogLimiter, createObservationSinkFailureLog, createPresentationObservationLog, createRequestObservationLog } from './observability/safe-observation-logging.js';
+const TERMINAL_SNAPSHOT_LOG_KEYS = Object.freeze([
+    'schemaVersion',
+    'observationId',
+    'runRef',
+    'revision',
+    'status',
+    'finishedAt',
+    'completion',
+    'errorCode',
+    'cancellationReason',
+    'counters',
+    'engineDurationMs'
+]);
+const TERMINAL_RECEIPT_LOG_KEYS = Object.freeze([
+    'schemaVersion',
+    'observationId',
+    'runRef',
+    'revision',
+    'deletedKeyCount',
+    'createdKeyCount',
+    'checkpointBytesDeleted',
+    'eventBytesDeleted',
+    'tombstoneBytes'
+]);
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
+}
+function projectOwnData(value, keys, label) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    const input = value;
+    const output = {};
+    for (const key of keys) {
+        let descriptor;
+        try {
+            descriptor = Object.getOwnPropertyDescriptor(input, key);
+        }
+        catch {
+            throw new TypeError(`${label} is invalid`);
+        }
+        if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+            throw new TypeError(`${label} property is invalid`);
+        }
+        output[key] = descriptor.value;
+    }
+    return output;
 }
 function getSafeMode(mode) {
     return typeof mode === 'string' && /^[a-z0-9_-]{1,32}$/i.test(mode)
@@ -69,30 +114,16 @@ export function createMessageInputLog(input) {
     };
 }
 export function createAgentRunLog(snapshotValue, receiptValue) {
-    const snapshot = parseRunTerminalSnapshot({
-        schemaVersion: snapshotValue.schemaVersion,
-        observationId: snapshotValue.observationId,
-        runRef: snapshotValue.runRef,
-        revision: snapshotValue.revision,
-        status: snapshotValue.status,
-        finishedAt: snapshotValue.finishedAt,
-        completion: snapshotValue.completion,
-        errorCode: snapshotValue.errorCode,
-        cancellationReason: snapshotValue.cancellationReason,
-        counters: snapshotValue.counters,
-        engineDurationMs: snapshotValue.engineDurationMs
-    });
-    const receipt = parseTerminalCommitReceipt({
-        schemaVersion: receiptValue.schemaVersion,
-        observationId: receiptValue.observationId,
-        runRef: receiptValue.runRef,
-        revision: receiptValue.revision,
-        deletedKeyCount: receiptValue.deletedKeyCount,
-        createdKeyCount: receiptValue.createdKeyCount,
-        checkpointBytesDeleted: receiptValue.checkpointBytesDeleted,
-        eventBytesDeleted: receiptValue.eventBytesDeleted,
-        tombstoneBytes: receiptValue.tombstoneBytes
-    });
+    const snapshot = parseObservationEvent({
+        schemaVersion: 1,
+        type: 'terminal_snapshot',
+        value: projectOwnData(snapshotValue, TERMINAL_SNAPSHOT_LOG_KEYS, 'terminal snapshot log input')
+    }).value;
+    const receipt = parseObservationEvent({
+        schemaVersion: 1,
+        type: 'terminal_commit',
+        value: projectOwnData(receiptValue, TERMINAL_RECEIPT_LOG_KEYS, 'terminal receipt log input')
+    }).value;
     if (snapshot.observationId !== receipt.observationId ||
         snapshot.runRef !== receipt.runRef || snapshot.revision !== receipt.revision) {
         throw new TypeError('agent run facts do not match');

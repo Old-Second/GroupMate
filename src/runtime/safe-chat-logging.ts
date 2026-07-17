@@ -1,14 +1,45 @@
 import {
-  parseRunTerminalSnapshot,
   type RunTerminalSnapshotV2
 } from '../agent/run/run-observation.js'
 import {
-  parseTerminalCommitReceipt,
   type TerminalCommitReceiptV1
 } from '../agent/run/run-store.js'
 import { readChatErrorMetadata } from './chat-error-presentation.js'
+import { parseObservationEvent } from './observability/observation-event.js'
+
+export {
+  SafeObservationFailureLogLimiter,
+  createObservationSinkFailureLog,
+  createPresentationObservationLog,
+  createRequestObservationLog
+} from './observability/safe-observation-logging.js'
 
 type UnknownRecord = Record<string, unknown>
+
+const TERMINAL_SNAPSHOT_LOG_KEYS = Object.freeze([
+  'schemaVersion',
+  'observationId',
+  'runRef',
+  'revision',
+  'status',
+  'finishedAt',
+  'completion',
+  'errorCode',
+  'cancellationReason',
+  'counters',
+  'engineDurationMs'
+])
+const TERMINAL_RECEIPT_LOG_KEYS = Object.freeze([
+  'schemaVersion',
+  'observationId',
+  'runRef',
+  'revision',
+  'deletedKeyCount',
+  'createdKeyCount',
+  'checkpointBytesDeleted',
+  'eventBytesDeleted',
+  'tombstoneBytes'
+])
 
 interface ChatRequestLogInput {
   mode?: unknown
@@ -38,6 +69,31 @@ interface MessageInputLogInput {
 
 function isRecord (value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null
+}
+
+function projectOwnData (
+  value: unknown,
+  keys: readonly string[],
+  label: string
+): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  const input = value as Record<PropertyKey, unknown>
+  const output: Record<string, unknown> = {}
+  for (const key of keys) {
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(input, key)
+    } catch {
+      throw new TypeError(`${label} is invalid`)
+    }
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      throw new TypeError(`${label} property is invalid`)
+    }
+    output[key] = descriptor.value
+  }
+  return output
 }
 
 function getSafeMode (mode: unknown): string {
@@ -118,30 +174,24 @@ export function createAgentRunLog (
   snapshotValue: RunTerminalSnapshotV2,
   receiptValue: TerminalCommitReceiptV1
 ) {
-  const snapshot = parseRunTerminalSnapshot({
-    schemaVersion: snapshotValue.schemaVersion,
-    observationId: snapshotValue.observationId,
-    runRef: snapshotValue.runRef,
-    revision: snapshotValue.revision,
-    status: snapshotValue.status,
-    finishedAt: snapshotValue.finishedAt,
-    completion: snapshotValue.completion,
-    errorCode: snapshotValue.errorCode,
-    cancellationReason: snapshotValue.cancellationReason,
-    counters: snapshotValue.counters,
-    engineDurationMs: snapshotValue.engineDurationMs
-  })
-  const receipt = parseTerminalCommitReceipt({
-    schemaVersion: receiptValue.schemaVersion,
-    observationId: receiptValue.observationId,
-    runRef: receiptValue.runRef,
-    revision: receiptValue.revision,
-    deletedKeyCount: receiptValue.deletedKeyCount,
-    createdKeyCount: receiptValue.createdKeyCount,
-    checkpointBytesDeleted: receiptValue.checkpointBytesDeleted,
-    eventBytesDeleted: receiptValue.eventBytesDeleted,
-    tombstoneBytes: receiptValue.tombstoneBytes
-  })
+  const snapshot = parseObservationEvent({
+    schemaVersion: 1,
+    type: 'terminal_snapshot',
+    value: projectOwnData(
+      snapshotValue,
+      TERMINAL_SNAPSHOT_LOG_KEYS,
+      'terminal snapshot log input'
+    )
+  }).value as RunTerminalSnapshotV2
+  const receipt = parseObservationEvent({
+    schemaVersion: 1,
+    type: 'terminal_commit',
+    value: projectOwnData(
+      receiptValue,
+      TERMINAL_RECEIPT_LOG_KEYS,
+      'terminal receipt log input'
+    )
+  }).value as TerminalCommitReceiptV1
   if (snapshot.observationId !== receipt.observationId ||
     snapshot.runRef !== receipt.runRef || snapshot.revision !== receipt.revision) {
     throw new TypeError('agent run facts do not match')
