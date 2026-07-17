@@ -398,6 +398,404 @@ test('resolves a flat reply segment when the adapter does not expose event.sourc
   assert.equal(parseInputPayload(result.prompt).quotedMessage.content, 'quoted from segment')
 })
 
+test('recovers a raw OneBot reply when the host adapter drops its projected source', async () => {
+  const rawApiCalls: unknown[][] = []
+  const projectedMessageCalls: unknown[] = []
+  const groupCalls: unknown[][] = []
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message_id: 'current-message',
+      message: [{ type: 'text', text: 'current' }],
+      bot: {
+        async getMsg (messageId: unknown) {
+          projectedMessageCalls.push(messageId)
+          throw new Error('target unavailable through projected lookup')
+        },
+        async sendApi (...args: unknown[]) {
+          rawApiCalls.push(args)
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: {
+              message_id: 'current-message',
+              group_id: 'group-1',
+              message: [
+                { type: 'reply', data: { id: 'quoted-message' } },
+                { type: 'text', data: { text: 'current' } }
+              ]
+            }
+          }
+        }
+      },
+      group: {
+        async getChatHistory (...args: unknown[]) {
+          groupCalls.push(args)
+          return [{
+            message_id: 'quoted-message',
+            sender: { user_id: 'actor-2', nickname: 'quoted member' },
+            message: [{ type: 'text', text: 'quoted from raw OneBot data' }]
+          }]
+        }
+      }
+    }
+  })
+
+  assert.deepEqual(rawApiCalls, [['get_msg', { message_id: 'current-message' }]])
+  assert.deepEqual(projectedMessageCalls, ['quoted-message'])
+  assert.deepEqual(groupCalls, [['quoted-message', 1]])
+  assert.equal(result.hasReply, true)
+  assert.equal(result.replyResolved, true)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'quoted from raw OneBot data'
+  )
+})
+
+test('rejects a raw current-message reply from another group before projected fallback', async () => {
+  const projectedMessageCalls: unknown[] = []
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message_id: 'current-message',
+      message: [{ type: 'text', text: 'current' }],
+      bot: {
+        async sendApi () {
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: {
+              message_id: 'current-message',
+              group_id: 'group-2',
+              message: [{ type: 'reply', data: { id: 'cross-group-message' } }]
+            }
+          }
+        },
+        async getMsg (messageId: unknown) {
+          projectedMessageCalls.push(messageId)
+          if (messageId === 'current-message') {
+            return {
+              message_id: 'current-message',
+              group_id: 'group-1',
+              message: [{ type: 'text', text: 'current' }],
+              source: { message_id: 'quoted-message' }
+            }
+          }
+          return {
+            message_id: 'quoted-message',
+            group_id: 'group-1',
+            sender: { user_id: 'actor-2', nickname: 'quoted member' },
+            message: [{ type: 'text', text: 'scoped quoted content' }]
+          }
+        }
+      }
+    }
+  })
+
+  assert.deepEqual(projectedMessageCalls, ['current-message', 'quoted-message'])
+  assert.equal(result.replyResolved, true)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'scoped quoted content'
+  )
+})
+
+test('keeps an ordinary raw OneBot message out of reply fallback paths', async () => {
+  let rawApiCalls = 0
+  let projectedMessageCalls = 0
+  let historyCalls = 0
+  const result = await buildModelMessageInput({
+    currentPrompt: 'ordinary current request',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message_id: 'current-message',
+      message: [{ type: 'text', text: 'ordinary current request' }],
+      bot: {
+        async sendApi () {
+          rawApiCalls++
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: {
+              message_id: 'current-message',
+              group_id: 'group-1',
+              message: [{ type: 'text', data: { text: 'ordinary current request' } }]
+            }
+          }
+        },
+        async getMsg () {
+          projectedMessageCalls++
+          throw new Error('ordinary message must not use projected fallback')
+        }
+      },
+      group: {
+        async getChatHistory () {
+          historyCalls++
+          return []
+        }
+      }
+    }
+  })
+
+  assert.equal(rawApiCalls, 1)
+  assert.equal(projectedMessageCalls, 0)
+  assert.equal(historyCalls, 0)
+  assert.equal(result.prompt, 'ordinary current request')
+  assert.equal(result.hasReply, false)
+  assert.equal(result.replyResolved, false)
+  assert.equal(result.quotedMessageId, null)
+})
+
+test('falls through every failed direct resolver before using the scoped sequence', async () => {
+  const calls: string[] = []
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message_id: 'current-message',
+      message: [{ type: 'text', text: 'current' }],
+      getReply: async () => {
+        calls.push('getReply')
+        throw new Error('canonical resolver unavailable')
+      },
+      bot: {
+        async sendApi () {
+          calls.push('sendApi:current-message')
+          throw new Error('raw current lookup unavailable')
+        },
+        async getMsg (messageId: unknown) {
+          calls.push(`getMsg:${String(messageId)}`)
+          if (messageId === 'current-message') {
+            return {
+              message_id: 'current-message',
+              group_id: 'group-1',
+              message: [{ type: 'text', text: 'current' }],
+              source: { seq: 42, message_id: 'quoted-message' }
+            }
+          }
+          throw new Error('direct target lookup unavailable')
+        }
+      },
+      group: {
+        async getChatHistory (cursor: unknown, count: number) {
+          calls.push(`history:${String(cursor)}:${count}`)
+          return [{
+            message_id: 'quoted-message',
+            sender: { user_id: 'actor-2', nickname: 'quoted member' },
+            message: [{ type: 'text', text: 'quoted through scoped history' }]
+          }]
+        }
+      }
+    }
+  })
+
+  assert.deepEqual(calls, [
+    'sendApi:current-message',
+    'getMsg:current-message',
+    'getReply',
+    'getMsg:quoted-message',
+    'history:42:1'
+  ])
+  assert.equal(result.replyResolved, true)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'quoted through scoped history'
+  )
+})
+
+test('reads the quoted target directly when history lookup cannot resolve a raw reply', async () => {
+  const projectedMessageCalls: unknown[] = []
+  let historyCalls = 0
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message_id: 'current-message',
+      message: [{ type: 'text', text: 'current' }],
+      bot: {
+        async sendApi () {
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: {
+              message_id: 'current-message',
+              group_id: 'group-1',
+              message: [{ type: 'reply', data: { id: 'quoted-message' } }]
+            }
+          }
+        },
+        async getMsg (messageId: unknown) {
+          projectedMessageCalls.push(messageId)
+          return {
+            message_id: 'quoted-message',
+            group_id: 'group-1',
+            sender: { user_id: 'actor-2', nickname: 'quoted member' },
+            message: [{ type: 'text', text: 'quoted from direct lookup' }]
+          }
+        }
+      },
+      group: {
+        async getChatHistory () {
+          historyCalls++
+          return []
+        }
+      }
+    }
+  })
+
+  assert.deepEqual(projectedMessageCalls, ['quoted-message'])
+  assert.equal(historyCalls, 0)
+  assert.equal(result.replyResolved, true)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'quoted from direct lookup'
+  )
+})
+
+test('uses the canonical Yunzai reply reference and resolver when available', async () => {
+  let replyCalls = 0
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      reply_id: 'quoted-message',
+      getReply: async () => {
+        replyCalls++
+        return {
+          message_id: 'quoted-message',
+          sender: { user_id: 'actor-2', nickname: 'quoted member' },
+          message: [{ type: 'text', text: 'quoted through Yunzai' }]
+        }
+      },
+      message: [{ type: 'text', text: 'current' }]
+    }
+  })
+
+  assert.equal(replyCalls, 1)
+  assert.equal(result.hasReply, true)
+  assert.equal(result.replyResolved, true)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'quoted through Yunzai'
+  )
+})
+
+test('uses a reply message id for direct lookup without confusing it with history sequence', async () => {
+  const projectedMessageCalls: unknown[] = []
+  let historyCalls = 0
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      source: { seq: 42, message_id: 'quoted-message' },
+      message: [{ type: 'text', text: 'current' }],
+      bot: {
+        async getMsg (messageId: unknown) {
+          projectedMessageCalls.push(messageId)
+          if (messageId !== 'quoted-message') throw new Error('not a message id')
+          return {
+            message_id: 'quoted-message',
+            group_id: 'group-1',
+            sender: { user_id: 'actor-2', nickname: 'quoted member' },
+            message: [{ type: 'text', text: 'quoted by message id' }]
+          }
+        }
+      },
+      group: {
+        async getChatHistory () {
+          historyCalls++
+          return []
+        }
+      }
+    }
+  })
+
+  assert.deepEqual(projectedMessageCalls, ['quoted-message'])
+  assert.equal(historyCalls, 0)
+  assert.equal(result.replyResolved, true)
+  assert.equal(
+    parseInputPayload(result.prompt).quotedMessage.content,
+    'quoted by message id'
+  )
+})
+
+for (const directCandidate of [
+  {
+    label: 'another group',
+    value: {
+      message_id: 'quoted-message',
+      group_id: 'group-2',
+      message: [{ type: 'text', text: 'cross-group content' }]
+    }
+  },
+  {
+    label: 'another message id',
+    value: {
+      message_id: 'different-message',
+      group_id: 'group-1',
+      message: [{ type: 'text', text: 'wrong-message content' }]
+    }
+  },
+  {
+    label: 'an empty placeholder',
+    value: {
+      message_id: 'quoted-message',
+      group_id: 'group-1',
+      message: []
+    }
+  }
+] as const) {
+  test(`rejects direct reply data from ${directCandidate.label} before scoped history`, async () => {
+    let historyCalls = 0
+    const result = await buildModelMessageInput({
+      currentPrompt: 'current',
+      event: {
+        isGroup: true,
+        group_id: 'group-1',
+        source: { seq: 42, message_id: 'quoted-message' },
+        message: [{ type: 'text', text: 'current' }],
+        bot: {
+          async getMsg () {
+            return directCandidate.value
+          }
+        },
+        group: {
+          async getChatHistory () {
+            historyCalls++
+            return [{
+              message_id: 'quoted-message',
+              group_id: 'group-1',
+              sender: { user_id: 'actor-2', nickname: 'quoted member' },
+              message: [{ type: 'text', text: 'scoped quoted content' }]
+            }]
+          }
+        }
+      }
+    })
+
+    assert.equal(historyCalls, 1)
+    assert.equal(result.replyResolved, true)
+    assert.equal(result.quotedMessageId, 'quoted-message')
+    assert.equal(
+      parseInputPayload(result.prompt).quotedMessage.content,
+      'scoped quoted content'
+    )
+  })
+}
+
 test('recovers structured NapCat reply media after re-reading the current message', async () => {
   const botCalls: unknown[] = []
   const groupCalls: unknown[][] = []
@@ -405,6 +803,7 @@ test('recovers structured NapCat reply media after re-reading the current messag
     currentPrompt: 'current',
     event: {
       isGroup: true,
+      group_id: 'group-1',
       message_id: 'current-message',
       message: [
         { type: 'at', qq: 'bot', text: '@GroupMate' },
@@ -413,7 +812,13 @@ test('recovers structured NapCat reply media after re-reading the current messag
       bot: {
         async getMsg (messageId: unknown) {
           botCalls.push(messageId)
+          if (messageId === 'quoted-message') {
+            throw new Error('target requires history lookup')
+          }
           return {
+            message_id: 'current-message',
+            group_id: 'group-1',
+            message: [{ type: 'text', text: 'current' }],
             source: {
               message_id: 'quoted-message',
               sender: { nickname: 'quoted-member', user_id: '10001' },
@@ -439,7 +844,7 @@ test('recovers structured NapCat reply media after re-reading the current messag
     }
   })
 
-  assert.deepEqual(botCalls, ['current-message'])
+  assert.deepEqual(botCalls, ['current-message', 'quoted-message'])
   assert.deepEqual(groupCalls, [['quoted-message', 1]])
   assert.equal(result.hasReply, true)
   assert.equal(result.replyResolved, true)

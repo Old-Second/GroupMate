@@ -54,6 +54,9 @@ function getReplyCursor(event, source) {
     }
     return source.time ?? source.seq ?? source.message_id ?? source.id;
 }
+function getReplyMessageId(event, source) {
+    return source.message_id ?? source.id ?? event.reply_id;
+}
 function findReplySegment(message) {
     if (!Array.isArray(message))
         return undefined;
@@ -69,38 +72,110 @@ function findReplySegment(message) {
     }
     return undefined;
 }
+function oneBotMessage(value) {
+    if (!isRecord(value))
+        return undefined;
+    const candidate = isRecord(value.data) ? value.data : value;
+    if (!Array.isArray(candidate.message) && !isRecord(candidate.source))
+        return undefined;
+    return candidate;
+}
 function hasReplyContent(source) {
-    return Array.isArray(source.message) ||
-        typeof source.message === 'string' ||
-        typeof source.raw_message === 'string';
+    return (Array.isArray(source.message) && source.message.length > 0) ||
+        (typeof source.message === 'string' && source.message.trim() !== '') ||
+        (typeof source.raw_message === 'string' && source.raw_message.trim() !== '');
+}
+function isScopedMessage(event, requestedMessageId, value) {
+    if (!isRecord(value) || !hasReplyContent(value))
+        return false;
+    const requested = getBoundedMessageId(requestedMessageId);
+    const actual = getBoundedMessageId(value.message_id ?? value.id);
+    if (requested === undefined || actual !== requested)
+        return false;
+    const groupId = getBoundedMessageId(event.group_id);
+    if (event.isGroup === true || groupId !== undefined) {
+        return groupId !== undefined && getBoundedMessageId(value.group_id) === groupId;
+    }
+    const actorId = getBoundedMessageId(event.user_id);
+    if (actorId === undefined)
+        return false;
+    const sender = isRecord(value.sender) ? value.sender : {};
+    return [value.user_id, value.target_id, value.peer_id, sender.user_id]
+        .some(candidate => getBoundedMessageId(candidate) === actorId);
 }
 async function resolveReplyReference(event, source) {
-    if (Array.isArray(source.message))
+    if (Array.isArray(source.message) && source.message.length > 0)
         return source;
     const fallback = hasReplyContent(source) ? source : undefined;
     const reader = event.isGroup === true ? event.group : event.friend;
     const cursor = getReplyCursor(event, source);
-    if (!reader || cursor === undefined || cursor === null)
-        return fallback;
-    try {
-        const history = await reader.getChatHistory(cursor, 1);
-        if (!Array.isArray(history))
-            return fallback;
-        const reply = history.at(-1);
-        return isRecord(reply) ? reply : fallback;
+    const messageId = getReplyMessageId(event, source);
+    if (event.getReply) {
+        try {
+            const reply = await event.getReply();
+            if (isRecord(reply) && hasReplyContent(reply))
+                return reply;
+        }
+        catch {
+            // Fall through to adapter-level message lookup.
+        }
     }
-    catch {
-        return fallback;
+    if (messageId !== undefined && messageId !== null && event.bot?.getMsg) {
+        try {
+            const reply = await event.bot.getMsg(messageId);
+            if (isScopedMessage(event, messageId, reply))
+                return reply;
+        }
+        catch {
+            // Keep the structural reply reference even when its content is unavailable.
+        }
     }
+    if (reader && cursor !== undefined && cursor !== null) {
+        try {
+            const history = await reader.getChatHistory(cursor, 1);
+            if (Array.isArray(history)) {
+                const reply = history.at(-1);
+                if (isRecord(reply) && hasReplyContent(reply))
+                    return reply;
+            }
+        }
+        catch {
+            // Keep the structural reply reference even when its content is unavailable.
+        }
+    }
+    return fallback;
 }
 async function findReplyMessage(event) {
-    let source = isRecord(event.source) ? event.source : findReplySegment(event.message);
+    const canonicalReplyId = getBoundedMessageId(event.reply_id);
+    let source = isRecord(event.source)
+        ? event.source
+        : canonicalReplyId === undefined
+            ? findReplySegment(event.message)
+            : { message_id: canonicalReplyId };
     if (!source) {
         const currentMessageId = event.message_id ?? event.seq;
-        if (currentMessageId !== undefined && currentMessageId !== null && event.bot?.getMsg) {
+        let rawCurrentInspected = false;
+        if (currentMessageId !== undefined && currentMessageId !== null && event.bot?.sendApi) {
+            try {
+                const currentMessage = oneBotMessage(await event.bot.sendApi('get_msg', {
+                    message_id: currentMessageId
+                }));
+                if (isScopedMessage(event, currentMessageId, currentMessage)) {
+                    rawCurrentInspected = true;
+                    source = isRecord(currentMessage.source)
+                        ? currentMessage.source
+                        : findReplySegment(currentMessage.message);
+                }
+            }
+            catch {
+                rawCurrentInspected = false;
+            }
+        }
+        if (!source && !rawCurrentInspected && currentMessageId !== undefined &&
+            currentMessageId !== null && event.bot?.getMsg) {
             try {
                 const currentMessage = await event.bot.getMsg(currentMessageId);
-                if (isRecord(currentMessage)) {
+                if (isScopedMessage(event, currentMessageId, currentMessage)) {
                     source = isRecord(currentMessage.source)
                         ? currentMessage.source
                         : findReplySegment(currentMessage.message);
