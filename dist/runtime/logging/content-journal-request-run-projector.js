@@ -257,7 +257,7 @@ function projectTerminalCheckpointResources(checkpoint) {
                 ? Object.freeze({ ...call, result: projectToolResultResources(call.result) })
                 : call)))
         });
-    return parseRunCheckpoint({
+    return Object.freeze({
         ...checkpoint,
         output,
         toolLedgers,

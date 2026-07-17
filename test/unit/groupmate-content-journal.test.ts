@@ -354,6 +354,63 @@ function terminalContentFixture (): Readonly<{
   })
 }
 
+function terminalUnicodeResourcesFixture (): Readonly<{
+  checkpoint: RunCheckpoint
+  receipt: ReturnType<typeof parseTerminalCommitReceipt>
+  ledgerSourceUrl: string
+  ledgerLoggedUrl: string
+  preparedSourceUrl: string
+  preparedLoggedUrl: string
+}> {
+  const base = terminalContentFixture().checkpoint
+  const ledgerPath = '中'.repeat(600)
+  const preparedPath = '界'.repeat(600)
+  const ledgerSourceUrl = `https://user:pass@ledger.example.test/${ledgerPath}?token=secret#private`
+  const preparedSourceUrl = `https://user:pass@prepared.example.test/${preparedPath}?token=secret#private`
+  const ledgerResult = parseToolResult({
+    status: 'success', effect: 'background', retryable: false,
+    content: [{
+      type: 'resource_ref', resourceType: 'image',
+      resourceId: ledgerSourceUrl, mimeType: 'image/png'
+    }]
+  })
+  const preparedResult = parseToolResult({
+    status: 'success', effect: 'background', retryable: false,
+    content: [{
+      type: 'resource_ref', resourceType: 'file',
+      resourceId: preparedSourceUrl, mimeType: 'application/octet-stream'
+    }]
+  })
+  const checkpoint = parseRunCheckpoint({
+    ...base,
+    toolLedgers: [{
+      schemaVersion: 1,
+      step: 0,
+      calls: [{
+        occurrenceId: '0:0', step: 0, index: 0,
+        callId: 'unicode-ledger-call', toolName: 'unicode_ledger_tool',
+        arguments: {}, status: 'succeeded', capability: null,
+        result: ledgerResult
+      }]
+    }],
+    preparedBatch: {
+      schemaVersion: 1,
+      calls: [{
+        kind: 'completed', callId: 'unicode-prepared-call',
+        toolName: 'unicode_prepared_tool', result: preparedResult
+      }]
+    }
+  })
+  return Object.freeze({
+    checkpoint,
+    receipt: terminalReceipt(checkpoint),
+    ledgerSourceUrl,
+    ledgerLoggedUrl: `https://ledger.example.test/${ledgerPath}`,
+    preparedSourceUrl,
+    preparedLoggedUrl: `https://prepared.example.test/${preparedPath}`
+  })
+}
+
 function largeTerminalFixture (): Readonly<{
   checkpoint: RunCheckpoint
   receipt: ReturnType<typeof parseTerminalCommitReceipt>
@@ -612,6 +669,50 @@ test('sanitizes terminal tool resources while retaining assistant text and tool 
   assert.equal(sourceResult?.status === 'success' && sourceResult.content[0]?.type === 'resource_ref'
     ? sourceResult.content[0].resourceId
     : null, terminal.toolResourceUrl)
+})
+
+test('preserves long Unicode paths in terminal ledger and prepared-batch log copies', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalUnicodeResourcesFixture()
+  assert.ok(Buffer.byteLength(terminal.ledgerSourceUrl, 'utf8') < 4 * 1024)
+  assert.ok(Buffer.byteLength(new URL(terminal.ledgerSourceUrl).pathname, 'utf8') > 4 * 1024)
+  assert.ok(Buffer.byteLength(terminal.preparedSourceUrl, 'utf8') < 4 * 1024)
+  assert.ok(Buffer.byteLength(new URL(terminal.preparedSourceUrl).pathname, 'utf8') > 4 * 1024)
+  const sourceJson = JSON.stringify(terminal.checkpoint)
+
+  journal.recordRunEvent({
+    type: 'run.terminal_committed',
+    occurredAt: terminal.checkpoint.updatedAt,
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    checkpoint: terminal.checkpoint,
+    receipt: terminal.receipt
+  })
+
+  assert.equal(JSON.stringify(terminal.checkpoint), sourceJson)
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.type, 'run.terminal_committed')
+  const logged = (events[0]?.payload as { checkpoint: RunCheckpoint }).checkpoint
+  const ledgerResult = logged.toolLedgers[0]?.calls[0]?.result
+  assert.equal(ledgerResult?.status === 'success' && ledgerResult.content[0]?.type === 'resource_ref'
+    ? ledgerResult.content[0].resourceId
+    : null, terminal.ledgerLoggedUrl)
+  const prepared = logged.preparedBatch?.calls[0]
+  assert.equal(prepared?.kind === 'completed' &&
+    prepared.result.status === 'success' &&
+    prepared.result.content[0]?.type === 'resource_ref'
+    ? prepared.result.content[0].resourceId
+    : null, terminal.preparedLoggedUrl)
+  const sourceLedger = terminal.checkpoint.toolLedgers[0]?.calls[0]?.result
+  assert.equal(sourceLedger?.status === 'success' && sourceLedger.content[0]?.type === 'resource_ref'
+    ? sourceLedger.content[0].resourceId
+    : null, terminal.ledgerSourceUrl)
+  const sourcePrepared = terminal.checkpoint.preparedBatch?.calls[0]
+  assert.equal(sourcePrepared?.kind === 'completed' &&
+    sourcePrepared.result.status === 'success' &&
+    sourcePrepared.result.content[0]?.type === 'resource_ref'
+    ? sourcePrepared.result.content[0].resourceId
+    : null, terminal.preparedSourceUrl)
 })
 
 test('authoritative checkpoint parser rejects terminal resource output before journaling', () => {
@@ -955,7 +1056,7 @@ test('projects exact QQ text and forward content while bounding media resources'
   }
 })
 
-test('preserves a legal 257-atom outbound part under the shared hard budget', () => {
+test('preserves legal 257-atom node and button collections under the shared hard budget', () => {
   const { journal, events } = inMemoryContentJournal()
   const target = Object.freeze({
     botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
@@ -980,17 +1081,124 @@ test('preserves a legal 257-atom outbound part under the shared hard budget', ()
     quoteMessageId: null,
     result
   })
+  const nodes = Object.freeze(Array.from({ length: 257 }, (_, index) => Object.freeze({
+    kind: 'text' as const,
+    text: `node-${index}`
+  })))
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: Object.freeze({ media: 'forward', title: '257 nodes', nodes }),
+    attempt: 1,
+    quoteMessageId: null,
+    result: Object.freeze({ ...result, media: 'forward' })
+  })
+  const suggestions = Object.freeze(Array.from(
+    { length: 257 }, (_, index) => `suggestion-${index}`
+  ))
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: Object.freeze({
+      media: 'text',
+      atoms: Object.freeze([{ kind: 'text' as const, text: 'buttons' }]),
+      buttons: Object.freeze({
+        schemaVersion: 1 as const,
+        kind: 'chat_suggestions' as const,
+        suggestions
+      })
+    }),
+    attempt: 1,
+    quoteMessageId: null,
+    result
+  })
 
-  assert.equal(events.length, 1)
+  assert.equal(events.length, 3)
   assert.equal(events[0]?.type, 'qq.outbound.deliver')
-  const payload = events[0]?.payload as {
+  const atomPayload = events[0]?.payload as {
     part: { atoms: Array<{ text: string }> }
     result: unknown
   }
-  assert.equal(payload.part.atoms.length, 257)
-  assert.equal(payload.part.atoms[0]?.text, 'atom-0')
-  assert.equal(payload.part.atoms[256]?.text, 'atom-256')
-  assert.deepEqual(payload.result, result)
+  assert.equal(atomPayload.part.atoms.length, 257)
+  assert.equal(atomPayload.part.atoms[0]?.text, 'atom-0')
+  assert.equal(atomPayload.part.atoms[256]?.text, 'atom-256')
+  assert.deepEqual(atomPayload.result, result)
+  const nodePayload = events[1]?.payload as {
+    part: { nodes: Array<{ text: string }> }
+  }
+  assert.equal(nodePayload.part.nodes.length, 257)
+  assert.equal(nodePayload.part.nodes[256]?.text, 'node-256')
+  const buttonPayload = events[2]?.payload as {
+    part: { buttons: { suggestions: string[] } }
+  }
+  assert.equal(buttonPayload.part.buttons.suggestions.length, 257)
+  assert.equal(buttonPayload.part.buttons.suggestions[256], 'suggestion-256')
+})
+
+test('rejects a hostile 100000-item outbound Array Proxy before whole-array inspection', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const atom = Object.freeze({ kind: 'text' as const, text: 'hostile-array-item' })
+  const backing = Array.from({ length: 100_000 }, () => atom)
+  let ownKeysTraps = 0
+  let descriptorTraps = 0
+  const atoms = new Proxy(backing, {
+    ownKeys: value => {
+      ownKeysTraps += 1
+      return Reflect.ownKeys(value)
+    },
+    getOwnPropertyDescriptor: (value, key) => {
+      descriptorTraps += 1
+      return Reflect.getOwnPropertyDescriptor(value, key)
+    }
+  })
+
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: { media: 'text', atoms },
+    attempt: 1,
+    quoteMessageId: null,
+    result: {
+      kind: 'failed_definite', media: 'text', attempt: 1, code: 'host_rejected'
+    }
+  })
+
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'outbound', code: 'invalid_content' }
+  }])
+  assert.equal(ownKeysTraps, 0)
+  assert.ok(descriptorTraps <= 2, `descriptor traps: ${descriptorTraps}`)
+})
+
+test('rejects outbound text beyond the incremental UTF-8 byte budget', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const oversizedText = '界'.repeat(Math.floor((1024 * 1024) / 3) + 1)
+  assert.ok(Buffer.byteLength(oversizedText, 'utf8') > 1024 * 1024)
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target: Object.freeze({
+      botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+    }),
+    part: { media: 'text', atoms: [{ kind: 'text', text: oversizedText }] },
+    attempt: 1,
+    quoteMessageId: null,
+    result: {
+      kind: 'failed_definite', media: 'text', attempt: 1, code: 'host_rejected'
+    }
+  })
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'outbound', code: 'invalid_content' }
+  }])
+  assert.equal(JSON.stringify(events).includes('界界界'), false)
 })
 
 test('retains metadata when an accepted remote URL is malformed or non-HTTP', () => {

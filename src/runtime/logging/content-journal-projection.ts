@@ -24,6 +24,39 @@ export interface ProjectedJournalEvent {
 export const CONTENT_JOURNAL_JSON_DEPTH_LIMIT = 32
 export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 8_192
 
+export interface ProjectionBudget {
+  reserveArray(length: number, label: string): void
+  consumeText(value: string, label: string): void
+}
+
+export function createProjectionBudget (options: Readonly<{
+  maxNodes: number
+  maxTextBytes: number
+}>): ProjectionBudget {
+  if (!Number.isSafeInteger(options.maxNodes) || options.maxNodes <= 0 ||
+    !Number.isSafeInteger(options.maxTextBytes) || options.maxTextBytes <= 0) {
+    throw new TypeError('projection budget is invalid')
+  }
+  let nodes = 0
+  let textBytes = 0
+  return Object.freeze({
+    reserveArray (length: number, label: string): void {
+      if (!Number.isSafeInteger(length) || length < 0 ||
+        length + 1 > options.maxNodes - nodes) {
+        throw new TypeError(`${label} exceeds the projection node budget`)
+      }
+      nodes += length + 1
+    },
+    consumeText (value: string, label: string): void {
+      const bytes = Buffer.byteLength(value, 'utf8')
+      if (bytes > options.maxTextBytes - textBytes) {
+        throw new TypeError(`${label} exceeds the projection text budget`)
+      }
+      textBytes += bytes
+    }
+  })
+}
+
 export function boundedRecord (
   value: unknown,
   maxBytes: number,
@@ -147,20 +180,37 @@ export function ownDataRecord (
   return output
 }
 
-export function ownDataArray (value: unknown, label: string): readonly unknown[] {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+export function ownDataArray (
+  value: unknown,
+  label: string,
+  budget: ProjectionBudget
+): readonly unknown[] {
+  if (!Array.isArray(value)) {
     throw new TypeError(`${label} is invalid`)
   }
-  const descriptors = Object.getOwnPropertyDescriptors(value)
-  if (Object.getOwnPropertySymbols(value).length > 0 ||
-    Reflect.ownKeys(descriptors).some(key => (
-      typeof key === 'string' && key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)
-    ))) {
+  let prototype: object | null
+  let lengthDescriptor: PropertyDescriptor | undefined
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
+  } catch {
     throw new TypeError(`${label} is invalid`)
   }
+  if (prototype !== Array.prototype || lengthDescriptor === undefined ||
+    !Object.hasOwn(lengthDescriptor, 'value') ||
+    !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  const length = Number(lengthDescriptor.value)
+  budget.reserveArray(length, label)
   const output: unknown[] = []
-  for (let index = 0; index < value.length; index += 1) {
-    const descriptor = descriptors[String(index)]
+  for (let index = 0; index < length; index += 1) {
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+    } catch {
+      throw new TypeError(`${label} item is invalid`)
+    }
     if (descriptor === undefined || !descriptor.enumerable ||
       !Object.hasOwn(descriptor, 'value')) {
       throw new TypeError(`${label} item is invalid`)
@@ -213,7 +263,11 @@ export function safeHttpUrl (value: string): string | undefined {
   try {
     const url = new URL(value)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-    return `${url.origin}${url.pathname}`
+    let pathname = url.pathname
+    try {
+      pathname = decodeURI(pathname)
+    } catch {}
+    return `${url.origin}${pathname}`
   } catch {
     return undefined
   }
@@ -252,5 +306,5 @@ export function projectToolResultResources (value: unknown): ToolResult {
       ? item
       : Object.freeze({ ...item, resourceId: safe })
   }))
-  return parseToolResult({ ...result, content })
+  return Object.freeze({ ...result, content }) as ToolResult
 }

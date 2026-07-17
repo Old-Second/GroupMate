@@ -325,12 +325,12 @@ function projectTerminalCheckpointResources (checkpoint: RunCheckpoint): RunChec
             : call
         )))
       })
-  return parseRunCheckpoint({
+  return Object.freeze({
     ...checkpoint,
     output,
     toolLedgers,
     preparedBatch
-  })
+  }) as RunCheckpoint
 }
 
 function projectTerminalEvent (input: UnknownRecord): ProjectedJournalEvent {

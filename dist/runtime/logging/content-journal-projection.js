@@ -4,6 +4,30 @@ import { canonicalSessionKey } from '../../agent/session/conversation-scope.js';
 import { parseToolResult } from '../../agent/tools/tool-result.js';
 export const CONTENT_JOURNAL_JSON_DEPTH_LIMIT = 32;
 export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 8_192;
+export function createProjectionBudget(options) {
+    if (!Number.isSafeInteger(options.maxNodes) || options.maxNodes <= 0 ||
+        !Number.isSafeInteger(options.maxTextBytes) || options.maxTextBytes <= 0) {
+        throw new TypeError('projection budget is invalid');
+    }
+    let nodes = 0;
+    let textBytes = 0;
+    return Object.freeze({
+        reserveArray(length, label) {
+            if (!Number.isSafeInteger(length) || length < 0 ||
+                length + 1 > options.maxNodes - nodes) {
+                throw new TypeError(`${label} exceeds the projection node budget`);
+            }
+            nodes += length + 1;
+        },
+        consumeText(value, label) {
+            const bytes = Buffer.byteLength(value, 'utf8');
+            if (bytes > options.maxTextBytes - textBytes) {
+                throw new TypeError(`${label} exceeds the projection text budget`);
+            }
+            textBytes += bytes;
+        }
+    });
+}
 export function boundedRecord(value, maxBytes, label, options = {}) {
     const parsed = parseJsonValue(value, {
         maxBytes,
@@ -101,18 +125,35 @@ export function ownDataRecord(value, label, options = {}) {
     }
     return output;
 }
-export function ownDataArray(value, label) {
-    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+export function ownDataArray(value, label, budget) {
+    if (!Array.isArray(value)) {
         throw new TypeError(`${label} is invalid`);
     }
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    if (Object.getOwnPropertySymbols(value).length > 0 ||
-        Reflect.ownKeys(descriptors).some(key => (typeof key === 'string' && key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)))) {
+    let prototype;
+    let lengthDescriptor;
+    try {
+        prototype = Object.getPrototypeOf(value);
+        lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    }
+    catch {
         throw new TypeError(`${label} is invalid`);
     }
+    if (prototype !== Array.prototype || lengthDescriptor === undefined ||
+        !Object.hasOwn(lengthDescriptor, 'value') ||
+        !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    const length = Number(lengthDescriptor.value);
+    budget.reserveArray(length, label);
     const output = [];
-    for (let index = 0; index < value.length; index += 1) {
-        const descriptor = descriptors[String(index)];
+    for (let index = 0; index < length; index += 1) {
+        let descriptor;
+        try {
+            descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        }
+        catch {
+            throw new TypeError(`${label} item is invalid`);
+        }
         if (descriptor === undefined || !descriptor.enumerable ||
             !Object.hasOwn(descriptor, 'value')) {
             throw new TypeError(`${label} item is invalid`);
@@ -159,7 +200,12 @@ export function safeHttpUrl(value) {
         const url = new URL(value);
         if (url.protocol !== 'http:' && url.protocol !== 'https:')
             return undefined;
-        return `${url.origin}${url.pathname}`;
+        let pathname = url.pathname;
+        try {
+            pathname = decodeURI(pathname);
+        }
+        catch { }
+        return `${url.origin}${pathname}`;
     }
     catch {
         return undefined;
@@ -200,5 +246,5 @@ export function projectToolResultResources(value) {
             ? item
             : Object.freeze({ ...item, resourceId: safe });
     }));
-    return parseToolResult({ ...result, content });
+    return Object.freeze({ ...result, content });
 }

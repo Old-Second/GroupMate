@@ -11,6 +11,8 @@ import type {
 } from '../presentation/yunzai-outbound-port.js'
 import {
   boundedRecord,
+  CONTENT_JOURNAL_JSON_NODE_LIMIT,
+  createProjectionBudget,
   exactKeys,
   ownDataArray,
   ownDataRecord,
@@ -19,6 +21,7 @@ import {
   safeInteger,
   text,
   timestamp,
+  type ProjectionBudget,
   type ProjectedJournalEvent,
   type UnknownRecord
 } from './content-journal-projection.js'
@@ -57,15 +60,32 @@ const RECALL_UNKNOWN_CODES = new Set([
   'host_abort_after_dispatch', 'unknown_host_result'
 ])
 
-function projectTextAtom (value: unknown): Readonly<Record<string, unknown>> {
+function projectedText (
+  value: unknown,
+  label: string,
+  budget: ProjectionBudget,
+  allowEmpty = false
+): string {
+  const result = text(value, label, allowEmpty)
+  budget.consumeText(result, label)
+  return result
+}
+
+function projectTextAtom (
+  value: unknown,
+  budget: ProjectionBudget
+): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound text atom')
   if (input.kind === 'text') {
     exactKeys(input, ['kind', 'text'], ['kind', 'text'], 'outbound text atom')
-    return { kind: input.kind, text: text(input.text, 'outbound text', true) }
+    return { kind: input.kind, text: projectedText(input.text, 'outbound text', budget, true) }
   }
   if (input.kind === 'markdown') {
     exactKeys(input, ['kind', 'markdown'], ['kind', 'markdown'], 'outbound markdown atom')
-    return { kind: input.kind, markdown: text(input.markdown, 'outbound markdown', true) }
+    return {
+      kind: input.kind,
+      markdown: projectedText(input.markdown, 'outbound markdown', budget, true)
+    }
   }
   if (input.kind === 'face') {
     exactKeys(input, ['kind', 'faceId'], ['kind', 'faceId'], 'outbound face atom')
@@ -76,10 +96,16 @@ function projectTextAtom (value: unknown): Readonly<Record<string, unknown>> {
   if (input.target === 'all') return { kind: input.kind, target: 'all' }
   const target = ownDataRecord(input.target, 'outbound at target')
   exactKeys(target, ['userId'], ['userId'], 'outbound at target')
-  return { kind: input.kind, target: { userId: text(target.userId, 'outbound at user ID') } }
+  return {
+    kind: input.kind,
+    target: { userId: projectedText(target.userId, 'outbound at user ID', budget) }
+  }
 }
 
-function projectButtons (value: unknown): Readonly<Record<string, unknown>> {
+function projectButtons (
+  value: unknown,
+  budget: ProjectionBudget
+): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound buttons')
   exactKeys(
     input,
@@ -90,15 +116,18 @@ function projectButtons (value: unknown): Readonly<Record<string, unknown>> {
   if (input.schemaVersion !== 1 || input.kind !== 'chat_suggestions') {
     throw new TypeError('outbound buttons are invalid')
   }
-  const suggestions = ownDataArray(input.suggestions, 'outbound suggestions')
-    .map(item => text(item, 'outbound suggestion'))
+  const suggestions = ownDataArray(input.suggestions, 'outbound suggestions', budget)
+    .map(item => projectedText(item, 'outbound suggestion', budget))
   return { schemaVersion: 1, kind: 'chat_suggestions', suggestions }
 }
 
-function projectResource (value: unknown): Readonly<Record<string, unknown>> {
+function projectResource (
+  value: unknown,
+  budget: ProjectionBudget
+): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound resource')
   const commonKeys = ['kind', 'mimeType', 'byteLength']
-  const mimeType = text(input.mimeType, 'outbound resource mime type')
+  const mimeType = projectedText(input.mimeType, 'outbound resource mime type', budget)
   const byteLength = safeInteger(input.byteLength, 'outbound resource byte length')
   if (input.kind === 'buffer') {
     exactKeys(
@@ -121,7 +150,7 @@ function projectResource (value: unknown): Readonly<Record<string, unknown>> {
     )
     return {
       kind: input.kind,
-      path: text(input.path, 'outbound resource path'),
+      path: projectedText(input.path, 'outbound resource path', budget),
       mimeType,
       byteLength
     }
@@ -135,6 +164,7 @@ function projectResource (value: unknown): Readonly<Record<string, unknown>> {
   )
   const rawUrl = text(input.url, 'outbound resource URL')
   const url = safeHttpUrl(rawUrl)
+  if (url !== undefined) budget.consumeText(url, 'outbound resource URL')
   return {
     kind: input.kind,
     ...(url === undefined ? {} : { url }),
@@ -143,39 +173,50 @@ function projectResource (value: unknown): Readonly<Record<string, unknown>> {
   }
 }
 
-function projectOutboundPart (value: unknown): Readonly<Record<string, unknown>> {
+function projectOutboundPart (
+  value: unknown,
+  budget: ProjectionBudget
+): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound part')
   if (input.media === 'text') {
     exactKeys(input, ['media', 'atoms', 'buttons'], ['media', 'atoms'], 'outbound text part')
-    const atoms = ownDataArray(input.atoms, 'outbound text atoms').map(projectTextAtom)
+    const atoms = ownDataArray(input.atoms, 'outbound text atoms', budget)
+      .map(atom => projectTextAtom(atom, budget))
     return {
       media: input.media,
       atoms,
-      ...(input.buttons === undefined ? {} : { buttons: projectButtons(input.buttons) })
+      ...(input.buttons === undefined ? {} : { buttons: projectButtons(input.buttons, budget) })
     }
   }
   if (input.media === 'picture' || input.media === 'voice' || input.media === 'video') {
     exactKeys(input, ['media', 'resource'], ['media', 'resource'], 'outbound media part')
-    return { media: input.media, resource: projectResource(input.resource) }
+    return { media: input.media, resource: projectResource(input.resource, budget) }
   }
   if (input.media === 'forward') {
     exactKeys(input, ['media', 'title', 'nodes'], ['media', 'title', 'nodes'], 'outbound forward part')
-    const nodes = ownDataArray(input.nodes, 'outbound forward nodes').map(node => {
+    const nodes = ownDataArray(input.nodes, 'outbound forward nodes', budget).map(node => {
       const item = ownDataRecord(node, 'outbound forward node')
       exactKeys(item, ['kind', 'text'], ['kind', 'text'], 'outbound forward node')
       if (item.kind !== 'text') throw new TypeError('outbound forward node is invalid')
-      return { kind: 'text' as const, text: text(item.text, 'outbound forward text', true) }
+      return {
+        kind: 'text' as const,
+        text: projectedText(item.text, 'outbound forward text', budget, true)
+      }
     })
     return {
       media: input.media,
-      title: text(input.title, 'outbound forward title'),
+      title: projectedText(input.title, 'outbound forward title', budget),
       nodes
     }
   }
   if (input.media === 'music') {
     exactKeys(input, ['media', 'provider', 'id'], ['media', 'provider', 'id'], 'outbound music')
     if (input.provider !== '163') throw new TypeError('outbound music provider is invalid')
-    return { media: input.media, provider: input.provider, id: text(input.id, 'music ID') }
+    return {
+      media: input.media,
+      provider: input.provider,
+      id: projectedText(input.id, 'music ID', budget)
+    }
   }
   if (input.media === 'dice') {
     exactKeys(input, ['media'], ['media'], 'outbound dice')
@@ -191,7 +232,10 @@ function projectOutboundPart (value: unknown): Readonly<Record<string, unknown>>
   throw new TypeError('outbound part media is invalid')
 }
 
-function projectReceipt (value: unknown): Readonly<Record<string, unknown>> {
+function projectReceipt (
+  value: unknown,
+  budget: ProjectionBudget
+): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound receipt', { allowReceiptBrand: true })
   exactKeys(
     input,
@@ -208,14 +252,21 @@ function projectReceipt (value: unknown): Readonly<Record<string, unknown>> {
     media: input.media,
     ...(input.messageId === undefined
       ? {}
-      : { messageId: text(input.messageId, 'outbound receipt message ID') })
+      : {
+          messageId: projectedText(
+            input.messageId,
+            'outbound receipt message ID',
+            budget
+          )
+        })
   }
 }
 
 function projectDeliveryResult (
   value: unknown,
   media: unknown,
-  attempt: unknown
+  attempt: unknown,
+  budget: ProjectionBudget
 ): Readonly<Record<string, unknown>> {
   const input = ownDataRecord(value, 'outbound delivery result')
   if (input.kind === 'sent') {
@@ -225,7 +276,7 @@ function projectDeliveryResult (
       ['kind', 'media', 'attempt', 'receipt'],
       'outbound delivery result'
     )
-    const receipt = projectReceipt(input.receipt)
+    const receipt = projectReceipt(input.receipt, budget)
     if (input.media !== media || input.attempt !== attempt || receipt.media !== media) {
       throw new TypeError('outbound delivery result correlation is invalid')
     }
@@ -275,16 +326,22 @@ export function projectOutboundJournalEvent (
   value: GroupMateOutboundJournalEvent
 ): ProjectedJournalEvent {
   const input = ownDataRecord(value, 'outbound journal event')
+  const budget = createProjectionBudget({
+    maxNodes: CONTENT_JOURNAL_JSON_NODE_LIMIT,
+    maxTextBytes: RUN_RESOURCE_LIMITS.providerResponseBytes
+  })
   if (input.type === 'qq.outbound.deliver') {
     const keys = [
       'type', 'occurredAt', 'target', 'part', 'attempt', 'quoteMessageId', 'result'
     ]
     exactKeys(input, keys, keys, 'outbound delivery event')
-    const part = projectOutboundPart(input.part)
+    const part = projectOutboundPart(input.part, budget)
     const media = part.media
     const attempt = input.attempt
     if (attempt !== 1 && attempt !== 2) throw new TypeError('outbound attempt is invalid')
-    if (input.quoteMessageId !== null) text(input.quoteMessageId, 'outbound quote message ID')
+    if (input.quoteMessageId !== null) {
+      projectedText(input.quoteMessageId, 'outbound quote message ID', budget)
+    }
     return {
       type: input.type,
       payload: boundedOutboundPayload({
@@ -293,7 +350,7 @@ export function projectOutboundJournalEvent (
         part,
         attempt,
         quoteMessageId: input.quoteMessageId,
-        result: projectDeliveryResult(input.result, media, attempt)
+        result: projectDeliveryResult(input.result, media, attempt, budget)
       })
     }
   }
@@ -305,7 +362,7 @@ export function projectOutboundJournalEvent (
     payload: boundedOutboundPayload({
       occurredAt: timestamp(input.occurredAt, 'outbound timestamp'),
       target: projectSessionAddress(input.target, 'outbound target'),
-      receipt: projectReceipt(input.receipt),
+      receipt: projectReceipt(input.receipt, budget),
       result: projectRecallResult(input.result)
     })
   }
