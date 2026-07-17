@@ -123,6 +123,100 @@ test('writes complete ordered JSONL envelopes', async () => {
   }
 })
 
+test('continues sequence in a fresh file after a process restart', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  try {
+    const first = new GroupMateDiskLog({
+      directory,
+      trustedRoot: path.dirname(directory),
+      now: () => new Date(FIXED_TIMESTAMP)
+    })
+    first.record({ type: 'fixture', payload: { text: 'before restart one' } })
+    first.record({ type: 'fixture', payload: { text: 'before restart two' } })
+    await first.drain()
+
+    const restarted = new GroupMateDiskLog({
+      directory,
+      trustedRoot: path.dirname(directory),
+      now: () => new Date(FIXED_TIMESTAMP)
+    })
+    restarted.record({ type: 'fixture', payload: { text: 'after restart one' } })
+    restarted.record({ type: 'fixture', payload: { text: 'after restart two' } })
+    await restarted.drain()
+
+    assert.deepEqual(await logFiles(directory), [
+      'groupmate-2026-07-17.0001.jsonl',
+      'groupmate-2026-07-17.0002.jsonl'
+    ])
+    assert.deepEqual((await readLogRows(directory)).map(row => row.sequence), [1, 2, 3, 4])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('migrates a pre-fix reset file from its maximum durable sequence', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const target = path.join(directory, 'groupmate-2026-07-17.0001.jsonl')
+  try {
+    const legacyRows = [1, 6, 1, 4].map(sequence => JSON.stringify({
+      schemaVersion: 1,
+      sequence,
+      recordedAt: FIXED_TIMESTAMP,
+      event: { type: 'fixture', payload: { sequence } }
+    })).join('\n')
+    await writeFile(target, `${legacyRows}\n`)
+
+    const log = new GroupMateDiskLog({
+      directory,
+      trustedRoot: path.dirname(directory),
+      now: () => new Date(FIXED_TIMESTAMP)
+    })
+    log.record({ type: 'fixture', payload: { text: 'after migration' } })
+    await log.drain()
+
+    assert.deepEqual(await logFiles(directory), [
+      'groupmate-2026-07-17.0001.jsonl',
+      'groupmate-2026-07-17.0002.jsonl'
+    ])
+    assert.deepEqual((await readLogRows(directory)).map(row => row.sequence), [1, 6, 1, 4, 7])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('ignores an incomplete crash tail while recovering the durable sequence', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const target = path.join(directory, 'groupmate-2026-07-17.0001.jsonl')
+  try {
+    const durable = JSON.stringify({
+      schemaVersion: 1,
+      sequence: 6,
+      recordedAt: FIXED_TIMESTAMP,
+      event: { type: 'fixture', payload: { state: 'durable' } }
+    })
+    const incomplete = '{"schemaVersion":1,"sequence":99,"recordedAt":"incomplete"'
+    await writeFile(target, `${durable}\n${incomplete}`)
+
+    const log = new GroupMateDiskLog({
+      directory,
+      trustedRoot: path.dirname(directory),
+      now: () => new Date(FIXED_TIMESTAMP)
+    })
+    log.record({ type: 'fixture', payload: { text: 'after crash' } })
+    await log.drain()
+
+    const files = await logFiles(directory)
+    assert.deepEqual(files, [
+      'groupmate-2026-07-17.0001.jsonl',
+      'groupmate-2026-07-17.0002.jsonl'
+    ])
+    const recovered = await readFile(path.join(directory, files[1] as string), 'utf8')
+    assert.equal(JSON.parse(recovered).sequence, 7)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('rotates a local-date file before an append crosses the file limit', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
   try {

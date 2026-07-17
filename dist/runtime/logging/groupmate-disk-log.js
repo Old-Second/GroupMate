@@ -12,8 +12,14 @@ export const GROUPMATE_DISK_LOG_LIMITS = Object.freeze({
 const FILE_NAME_PATTERN = /^groupmate-(\d{4})-(\d{2})-(\d{2})\.(\d{4})\.jsonl$/;
 const FAILURE_LIMIT_MS = 60_000;
 const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const LOG_FILE_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const LOG_FILE_OPEN_FLAGS = constants.O_WRONLY |
     constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const READ_BUFFER_BYTES = 64 * 1024;
+const MAX_LINE_PREFIX_BYTES = 128;
+const SEQUENCE_PLACEHOLDER = Number.MAX_SAFE_INTEGER;
+const SEQUENCE_MARKER = `"sequence":${SEQUENCE_PLACEHOLDER}`;
+const SEQUENCE_PREFIX_PATTERN = /^\{"schemaVersion":1,"sequence":([1-9]\d*),/;
 function isMissingPathError(error) {
     return error !== null && typeof error === 'object' &&
         'code' in error && error.code === 'ENOENT';
@@ -95,6 +101,50 @@ function limitFor(key, overrides) {
     }
     return value;
 }
+async function maximumDurableSequence(filePath) {
+    const file = await open(filePath, LOG_FILE_READ_FLAGS);
+    try {
+        if (!(await file.stat()).isFile())
+            return null;
+        const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
+        const prefix = Buffer.allocUnsafe(MAX_LINE_PREFIX_BYTES);
+        let prefixBytes = 0;
+        let position = 0;
+        let maximum = null;
+        while (true) {
+            const { bytesRead } = await file.read(buffer, 0, buffer.length, position);
+            if (bytesRead === 0)
+                break;
+            position += bytesRead;
+            let offset = 0;
+            while (offset < bytesRead) {
+                const newline = buffer.indexOf(0x0a, offset);
+                const end = newline === -1 || newline >= bytesRead ? bytesRead : newline;
+                const available = MAX_LINE_PREFIX_BYTES - prefixBytes;
+                const copied = Math.min(Math.max(available, 0), end - offset);
+                if (copied > 0) {
+                    buffer.copy(prefix, prefixBytes, offset, offset + copied);
+                    prefixBytes += copied;
+                }
+                if (newline === -1 || newline >= bytesRead)
+                    break;
+                const match = SEQUENCE_PREFIX_PATTERN.exec(prefix.subarray(0, prefixBytes).toString('ascii'));
+                if (match !== null) {
+                    const sequence = Number(match[1]);
+                    if (Number.isSafeInteger(sequence) && sequence > 0 &&
+                        (maximum === null || sequence > maximum))
+                        maximum = sequence;
+                }
+                prefixBytes = 0;
+                offset = newline + 1;
+            }
+        }
+        return maximum;
+    }
+    finally {
+        await file.close();
+    }
+}
 export class GroupMateDiskLog {
     #directory;
     #trustedRoot;
@@ -102,7 +152,9 @@ export class GroupMateDiskLog {
     #onFailure;
     #limits;
     #queue = [];
+    #writerDates = new Set();
     #sequence = 0;
+    #sequenceBase = null;
     #pendingBytes = 0;
     #pendingRecords = 0;
     #lastExpiryCleanupDate = null;
@@ -125,11 +177,12 @@ export class GroupMateDiskLog {
     }
     record(event) {
         const now = this.#safeNow();
+        const localSequence = this.#sequence + 1;
         let line;
         try {
             const serialized = JSON.stringify({
                 schemaVersion: 1,
-                sequence: this.#sequence + 1,
+                sequence: SEQUENCE_PLACEHOLDER,
                 recordedAt: now.toISOString(),
                 event
             });
@@ -154,7 +207,7 @@ export class GroupMateDiskLog {
         this.#sequence += 1;
         this.#pendingRecords += 1;
         this.#pendingBytes += bytes;
-        this.#queue.push({ line, bytes, date: localDate(now), recordedAt: now });
+        this.#queue.push({ line, bytes, localSequence, date: localDate(now), recordedAt: now });
         this.#ensurePump();
     }
     async drain() {
@@ -205,11 +258,15 @@ export class GroupMateDiskLog {
             }
             await directory.chmod(0o700);
             const operationRoot = openedDirectoryPath(directory.fd, safeDirectory);
-            if (this.#lastExpiryCleanupDate !== entry.date) {
-                await this.#removeExpiredFiles(entry.recordedAt, operationRoot);
-                this.#lastExpiryCleanupDate = entry.date;
+            if (this.#sequenceBase === null) {
+                this.#sequenceBase = await this.#recoverSequence(operationRoot);
             }
-            const target = await this.#targetFor(entry, operationRoot);
+            const materialized = this.#materialize(entry);
+            if (this.#lastExpiryCleanupDate !== materialized.date) {
+                await this.#removeExpiredFiles(materialized.recordedAt, operationRoot);
+                this.#lastExpiryCleanupDate = materialized.date;
+            }
+            const target = await this.#targetFor(materialized, operationRoot);
             if (target === null) {
                 this.#reportFailure('directory_cap_exceeded');
                 return;
@@ -220,7 +277,8 @@ export class GroupMateDiskLog {
                 if (!(await file.stat()).isFile())
                     throw new TypeError('disk log target is invalid');
                 await file.chmod(0o600);
-                await file.writeFile(entry.line);
+                await file.writeFile(materialized.line);
+                this.#writerDates.add(materialized.date);
             }
             finally {
                 await file.close();
@@ -229,6 +287,30 @@ export class GroupMateDiskLog {
         finally {
             await directory.close();
         }
+    }
+    async #recoverSequence(operationRoot) {
+        const files = await this.#matchingFiles(operationRoot);
+        for (let index = files.length - 1; index >= 0; index -= 1) {
+            const file = files[index];
+            if (file === undefined)
+                continue;
+            const sequence = await maximumDurableSequence(file.path);
+            if (sequence !== null)
+                return sequence;
+        }
+        return 0;
+    }
+    #materialize(entry) {
+        if (this.#sequenceBase === null)
+            throw new TypeError('disk log sequence is unavailable');
+        const sequence = this.#sequenceBase + entry.localSequence;
+        if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+            throw new TypeError('disk log sequence is exhausted');
+        }
+        const line = entry.line.replace(SEQUENCE_MARKER, `"sequence":${sequence}`);
+        if (line === entry.line)
+            throw new TypeError('disk log sequence marker is missing');
+        return Object.freeze({ ...entry, line, bytes: Buffer.byteLength(line) });
     }
     async #removeExpiredFiles(now, operationRoot) {
         const cutoff = now.getTime() - this.#limits.retentionMs;
@@ -244,6 +326,11 @@ export class GroupMateDiskLog {
         let target;
         if (latest === undefined) {
             target = fileName(entry.date, 1);
+        }
+        else if (!this.#writerDates.has(entry.date) && (this.#sequenceBase ?? 0) > 0) {
+            if (latest.index >= 9_999)
+                return null;
+            target = fileName(entry.date, latest.index + 1);
         }
         else if (latest.bytes === 0 || latest.bytes + entry.bytes <= this.#limits.maxFileBytes) {
             target = latest.name;
