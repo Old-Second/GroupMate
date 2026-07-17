@@ -73,6 +73,30 @@ test('DeepSeek profile owns thinking tool protocol without changing standard', a
   })
 })
 
+test('DeepSeek owns bounded display reasoning independently of provider state', () => {
+  const display = deepSeekCompatibilityProfile.extractAssistantReasoning({
+    role: 'assistant',
+    content: 'fixture answer',
+    reasoning_content: `  ${'思'.repeat(2_001)}  `
+  })
+
+  assert.deepEqual(display, {
+    text: '思'.repeat(2_000),
+    truncated: true
+  })
+  assert.equal(deepSeekCompatibilityProfile.extractAssistantReasoning({
+    role: 'assistant',
+    content: 'fixture answer',
+    reasoning_content: null
+  }), undefined)
+  assert.equal(standardOpenAIProfile.extractAssistantReasoning({
+    reasoning_content: 'ignored'
+  }), undefined)
+  assert.throws(() => deepSeekCompatibilityProfile.extractAssistantReasoning({
+    reasoning_content: 1
+  }), /reasoning/i)
+})
+
 test('DeepSeek profile restores a complete assistant tool span and owns wire differences', async () => {
   const fixture = await readFixture('deepseek-thinking-tool.json')
   const choice = (fixture.choices as readonly JsonObject[])[0]

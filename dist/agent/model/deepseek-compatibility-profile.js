@@ -1,4 +1,5 @@
 import { parseJsonValue } from './json-value.js';
+import { normalizeModelReasoningTrace } from './model-adapter.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 const PROFILE_ID = 'deepseek';
 const PROFILE_VERSION = 1;
@@ -26,6 +27,15 @@ function captureDeepSeekAssistantState(message) {
             reasoningContent: message.reasoning_content
         }
     });
+}
+function extractDeepSeekAssistantReasoning(message) {
+    const value = message.reasoning_content;
+    if (value === undefined || value === null)
+        return undefined;
+    if (typeof value !== 'string') {
+        throw new TypeError('DeepSeek reasoning_content is invalid');
+    }
+    return normalizeModelReasoningTrace(value);
 }
 function restoreDeepSeekAssistantState(state) {
     const parsed = parseProviderTurnState(state);
@@ -143,6 +153,7 @@ export const deepSeekCompatibilityProfile = Object.freeze({
         ? Object.freeze({ tools: Object.freeze([...input.tools]) })
         : EMPTY_OBJECT,
     encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+    extractAssistantReasoning: extractDeepSeekAssistantReasoning,
     captureAssistantState: captureDeepSeekAssistantState,
     restoreAssistantExtensions: restoreDeepSeekAssistantState,
     classifyError: classifyDeepSeekError,

@@ -5,7 +5,9 @@ import {
   ModelProviderError,
   type ModelRequest
 } from '../../src/agent/model/model-adapter.js'
+import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { OpenAICompatibleAdapter } from '../../src/agent/model/openai-compatible-adapter.js'
+import type { OpenAICompatibleProfile } from '../../src/agent/model/openai-compatible-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 
@@ -83,12 +85,13 @@ function fixtureTool () {
 }
 
 function adapterWithFetch (
-  fetch: ConstructorParameters<typeof OpenAICompatibleAdapter>[0]['fetch']
+  fetch: ConstructorParameters<typeof OpenAICompatibleAdapter>[0]['fetch'],
+  profile: OpenAICompatibleProfile = standardOpenAIProfile
 ) {
   return new OpenAICompatibleAdapter({
     endpoint: 'https://fixture.invalid/v1/chat/completions',
     apiKey: 'fixture-key',
-    profile: standardOpenAIProfile,
+    profile,
     fetch
   })
 }
@@ -128,6 +131,102 @@ test('standard profile disables tools without mutating input', async () => {
     inputTokens: 11,
     outputTokens: 4,
     totalTokens: 15
+  })
+})
+
+test('DeepSeek non-streaming final turns expose display reasoning without provider state', async () => {
+  const response = JSON.stringify({
+    id: 'fixture-deepseek-final',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: 'fixture final answer',
+        reasoning_content: '  最终轮思考  '
+      }
+    }]
+  })
+  const adapter = adapterWithFetch(
+    async () => fixtureResponse(response),
+    deepSeekCompatibilityProfile
+  )
+
+  const turn = await adapter.complete(frozenRequest(), new AbortController().signal)
+
+  assert.deepEqual(turn.reasoning, {
+    text: '最终轮思考',
+    truncated: false
+  })
+  assert.equal(turn.providerState, undefined)
+})
+
+test('DeepSeek streaming tool turns preserve full provider state beside display reasoning', async () => {
+  const stream = [
+    'data: {"id":"fixture-deepseek-stream","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"checking "}}]}',
+    '',
+    'data: {"id":"fixture-deepseek-stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":"}}]}}]}',
+    '',
+    'data: {"id":"fixture-deepseek-stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Wuhan\\"}"}}]},"finish_reason":"tool_calls"}]}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join('\n')
+  const adapter = adapterWithFetch(async () => fixtureResponse(stream, {
+    contentType: 'text/event-stream',
+    chunkBytes: 13
+  }), deepSeekCompatibilityProfile)
+
+  const turn = await adapter.complete(frozenRequest({
+    streaming: true,
+    tools: [fixtureTool()],
+    toolMode: 'auto'
+  }), new AbortController().signal)
+
+  assert.deepEqual(turn.reasoning, {
+    text: 'checking',
+    truncated: false
+  })
+  assert.deepEqual(turn.providerState?.payload, {
+    reasoningContent: 'checking '
+  })
+})
+
+test('DeepSeek display truncation never truncates tool continuation state', async () => {
+  const fullReasoning = '思'.repeat(2_001)
+  const response = JSON.stringify({
+    id: 'fixture-deepseek-tool-long-reasoning',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: '',
+        reasoning_content: fullReasoning,
+        tool_calls: [{
+          id: 'call-weather',
+          type: 'function',
+          function: { name: 'weather', arguments: '{"city":"Wuhan"}' }
+        }]
+      }
+    }]
+  })
+  const adapter = adapterWithFetch(
+    async () => fixtureResponse(response),
+    deepSeekCompatibilityProfile
+  )
+
+  const turn = await adapter.complete(frozenRequest({
+    tools: [fixtureTool()],
+    toolMode: 'auto'
+  }), new AbortController().signal)
+
+  assert.deepEqual(turn.reasoning, {
+    text: '思'.repeat(2_000),
+    truncated: true
+  })
+  assert.deepEqual(turn.providerState?.payload, {
+    reasoningContent: fullReasoning
   })
 })
 

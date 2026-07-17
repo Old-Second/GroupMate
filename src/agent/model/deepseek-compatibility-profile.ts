@@ -1,8 +1,10 @@
 import { parseJsonValue, type JsonObject } from './json-value.js'
 import type {
   ModelProviderError,
+  ModelReasoningTrace,
   ModelReasoningOptions
 } from './model-adapter.js'
+import { normalizeModelReasoningTrace } from './model-adapter.js'
 import type {
   ModelErrorOverride,
   OpenAICompatibleProfile,
@@ -42,6 +44,17 @@ function captureDeepSeekAssistantState (
       reasoningContent: message.reasoning_content
     }
   })
+}
+
+function extractDeepSeekAssistantReasoning (
+  message: Readonly<JsonObject>
+): ModelReasoningTrace | undefined {
+  const value = message.reasoning_content
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new TypeError('DeepSeek reasoning_content is invalid')
+  }
+  return normalizeModelReasoningTrace(value)
 }
 
 function restoreDeepSeekAssistantState (state: ProviderTurnState): Readonly<JsonObject> {
@@ -168,6 +181,7 @@ export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.free
     ? Object.freeze({ tools: Object.freeze([...input.tools]) })
     : EMPTY_OBJECT,
   encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+  extractAssistantReasoning: extractDeepSeekAssistantReasoning,
   captureAssistantState: captureDeepSeekAssistantState,
   restoreAssistantExtensions: restoreDeepSeekAssistantState,
   classifyError: classifyDeepSeekError,

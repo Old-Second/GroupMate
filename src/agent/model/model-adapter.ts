@@ -68,12 +68,35 @@ export interface ModelUsage {
   readonly totalTokens: number
 }
 
+export const MAX_MODEL_REASONING_CODE_POINTS = 2_000
+
+export interface ModelReasoningTrace {
+  readonly text: string
+  readonly truncated: boolean
+}
+
+export function normalizeModelReasoningTrace (
+  value: string
+): ModelReasoningTrace | undefined {
+  const normalized = value.trim().normalize('NFC')
+  if (normalized === '') return undefined
+  const points = [...normalized]
+  const truncated = points.length > MAX_MODEL_REASONING_CODE_POINTS
+  return Object.freeze({
+    text: truncated
+      ? points.slice(0, MAX_MODEL_REASONING_CODE_POINTS).join('')
+      : normalized,
+    truncated
+  })
+}
+
 export interface ModelTurn {
   readonly text: string
   readonly refusal?: string
   readonly toolCalls: readonly NormalizedToolCall[]
   readonly finishReason: ModelFinishReason
   readonly usage?: ModelUsage
+  readonly reasoning?: ModelReasoningTrace
   readonly providerState?: ProviderTurnState
   readonly responseId?: string
 }

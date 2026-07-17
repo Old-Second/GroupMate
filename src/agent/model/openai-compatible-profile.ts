@@ -2,6 +2,7 @@ import type { AgentErrorCode } from '../contracts/error.js'
 import type { JsonObject } from './json-value.js'
 import type {
   ModelProviderError,
+  ModelReasoningTrace,
   ModelReasoningOptions,
   ModelToolMode
 } from './model-adapter.js'
@@ -33,6 +34,7 @@ export interface OpenAICompatibleProfile {
   }>
   encodeToolControls(input: ToolControlInput): Readonly<JsonObject>
   encodeRequestExtensions(input: ModelReasoningOptions): Readonly<JsonObject>
+  extractAssistantReasoning(message: Readonly<JsonObject>): ModelReasoningTrace | undefined
   captureAssistantState(message: Readonly<JsonObject>): ProviderTurnState | undefined
   restoreAssistantExtensions(state: ProviderTurnState): Readonly<JsonObject>
   classifyError(error: BoundedOpenAIWireError): ModelErrorOverride | undefined

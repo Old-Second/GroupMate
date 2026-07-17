@@ -1,4 +1,18 @@
 import { AgentError } from '../contracts/error.js';
+export const MAX_MODEL_REASONING_CODE_POINTS = 2_000;
+export function normalizeModelReasoningTrace(value) {
+    const normalized = value.trim().normalize('NFC');
+    if (normalized === '')
+        return undefined;
+    const points = [...normalized];
+    const truncated = points.length > MAX_MODEL_REASONING_CODE_POINTS;
+    return Object.freeze({
+        text: truncated
+            ? points.slice(0, MAX_MODEL_REASONING_CODE_POINTS).join('')
+            : normalized,
+        truncated
+    });
+}
 const SAFE_CODE = /^[a-z0-9_.:-]{1,128}$/i;
 export class ModelProviderError extends AgentError {
     statusCode;

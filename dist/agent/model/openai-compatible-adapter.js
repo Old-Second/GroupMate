@@ -310,6 +310,14 @@ function captureProviderState(message, profile) {
     }
     return parsed;
 }
+function captureDisplayReasoning(message, profile) {
+    try {
+        return profile.extractAssistantReasoning(message);
+    }
+    catch {
+        throw modelProtocolError('invalid_reasoning_content');
+    }
+}
 function parseJsonText(text) {
     try {
         return JSON.parse(text);
@@ -362,12 +370,14 @@ async function readBoundedJsonTurn(response, profile, signal) {
         throw modelProtocolError('invalid_assistant_message');
     }
     const providerState = captureProviderState(frozenMessage, profile);
+    const reasoning = captureDisplayReasoning(frozenMessage, profile);
     return Object.freeze({
         text: typeof message.content === 'string' ? message.content : '',
         ...(typeof message.refusal === 'string' ? { refusal: message.refusal } : {}),
         toolCalls,
         finishReason,
         ...(root.usage === undefined ? {} : { usage: parseUsage(root.usage) }),
+        ...(reasoning === undefined ? {} : { reasoning }),
         ...(providerState === undefined ? {} : { providerState }),
         ...(parseResponseId(root.id) === undefined ? {} : { responseId: parseResponseId(root.id) })
     });
@@ -540,12 +550,14 @@ async function readBoundedEventStream(response, profile, signal) {
         ...extensionAccumulator.value()
     });
     const providerState = captureProviderState(assistantMessage, profile);
+    const reasoning = captureDisplayReasoning(assistantMessage, profile);
     return Object.freeze({
         text,
         ...(refusal.length > 0 ? { refusal } : {}),
         toolCalls,
         finishReason,
         ...(usage === undefined ? {} : { usage }),
+        ...(reasoning === undefined ? {} : { reasoning }),
         ...(providerState === undefined ? {} : { providerState }),
         ...(responseId === undefined ? {} : { responseId })
     });
