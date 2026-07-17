@@ -166,11 +166,20 @@ function validMessageId(value) {
     return typeof value === 'string' && Buffer.byteLength(value, 'utf8') >= 1 &&
         Buffer.byteLength(value, 'utf8') <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
+function normalizedHostMessageId(value) {
+    if (validMessageId(value))
+        return { messageId: value, hostMessageId: value };
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+        return { messageId: String(value), hostMessageId: value };
+    }
+    return null;
+}
 function confirmedMessageId(value) {
     if (value === true)
         return { confirmed: true };
-    if (validMessageId(value))
-        return { confirmed: true, messageId: value };
+    const direct = normalizedHostMessageId(value);
+    if (direct !== null)
+        return { confirmed: true, ...direct };
     if (value === null || typeof value !== 'object' || Array.isArray(value))
         return { confirmed: false };
     let snakeOwn;
@@ -191,7 +200,8 @@ function confirmedMessageId(value) {
     if (snake !== null && camel !== null && snake.value !== camel.value)
         return { confirmed: false };
     const id = snake?.value ?? camel?.value;
-    return validMessageId(id) ? { confirmed: true, messageId: id } : { confirmed: false };
+    const normalized = normalizedHostMessageId(id);
+    return normalized === null ? { confirmed: false } : { confirmed: true, ...normalized };
 }
 function raceHost(invoke, timeoutMs, signal) {
     return new Promise(resolve => {
@@ -257,7 +267,7 @@ function createPort(target, hostTarget) {
                 ...(confirmation.messageId === undefined ? {} : { messageId: confirmation.messageId })
             });
             receipts.add(receipt);
-            receiptIds.set(receipt, confirmation.messageId);
+            receiptIds.set(receipt, confirmation.hostMessageId);
             return Object.freeze({ kind: 'sent', media, attempt, receipt });
         },
         async recall(receipt, signal) {
@@ -266,7 +276,7 @@ function createPort(target, hostTarget) {
                 return Object.freeze({ kind: 'failed_definite', code: 'receipt_not_owned' });
             }
             const messageId = receiptIds.get(receipt);
-            if (!validMessageId(messageId)) {
+            if (messageId === undefined) {
                 return Object.freeze({ kind: 'failed_definite', code: 'message_id_unavailable' });
             }
             if (signal?.aborted === true) {

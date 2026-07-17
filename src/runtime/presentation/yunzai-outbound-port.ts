@@ -81,7 +81,7 @@ export interface YunzaiHostTargetPort {
     quoteMessageId: string | undefined,
     signal: AbortSignal | undefined
   ): Promise<unknown>
-  recall(messageId: string, signal?: AbortSignal): Promise<unknown>
+  recall(messageId: string | number, signal?: AbortSignal): Promise<unknown>
 }
 
 export interface YunzaiOutboundHostPort {
@@ -251,9 +251,24 @@ function validMessageId (value: unknown): value is string {
     Buffer.byteLength(value, 'utf8') <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
 }
 
-function confirmedMessageId (value: unknown): { readonly confirmed: boolean; readonly messageId?: string } {
+function normalizedHostMessageId (
+  value: unknown
+): { readonly messageId: string; readonly hostMessageId: string | number } | null {
+  if (validMessageId(value)) return { messageId: value, hostMessageId: value }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    return { messageId: String(value), hostMessageId: value }
+  }
+  return null
+}
+
+function confirmedMessageId (value: unknown): {
+  readonly confirmed: boolean
+  readonly messageId?: string
+  readonly hostMessageId?: string | number
+} {
   if (value === true) return { confirmed: true }
-  if (validMessageId(value)) return { confirmed: true, messageId: value }
+  const direct = normalizedHostMessageId(value)
+  if (direct !== null) return { confirmed: true, ...direct }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return { confirmed: false }
   let snakeOwn: boolean
   let camelOwn: boolean
@@ -269,7 +284,8 @@ function confirmedMessageId (value: unknown): { readonly confirmed: boolean; rea
   if (!snakeOwn && !camelOwn) return { confirmed: false }
   if (snake !== null && camel !== null && snake.value !== camel.value) return { confirmed: false }
   const id = snake?.value ?? camel?.value
-  return validMessageId(id) ? { confirmed: true, messageId: id } : { confirmed: false }
+  const normalized = normalizedHostMessageId(id)
+  return normalized === null ? { confirmed: false } : { confirmed: true, ...normalized }
 }
 
 function raceHost (
@@ -317,7 +333,7 @@ function unknownDelivery<M extends OutboundMedia> (
 
 function createPort (target: SessionAddress, hostTarget: YunzaiHostTargetPort | null): YunzaiOutboundPort {
   const receipts = new WeakSet<object>()
-  const receiptIds = new WeakMap<object, string | undefined>()
+  const receiptIds = new WeakMap<object, string | number | undefined>()
   const port: YunzaiOutboundPort = {
     target,
     async deliver<P extends OutboundPart> (
@@ -353,7 +369,7 @@ function createPort (target: SessionAddress, hostTarget: YunzaiHostTargetPort | 
         ...(confirmation.messageId === undefined ? {} : { messageId: confirmation.messageId })
       }) as unknown as RuntimeDeliveryReceipt<P['media']>
       receipts.add(receipt)
-      receiptIds.set(receipt, confirmation.messageId)
+      receiptIds.set(receipt, confirmation.hostMessageId)
       return Object.freeze({ kind: 'sent', media, attempt, receipt })
     },
     async recall (receipt: RuntimeDeliveryReceipt, signal?: AbortSignal): Promise<RecallResult> {
@@ -362,7 +378,7 @@ function createPort (target: SessionAddress, hostTarget: YunzaiHostTargetPort | 
         return Object.freeze({ kind: 'failed_definite', code: 'receipt_not_owned' })
       }
       const messageId = receiptIds.get(receipt)
-      if (!validMessageId(messageId)) {
+      if (messageId === undefined) {
         return Object.freeze({ kind: 'failed_definite', code: 'message_id_unavailable' })
       }
       if (signal?.aborted === true) {

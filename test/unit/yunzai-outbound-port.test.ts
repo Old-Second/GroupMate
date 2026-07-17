@@ -28,10 +28,10 @@ function hostTarget (
 ): {
     readonly target: YunzaiHostTargetPort
     readonly dispatches: OutboundPart[]
-    readonly recalls: string[]
+    readonly recalls: Array<string | number>
   } {
   const dispatches: OutboundPart[] = []
-  const recalls: string[] = []
+  const recalls: Array<string | number> = []
   const resolve = async (result: HostResult | undefined): Promise<unknown> => {
     return typeof result === 'function' ? await result() : result
   }
@@ -62,6 +62,22 @@ async function withImmediateTimers<T> (operation: () => Promise<T>): Promise<T> 
     globalThis.setTimeout = original
   }
 }
+
+test('outbound normalizes a NapCat numeric message ID and recalls with its host type', async () => {
+  const fixture = hostTarget([{ message_id: 12_345_678 }], [true])
+  const port = await createYunzaiOutboundPortFactory({
+    forTarget: async () => fixture.target
+  }).forTarget(groupUserTarget)
+
+  const delivered = await port.deliver(textPart, 1)
+  assert.equal(delivered.kind, 'sent')
+  if (delivered.kind !== 'sent') return
+  assert.equal(delivered.receipt.schemaVersion, 1)
+  assert.equal(delivered.receipt.media, 'text')
+  assert.equal(delivered.receipt.messageId, '12345678')
+  assert.deepEqual(await port.recall(delivered.receipt), { kind: 'recalled' })
+  assert.deepEqual(fixture.recalls, [12_345_678])
+})
 
 test('outbound classifies confirmed host results and never treats unknown as sent', async () => {
   let getterReads = 0
