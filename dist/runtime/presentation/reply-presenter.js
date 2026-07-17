@@ -1,8 +1,10 @@
 import { getChatErrorPresentation } from '../chat-error-presentation.js';
+import { EMPTY_PRESENTATION_TRACE } from '../../agent/contracts/presentation-trace.js';
 import { aggregatePresentationResults } from './presentation-result.js';
 import { buildChatSuggestionButtonRequest, normalizeCitationForwards, normalizeReasoningView, normalizeSuggestions } from './reply-content.js';
 import { BLOCKED_RESPONSE_MESSAGE, CANCELLED_MESSAGE, POSTPROCESS_EMPTY_MESSAGE, responseIsBlocked, SESSION_PERSISTENCE_FAILED_MESSAGE } from './response-presentation-safety.js';
-import { citationForwardPart, codePointLength, plainTextPart, reasoningForwardPart, repairCodeFences, splitProactiveText, textPart } from './text-presentation.js';
+import { citationForwardPart, codePointLength, plainTextPart, repairCodeFences, splitProactiveText, textPart } from './text-presentation.js';
+import { executionTraceForwardPart, selectExecutionTrace } from './execution-trace-presentation.js';
 import { deliverWithDefiniteRetry } from './yunzai-outbound-port.js';
 import { presentTtsReply } from './tts-reply-presentation.js';
 import { presentPictureReply } from '../picture-reply.js';
@@ -123,7 +125,7 @@ async function presentFixedText(dependencies, input, text, quote = false) {
         ...(input.signal === undefined ? {} : { signal: input.signal })
     });
 }
-async function presentOrdinary(dependencies, input, text, reasoningView) {
+async function presentOrdinary(dependencies, input, text, executionTrace) {
     const profile = input.profile;
     if (profile.kind !== 'ordinary')
         return failedWithoutDelivery();
@@ -148,11 +150,6 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             diagnostics: dependencies.ttsDiagnostics,
             outboundFactory: dependencies.outboundFactory
         }));
-        if (reasoningView !== undefined) {
-            children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-                ...(input.signal === undefined ? {} : { signal: input.signal })
-            }));
-        }
     }
     else if (profile.forcePicture ||
         input.settings.picture.userEnabled ||
@@ -162,7 +159,7 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             text,
             target: input.route.sessionAddress,
             citations,
-            reasoningView: reasoningView ?? null,
+            reasoningView: null,
             settings: input.settings.picture,
             ...(quote === undefined ? {} : { quoteMessageId: quote }),
             ...(input.signal === undefined ? {} : { signal: input.signal })
@@ -186,11 +183,11 @@ async function presentOrdinary(dependencies, input, text, reasoningView) {
             ...(quote === undefined ? {} : { quoteMessageId: quote }),
             ...(input.signal === undefined ? {} : { signal: input.signal })
         }));
-        if (reasoningView !== undefined) {
-            children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-                ...(input.signal === undefined ? {} : { signal: input.signal })
-            }));
-        }
+    }
+    if (executionTrace.segments.length > 0) {
+        children.push(await deliverLogicalPart(port, executionTraceForwardPart(executionTrace), {
+            ...(input.signal === undefined ? {} : { signal: input.signal })
+        }));
     }
     if (input.settings.enableSuggestedResponses) {
         const suggestions = normalizeSuggestions(input.suggestions);
@@ -269,12 +266,25 @@ export class ReplyPresenter {
                 return skipped('allowed_silence');
             }
             if (input.result.completion.kind === 'already_visible') {
-                if (input.profile.kind === 'ordinary' && input.sessionPersistence === 'failed') {
-                    decision.textLengthBucket = this.#lengthBucket(SESSION_PERSISTENCE_FAILED_MESSAGE);
-                    return await presentFixedText(this.#dependencies, input, SESSION_PERSISTENCE_FAILED_MESSAGE);
+                if (input.profile.kind !== 'ordinary') {
+                    decision.selectedMode = 'silent';
+                    return skipped('already_visible');
                 }
                 decision.selectedMode = 'silent';
-                return skipped('already_visible');
+                const executionTrace = selectExecutionTrace(input.result.presentationTrace, input.settings, undefined);
+                decision.hasReasoning = executionTrace.segments.some(segment => (segment.kind === 'reasoning'));
+                const children = [];
+                if (executionTrace.segments.length > 0) {
+                    const port = await this.#dependencies.outboundFactory.forTarget(input.route.sessionAddress);
+                    children.push(await deliverLogicalPart(port, executionTraceForwardPart(executionTrace), { ...(input.signal === undefined ? {} : { signal: input.signal }) }));
+                }
+                if (input.sessionPersistence === 'failed') {
+                    decision.textLengthBucket = this.#lengthBucket(SESSION_PERSISTENCE_FAILED_MESSAGE);
+                    children.push(await presentFixedText(this.#dependencies, input, SESSION_PERSISTENCE_FAILED_MESSAGE));
+                }
+                return children.length === 0
+                    ? skipped('already_visible')
+                    : aggregatePresentationResults(children);
             }
             return await this.#presentReplyText(input, input.result.completion.text, decision);
         }
@@ -323,14 +333,17 @@ export class ReplyPresenter {
             return await this.#appendPersistenceNotice(input, main);
         }
         const finalText = repairCodeFences(normalized);
-        const reasoningView = input.profile.kind === 'ordinary' && input.settings.forwardReasoning
+        const reasoningView = input.profile.kind === 'ordinary'
             ? normalizeReasoningView(processed.reasoningView)
             : undefined;
-        decision.hasReasoning = reasoningView !== undefined;
-        fireNotification(input, finalText, reasoningView !== undefined);
+        const executionTrace = input.profile.kind === 'ordinary' && input.result.kind === 'completed'
+            ? selectExecutionTrace(input.result.presentationTrace, input.settings, reasoningView)
+            : EMPTY_PRESENTATION_TRACE;
+        decision.hasReasoning = executionTrace.segments.some(segment => segment.kind === 'reasoning');
+        fireNotification(input, finalText, decision.hasReasoning);
         let main;
         if (input.profile.kind === 'ordinary') {
-            main = await presentOrdinary(this.#dependencies, input, finalText, reasoningView);
+            main = await presentOrdinary(this.#dependencies, input, finalText, executionTrace);
             this.#captureOrdinaryMode(input, finalText, main, decision);
         }
         else {

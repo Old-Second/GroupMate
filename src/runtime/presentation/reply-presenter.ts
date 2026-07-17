@@ -1,5 +1,9 @@
 import { getChatErrorPresentation } from '../chat-error-presentation.js'
 import {
+  EMPTY_PRESENTATION_TRACE,
+  type PresentationTraceV1
+} from '../../agent/contracts/presentation-trace.js'
+import {
   aggregatePresentationResults,
   type DeliveryResult,
   type PresentationDeliveryMedia,
@@ -10,8 +14,7 @@ import {
   buildChatSuggestionButtonRequest,
   normalizeCitationForwards,
   normalizeReasoningView,
-  normalizeSuggestions,
-  type ReasoningView
+  normalizeSuggestions
 } from './reply-content.js'
 import {
   BLOCKED_RESPONSE_MESSAGE,
@@ -24,11 +27,14 @@ import {
   citationForwardPart,
   codePointLength,
   plainTextPart,
-  reasoningForwardPart,
   repairCodeFences,
   splitProactiveText,
   textPart
 } from './text-presentation.js'
+import {
+  executionTraceForwardPart,
+  selectExecutionTrace
+} from './execution-trace-presentation.js'
 import {
   deliverWithDefiniteRetry,
   type OutboundDeliveryOptions,
@@ -239,7 +245,7 @@ async function presentOrdinary (
   dependencies: ReplyPresenterDependencies,
   input: PresentationInput,
   text: string,
-  reasoningView: ReasoningView | undefined
+  executionTrace: PresentationTraceV1
 ): Promise<PresentationResult> {
   const profile = input.profile
   if (profile.kind !== 'ordinary') return failedWithoutDelivery()
@@ -264,11 +270,6 @@ async function presentOrdinary (
       diagnostics: dependencies.ttsDiagnostics,
       outboundFactory: dependencies.outboundFactory
     }))
-    if (reasoningView !== undefined) {
-      children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-        ...(input.signal === undefined ? {} : { signal: input.signal })
-      }))
-    }
   } else if (
     profile.forcePicture ||
     input.settings.picture.userEnabled ||
@@ -279,7 +280,7 @@ async function presentOrdinary (
       text,
       target: input.route.sessionAddress,
       citations,
-      reasoningView: reasoningView ?? null,
+      reasoningView: null,
       settings: input.settings.picture,
       ...(quote === undefined ? {} : { quoteMessageId: quote }),
       ...(input.signal === undefined ? {} : { signal: input.signal })
@@ -302,11 +303,12 @@ async function presentOrdinary (
       ...(quote === undefined ? {} : { quoteMessageId: quote }),
       ...(input.signal === undefined ? {} : { signal: input.signal })
     }))
-    if (reasoningView !== undefined) {
-      children.push(await deliverLogicalPart(port, reasoningForwardPart(reasoningView.text), {
-        ...(input.signal === undefined ? {} : { signal: input.signal })
-      }))
-    }
+  }
+
+  if (executionTrace.segments.length > 0) {
+    children.push(await deliverLogicalPart(port, executionTraceForwardPart(executionTrace), {
+      ...(input.signal === undefined ? {} : { signal: input.signal })
+    }))
   }
 
   if (input.settings.enableSuggestedResponses) {
@@ -406,16 +408,41 @@ export class ReplyPresenter {
         return skipped('allowed_silence')
       }
       if (input.result.completion.kind === 'already_visible') {
-        if (input.profile.kind === 'ordinary' && input.sessionPersistence === 'failed') {
+        if (input.profile.kind !== 'ordinary') {
+          decision.selectedMode = 'silent'
+          return skipped('already_visible')
+        }
+        decision.selectedMode = 'silent'
+        const executionTrace = selectExecutionTrace(
+          input.result.presentationTrace,
+          input.settings,
+          undefined
+        )
+        decision.hasReasoning = executionTrace.segments.some(segment => (
+          segment.kind === 'reasoning'
+        ))
+        const children: PresentationResult[] = []
+        if (executionTrace.segments.length > 0) {
+          const port = await this.#dependencies.outboundFactory.forTarget(
+            input.route.sessionAddress
+          )
+          children.push(await deliverLogicalPart(
+            port,
+            executionTraceForwardPart(executionTrace),
+            { ...(input.signal === undefined ? {} : { signal: input.signal }) }
+          ))
+        }
+        if (input.sessionPersistence === 'failed') {
           decision.textLengthBucket = this.#lengthBucket(SESSION_PERSISTENCE_FAILED_MESSAGE)
-          return await presentFixedText(
+          children.push(await presentFixedText(
             this.#dependencies,
             input,
             SESSION_PERSISTENCE_FAILED_MESSAGE
-          )
+          ))
         }
-        decision.selectedMode = 'silent'
-        return skipped('already_visible')
+        return children.length === 0
+          ? skipped('already_visible')
+          : aggregatePresentationResults(children)
       }
       return await this.#presentReplyText(input, input.result.completion.text, decision)
     }
@@ -493,15 +520,22 @@ export class ReplyPresenter {
     }
 
     const finalText = repairCodeFences(normalized)
-    const reasoningView = input.profile.kind === 'ordinary' && input.settings.forwardReasoning
+    const reasoningView = input.profile.kind === 'ordinary'
       ? normalizeReasoningView(processed.reasoningView)
       : undefined
-    decision.hasReasoning = reasoningView !== undefined
-    fireNotification(input, finalText, reasoningView !== undefined)
+    const executionTrace = input.profile.kind === 'ordinary' && input.result.kind === 'completed'
+      ? selectExecutionTrace(
+          input.result.presentationTrace,
+          input.settings,
+          reasoningView
+        )
+      : EMPTY_PRESENTATION_TRACE
+    decision.hasReasoning = executionTrace.segments.some(segment => segment.kind === 'reasoning')
+    fireNotification(input, finalText, decision.hasReasoning)
 
     let main: PresentationResult
     if (input.profile.kind === 'ordinary') {
-      main = await presentOrdinary(this.#dependencies, input, finalText, reasoningView)
+      main = await presentOrdinary(this.#dependencies, input, finalText, executionTrace)
       this.#captureOrdinaryMode(input, finalText, main, decision)
     } else {
       main = input.profile.kind === 'proactive'

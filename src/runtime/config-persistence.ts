@@ -2,6 +2,13 @@ import { isDeepStrictEqual } from 'node:util'
 
 type Configuration = Record<string, unknown>
 
+export function resolveForwardToolDetailsSetting (
+  value: unknown,
+  forwardReasoning: boolean
+): boolean {
+  return typeof value === 'boolean' ? value : forwardReasoning
+}
+
 export function selectPersistedConfig (
   configuration: Readonly<Configuration>,
   defaults: Readonly<Configuration>

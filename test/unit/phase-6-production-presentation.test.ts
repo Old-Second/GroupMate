@@ -64,6 +64,8 @@ function presentationSettings (overrides: Readonly<{
   forcePicture?: boolean
   tts?: boolean
   alsoSendText?: boolean
+  forwardReasoning?: boolean
+  forwardToolDetails?: boolean
 }> = {}): PresentationSettings {
   return Object.freeze({
     schemaVersion: 1,
@@ -71,7 +73,8 @@ function presentationSettings (overrides: Readonly<{
     enableRobotAt: false,
     enableMarkdown: false,
     enableSuggestedResponses: false,
-    forwardReasoning: false,
+    forwardReasoning: overrides.forwardReasoning === true,
+    forwardToolDetails: overrides.forwardToolDetails === true,
     blockWords: Object.freeze([]),
     promptBlockWords: Object.freeze([]),
     tts: Object.freeze({
@@ -340,8 +343,15 @@ function graphFixture (input: GraphFixtureOptions) {
   }
 }
 
-function textTurn (text: string): ModelTurn {
-  return Object.freeze({ text, toolCalls: Object.freeze([]), finishReason: 'stop' })
+function textTurn (text: string, reasoning?: string): ModelTurn {
+  return Object.freeze({
+    text,
+    toolCalls: Object.freeze([]),
+    finishReason: 'stop',
+    ...(reasoning === undefined
+      ? {}
+      : { reasoning: Object.freeze({ text: reasoning, truncated: false }) })
+  })
 }
 
 function toolTurn (
@@ -388,7 +398,7 @@ class ControllerScenarioModel implements ProductionModelPort {
     ].find(value => requestContains(request, value))
     if (marker === undefined) throw new Error('unexpected controller scenario request')
     this.counts.set(marker, this.count(marker) + 1)
-    if (marker === '普通文字请求') return textTurn('普通正文')
+    if (marker === '普通文字请求') return textTurn('普通正文', '生产链路思考')
     if (marker === '图片请求') return textTurn('图片正文')
     if (marker === '语音请求') return textTurn('语音正文')
     if (marker === '骰子请求') return toolTurn('call-dice', 'sendDice', { count: 1 })
@@ -881,19 +891,25 @@ test('production presentation covers ordinary proactive approval and all termina
     bot: host.bot,
     bymPolicy: activeBymPolicy,
     settingsForActor: actorId => {
+      if (actorId === 'actor-text') return presentationSettings({ forwardReasoning: true })
       if (actorId === 'actor-picture') return presentationSettings({ forcePicture: true })
       if (actorId === 'actor-tts') return presentationSettings({ tts: true, alsoSendText: true })
+      if (actorId === 'actor-dice') return presentationSettings({ forwardToolDetails: true })
       return presentationSettings()
     }
   })
   const { graph, dispatches, observations } = fixture
   let shutdown = false
   try {
+    const ordinaryStart = dispatches.length
     assert.equal(await graph.chatController.chatgpt1(groupEvent({
       marker: '普通文字请求', actorId: 'actor-text'
     }, host)), true)
-    assert.equal(dispatches.at(-1)?.part.media, 'text')
-    assert.equal(deliveredText(dispatches.at(-1)?.part as OutboundPart), '普通正文')
+    const ordinary = dispatches.slice(ordinaryStart)
+    assert.deepEqual(ordinary.map(item => item.part.media), ['text', 'forward'])
+    assert.equal(deliveredText(ordinary[0]?.part as OutboundPart), '普通正文')
+    assert.equal(ordinary[1]?.part.media === 'forward' ? ordinary[1].part.title : null, '思考过程')
+    assert.match(JSON.stringify(ordinary[1]?.part), /生产链路思考/)
 
     assert.equal(await graph.chatController.chatgpt1(groupEvent({
       marker: '图片请求', actorId: 'actor-picture', msg: '#图片chat1 图片请求'
@@ -913,10 +929,11 @@ test('production presentation covers ordinary proactive approval and all termina
     assert.equal(await graph.chatController.chatgpt1(groupEvent({
       marker: '骰子请求', actorId: 'actor-dice', msg: '#chat1 骰子请求，请投掷 1 个骰子'
     }, host)), true)
-    assert.deepEqual(
-      dispatches.slice(visibleStart).map(item => deliveredText(item.part)),
-      ['正在执行任务步骤']
-    )
+    const visible = dispatches.slice(visibleStart)
+    assert.deepEqual(visible.map(item => item.part.media), ['text', 'forward'])
+    assert.deepEqual(visible.map(item => deliveredText(item.part)), ['正在执行任务步骤', ''])
+    assert.equal(visible[1]?.part.media === 'forward' ? visible[1].part.title : null, '工具执行详情')
+    assert.match(JSON.stringify(visible[1]?.part), /工具执行：sendDice|结果已通过工具发送/)
     assert.equal(host.visibleMessages.length, 1)
 
     const silenceStart = dispatches.length

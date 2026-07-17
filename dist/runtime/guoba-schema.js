@@ -66,6 +66,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('apiThinkingMode', '思考模式', '向支持该扩展的 OpenAI-compatible 服务传递 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
         field('apiReasoningEffort', '思考强度', '向支持该扩展的模型传递 reasoning_effort；默认表示由服务端决定。', 'Select', { options: reasoningEffortOptions }),
         field('forwardReasoning', '转发思考过程', '将兼容服务返回的 reasoning_content 以转发消息展示；可能增加消息数量并暴露模型推理文本。', 'Switch'),
+        field('forwardToolDetails', '转发工具执行详情', '以转发消息展示脱敏后的工具名、参数和结果摘要；仍可能暴露用户输入、任务目标和执行结果，群聊中请按需开启。', 'Switch'),
         field('openAiForceUseReverse', '强制保留自定义 API 地址', '开启后即使设置了代理或环境可直连，也始终使用上方自定义 API Base URL。', 'Switch'),
         field('enableGroupContext', '读取群聊上下文', '将近期群聊记录加入模型上下文；会增加 Token 消耗并向模型服务发送相关消息内容。', 'Switch'),
         field('groupContextLength', '群聊上下文条数', '最多读取的近期群消息数量；越大越消耗 Token。', 'InputNumber', { min: 0 }),

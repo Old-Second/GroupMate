@@ -26,6 +26,7 @@
   "model": "",
   "temperature": 0.8,
   "forwardReasoning": true,
+  "forwardToolDetails": true,
   "toneStyle": "Creative",
   "enableSuggestedResponses": false,
   "promptPrefixOverride": "Your answer shouldn\"t be too verbose. Prefer to answer in Chinese.",

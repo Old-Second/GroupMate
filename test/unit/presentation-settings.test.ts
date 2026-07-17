@@ -15,6 +15,7 @@ function safeConfig (
     enableMd: false,
     enableSuggestedResponses: true,
     forwardReasoning: true,
+    forwardToolDetails: true,
     blockWords: [' Alpha ', 'A\u030A', '', 'Alpha'],
     promptBlockWords: [' Prompt '],
     defaultUsePicture: false,
@@ -92,7 +93,7 @@ test('presentation settings keep only the safe allowlist', async () => {
 
   assert.deepEqual(Reflect.ownKeys(settings), [
     'schemaVersion', 'quoteReply', 'enableRobotAt', 'enableMarkdown',
-    'enableSuggestedResponses', 'forwardReasoning', 'blockWords',
+    'enableSuggestedResponses', 'forwardReasoning', 'forwardToolDetails', 'blockWords',
     'promptBlockWords', 'tts', 'picture'
   ])
   assert.equal(settings.picture.userEnabled, true)
@@ -128,6 +129,23 @@ test('presentation settings keep only the safe allowlist', async () => {
     'sk-secret', 'private.example', 'private-model', 'private quoted body'
   ]) {
     assert.equal(serialized.includes(forbiddenValue), false)
+  }
+})
+
+test('presentation settings inherit missing tool details from the effective reasoning switch', async () => {
+  for (const [overrides, expected] of [
+    [{ forwardReasoning: false, forwardToolDetails: undefined }, [false, false]],
+    [{ forwardReasoning: true, forwardToolDetails: undefined }, [true, true]],
+    [{ forwardReasoning: false, forwardToolDetails: true }, [false, true]],
+    [{ forwardReasoning: true, forwardToolDetails: false }, [true, false]]
+  ] as const) {
+    const settings = await createPresentationSettingsPort(source({
+      overrides: overrides as Partial<ReturnType<PresentationSettingsSource['currentSafeConfig']>>
+    })).load('actor-1')
+    assert.deepEqual(
+      [settings.forwardReasoning, settings.forwardToolDetails],
+      expected
+    )
   }
 })
 

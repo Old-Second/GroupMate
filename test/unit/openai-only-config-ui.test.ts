@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { test } from 'node:test'
 import {
+  resolveForwardToolDetailsSetting,
   selectImportableConfig,
   selectPersistedConfig
 } from '../../src/runtime/config-persistence.js'
@@ -127,6 +128,7 @@ const requiredGuobaFields = [
   'promptPrefixOverride',
   'temperature',
   'forwardReasoning',
+  'forwardToolDetails',
   'smartMode',
   'toolPolicyProfile',
   'toolApprovalTtlSeconds',
@@ -233,7 +235,7 @@ const expectedGuobaGroups = [
       'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model',
       'promptPrefixOverride', 'temperature',
       'apiStream', 'apiMaxToken', 'apiThinkingMode', 'apiReasoningEffort',
-      'forwardReasoning', 'openAiForceUseReverse', 'enableGroupContext',
+      'forwardReasoning', 'forwardToolDetails', 'openAiForceUseReverse', 'enableGroupContext',
       'groupContextLength', 'groupContextTip', 'groupMerge',
       'conversationPreserveTime'
     ]
@@ -641,5 +643,39 @@ test('Guoba exposes exactly one pending indicator field with lifecycle semantics
   assert.equal(
     fields[0]?.bottomHelpMessage,
     '普通聊天开始后显示一次提示，并在首条进度、审批暂停、终态或最多 8 秒后撤回；主动群聊不显示。'
+  )
+})
+
+test('Guoba exposes adjacent independent reasoning and tool-detail switches', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const reasoningIndex = schemas.findIndex(schema => schema.field === 'forwardReasoning')
+  const toolIndexes = schemas.flatMap((schema, index) => (
+    schema.field === 'forwardToolDetails' ? [index] : []
+  ))
+  assert.equal(toolIndexes.length, 1)
+  assert.equal(toolIndexes[0], reasoningIndex + 1)
+  const field = schemas[toolIndexes[0] ?? -1]
+  assert.equal(field?.component, 'Switch')
+  assert.match(field?.bottomHelpMessage ?? '', /脱敏|参数|结果|目标/)
+
+  const example = JSON.parse(await readSource('config/config.example.json')) as Record<string, unknown>
+  assert.equal(example.forwardReasoning, true)
+  assert.equal(example.forwardToolDetails, true)
+
+  assert.equal(resolveForwardToolDetailsSetting(undefined, false), false)
+  assert.equal(resolveForwardToolDetailsSetting(undefined, true), true)
+  assert.equal(resolveForwardToolDetailsSetting(true, false), true)
+  assert.equal(resolveForwardToolDetailsSetting(false, true), false)
+  const source = await readSource('utils/config.js')
+  const inheritanceIndex = source.indexOf(
+    'const effectiveForwardToolDetails = resolveForwardToolDetailsSetting('
+  )
+  assert.ok(inheritanceIndex >= 0)
+  assert.ok(
+    inheritanceIndex <
+      source.indexOf('Object.assign({}, defaultConfig, config)'),
+    'legacy inheritance must be resolved before defaults hide a missing field'
   )
 })

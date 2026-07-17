@@ -37,6 +37,7 @@ export interface PresentationSettings {
   readonly enableMarkdown: boolean
   readonly enableSuggestedResponses: boolean
   readonly forwardReasoning: boolean
+  readonly forwardToolDetails: boolean
   readonly blockWords: readonly string[]
   readonly promptBlockWords: readonly string[]
   readonly tts: TtsPresentationSettings
@@ -55,6 +56,7 @@ export interface PresentationSettingsSource {
     enableMd: boolean
     enableSuggestedResponses: boolean
     forwardReasoning: boolean
+    forwardToolDetails?: boolean
     blockWords: readonly string[]
     promptBlockWords: readonly string[]
     defaultUsePicture: boolean
@@ -236,6 +238,7 @@ export function createPresentationSettingsPort (
         voicevox: boundedText(user.ttsRoleVoiceVox, 256, voicevoxRole)
       })
       const live2dEnabled = booleanValue(config.live2d, DEFAULTS.live2d)
+      const forwardReasoning = booleanValue(config.forwardReasoning, DEFAULTS.forwardReasoning)
       const tts = Object.freeze({
         enabled: user.useTTS ?? booleanValue(config.defaultUseTTS, DEFAULTS.defaultUseTTS),
         mode,
@@ -310,7 +313,8 @@ export function createPresentationSettingsPort (
           config.enableSuggestedResponses,
           DEFAULTS.enableSuggestedResponses
         ),
-        forwardReasoning: booleanValue(config.forwardReasoning, DEFAULTS.forwardReasoning),
+        forwardReasoning,
+        forwardToolDetails: booleanValue(config.forwardToolDetails, forwardReasoning),
         blockWords: normalizedWords(config.blockWords),
         promptBlockWords: normalizedWords(config.promptBlockWords),
         tts,

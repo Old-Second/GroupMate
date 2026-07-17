@@ -4,7 +4,11 @@ import type { CompletionDisposition } from '../../src/agent/contracts/completion
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
 import type { PresentationRouteV1, RecoveredLegacyPresentationRoute } from '../../src/agent/contracts/interaction.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
-import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
+import {
+  EMPTY_PRESENTATION_TRACE,
+  parsePresentationTrace,
+  type PresentationTraceV1
+} from '../../src/agent/contracts/presentation-trace.js'
 import { serializeAgentError, AgentError } from '../../src/agent/contracts/error.js'
 import { createInitialRunObservationCounters, terminalObservationId } from '../../src/agent/run/run-observation.js'
 import {
@@ -116,7 +120,8 @@ function settings (overrides: Partial<PresentationSettings> = {}): PresentationS
       showQRCode: true,
       live2d: null
     }),
-    ...overrides
+    ...overrides,
+    forwardToolDetails: overrides.forwardToolDetails ?? true
   })
 }
 
@@ -172,16 +177,44 @@ function output (text: string) {
   })
 }
 
-function completed (completion: CompletionDisposition): Extract<RunAdvanceResult, { kind: 'completed' }> {
+function completed (
+  completion: CompletionDisposition,
+  presentationTrace: PresentationTraceV1 = EMPTY_PRESENTATION_TRACE
+): Extract<RunAdvanceResult, { kind: 'completed' }> {
   return Object.freeze({
     kind: 'completed', runId: 'run-1', runRef, completion,
     output: completion.kind === 'already_visible'
       ? null
       : output(completion.kind === 'allowed_silence' ? '<EMPTY>' : completion.text),
-    presentationTrace: EMPTY_PRESENTATION_TRACE,
+    presentationTrace,
     terminal: terminalFacts('completed', completion)
   })
 }
+
+const providerTrace = parsePresentationTrace({
+  schemaVersion: 1,
+  truncated: false,
+  segments: [
+    {
+      kind: 'reasoning', step: 0, turn: 1,
+      text: 'Provider 原生思考', truncated: false
+    },
+    {
+      kind: 'tool', step: 0, index: 0, toolName: 'search', outcome: 'succeeded',
+      argumentsSummary: '{"query":"天气"}', resultSummary: '晴', truncated: false
+    }
+  ]
+})
+
+const toolOnlyTrace = parsePresentationTrace({
+  schemaVersion: 1,
+  truncated: false,
+  segments: [{
+    kind: 'tool', step: 0, index: 0, toolName: 'sendMessage', outcome: 'succeeded',
+    argumentsSummary: '{"text":"已处理"}',
+    resultSummary: '结果已通过工具发送', truncated: false
+  }]
+})
 
 const failed: Extract<RunAdvanceResult, { kind: 'failed' }> = Object.freeze({
   kind: 'failed', runId: 'run-1', runRef,
@@ -395,12 +428,21 @@ async function captureUnhandledRejections (
 
 test('postprocessor empty never falls back to the original response', async () => {
   const secret = 'ORIGINAL-SECRET-FIXTURE'
+  const secretTrace = parsePresentationTrace({
+    schemaVersion: 1,
+    truncated: false,
+    segments: [{
+      kind: 'reasoning', step: 0, turn: 1, text: secret, truncated: false
+    }]
+  })
   const f = fixture({
     hooks: {
       postprocess: async () => ({ text: '   ', reasoningView: { text: secret, truncated: false } })
     }
   })
-  const result = await f.presenter.present(input(completed({ kind: 'reply_text', text: secret }), {
+  const result = await f.presenter.present(input(completed({
+    kind: 'reply_text', text: secret
+  }, secretTrace), {
     hooks: f.hooks
   }))
   assert.equal(result.outcome, 'complete')
@@ -765,6 +807,97 @@ test('ordinary profile preserves citation reasoning suggestions and trusted butt
   )
 })
 
+test('ordinary success appends one selected execution trace after text, TTS or picture', async () => {
+  const text = fixture({
+    hooks: {
+      postprocess: async ({ text }) => ({
+        text,
+        reasoningView: { text: '不应重复的内联思考', truncated: false }
+      })
+    }
+  })
+  await text.presenter.present(input(completed({
+    kind: 'reply_text', text: '文本正文'
+  }, providerTrace), { hooks: text.hooks }))
+  assert.deepEqual(text.calls.map(call => call.part.media), ['text', 'forward'])
+  const textTrace = text.calls[1]?.part
+  assert.equal(textTrace?.media === 'forward' ? textTrace.title : null, '执行过程')
+  assert.doesNotMatch(JSON.stringify(textTrace), /不应重复的内联思考/)
+  assert.deepEqual(text.notifications, [{ runRef, text: '文本正文', hasReasoning: true }])
+
+  const tts = fixture()
+  await tts.presenter.present(input(completed({
+    kind: 'reply_text', text: '语音正文'
+  }, providerTrace), {
+    settings: settings({
+      tts: Object.freeze({ ...settings().tts, enabled: true, mode: 'azure' })
+    }),
+    hooks: tts.hooks
+  }))
+  assert.deepEqual(tts.calls.map(call => call.part.media), ['voice', 'forward'])
+
+  const picture = fixture({
+    hooks: {
+      postprocess: async ({ text }) => ({
+        text,
+        reasoningView: { text: '图片不应重复的内联思考', truncated: false }
+      })
+    }
+  })
+  await picture.presenter.present(input(completed({
+    kind: 'reply_text', text: '图片正文'
+  }, providerTrace), {
+    settings: settings({
+      picture: Object.freeze({ ...settings().picture, userEnabled: true })
+    }),
+    hooks: picture.hooks
+  }))
+  assert.deepEqual(picture.calls.map(call => call.part.media), ['picture', 'forward'])
+  assert.equal((picture.pictureCalls[0] as { reasoningView?: unknown } | undefined)?.reasoningView, null)
+})
+
+test('already-visible success sends only its tool trace before a persistence notice', async () => {
+  const saved = fixture()
+  const visible = completed({ kind: 'already_visible', source: 'tool_output' }, toolOnlyTrace)
+  const savedResult = await saved.presenter.present(input(visible, { hooks: saved.hooks }))
+  assert.equal(savedResult.outcome, 'complete')
+  assert.deepEqual(saved.calls.map(call => call.part.media), ['forward'])
+
+  const failedSave = fixture()
+  const failedSaveResult = await failedSave.presenter.present(input(visible, {
+    sessionPersistence: 'failed',
+    hooks: failedSave.hooks
+  }))
+  assert.equal(failedSaveResult.outcome, 'complete')
+  assert.deepEqual(failedSave.calls.map(call => call.part.media), ['forward', 'text'])
+  assert.deepEqual(sentTexts(failedSave.calls), [SESSION_PERSISTENCE_FAILED_MESSAGE])
+})
+
+test('blocked output suppresses execution trace and trace delivery failure preserves the main reply', async () => {
+  const blocked = fixture()
+  await blocked.presenter.present(input(completed({
+    kind: 'reply_text', text: '命中屏蔽词'
+  }, providerTrace), {
+    settings: settings({ blockWords: Object.freeze(['屏蔽词']) }),
+    hooks: blocked.hooks
+  }))
+  assert.deepEqual(blocked.calls.map(call => call.part.media), ['text'])
+  assert.deepEqual(sentTexts(blocked.calls), [BLOCKED_RESPONSE_MESSAGE])
+  assert.doesNotMatch(JSON.stringify(blocked.calls), /Provider 原生思考|query|天气/)
+
+  const failedTrace = fixture({ deliveries: [
+    sent('text'), definite('forward', 1), definite('forward', 2)
+  ] })
+  const result = await failedTrace.presenter.present(input(completed({
+    kind: 'reply_text', text: '主回复已发送'
+  }, providerTrace), { hooks: failedTrace.hooks }))
+  assert.equal(result.outcome, 'partial')
+  assert.deepEqual(failedTrace.calls.map(call => [call.part.media, call.attempt]), [
+    ['text', 1], ['forward', 1], ['forward', 2]
+  ])
+  assert.deepEqual(sentTexts(failedTrace.calls), ['主回复已发送'])
+})
+
 test('response post notification failures never escape presentation', async () => {
   for (const notifyResponsePost of [
     () => { throw new Error('private-body target-group receipt-sync') },
@@ -979,14 +1112,14 @@ test('ReplyPresenter selects TTS then picture then text with required renderer',
   }))
   assert.equal(picture.ttsCalls.length, 0)
   assert.equal(picture.pictureCalls.length, 1)
-  assert.deepEqual(picture.calls.map(call => call.part.media), ['picture'])
+  assert.deepEqual(picture.calls.map(call => call.part.media), ['picture', 'forward'])
   assert.equal(picture.conversions.length, 0)
   assert.deepEqual(picture.pictureCalls[0], {
     replyText: '图片正文',
     citations: [{
       title: '图片内来源', text: '图片内引用', sourceUrl: 'https://example.com/source'
     }],
-    reasoningView: { text: '图片内推理', truncated: false },
+    reasoningView: null,
     settings: settings({
       picture: Object.freeze({ ...settings().picture, userEnabled: true })
     }).picture

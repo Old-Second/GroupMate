@@ -51,6 +51,7 @@ import {
   type GroupHistoryDiagnosticCode
 } from './group-history-read-coordinator.js'
 import { createAgentRunLog } from './safe-chat-logging.js'
+import { resolveForwardToolDetailsSetting } from './config-persistence.js'
 import type { GroupMateContentJournal } from './logging/groupmate-content-journal.js'
 import { TerminalFactCollector } from './terminal-fact-collector.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js'
@@ -364,6 +365,7 @@ const RECOVERED_LEGACY_SETTINGS: PresentationSettings = Object.freeze({
   enableMarkdown: false,
   enableSuggestedResponses: false,
   forwardReasoning: false,
+  forwardToolDetails: false,
   blockWords: Object.freeze([]),
   promptBlockWords: Object.freeze([]),
   tts: Object.freeze({
@@ -557,6 +559,20 @@ function configStringList (config: RuntimeConfig, key: string): readonly string[
     : [])
 }
 
+function presentationTraceSettings (config: RuntimeConfig): Readonly<{
+  forwardReasoning: boolean
+  forwardToolDetails: boolean
+}> {
+  const forwardReasoning = configBoolean(config, 'forwardReasoning', true)
+  return Object.freeze({
+    forwardReasoning,
+    forwardToolDetails: resolveForwardToolDetailsSetting(
+      config.forwardToolDetails,
+      forwardReasoning
+    )
+  })
+}
+
 function presentationSettingsSource (
   options: YunzaiAgentServiceBridgeOptions
 ): PresentationSettingsSource {
@@ -571,7 +587,7 @@ function presentationSettingsSource (
         'enableSuggestedResponses',
         false
       ),
-      forwardReasoning: configBoolean(options.config, 'forwardReasoning', true),
+      ...presentationTraceSettings(options.config),
       blockWords: configStringList(options.config, 'blockWords'),
       promptBlockWords: configStringList(options.config, 'promptBlockWords'),
       defaultUsePicture: configBoolean(options.config, 'defaultUsePicture', false),

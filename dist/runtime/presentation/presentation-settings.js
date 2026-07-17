@@ -137,6 +137,7 @@ export function createPresentationSettingsPort(source) {
                 voicevox: boundedText(user.ttsRoleVoiceVox, 256, voicevoxRole)
             });
             const live2dEnabled = booleanValue(config.live2d, DEFAULTS.live2d);
+            const forwardReasoning = booleanValue(config.forwardReasoning, DEFAULTS.forwardReasoning);
             const tts = Object.freeze({
                 enabled: user.useTTS ?? booleanValue(config.defaultUseTTS, DEFAULTS.defaultUseTTS),
                 mode,
@@ -170,7 +171,8 @@ export function createPresentationSettingsPort(source) {
                 enableRobotAt: booleanValue(config.enableRobotAt, DEFAULTS.enableRobotAt),
                 enableMarkdown: booleanValue(config.enableMd, DEFAULTS.enableMarkdown),
                 enableSuggestedResponses: booleanValue(config.enableSuggestedResponses, DEFAULTS.enableSuggestedResponses),
-                forwardReasoning: booleanValue(config.forwardReasoning, DEFAULTS.forwardReasoning),
+                forwardReasoning,
+                forwardToolDetails: booleanValue(config.forwardToolDetails, forwardReasoning),
                 blockWords: normalizedWords(config.blockWords),
                 promptBlockWords: normalizedWords(config.promptBlockWords),
                 tts,

@@ -31,6 +31,7 @@ const settings: PresentationSettings = Object.freeze({
   enableMarkdown: false,
   enableSuggestedResponses: false,
   forwardReasoning: false,
+  forwardToolDetails: false,
   blockWords: Object.freeze([]),
   promptBlockWords: Object.freeze([]),
   tts: Object.freeze({

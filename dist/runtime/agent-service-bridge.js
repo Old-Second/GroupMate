@@ -16,6 +16,7 @@ import { AgentService } from './agent-service.js';
 import { beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
 import { GroupHistoryReadCoordinator } from './group-history-read-coordinator.js';
 import { createAgentRunLog } from './safe-chat-logging.js';
+import { resolveForwardToolDetailsSetting } from './config-persistence.js';
 import { TerminalFactCollector } from './terminal-fact-collector.js';
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js';
 import { RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
@@ -128,6 +129,7 @@ const RECOVERED_LEGACY_SETTINGS = Object.freeze({
     enableMarkdown: false,
     enableSuggestedResponses: false,
     forwardReasoning: false,
+    forwardToolDetails: false,
     blockWords: Object.freeze([]),
     promptBlockWords: Object.freeze([]),
     tts: Object.freeze({
@@ -294,6 +296,13 @@ function configStringList(config, key) {
         ? value.filter((item) => typeof item === 'string')
         : []);
 }
+function presentationTraceSettings(config) {
+    const forwardReasoning = configBoolean(config, 'forwardReasoning', true);
+    return Object.freeze({
+        forwardReasoning,
+        forwardToolDetails: resolveForwardToolDetailsSetting(config.forwardToolDetails, forwardReasoning)
+    });
+}
 function presentationSettingsSource(options) {
     return Object.freeze({
         loadUserJson: async (actorId) => await options.redis.get(`CHATGPT:USER:${actorId}`),
@@ -302,7 +311,7 @@ function presentationSettingsSource(options) {
             enableRobotAt: configBoolean(options.config, 'enableRobotAt', true),
             enableMd: configBoolean(options.config, 'enableMd', false),
             enableSuggestedResponses: configBoolean(options.config, 'enableSuggestedResponses', false),
-            forwardReasoning: configBoolean(options.config, 'forwardReasoning', true),
+            ...presentationTraceSettings(options.config),
             blockWords: configStringList(options.config, 'blockWords'),
             promptBlockWords: configStringList(options.config, 'promptBlockWords'),
             defaultUsePicture: configBoolean(options.config, 'defaultUsePicture', false),

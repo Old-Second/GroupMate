@@ -37,6 +37,7 @@ const RECOVERED_LEGACY_SETTINGS = Object.freeze({
     enableMarkdown: false,
     enableSuggestedResponses: false,
     forwardReasoning: false,
+    forwardToolDetails: false,
     blockWords: Object.freeze([]),
     promptBlockWords: Object.freeze([]),
     tts: Object.freeze({

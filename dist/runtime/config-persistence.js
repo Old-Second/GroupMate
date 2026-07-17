@@ -1,4 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
+export function resolveForwardToolDetailsSetting(value, forwardReasoning) {
+    return typeof value === 'boolean' ? value : forwardReasoning;
+}
 export function selectPersistedConfig(configuration, defaults) {
     const persisted = {};
     for (const [key, value] of Object.entries(configuration)) {

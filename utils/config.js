@@ -1,6 +1,9 @@
 import fs from 'fs'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
-import { selectPersistedConfig } from '../dist/runtime/config-persistence.js'
+import {
+  resolveForwardToolDetailsSetting,
+  selectPersistedConfig
+} from '../dist/runtime/config-persistence.js'
 import { migrateLegacyCrossChannelPolicies } from '../dist/runtime/tools/cross-channel-policy.js'
 // Reverse proxy of https://api.openai.com
 export const defaultOpenAIReverseProxy = 'https://mondstadt.d201.eu.org/v1'
@@ -142,6 +145,8 @@ const defaultConfig = {
   bymReasoningEffort: 'default',
   // 思考过程转发
   forwardReasoning: true,
+  // 脱敏后的工具执行详情转发
+  forwardToolDetails: true,
   // OpenAI兼容API思考模式开关：default/enabled/disabled
   apiThinkingMode: 'default',
   // OpenAI兼容API思考强度：default/high/max
@@ -201,7 +206,15 @@ if (fs.existsSync(configJsonPath)) {
   }
 }
 config = migrateLegacyCrossChannelPolicies(config)
+const effectiveForwardReasoning = typeof config.forwardReasoning === 'boolean'
+  ? config.forwardReasoning
+  : defaultConfig.forwardReasoning
+const effectiveForwardToolDetails = resolveForwardToolDetailsSetting(
+  config.forwardToolDetails,
+  effectiveForwardReasoning
+)
 config = Object.assign({}, defaultConfig, config)
+config.forwardToolDetails = effectiveForwardToolDetails
 config.version = defaultConfig.version
 // const latestTag = execSync(`git -C ${resolvePluginPath()} describe --tags --abbrev=0`).toString().trim()
 // config.version = latestTag

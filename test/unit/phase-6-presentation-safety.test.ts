@@ -169,6 +169,7 @@ test('published request facts exclude presentation-local data after delivery', a
         enableMarkdown: true,
         enableSuggestedResponses: true,
         forwardReasoning: false,
+        forwardToolDetails: false,
         blockWords: Object.freeze([]),
         promptBlockWords: Object.freeze([]),
         tts: Object.freeze({
