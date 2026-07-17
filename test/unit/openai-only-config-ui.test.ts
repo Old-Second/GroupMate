@@ -109,6 +109,7 @@ const requiredGuobaFields = [
   'turnConfirm',
   'enableRobotAt',
   'debug',
+  'diskLogEnabled',
   'proxy',
   'defaultTimeoutMs',
   'observabilityLevel',
@@ -222,7 +223,7 @@ const expectedGuobaGroups = [
   {
     label: '网络与调试',
     fields: [
-      'proxy', 'defaultTimeoutMs', 'observabilityLevel', 'debug'
+      'proxy', 'defaultTimeoutMs', 'observabilityLevel', 'diskLogEnabled', 'debug'
     ]
   },
   {
@@ -384,6 +385,28 @@ test('Guoba explains the current bounded Redis trace retention', () => {
   assert.match(field?.bottomHelpMessage ?? '', /7 天/)
   assert.match(field?.bottomHelpMessage ?? '', /2048 条/)
   assert.match(field?.bottomHelpMessage ?? '', /16 MiB/)
+})
+
+test('full disk journal is enabled by default and explained independently from Redis', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const fields = schemas.filter(schema => schema.field === 'diskLogEnabled')
+  const source = await readSource('utils/config.js')
+  const example = JSON.parse(
+    await readSource('config/config.example.json')
+  ) as Record<string, unknown>
+
+  assert.equal(fields.length, 1)
+  assert.equal(fields[0]?.component, 'Switch')
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /完整/)
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /30 天/)
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /32 MiB/)
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /512 MiB/)
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /Redis/)
+  assert.match(fields[0]?.bottomHelpMessage ?? '', /独立/)
+  assert.match(source, /^  diskLogEnabled: true,/m)
+  assert.equal(example.diskLogEnabled, true)
 })
 
 test('Guoba exposes only explicit standard and DeepSeek compatibility profiles', () => {

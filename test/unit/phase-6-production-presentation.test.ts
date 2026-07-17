@@ -7,6 +7,7 @@ import {
   type ModelTurn
 } from '../../src/agent/model/model-adapter.js'
 import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
+import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
 import { AGENT_SESSION_NAMESPACE } from '../../src/agent/session/redis-agent-session-store.js'
 import type { ToolResource } from '../../src/tools/visible-tool-support.js'
 import type { RequestObservationV1 } from '../../src/runtime/request-observation.js'
@@ -25,6 +26,11 @@ import {
   RedisApprovalReferenceIndex
 } from '../../src/runtime/run-approval-router.js'
 import type { YunzaiMessageEvent } from '../../src/runtime/agent-service-bridge.js'
+import type {
+  GroupMateContentJournal,
+  GroupMateOutboundJournalEvent
+} from '../../src/runtime/logging/groupmate-content-journal.js'
+import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import type { BymPolicySnapshot } from '../../src/runtime/yunzai-bym-controller.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
@@ -112,6 +118,42 @@ interface GraphFixtureOptions {
   readonly settingsForActor?: (actorId: string) => PresentationSettings
   readonly bymPolicy?: BymPolicySnapshot
   readonly toolPolicyProfile?: 'compatible' | 'safe' | 'strict'
+  readonly diskLogEnabled?: boolean
+  readonly contentJournal?: GroupMateContentJournal
+  readonly journalNow?: () => Date
+  readonly now?: () => Date
+  readonly promptPrefixOverride?: string
+}
+
+class RecordingContentJournal implements GroupMateContentJournal {
+  readonly requests: YunzaiAgentRequestDraft[] = []
+  readonly runEvents: RunContentJournalEvent[] = []
+  readonly outboundEvents: GroupMateOutboundJournalEvent[] = []
+  drainCalls = 0
+  throwOnRecord = false
+  throwOnDrain = false
+  blockedDrain: Promise<void> | undefined
+
+  recordRequest (request: YunzaiAgentRequestDraft): void {
+    if (this.throwOnRecord) throw new Error('injected request journal failure')
+    this.requests.push(request)
+  }
+
+  recordRunEvent (event: RunContentJournalEvent): void {
+    if (this.throwOnRecord) throw new Error('injected run journal failure')
+    this.runEvents.push(event)
+  }
+
+  recordOutbound (event: GroupMateOutboundJournalEvent): void {
+    if (this.throwOnRecord) throw new Error('injected outbound journal failure')
+    this.outboundEvents.push(event)
+  }
+
+  async drain (): Promise<void> {
+    this.drainCalls += 1
+    if (this.throwOnDrain) throw new Error('injected drain failure')
+    await this.blockedDrain
+  }
 }
 
 const disabledBymPolicy: BymPolicySnapshot = Object.freeze({
@@ -146,7 +188,10 @@ function graphFixture (input: GraphFixtureOptions) {
         openAiCompatibilityProfile: 'standard',
         model: 'fixture-model',
         toolPolicyProfile: input.toolPolicyProfile ?? 'compatible',
-        toolApprovalTtlSeconds: 120
+        toolApprovalTtlSeconds: 120,
+        ...(input.diskLogEnabled === undefined
+          ? {}
+          : { diskLogEnabled: input.diskLogEnabled })
       }),
       redis,
       getMasterIds: async () => Object.freeze(['7']),
@@ -203,7 +248,7 @@ function graphFixture (input: GraphFixtureOptions) {
         thinkingMode: 'default' as const,
         reasoningEffort: 'default' as const,
         assistantLabel: 'GroupMate',
-        promptPrefixOverride: '',
+        promptPrefixOverride: input.promptPrefixOverride ?? '',
         actorCastApi: ''
       }),
       isMuted: async () => false,
@@ -254,8 +299,10 @@ function graphFixture (input: GraphFixtureOptions) {
     }),
     modelFactory: () => input.model,
     random: () => 0.5,
-    now: () => new Date(createdAt),
-    monotonicNow: () => 10
+    now: input.now ?? (() => new Date(createdAt)),
+    monotonicNow: () => 10,
+    ...(input.contentJournal === undefined ? {} : { contentJournal: input.contentJournal }),
+    ...(input.journalNow === undefined ? {} : { journalNow: input.journalNow })
   }
   const graph = createProductionYunzaiAgent(options)
   return {
@@ -457,6 +504,11 @@ function groupEvent (input: Readonly<{
   role?: 'owner' | 'admin' | 'member'
   messageId?: string
   sourceMessageId?: string
+  quotedMessage?: Readonly<{
+    readonly actorId: string
+    readonly nickname: string
+    readonly text: string
+  }>
 }>, host: HostFixture): YunzaiMessageEvent {
   const msg = input.msg ?? `#chat1 ${input.marker}`
   return {
@@ -473,7 +525,21 @@ function groupEvent (input: Readonly<{
       nickname: input.actorId
     }),
     bot: host.bot as never,
-    group: host.group,
+    group: input.quotedMessage === undefined
+      ? host.group
+      : Object.freeze({
+          ...host.group,
+          getChatHistory: async () => Object.freeze([Object.freeze({
+            message_id: input.sourceMessageId,
+            sender: Object.freeze({
+              user_id: input.quotedMessage?.actorId,
+              nickname: input.quotedMessage?.nickname
+            }),
+            message: Object.freeze([Object.freeze({
+              type: 'text', text: input.quotedMessage?.text
+            })])
+          })])
+        }),
     ...(input.hasAlias === undefined ? {} : { hasAlias: input.hasAlias }),
     ...(input.atme === undefined ? {} : { atme: input.atme }),
     ...(input.isMaster === undefined ? {} : { isMaster: input.isMaster }),
@@ -496,6 +562,217 @@ function deliveredText (part: OutboundPart): string {
     ? part.atoms.map(atom => atom.kind === 'text' ? atom.text : '').join('')
     : ''
 }
+
+function fixedModel (text = '日志正文'): ProductionModelPort & {
+  readonly requests: ModelRequest[]
+} {
+  const requests: ModelRequest[] = []
+  return Object.freeze({
+    requests,
+    async complete (request: ModelRequest): Promise<ModelTurn> {
+      requests.push(request)
+      return textTurn(text)
+    },
+    async generate (): Promise<readonly string[]> {
+      return Object.freeze([])
+    }
+  })
+}
+
+test('enabled production journal receives one complete request, provider run and outbound flow', async () => {
+  const host = hostFixture()
+  const model = fixedModel()
+  const journal = new RecordingContentJournal()
+  const fixture = graphFixture({
+    model,
+    bot: host.bot,
+    diskLogEnabled: true,
+    contentJournal: journal,
+    promptPrefixOverride: '日志系统指令'
+  })
+  try {
+    const handled = await fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '完整日志请求',
+      actorId: 'actor-journal',
+      sourceMessageId: 'quoted-journal-message',
+      quotedMessage: Object.freeze({
+        actorId: 'actor-quoted', nickname: '被引用群友', text: '完整引用正文'
+      })
+    }, host))
+
+    assert.equal(handled, true)
+    assert.equal(journal.requests.length, 1)
+    const request = journal.requests[0]
+    assert.match(JSON.stringify(request.message), /完整日志请求/)
+    assert.match(JSON.stringify(request.message.replyTo), /完整引用正文/)
+    assert.match(JSON.stringify(request.systemInstructions), /日志系统指令/)
+    assert.deepEqual(
+      journal.runEvents.map(event => event.type),
+      ['provider.request', 'provider.response', 'run.terminal_committed']
+    )
+    assert.match(
+      JSON.stringify(journal.runEvents.find(event => event.type === 'provider.request')),
+      /完整日志请求/
+    )
+    assert.match(
+      JSON.stringify(journal.runEvents.find(event => event.type === 'provider.response')),
+      /日志正文/
+    )
+    assert.equal(journal.outboundEvents.length, 1)
+    assert.equal(journal.outboundEvents[0]?.type, 'qq.outbound.deliver')
+    assert.equal(deliveredText(fixture.dispatches[0]?.part as OutboundPart), '日志正文')
+    assert.equal(model.requests.length, 1)
+  } finally {
+    assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  }
+  assert.equal(journal.drainCalls, 1)
+})
+
+test('production wraps its selected outbound factory once for delivery and recall', async () => {
+  const journal = new RecordingContentJournal()
+  const fixture = graphFixture({
+    model: fixedModel(),
+    diskLogEnabled: true,
+    contentJournal: journal,
+    journalNow: () => new Date('2026-07-17T03:04:05.000Z')
+  })
+  const target: SessionAddress = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group', groupId: 'journal-group' })
+  })
+  const part: OutboundPart = Object.freeze({
+    media: 'text',
+    atoms: Object.freeze([Object.freeze({ kind: 'text', text: '出站完整正文' })])
+  })
+  try {
+    const port = await fixture.graph.outboundFactory.forTarget(target)
+    const delivered = await port.deliver(part, 1, { quoteMessageId: 'quoted-outbound' })
+    assert.equal(delivered.kind, 'sent')
+    if (delivered.kind !== 'sent') assert.fail('fixture delivery must succeed')
+    const recalled = await port.recall(delivered.receipt)
+
+    assert.deepEqual(recalled, { kind: 'recalled' })
+    assert.deepEqual(journal.outboundEvents.map(event => event.type), [
+      'qq.outbound.deliver', 'qq.outbound.recall'
+    ])
+    const deliveryEvent = journal.outboundEvents[0]
+    const recallEvent = journal.outboundEvents[1]
+    assert.ok(deliveryEvent?.type === 'qq.outbound.deliver')
+    assert.ok(recallEvent?.type === 'qq.outbound.recall')
+    assert.equal(deliveryEvent.result, delivered)
+    assert.equal(recallEvent.result, recalled)
+    assert.equal(deliveryEvent.part, part)
+    assert.deepEqual(deliveryEvent.target, target)
+    assert.equal(deliveryEvent.quoteMessageId, 'quoted-outbound')
+    assert.equal(recallEvent.receipt, delivered.receipt)
+    assert.equal(fixture.dispatches.length, 1)
+    assert.equal(fixture.recalls.length, 1)
+  } finally {
+    await fixture.graph.shutdown('unit_test')
+  }
+})
+
+test('omitted and false disk log configuration never touches an injected journal', async () => {
+  for (const diskLogEnabled of [undefined, false] as const) {
+    const journal = new RecordingContentJournal()
+    const fixture = graphFixture({
+      model: fixedModel(),
+      contentJournal: journal,
+      ...(diskLogEnabled === undefined ? {} : { diskLogEnabled })
+    })
+    const target: SessionAddress = Object.freeze({
+      botId: 'bot-1', scope: Object.freeze({ kind: 'private', userId: 'journal-user' })
+    })
+    const port = await fixture.graph.outboundFactory.forTarget(target)
+    await port.deliver(Object.freeze({
+      media: 'text',
+      atoms: Object.freeze([Object.freeze({ kind: 'text', text: '禁用日志' })])
+    }), 1)
+    assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+
+    assert.equal(journal.requests.length, 0)
+    assert.equal(journal.runEvents.length, 0)
+    assert.equal(journal.outboundEvents.length, 0)
+    assert.equal(journal.drainCalls, 0)
+  }
+})
+
+test('throwing production journal callbacks cannot alter model, presentation or shutdown', async () => {
+  const host = hostFixture()
+  const journal = new RecordingContentJournal()
+  journal.throwOnRecord = true
+  journal.throwOnDrain = true
+  const fixture = graphFixture({
+    model: fixedModel('投影失败仍可见'),
+    bot: host.bot,
+    diskLogEnabled: true,
+    contentJournal: journal
+  })
+
+  assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+    marker: '日志回调失败', actorId: 'actor-throwing-journal'
+  }, host)), true)
+  assert.equal(fixture.dispatches.length, 1)
+  assert.equal(deliveredText(fixture.dispatches[0]?.part as OutboundPart), '投影失败仍可见')
+  assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  assert.equal(journal.drainCalls, 1)
+})
+
+test('journal activity consumes only its dedicated clock', async () => {
+  const execute = async (enabled: boolean): Promise<Readonly<{
+    authoritativeReads: number
+    journalReads: number
+  }>> => {
+    let authoritativeReads = 0
+    let journalReads = 0
+    const host = hostFixture()
+    const journal = new RecordingContentJournal()
+    const fixture = graphFixture({
+      model: fixedModel(),
+      bot: host.bot,
+      diskLogEnabled: enabled,
+      contentJournal: journal,
+      now: () => {
+        authoritativeReads += 1
+        return new Date(Date.parse(createdAt) + authoritativeReads)
+      },
+      journalNow: () => {
+        journalReads += 1
+        return new Date('2026-07-17T03:04:05.000Z')
+      }
+    })
+    await fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '时钟隔离请求', actorId: 'actor-clock'
+    }, host))
+    await fixture.graph.shutdown('unit_test')
+    return { authoritativeReads, journalReads }
+  }
+
+  const disabled = await execute(false)
+  const enabled = await execute(true)
+  assert.equal(enabled.authoritativeReads, disabled.authoritativeReads)
+  assert.ok(enabled.journalReads > 0)
+  assert.equal(disabled.journalReads, 0)
+})
+
+test('shutdown waits for one journal drain and preserves idempotent bridge count', async () => {
+  let releaseDrain: (() => void) | undefined
+  const journal = new RecordingContentJournal()
+  journal.blockedDrain = new Promise(resolve => { releaseDrain = resolve })
+  const fixture = graphFixture({
+    model: fixedModel(), diskLogEnabled: true, contentJournal: journal
+  })
+  let settled = false
+  const first = fixture.graph.shutdown('first_reason')
+  const second = fixture.graph.shutdown('ignored_reason')
+  void first.then(() => { settled = true })
+  await waitFor(() => journal.drainCalls === 1, 'blocked journal drain')
+  assert.equal(settled, false)
+  assert.equal(journal.drainCalls, 1)
+
+  releaseDrain?.()
+  assert.deepEqual(await Promise.all([first, second]), [0, 0])
+  assert.equal(journal.drainCalls, 1)
+})
 
 test('production presentation covers ordinary proactive approval and all terminal kinds', async () => {
   const host = hostFixture()

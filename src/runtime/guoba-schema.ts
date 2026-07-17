@@ -71,6 +71,7 @@ export function buildGuobaSchemas ({
         { label: '诊断', value: 'diagnostic' }
       ]
     }),
+    field('diskLogEnabled', '完整内容落盘日志', '开启后将完整业务内容写入独立落盘日志；最长保留 30 天，单文件 32 MiB 轮转，目录总量硬上限 512 MiB。该日志与 Redis 脱敏可观测轨迹彼此独立，修改后需重启。', 'Switch'),
     field('debug', '调试日志', '独立控制旧业务调试日志，不会改变脱敏观测级别、轨迹采样或清理屏障。', 'Switch'),
 
     divider('模型与会话'),

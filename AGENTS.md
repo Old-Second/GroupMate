@@ -39,6 +39,8 @@ Use concise prefixes such as `fix:` and `feat:` followed by a focused Chinese de
 
 Never commit API keys, tokens, cookies, chat history, or generated data. Real configuration files under `config/` are ignored; update `config/config.example.json` only with safe placeholders when introducing a setting.
 
+The default-enabled GroupMate content journal writes complete normalized business content to `data/logs/groupmate/` for local diagnosis. It rotates each JSONL file at 32 MiB, retains at most 30 days, and caps matching files at 512 MiB. Credential fields, authorization headers, real configuration objects, and media binary bytes are excluded by its typed projection boundary. This journal is independent from the redacted Redis observability trace; deployments already preserve the ignored `data/` runtime directory. Logging, rotation, cleanup, or drain failures must never change Agent or QQ behavior.
+
 ## Deployment Context & Remote Safety
 
 - This checkout was copied from the SSH host alias `my`. Its active deployed counterpart is `/root/trss-Yunzai/plugins/GroupMate`.

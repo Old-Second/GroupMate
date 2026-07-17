@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
+import type {
+  GroupMateContentJournal,
+  GroupMateOutboundJournalEvent
+} from '../../src/runtime/logging/groupmate-content-journal.js'
+import type {
+  GroupMateDiskLogEvent,
+  GroupMateDiskLogOptions
+} from '../../src/runtime/logging/groupmate-disk-log.js'
+import { resolvePluginPath } from '../../src/runtime/plugin-context.js'
 import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
+import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import {
   createProductionYunzaiAgent,
   getProductionYunzaiAgent,
@@ -185,6 +196,15 @@ function options (onModelFactory: () => void): ProductionYunzaiAgentOptions {
   }
 }
 
+function journalStub (drain: () => Promise<void>): GroupMateContentJournal {
+  return Object.freeze({
+    recordRequest (_request: YunzaiAgentRequestDraft): void {},
+    recordRunEvent (_event: RunContentJournalEvent): void {},
+    recordOutbound (_event: GroupMateOutboundJournalEvent): void {},
+    drain
+  })
+}
+
 test('production initializer owns one complete graph and rejects every reinitialization', async () => {
   assert.throws(
     () => getProductionYunzaiAgent(),
@@ -193,7 +213,21 @@ test('production initializer owns one complete graph and rejects every reinitial
   const beforeSigint = process.listenerCount('SIGINT')
   const beforeSigterm = process.listenerCount('SIGTERM')
   let modelFactoryCalls = 0
-  const graph = initializeProductionYunzaiAgent(options(() => { modelFactoryCalls += 1 }))
+  let drainCalls = 0
+  let releaseDrain: (() => void) | undefined
+  const blockedDrain = new Promise<void>(resolve => { releaseDrain = resolve })
+  const baseOptions = options(() => { modelFactoryCalls += 1 })
+  const graph = initializeProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: {
+      ...baseOptions.bridge,
+      config: Object.freeze({ ...baseOptions.bridge.config, diskLogEnabled: true })
+    },
+    contentJournal: journalStub(async () => {
+      drainCalls += 1
+      await blockedDrain
+    })
+  })
 
   assert.equal(getProductionYunzaiAgent(), graph)
   assert.equal(modelFactoryCalls, 1)
@@ -223,7 +257,13 @@ test('production initializer owns one complete graph and rejects every reinitial
   assert.equal(process.listenerCount('SIGINT'), beforeSigint + 1)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm + 1)
 
-  await graph.shutdown('unit_test')
+  const shutdown = graph.shutdown('unit_test')
+  while (drainCalls === 0) await new Promise(resolve => setTimeout(resolve, 1))
+  assert.equal(process.listenerCount('SIGINT'), beforeSigint + 1)
+  assert.equal(process.listenerCount('SIGTERM'), beforeSigterm + 1)
+  releaseDrain?.()
+  await shutdown
+  assert.equal(drainCalls, 1)
   assert.equal(process.listenerCount('SIGINT'), beforeSigint)
   assert.equal(process.listenerCount('SIGTERM'), beforeSigterm)
 })
@@ -247,4 +287,76 @@ test('agent service bridge factory is non-singleton and production graph binds s
 
   await first.shutdown('unit_test')
   await second.shutdown('unit_test')
+})
+
+test('default disk journal construction uses plugin data path and fixed failure diagnostics', async () => {
+  const failures: Array<Readonly<Record<string, unknown>>> = []
+  const recorded: GroupMateDiskLogEvent[] = []
+  let createdOptions: GroupMateDiskLogOptions | undefined
+  let drainCalls = 0
+  const journalDate = new Date('2026-07-17T04:05:06.000Z')
+  const journalNow = (): Date => journalDate
+  const baseOptions = options(() => undefined)
+  const graph = createProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: {
+      ...baseOptions.bridge,
+      config: Object.freeze({ ...baseOptions.bridge.config, diskLogEnabled: true }),
+      logger: Object.freeze({
+        error: (failure: Readonly<Record<string, unknown>>) => { failures.push(failure) }
+      })
+    },
+    journalNow,
+    diskLogFactory: (diskOptions: GroupMateDiskLogOptions) => {
+      createdOptions = diskOptions
+      return Object.freeze({
+        record: (event: GroupMateDiskLogEvent) => { recorded.push(event) },
+        drain: async () => { drainCalls += 1 }
+      })
+    }
+  })
+
+  assert.equal(createdOptions?.directory, resolvePluginPath('data', 'logs', 'groupmate'))
+  assert.equal(createdOptions?.now, journalNow)
+  createdOptions?.onFailure?.(Object.freeze({
+    event: 'groupmate.disk_log.failure', code: 'queue_overflow'
+  }))
+  assert.deepEqual(failures, [Object.freeze({
+    event: 'groupmate.disk_log.failure', code: 'queue_overflow'
+  })])
+  assert.deepEqual(Reflect.ownKeys(failures[0] ?? {}), ['event', 'code'])
+  assert.equal(recorded.length, 0)
+  assert.equal(await graph.shutdown('unit_test'), 0)
+  assert.equal(drainCalls, 1)
+})
+
+test('journal drain cannot replace the original bridge shutdown rejection', async () => {
+  const original = new Error('injected bridge shutdown rejection')
+  let drainCalls = 0
+  const baseOptions = options(() => undefined)
+  const graph = createProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: {
+      ...baseOptions.bridge,
+      config: Object.freeze({ ...baseOptions.bridge.config, diskLogEnabled: true })
+    },
+    contentJournal: journalStub(async () => {
+      drainCalls += 1
+      throw new Error('injected drain rejection')
+    })
+  })
+  Object.defineProperty(graph.bridge, 'shutdown', {
+    configurable: true,
+    value: async () => { throw original }
+  })
+
+  await assert.rejects(
+    graph.shutdown('unit_test'),
+    error => error === original
+  )
+  await assert.rejects(
+    graph.shutdown('ignored'),
+    error => error === original
+  )
+  assert.equal(drainCalls, 1)
 })

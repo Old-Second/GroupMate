@@ -44,6 +44,7 @@ const defaultConfig = {
   proxy: '',
   debug: true,
   observabilityLevel: 'basic',
+  diskLogEnabled: true,
   defaultTimeoutMs: 120000,
   chromeTimeoutMS: 120000,
   sunoApiTimeout: 60,

@@ -2,6 +2,10 @@ import { RunAdmission } from '../agent/run/run-admission.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { bindYunzaiShutdownSignals, createYunzaiAgentServiceBridge } from './agent-service-bridge.js';
 import { prepareYunzaiMessageEvidence } from './message-input.js';
+import { createGroupMateContentJournal } from './logging/groupmate-content-journal.js';
+import { GroupMateDiskLog } from './logging/groupmate-disk-log.js';
+import { createJournaledYunzaiOutboundPortFactory } from './logging/journaled-yunzai-outbound.js';
+import { resolvePluginPath } from './plugin-context.js';
 import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
 import { ordinaryProfile, proactiveProfile, RECOVERED_LEGACY_PROFILE } from './presentation/presentation-profile.js';
 import { ReplyPresenter } from './presentation/reply-presenter.js';
@@ -421,6 +425,7 @@ export function createProductionYunzaiAgent(options) {
     const model = options.modelFactory();
     const random = options.random ?? Math.random;
     const now = options.now ?? (() => new Date());
+    const journalNow = options.journalNow ?? (() => new Date());
     const monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()));
     const runStore = new RedisRunStore({ client: options.bridge.redis });
     const admission = new RunAdmission({ client: options.bridge.redis });
@@ -434,7 +439,25 @@ export function createProductionYunzaiAgent(options) {
         now
     });
     activeObservabilityRuntime = observability;
-    const outboundFactory = createYunzaiOutboundPortFactory(options.outboundHost);
+    const contentJournal = options.bridge.config.diskLogEnabled === true
+        ? options.contentJournal ?? createGroupMateContentJournal((options.diskLogFactory ?? (diskLogOptions => new GroupMateDiskLog(diskLogOptions)))({
+            directory: resolvePluginPath('data', 'logs', 'groupmate'),
+            now: journalNow,
+            onFailure: failure => {
+                try {
+                    options.bridge.logger?.error?.(Object.freeze({
+                        event: failure.event,
+                        code: failure.code
+                    }));
+                }
+                catch { }
+            }
+        }))
+        : undefined;
+    const rawOutboundFactory = createYunzaiOutboundPortFactory(options.outboundHost);
+    const outboundFactory = contentJournal === undefined
+        ? rawOutboundFactory
+        : createJournaledYunzaiOutboundPortFactory(rawOutboundFactory, contentJournal, journalNow);
     const progressPresenter = new RunProgressPresenter({
         onAttachment: metadata => observability.registerPolicy(metadata.runRef, metadata.observationPolicy),
         publishObservation: event => observability.publish(event),
@@ -487,6 +510,7 @@ export function createProductionYunzaiAgent(options) {
         modelAdapter: model,
         runStore,
         admission,
+        ...(contentJournal === undefined ? {} : { contentJournal }),
         observations: Object.freeze({
             publish: event => observability.publish(event),
             acceptCommittedTraceCandidate: candidate => (observability.acceptCommittedTraceCandidate(candidate)),
@@ -667,7 +691,17 @@ export function createProductionYunzaiAgent(options) {
             traceStore: observability.traceStore
         }),
         shutdown: async (reason = 'process_shutdown') => {
-            lifecycle.shutdownPromise ??= bridge.shutdown(reason).finally(() => {
+            lifecycle.shutdownPromise ??= (async () => {
+                try {
+                    return await bridge.shutdown(reason);
+                }
+                finally {
+                    try {
+                        await contentJournal?.drain();
+                    }
+                    catch { }
+                }
+            })().finally(() => {
                 lifecycle.unbindShutdown?.();
                 lifecycle.unbindShutdown = null;
             });

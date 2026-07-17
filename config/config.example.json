@@ -33,6 +33,7 @@
   "proxy": "",
   "debug": true,
   "observabilityLevel": "basic",
+  "diskLogEnabled": true,
   "enableToolbox": false,
   "defaultTimeoutMs": 120000,
   "headless": false,
