@@ -851,6 +851,59 @@ test('RunEngine keeps the canonical Provider failure within the total error byte
     RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes)
 })
 
+test('RunEngine bounds the complete Provider failure envelope across UTF-8 boundaries', async () => {
+  const boundaryCases = Object.freeze([
+    Object.freeze({ label: 'ascii', character: 'x', valueLength: 512 }),
+    Object.freeze({ label: 'cjk', character: '界', valueLength: 171 }),
+    Object.freeze({ label: 'emoji', character: '😀', valueLength: 128 }),
+    Object.freeze({ label: 'escaped-control', character: '\u0000', valueLength: 64 })
+  ])
+
+  for (const boundary of boundaryCases) {
+    const journalEvents: RunContentJournalEvent[] = []
+    const candidates: TraceCandidateV1[] = []
+    const details = Object.freeze(Object.fromEntries(
+      Array.from({ length: 32 }, (_, index) => [
+        `${boundary.character}${index}`,
+        boundary.character.repeat(boundary.valueLength)
+      ])
+    ))
+    const fixture = harness([new ModelProviderError({
+      code: 'provider_unavailable',
+      stage: boundary.character.repeat(10_000),
+      retryable: false,
+      userMessage: boundary.character.repeat(10_000),
+      details
+    })], {
+      contentJournal: { record: event => { journalEvents.push(event) } },
+      onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+    })
+
+    const result = await fixture.engine.start(fixture.input)
+    const failure = journalEvents.find(event => event.type === 'provider.failure')
+    const projected = candidates[0]?.events.find(event => event.type === 'provider_request')
+    const failureBytes = Buffer.byteLength(JSON.stringify(failure), 'utf8')
+
+    assert.equal(failure?.type, 'provider.failure', boundary.label)
+    assert.ok(failureBytes <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes,
+      `${boundary.label}: ${failureBytes}`)
+    assert.deepEqual(
+      result.kind === 'failed' ? result.error : null,
+      failure?.type === 'provider.failure' ? failure.error : null,
+      boundary.label
+    )
+    assert.equal(result.kind === 'failed' ? result.error.code : null,
+      'provider_unavailable', boundary.label)
+    assert.equal(candidates[0]?.terminal.errorCode, 'provider_unavailable', boundary.label)
+    assert.deepEqual(projected?.type === 'provider_request'
+      ? { outcome: projected.outcome, errorCode: projected.errorCode }
+      : null, {
+      outcome: 'failed',
+      errorCode: 'provider_unavailable'
+    }, boundary.label)
+  }
+})
+
 test('RunEngine journals Provider timeout classification before returning the same failure', async () => {
   const journalEvents: RunContentJournalEvent[] = []
   const fixture = harness([new ModelProviderError({

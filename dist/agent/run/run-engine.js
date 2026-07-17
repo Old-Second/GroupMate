@@ -125,10 +125,47 @@ function boundedUtf8(value, maxBytes) {
     }
     return pieces.join('');
 }
-function boundedSerializedAgentError(error) {
-    const stage = boundedUtf8(error.stage, 256);
-    const userMessage = boundedUtf8(error.userMessage, 2_048);
+function providerFailureJournalEvent(fields, error) {
+    return Object.freeze({ type: 'provider.failure', ...fields, error });
+}
+function serializedAgentError(error, stage, userMessage, details) {
+    return Object.freeze({
+        code: error.code,
+        stage,
+        retryable: error.retryable,
+        userMessage,
+        details
+    });
+}
+function longestFittingPrefix(value, fits) {
+    const characters = Array.from(value);
+    let lower = 0;
+    let upper = characters.length;
+    while (lower < upper) {
+        const middle = Math.ceil((lower + upper) / 2);
+        if (fits(characters.slice(0, middle).join('')))
+            lower = middle;
+        else
+            upper = middle - 1;
+    }
+    return characters.slice(0, lower).join('');
+}
+function boundedSerializedAgentError(error, fits = candidate => (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <=
+    RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes)) {
+    let stage = boundedUtf8(error.stage, 256);
+    let userMessage = boundedUtf8(error.userMessage, 2_048);
     let details = Object.freeze({});
+    let bounded = serializedAgentError(error, stage, userMessage, details);
+    if (!fits(bounded)) {
+        stage = longestFittingPrefix(stage, prefix => fits(serializedAgentError(error, prefix, userMessage, details)));
+        bounded = serializedAgentError(error, stage, userMessage, details);
+    }
+    if (!fits(bounded)) {
+        userMessage = longestFittingPrefix(userMessage, prefix => fits(serializedAgentError(error, stage, prefix, details)));
+        bounded = serializedAgentError(error, stage, userMessage, details);
+    }
+    if (!fits(bounded))
+        throw new TypeError('provider failure envelope exceeds its byte limit');
     let considered = 0;
     for (const unboundedKey in error.details) {
         if (!Object.prototype.hasOwnProperty.call(error.details, unboundedKey))
@@ -149,27 +186,15 @@ function boundedSerializedAgentError(error) {
             ? boundedUtf8(unboundedValue, 2_048)
             : unboundedValue;
         const candidateDetails = Object.freeze({ ...details, [key]: value });
-        const candidate = Object.freeze({
-            code: error.code,
-            stage,
-            retryable: error.retryable,
-            userMessage,
-            details: candidateDetails
-        });
-        if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <=
-            RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes) {
+        const candidate = serializedAgentError(error, stage, userMessage, candidateDetails);
+        if (fits(candidate)) {
             details = candidateDetails;
+            bounded = candidate;
         }
     }
-    return Object.freeze({
-        code: error.code,
-        stage,
-        retryable: error.retryable,
-        userMessage,
-        details
-    });
+    return bounded;
 }
-function canonicalProviderCallError(error, aborted) {
+function canonicalProviderCallError(error, aborted, journalFields) {
     const classified = aborted
         ? new AgentError({
             code: 'cancelled',
@@ -181,7 +206,9 @@ function canonicalProviderCallError(error, aborted) {
         : error instanceof ModelProviderError
             ? error
             : internalError(error);
-    const serialized = boundedSerializedAgentError(classified);
+    const serialized = boundedSerializedAgentError(classified, journalFields === null
+        ? undefined
+        : candidate => Buffer.byteLength(JSON.stringify(providerFailureJournalEvent(journalFields, candidate)), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes);
     return Object.freeze({
         error: new AgentError({ ...serialized, cause: error }),
         serialized
@@ -1281,18 +1308,28 @@ export class RunEngine {
                     const accounted = this.#recordProviderUsage(counters, activeRuntimeMs);
                     counters = accounted.counters;
                     const aborted = isAbortError(error) || signal.aborted;
-                    const classified = canonicalProviderCallError(error, aborted);
-                    const errorCode = classified.error.code;
                     const completionOccurredAt = this.#timestamp();
-                    this.#recordContentJournal(() => Object.freeze({
-                        type: 'provider.failure',
-                        occurredAt: completionOccurredAt,
-                        runRef: current.runRef,
-                        requestRef: current.requestRef,
-                        ordinal: this.#providerAttemptOrdinal(current),
-                        attemptKind,
-                        error: classified.serialized
-                    }));
+                    let journalFields = null;
+                    try {
+                        journalFields = Object.freeze({
+                            occurredAt: completionOccurredAt,
+                            runRef: current.runRef,
+                            requestRef: current.requestRef,
+                            ordinal: this.#providerAttemptOrdinal(current),
+                            attemptKind
+                        });
+                    }
+                    catch {
+                        // A recovered legacy attempt can lack an authoritative ordinal.
+                    }
+                    const classified = canonicalProviderCallError(error, aborted, journalFields);
+                    const errorCode = classified.error.code;
+                    this.#recordContentJournal(() => {
+                        if (journalFields === null) {
+                            throw new TypeError('provider failure journal identity is unavailable');
+                        }
+                        return providerFailureJournalEvent(journalFields, classified.serialized);
+                    });
                     current = await this.#completeProviderDispatch(current, counters, reservedDispatch.previousUsage, completionOccurredAt, undefined, [{
                             type: 'model.attempted',
                             payload: Object.freeze({
