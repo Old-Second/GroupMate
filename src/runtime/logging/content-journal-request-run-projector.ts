@@ -65,6 +65,20 @@ function parseReasoning (value: unknown, label: string): void {
   }
 }
 
+function parseModelReasoningTrace (value: unknown): void {
+  const input = jsonObject(value, 'model reasoning trace') as UnknownRecord
+  exactKeys(
+    input,
+    ['text', 'truncated'],
+    ['text', 'truncated'],
+    'model reasoning trace'
+  )
+  text(input.text, 'model reasoning text')
+  if (typeof input.truncated !== 'boolean') {
+    throw new TypeError('model reasoning trace is invalid')
+  }
+}
+
 function parseRunModelConfig (value: unknown): void {
   const input = jsonObject(value, 'run model') as UnknownRecord
   exactKeys(
@@ -218,7 +232,10 @@ function parseModelTurn (value: unknown): ModelTurn {
   const input = boundedRecord(value, RUN_RESOURCE_LIMITS.providerResponseBytes, 'model turn')
   exactKeys(
     input,
-    ['text', 'refusal', 'toolCalls', 'finishReason', 'usage', 'providerState', 'responseId'],
+    [
+      'text', 'refusal', 'toolCalls', 'finishReason', 'usage', 'reasoning',
+      'providerState', 'responseId'
+    ],
     ['text', 'toolCalls', 'finishReason'],
     'model turn'
   )
@@ -254,6 +271,7 @@ function parseModelTurn (value: unknown): ModelTurn {
     safeInteger(usage.outputTokens, 'model output tokens')
     safeInteger(usage.totalTokens, 'model total tokens')
   }
+  if (input.reasoning !== undefined) parseModelReasoningTrace(input.reasoning)
   if (input.providerState !== undefined) parseProviderTurnState(input.providerState)
   if (input.responseId !== undefined) text(input.responseId, 'model response ID')
   return input as unknown as ModelTurn

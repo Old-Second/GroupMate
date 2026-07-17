@@ -640,6 +640,33 @@ test('projects complete provider response failure and committed terminal content
   ])
 })
 
+test('projects provider reasoning into the complete content journal', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalJournalFixture()
+  const turn = Object.freeze({
+    ...modelTurnFixture(),
+    reasoning: Object.freeze({ text: '完整 Provider 思考', truncated: false })
+  })
+  const response: RunContentJournalEvent = Object.freeze({
+    type: 'provider.response',
+    occurredAt: '2026-07-17T08:03:00.000Z',
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary',
+    turn
+  })
+
+  journal.recordRunEvent(response)
+
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.type, 'provider.response')
+  assert.deepEqual((events[0]?.payload as { turn: ModelTurn }).turn.reasoning, {
+    text: '完整 Provider 思考',
+    truncated: false
+  })
+})
+
 test('sanitizes terminal tool resources while retaining assistant text and tool arguments', () => {
   const { journal, events } = inMemoryContentJournal()
   const terminal = terminalContentFixture()

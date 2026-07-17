@@ -43,6 +43,14 @@ function parseReasoning(value, label) {
         throw new TypeError(`${label} is invalid`);
     }
 }
+function parseModelReasoningTrace(value) {
+    const input = jsonObject(value, 'model reasoning trace');
+    exactKeys(input, ['text', 'truncated'], ['text', 'truncated'], 'model reasoning trace');
+    text(input.text, 'model reasoning text');
+    if (typeof input.truncated !== 'boolean') {
+        throw new TypeError('model reasoning trace is invalid');
+    }
+}
 function parseRunModelConfig(value) {
     const input = jsonObject(value, 'run model');
     exactKeys(input, ['model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'], ['model', 'streaming', 'maxOutputTokens', 'reasoning'], 'run model');
@@ -173,7 +181,10 @@ function parseModelRequest(value) {
 }
 function parseModelTurn(value) {
     const input = boundedRecord(value, RUN_RESOURCE_LIMITS.providerResponseBytes, 'model turn');
-    exactKeys(input, ['text', 'refusal', 'toolCalls', 'finishReason', 'usage', 'providerState', 'responseId'], ['text', 'toolCalls', 'finishReason'], 'model turn');
+    exactKeys(input, [
+        'text', 'refusal', 'toolCalls', 'finishReason', 'usage', 'reasoning',
+        'providerState', 'responseId'
+    ], ['text', 'toolCalls', 'finishReason'], 'model turn');
     text(input.text, 'model turn text', true);
     if (input.refusal !== undefined)
         text(input.refusal, 'model refusal', true);
@@ -197,6 +208,8 @@ function parseModelTurn(value) {
         safeInteger(usage.outputTokens, 'model output tokens');
         safeInteger(usage.totalTokens, 'model total tokens');
     }
+    if (input.reasoning !== undefined)
+        parseModelReasoningTrace(input.reasoning);
     if (input.providerState !== undefined)
         parseProviderTurnState(input.providerState);
     if (input.responseId !== undefined)
