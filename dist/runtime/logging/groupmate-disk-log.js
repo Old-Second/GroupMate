@@ -1,4 +1,5 @@
-import { chmod, mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 export const GROUPMATE_DISK_LOG_LIMITS = Object.freeze({
     maxFileBytes: 32 * 1024 * 1024,
@@ -10,6 +11,9 @@ export const GROUPMATE_DISK_LOG_LIMITS = Object.freeze({
 });
 const FILE_NAME_PATTERN = /^groupmate-(\d{4})-(\d{2})-(\d{2})\.(\d{4})\.jsonl$/;
 const FAILURE_LIMIT_MS = 60_000;
+const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const LOG_FILE_OPEN_FLAGS = constants.O_WRONLY |
+    constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW;
 function localDate(now) {
     const year = String(now.getFullYear()).padStart(4, '0');
     const month = String(now.getMonth() + 1).padStart(2, '0');
@@ -145,7 +149,15 @@ export class GroupMateDiskLog {
     }
     async #write(entry) {
         await mkdir(this.#directory, { recursive: true, mode: 0o700 });
-        await chmod(this.#directory, 0o700);
+        const directory = await open(this.#directory, DIRECTORY_OPEN_FLAGS);
+        try {
+            if (!(await directory.stat()).isDirectory())
+                throw new TypeError('disk log directory is invalid');
+            await directory.chmod(0o700);
+        }
+        finally {
+            await directory.close();
+        }
         if (this.#lastExpiryCleanupDate !== entry.date) {
             await this.#removeExpiredFiles(entry.recordedAt);
             this.#lastExpiryCleanupDate = entry.date;
@@ -156,9 +168,11 @@ export class GroupMateDiskLog {
             return;
         }
         const targetPath = path.join(this.#directory, target);
-        const file = await open(targetPath, 'a', 0o600);
+        const file = await open(targetPath, LOG_FILE_OPEN_FLAGS, 0o600);
         try {
-            await chmod(targetPath, 0o600);
+            if (!(await file.stat()).isFile())
+                throw new TypeError('disk log target is invalid');
+            await file.chmod(0o600);
             await file.writeFile(entry.line);
         }
         finally {

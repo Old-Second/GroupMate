@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -190,6 +192,73 @@ test('tightens an existing log directory and target file before appending', asyn
     assert.equal((await stat(target)).mode & 0o777, 0o600)
   } finally {
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('never follows a matching log-file symlink to an unrelated file', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const directory = path.join(root, 'logs')
+  const victim = path.join(root, 'victim.txt')
+  const target = path.join(directory, 'groupmate-2026-07-17.0001.jsonl')
+  try {
+    await mkdir(directory)
+    await writeFile(victim, 'victim bytes\n')
+    await chmod(victim, 0o644)
+    await symlink(victim, target)
+    const before = await readFile(victim, 'utf8')
+    const beforeMode = (await stat(victim)).mode & 0o777
+    const failures: unknown[] = []
+    const log = new GroupMateDiskLog({
+      directory,
+      now: () => new Date(FIXED_TIMESTAMP),
+      onFailure: failure => { failures.push(failure) }
+    })
+
+    log.record({ type: 'fixture', payload: { text: 'current' } })
+    await assert.doesNotReject(log.drain())
+
+    assert.equal(await readFile(victim, 'utf8'), before)
+    assert.equal((await stat(victim)).mode & 0o777, beforeMode)
+    assert.equal((await lstat(target)).isSymbolicLink(), true)
+    assert.deepEqual(failures, [
+      { event: 'groupmate.disk_log.failure', code: 'write_failed' }
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects a configured log-directory symlink without changing its target', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const targetDirectory = path.join(root, 'target-directory')
+  const directory = path.join(root, 'log-directory')
+  const victim = path.join(targetDirectory, 'victim.txt')
+  try {
+    await mkdir(targetDirectory)
+    await chmod(targetDirectory, 0o755)
+    await writeFile(victim, 'victim bytes\n')
+    await symlink(targetDirectory, directory, 'dir')
+    const before = await readFile(victim, 'utf8')
+    const beforeMode = (await stat(targetDirectory)).mode & 0o777
+    const failures: unknown[] = []
+    const log = new GroupMateDiskLog({
+      directory,
+      now: () => new Date(FIXED_TIMESTAMP),
+      onFailure: failure => { failures.push(failure) }
+    })
+
+    log.record({ type: 'fixture', payload: { text: 'current' } })
+    await assert.doesNotReject(log.drain())
+
+    assert.equal(await readFile(victim, 'utf8'), before)
+    assert.equal((await stat(targetDirectory)).mode & 0o777, beforeMode)
+    assert.equal((await lstat(directory)).isSymbolicLink(), true)
+    assert.deepEqual(await readdir(targetDirectory), ['victim.txt'])
+    assert.deepEqual(failures, [
+      { event: 'groupmate.disk_log.failure', code: 'write_failed' }
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })
 
