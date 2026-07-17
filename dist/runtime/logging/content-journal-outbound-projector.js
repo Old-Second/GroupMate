@@ -1,0 +1,227 @@
+import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js';
+import { boundedRecord, exactKeys, ownDataArray, ownDataRecord, projectSessionAddress, safeHttpUrl, safeInteger, text, timestamp } from './content-journal-projection.js';
+const MEDIA = new Set([
+    'text', 'picture', 'voice', 'forward', 'video', 'music', 'dice', 'rps'
+]);
+const DELIVERY_CODES = new Set([
+    'invalid_target', 'invalid_part', 'aborted_before_dispatch', 'host_rejected',
+    'host_exception_after_dispatch', 'host_timeout_after_dispatch',
+    'host_abort_after_dispatch', 'unknown_host_result'
+]);
+const RECALL_DEFINITE_CODES = new Set([
+    'receipt_not_owned', 'message_id_unavailable', 'aborted_before_dispatch', 'host_rejected'
+]);
+const RECALL_UNKNOWN_CODES = new Set([
+    'host_exception_after_dispatch', 'host_timeout_after_dispatch',
+    'host_abort_after_dispatch', 'unknown_host_result'
+]);
+function projectTextAtom(value) {
+    const input = ownDataRecord(value, 'outbound text atom');
+    if (input.kind === 'text') {
+        exactKeys(input, ['kind', 'text'], ['kind', 'text'], 'outbound text atom');
+        return { kind: input.kind, text: text(input.text, 'outbound text', true) };
+    }
+    if (input.kind === 'markdown') {
+        exactKeys(input, ['kind', 'markdown'], ['kind', 'markdown'], 'outbound markdown atom');
+        return { kind: input.kind, markdown: text(input.markdown, 'outbound markdown', true) };
+    }
+    if (input.kind === 'face') {
+        exactKeys(input, ['kind', 'faceId'], ['kind', 'faceId'], 'outbound face atom');
+        return { kind: input.kind, faceId: safeInteger(input.faceId, 'outbound face ID') };
+    }
+    if (input.kind !== 'at')
+        throw new TypeError('outbound text atom is invalid');
+    exactKeys(input, ['kind', 'target'], ['kind', 'target'], 'outbound at atom');
+    if (input.target === 'all')
+        return { kind: input.kind, target: 'all' };
+    const target = ownDataRecord(input.target, 'outbound at target');
+    exactKeys(target, ['userId'], ['userId'], 'outbound at target');
+    return { kind: input.kind, target: { userId: text(target.userId, 'outbound at user ID') } };
+}
+function projectButtons(value) {
+    const input = ownDataRecord(value, 'outbound buttons');
+    exactKeys(input, ['schemaVersion', 'kind', 'suggestions'], ['schemaVersion', 'kind', 'suggestions'], 'outbound buttons');
+    if (input.schemaVersion !== 1 || input.kind !== 'chat_suggestions') {
+        throw new TypeError('outbound buttons are invalid');
+    }
+    const suggestions = ownDataArray(input.suggestions, 'outbound suggestions')
+        .map(item => text(item, 'outbound suggestion'));
+    return { schemaVersion: 1, kind: 'chat_suggestions', suggestions };
+}
+function projectResource(value) {
+    const input = ownDataRecord(value, 'outbound resource');
+    const commonKeys = ['kind', 'mimeType', 'byteLength'];
+    const mimeType = text(input.mimeType, 'outbound resource mime type');
+    const byteLength = safeInteger(input.byteLength, 'outbound resource byte length');
+    if (input.kind === 'buffer') {
+        exactKeys(input, [...commonKeys, 'data'], [...commonKeys, 'data'], 'outbound buffer resource');
+        if (!(input.data instanceof Uint8Array) || input.data.byteLength !== byteLength) {
+            throw new TypeError('outbound buffer resource is invalid');
+        }
+        return { kind: input.kind, mimeType, byteLength };
+    }
+    if (input.kind === 'local_path') {
+        exactKeys(input, [...commonKeys, 'path'], [...commonKeys, 'path'], 'outbound local resource');
+        return {
+            kind: input.kind,
+            path: text(input.path, 'outbound resource path'),
+            mimeType,
+            byteLength
+        };
+    }
+    if (input.kind !== 'remote_url')
+        throw new TypeError('outbound resource kind is invalid');
+    exactKeys(input, [...commonKeys, 'url'], [...commonKeys, 'url'], 'outbound remote resource');
+    const rawUrl = text(input.url, 'outbound resource URL');
+    const url = safeHttpUrl(rawUrl);
+    return {
+        kind: input.kind,
+        ...(url === undefined ? {} : { url }),
+        mimeType,
+        byteLength
+    };
+}
+function projectOutboundPart(value) {
+    const input = ownDataRecord(value, 'outbound part');
+    if (input.media === 'text') {
+        exactKeys(input, ['media', 'atoms', 'buttons'], ['media', 'atoms'], 'outbound text part');
+        const atoms = ownDataArray(input.atoms, 'outbound text atoms').map(projectTextAtom);
+        return {
+            media: input.media,
+            atoms,
+            ...(input.buttons === undefined ? {} : { buttons: projectButtons(input.buttons) })
+        };
+    }
+    if (input.media === 'picture' || input.media === 'voice' || input.media === 'video') {
+        exactKeys(input, ['media', 'resource'], ['media', 'resource'], 'outbound media part');
+        return { media: input.media, resource: projectResource(input.resource) };
+    }
+    if (input.media === 'forward') {
+        exactKeys(input, ['media', 'title', 'nodes'], ['media', 'title', 'nodes'], 'outbound forward part');
+        const nodes = ownDataArray(input.nodes, 'outbound forward nodes').map(node => {
+            const item = ownDataRecord(node, 'outbound forward node');
+            exactKeys(item, ['kind', 'text'], ['kind', 'text'], 'outbound forward node');
+            if (item.kind !== 'text')
+                throw new TypeError('outbound forward node is invalid');
+            return { kind: 'text', text: text(item.text, 'outbound forward text', true) };
+        });
+        return {
+            media: input.media,
+            title: text(input.title, 'outbound forward title'),
+            nodes
+        };
+    }
+    if (input.media === 'music') {
+        exactKeys(input, ['media', 'provider', 'id'], ['media', 'provider', 'id'], 'outbound music');
+        if (input.provider !== '163')
+            throw new TypeError('outbound music provider is invalid');
+        return { media: input.media, provider: input.provider, id: text(input.id, 'music ID') };
+    }
+    if (input.media === 'dice') {
+        exactKeys(input, ['media'], ['media'], 'outbound dice');
+        return { media: input.media };
+    }
+    if (input.media === 'rps') {
+        exactKeys(input, ['media', 'value'], ['media', 'value'], 'outbound rps');
+        if (input.value !== 1 && input.value !== 2 && input.value !== 3) {
+            throw new TypeError('outbound rps value is invalid');
+        }
+        return { media: input.media, value: input.value };
+    }
+    throw new TypeError('outbound part media is invalid');
+}
+function projectReceipt(value) {
+    const input = ownDataRecord(value, 'outbound receipt', { allowReceiptBrand: true });
+    exactKeys(input, ['schemaVersion', 'media', 'messageId'], ['schemaVersion', 'media'], 'outbound receipt');
+    if (input.schemaVersion !== 1 || typeof input.media !== 'string' ||
+        !MEDIA.has(input.media)) {
+        throw new TypeError('outbound receipt is invalid');
+    }
+    return {
+        schemaVersion: 1,
+        media: input.media,
+        ...(input.messageId === undefined
+            ? {}
+            : { messageId: text(input.messageId, 'outbound receipt message ID') })
+    };
+}
+function projectDeliveryResult(value, media, attempt) {
+    const input = ownDataRecord(value, 'outbound delivery result');
+    if (input.kind === 'sent') {
+        exactKeys(input, ['kind', 'media', 'attempt', 'receipt'], ['kind', 'media', 'attempt', 'receipt'], 'outbound delivery result');
+        const receipt = projectReceipt(input.receipt);
+        if (input.media !== media || input.attempt !== attempt || receipt.media !== media) {
+            throw new TypeError('outbound delivery result correlation is invalid');
+        }
+        return { kind: input.kind, media: input.media, attempt: input.attempt, receipt };
+    }
+    if (input.kind !== 'failed_definite' && input.kind !== 'outcome_unknown') {
+        throw new TypeError('outbound delivery result kind is invalid');
+    }
+    exactKeys(input, ['kind', 'media', 'attempt', 'code'], ['kind', 'media', 'attempt', 'code'], 'outbound delivery result');
+    if (input.media !== media || input.attempt !== attempt ||
+        typeof input.code !== 'string' || !DELIVERY_CODES.has(input.code)) {
+        throw new TypeError('outbound delivery result is invalid');
+    }
+    return { kind: input.kind, media: input.media, attempt: input.attempt, code: input.code };
+}
+function projectRecallResult(value) {
+    const input = ownDataRecord(value, 'outbound recall result');
+    if (input.kind === 'recalled') {
+        exactKeys(input, ['kind'], ['kind'], 'outbound recall result');
+        return { kind: input.kind };
+    }
+    exactKeys(input, ['kind', 'code'], ['kind', 'code'], 'outbound recall result');
+    const codes = input.kind === 'failed_definite'
+        ? RECALL_DEFINITE_CODES
+        : input.kind === 'outcome_unknown'
+            ? RECALL_UNKNOWN_CODES
+            : null;
+    if (codes === null || typeof input.code !== 'string' || !codes.has(input.code)) {
+        throw new TypeError('outbound recall result is invalid');
+    }
+    return { kind: input.kind, code: input.code };
+}
+function boundedOutboundPayload(value) {
+    return boundedRecord(value, RUN_RESOURCE_LIMITS.providerResponseBytes, 'outbound payload');
+}
+export function projectOutboundJournalEvent(value) {
+    const input = ownDataRecord(value, 'outbound journal event');
+    if (input.type === 'qq.outbound.deliver') {
+        const keys = [
+            'type', 'occurredAt', 'target', 'part', 'attempt', 'quoteMessageId', 'result'
+        ];
+        exactKeys(input, keys, keys, 'outbound delivery event');
+        const part = projectOutboundPart(input.part);
+        const media = part.media;
+        const attempt = input.attempt;
+        if (attempt !== 1 && attempt !== 2)
+            throw new TypeError('outbound attempt is invalid');
+        if (input.quoteMessageId !== null)
+            text(input.quoteMessageId, 'outbound quote message ID');
+        return {
+            type: input.type,
+            payload: boundedOutboundPayload({
+                occurredAt: timestamp(input.occurredAt, 'outbound timestamp'),
+                target: projectSessionAddress(input.target, 'outbound target'),
+                part,
+                attempt,
+                quoteMessageId: input.quoteMessageId,
+                result: projectDeliveryResult(input.result, media, attempt)
+            })
+        };
+    }
+    if (input.type !== 'qq.outbound.recall')
+        throw new TypeError('outbound event type is invalid');
+    const keys = ['type', 'occurredAt', 'target', 'receipt', 'result'];
+    exactKeys(input, keys, keys, 'outbound recall event');
+    return {
+        type: input.type,
+        payload: boundedOutboundPayload({
+            occurredAt: timestamp(input.occurredAt, 'outbound timestamp'),
+            target: projectSessionAddress(input.target, 'outbound target'),
+            receipt: projectReceipt(input.receipt),
+            result: projectRecallResult(input.result)
+        })
+    };
+}

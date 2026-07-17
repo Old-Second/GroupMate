@@ -4,13 +4,16 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
+import { parseAgentMessage } from '../../src/agent/contracts/content.js'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
+import { parseJsonValue } from '../../src/agent/model/json-value.js'
 import type { JsonObject } from '../../src/agent/model/json-value.js'
 import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
+  parseRunCheckpoint,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
 import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
@@ -20,6 +23,7 @@ import {
   createRunTerminalSnapshot
 } from '../../src/agent/run/run-observation.js'
 import { parseTerminalCommitReceipt } from '../../src/agent/run/run-store.js'
+import { parseToolResult } from '../../src/agent/tools/tool-result.js'
 import {
   createGroupMateContentJournal
 } from '../../src/runtime/logging/groupmate-content-journal.js'
@@ -199,6 +203,23 @@ function modelTurnFixture (): ModelTurn {
   })
 }
 
+function terminalReceipt (
+  checkpoint: RunCheckpoint
+): ReturnType<typeof parseTerminalCommitReceipt> {
+  const snapshot = createRunTerminalSnapshot(checkpoint)
+  return parseTerminalCommitReceipt({
+    schemaVersion: 1,
+    observationId: snapshot.observationId,
+    runRef: snapshot.runRef,
+    revision: snapshot.revision,
+    deletedKeyCount: 2,
+    createdKeyCount: 1,
+    checkpointBytesDeleted: 123,
+    eventBytesDeleted: 45,
+    tombstoneBytes: 67
+  })
+}
+
 function terminalJournalFixture (): Readonly<{
   checkpoint: RunCheckpoint
   receipt: ReturnType<typeof parseTerminalCommitReceipt>
@@ -269,19 +290,93 @@ function terminalJournalFixture (): Readonly<{
     occurredAt: finishedAt, type: 'run.cancelled',
     payload: Object.freeze({ reason: 'user_cancelled' })
   })], finishedAt)
-  const snapshot = createRunTerminalSnapshot(checkpoint)
-  const receipt = parseTerminalCommitReceipt({
-    schemaVersion: 1,
-    observationId: snapshot.observationId,
-    runRef: snapshot.runRef,
-    revision: snapshot.revision,
-    deletedKeyCount: 2,
-    createdKeyCount: 1,
-    checkpointBytesDeleted: 123,
-    eventBytesDeleted: 45,
-    tombstoneBytes: 67
+  return Object.freeze({ checkpoint, receipt: terminalReceipt(checkpoint) })
+}
+
+function terminalContentFixture (): Readonly<{
+  checkpoint: RunCheckpoint
+  receipt: ReturnType<typeof parseTerminalCommitReceipt>
+  assistantText: string
+  toolArgumentUrl: string
+  toolResourceUrl: string
+}> {
+  const base = terminalJournalFixture().checkpoint
+  const assistantText = '终态 assistant 保留普通文本 URL：https://text.example.test/full?q=1#fragment'
+  const toolArgumentUrl = 'https://user:pass@arguments.example.test/raw?q=2#fragment'
+  const toolResourceUrl = 'https://user:pass@tools.example.test/assets/result.png?token=secret#private'
+  const output = parseAgentMessage({
+    id: 'terminal-output-message',
+    role: 'assistant',
+    parts: [{ type: 'text', text: assistantText }],
+    createdAt: base.updatedAt,
+    provenance: {
+      source: 'model', trust: 'trusted', sensitivity: 'group',
+      sourceId: 'terminal-output-message', createdAt: base.updatedAt
+    }
   })
-  return Object.freeze({ checkpoint, receipt })
+  const result = parseToolResult({
+    status: 'success',
+    effect: 'background',
+    content: [{
+      type: 'resource_ref', resourceType: 'image',
+      resourceId: toolResourceUrl, mimeType: 'image/png'
+    }],
+    retryable: false
+  })
+  const checkpoint = parseRunCheckpoint({
+    ...base,
+    status: 'completed',
+    cancellationReason: null,
+    output,
+    completion: { kind: 'reply_text', text: assistantText },
+    toolLedgers: [{
+      schemaVersion: 1,
+      step: 0,
+      calls: [{
+        occurrenceId: '0:0',
+        step: 0,
+        index: 0,
+        callId: 'terminal-call-1',
+        toolName: 'terminal_tool',
+        arguments: { url: toolArgumentUrl },
+        status: 'succeeded',
+        capability: null,
+        result
+      }]
+    }]
+  })
+  return Object.freeze({
+    checkpoint,
+    receipt: terminalReceipt(checkpoint),
+    assistantText,
+    toolArgumentUrl,
+    toolResourceUrl
+  })
+}
+
+function largeTerminalFixture (): Readonly<{
+  checkpoint: RunCheckpoint
+  receipt: ReturnType<typeof parseTerminalCommitReceipt>
+}> {
+  const base = terminalJournalFixture().checkpoint
+  const payload = Object.freeze(Object.fromEntries(
+    Array.from({ length: 90 }, (_, index) => [`k${index}`, index])
+  ))
+  const events = Object.freeze(Array.from({ length: 96 }, (_, sequence) => createRunEvent({
+    eventId: `large-event-${sequence}`,
+    runId: base.runId,
+    sessionId: base.sessionId,
+    sequence,
+    occurredAt: base.updatedAt,
+    type: 'run.progress',
+    payload
+  })))
+  const checkpoint = parseRunCheckpoint({
+    ...base,
+    events,
+    nextEventSequence: events.length
+  })
+  return Object.freeze({ checkpoint, receipt: terminalReceipt(checkpoint) })
 }
 
 function inMemoryContentJournal (): Readonly<{
@@ -355,6 +450,83 @@ test('projects complete normalized request and provider content with legitimate 
   }
 })
 
+test('sanitizes only typed current and quoted request resource URLs without mutating source', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const base = requestFixture()
+  const currentResourceUrl = 'https://user:pass@current.example.test/images/a.png?token=current#private'
+  const quotedResourceUrl = 'https://user:pass@quote.example.test/files/b.jpg?token=quote#private'
+  const ordinaryTextUrl = 'https://user:pass@text.example.test/raw?q=1#keep'
+  const toolArgumentUrl = 'https://user:pass@arguments.example.test/raw?q=2#keep'
+  const request = Object.freeze({
+    ...base,
+    message: Object.freeze({
+      ...base.message,
+      parts: Object.freeze([
+        Object.freeze({ type: 'text' as const, text: ordinaryTextUrl }),
+        Object.freeze({
+          type: 'resource_ref' as const,
+          resourceType: 'image' as const,
+          resourceId: currentResourceUrl,
+          mimeType: 'image/png'
+        }),
+        Object.freeze({
+          type: 'tool_call' as const,
+          toolCallId: 'request-url-call',
+          name: 'retain_url_argument',
+          arguments: Object.freeze({ url: toolArgumentUrl })
+        })
+      ]),
+      replyTo: Object.freeze({
+        messageId: 'quoted-url-message',
+        sender: Object.freeze({ userId: 'quoted-user' }),
+        parts: Object.freeze([
+          Object.freeze({ type: 'text' as const, text: ordinaryTextUrl }),
+          Object.freeze({
+            type: 'resource_ref' as const,
+            resourceType: 'image' as const,
+            resourceId: quotedResourceUrl,
+            mimeType: 'image/jpeg'
+          })
+        ])
+      })
+    })
+  }) satisfies YunzaiAgentRequestDraft
+  const sourceJson = JSON.stringify(request)
+
+  journal.recordRequest(request)
+
+  assert.equal(JSON.stringify(request), sourceJson)
+  assert.equal(events.length, 1)
+  const loggedRequest = (events[0]?.payload as {
+    request: {
+      message: {
+        parts: Array<Record<string, unknown>>
+        replyTo: { parts: Array<Record<string, unknown>> }
+      }
+    }
+  }).request
+  assert.equal(loggedRequest.message.parts[0]?.text, ordinaryTextUrl)
+  assert.equal(
+    (loggedRequest.message.parts[2]?.arguments as { url: string }).url,
+    toolArgumentUrl
+  )
+  assert.equal(
+    loggedRequest.message.parts[1]?.resourceId,
+    'https://current.example.test/images/a.png'
+  )
+  assert.equal(loggedRequest.message.replyTo.parts[0]?.text, ordinaryTextUrl)
+  assert.equal(
+    loggedRequest.message.replyTo.parts[1]?.resourceId,
+    'https://quote.example.test/files/b.jpg'
+  )
+  assert.equal(request.message.parts[1]?.type === 'resource_ref'
+    ? request.message.parts[1].resourceId
+    : null, currentResourceUrl)
+  assert.equal(request.message.replyTo?.parts[1]?.type === 'resource_ref'
+    ? request.message.replyTo.parts[1].resourceId
+    : null, quotedResourceUrl)
+})
+
 test('projects complete provider response failure and committed terminal content', () => {
   const { journal, events } = inMemoryContentJournal()
   const turn = modelTurnFixture()
@@ -409,6 +581,116 @@ test('projects complete provider response failure and committed terminal content
       }
     }
   ])
+})
+
+test('sanitizes terminal tool resources while retaining assistant text and tool arguments', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalContentFixture()
+  journal.recordRunEvent(Object.freeze({
+    type: 'run.terminal_committed',
+    occurredAt: terminal.checkpoint.updatedAt,
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    checkpoint: terminal.checkpoint,
+    receipt: terminal.receipt
+  }))
+
+  assert.equal(events.length, 1)
+  const checkpoint = (events[0]?.payload as { checkpoint: RunCheckpoint }).checkpoint
+  assert.equal(checkpoint.output?.parts[0]?.type === 'text'
+    ? checkpoint.output.parts[0].text
+    : null, terminal.assistantText)
+  assert.equal(
+    (checkpoint.toolLedgers[0]?.calls[0]?.arguments as { url: string }).url,
+    terminal.toolArgumentUrl
+  )
+  const loggedResult = checkpoint.toolLedgers[0]?.calls[0]?.result
+  assert.equal(loggedResult?.status === 'success' && loggedResult.content[0]?.type === 'resource_ref'
+    ? loggedResult.content[0].resourceId
+    : null, 'https://tools.example.test/assets/result.png')
+  const sourceResult = terminal.checkpoint.toolLedgers[0]?.calls[0]?.result
+  assert.equal(sourceResult?.status === 'success' && sourceResult.content[0]?.type === 'resource_ref'
+    ? sourceResult.content[0].resourceId
+    : null, terminal.toolResourceUrl)
+})
+
+test('authoritative checkpoint parser rejects terminal resource output before journaling', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalContentFixture()
+  const resourceUrl = 'https://user:pass@unreachable.example.test/output.png?token=secret#private'
+  const invalidOutput = parseAgentMessage({
+    id: 'invalid-terminal-output',
+    role: 'assistant',
+    parts: [{ type: 'resource_ref', resourceType: 'image', resourceId: resourceUrl }],
+    createdAt: terminal.checkpoint.updatedAt,
+    provenance: {
+      source: 'model', trust: 'trusted', sensitivity: 'group',
+      sourceId: 'invalid-terminal-output', createdAt: terminal.checkpoint.updatedAt
+    }
+  })
+  const invalidCheckpoint = {
+    ...terminal.checkpoint,
+    output: invalidOutput
+  } as RunCheckpoint
+
+  assert.throws(
+    () => parseRunCheckpoint(invalidCheckpoint),
+    /terminal output must be a canonical assistant text message/
+  )
+  journal.recordRunEvent({
+    type: 'run.terminal_committed',
+    occurredAt: terminal.checkpoint.updatedAt,
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    checkpoint: invalidCheckpoint,
+    receipt: terminal.receipt
+  })
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'run_event', code: 'invalid_content' }
+  }])
+  assert.equal(JSON.stringify(events).includes(resourceUrl), false)
+})
+
+test('terminal envelope uses the authority node budget and rejects nonterminal checkpoints', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const large = largeTerminalFixture()
+  assert.throws(() => parseJsonValue(large.checkpoint, {
+    maxBytes: 1024 * 1024,
+    maxDepth: 32,
+    maxNodes: 8_192
+  }), /node limit exceeded/)
+  assert.doesNotThrow(() => parseRunCheckpoint(large.checkpoint))
+
+  journal.recordRunEvent({
+    type: 'run.terminal_committed',
+    occurredAt: large.checkpoint.updatedAt,
+    runRef: large.checkpoint.runRef,
+    requestRef: large.checkpoint.requestRef,
+    checkpoint: large.checkpoint,
+    receipt: large.receipt
+  })
+
+  const terminal = terminalJournalFixture()
+  const nonterminal = parseRunCheckpoint({
+    ...terminal.checkpoint,
+    status: 'calling_model',
+    cancellationReason: null
+  })
+  journal.recordRunEvent({
+    type: 'run.terminal_committed',
+    occurredAt: nonterminal.updatedAt,
+    runRef: nonterminal.runRef,
+    requestRef: nonterminal.requestRef,
+    checkpoint: nonterminal,
+    receipt: terminal.receipt
+  })
+
+  assert.equal(events[0]?.type, 'run.terminal_committed')
+  assert.deepEqual(events[1], {
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'run_event', code: 'invalid_content' }
+  })
 })
 
 test('rejects structural credential and configuration extras with fixed failure evidence', () => {
@@ -623,7 +905,7 @@ test('projects exact QQ text and forward content while bounding media resources'
         media: 'video' as const,
         resource: Object.freeze({
           kind: 'remote_url' as const,
-          url: 'https://media.example.test/video/clip.mp4?token=secret#private',
+          url: 'https://user:pass@media.example.test/video/clip.mp4?token=secret#private',
           mimeType: 'video/mp4',
           byteLength: 1_024
         })
@@ -671,6 +953,99 @@ test('projects exact QQ text and forward content while bounding media resources'
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('preserves a legal 257-atom outbound part under the shared hard budget', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const atoms = Object.freeze(Array.from({ length: 257 }, (_, index) => Object.freeze({
+    kind: 'text' as const,
+    text: `atom-${index}`
+  })))
+  const part = Object.freeze({ media: 'text' as const, atoms })
+  const result = Object.freeze({
+    kind: 'failed_definite' as const,
+    media: 'text' as const,
+    attempt: 1 as const,
+    code: 'host_rejected' as const
+  })
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part,
+    attempt: 1,
+    quoteMessageId: null,
+    result
+  })
+
+  assert.equal(events.length, 1)
+  assert.equal(events[0]?.type, 'qq.outbound.deliver')
+  const payload = events[0]?.payload as {
+    part: { atoms: Array<{ text: string }> }
+    result: unknown
+  }
+  assert.equal(payload.part.atoms.length, 257)
+  assert.equal(payload.part.atoms[0]?.text, 'atom-0')
+  assert.equal(payload.part.atoms[256]?.text, 'atom-256')
+  assert.deepEqual(payload.result, result)
+})
+
+test('retains metadata when an accepted remote URL is malformed or non-HTTP', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const inputs = Object.freeze([
+    Object.freeze({
+      media: 'picture' as const,
+      resource: Object.freeze({
+        kind: 'remote_url' as const,
+        url: 'malformed remote value ?token=secret#private',
+        mimeType: 'image/png',
+        byteLength: 321
+      })
+    }),
+    Object.freeze({
+      media: 'video' as const,
+      resource: Object.freeze({
+        kind: 'remote_url' as const,
+        url: 'file:///private/video.mp4?token=secret#private',
+        mimeType: 'video/mp4',
+        byteLength: 654
+      })
+    })
+  ])
+  for (const part of inputs) {
+    journal.recordOutbound({
+      type: 'qq.outbound.deliver',
+      occurredAt: FIXED_TIMESTAMP,
+      target,
+      part,
+      attempt: 1,
+      quoteMessageId: null,
+      result: Object.freeze({
+        kind: 'failed_definite', media: part.media, attempt: 1, code: 'host_rejected'
+      })
+    })
+  }
+
+  assert.deepEqual(events.map(event => event.payload.part), [
+    {
+      media: 'picture',
+      resource: { kind: 'remote_url', mimeType: 'image/png', byteLength: 321 }
+    },
+    {
+      media: 'video',
+      resource: { kind: 'remote_url', mimeType: 'video/mp4', byteLength: 654 }
+    }
+  ])
+  const serialized = JSON.stringify(events)
+  assert.equal(serialized.includes('malformed remote value'), false)
+  assert.equal(serialized.includes('file:///private/video.mp4'), false)
+  assert.equal(serialized.includes('token=secret'), false)
 })
 
 function collectingJournal (
