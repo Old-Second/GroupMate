@@ -1,0 +1,286 @@
+import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises'
+import path from 'node:path'
+
+interface GroupMateDiskLogLimits {
+  readonly maxFileBytes: number
+  readonly retentionMs: number
+  readonly maxDirectoryBytes: number
+  readonly maxQueueRecords: number
+  readonly maxQueueBytes: number
+  readonly maxEntryBytes: number
+}
+
+export const GROUPMATE_DISK_LOG_LIMITS: Readonly<GroupMateDiskLogLimits> = Object.freeze({
+  maxFileBytes: 32 * 1024 * 1024,
+  retentionMs: 30 * 24 * 60 * 60 * 1_000,
+  maxDirectoryBytes: 512 * 1024 * 1024,
+  maxQueueRecords: 256,
+  maxQueueBytes: 8 * 1024 * 1024,
+  maxEntryBytes: 4 * 1024 * 1024
+})
+
+export interface GroupMateDiskLogEvent {
+  readonly type: string
+  readonly payload: Readonly<Record<string, unknown>>
+}
+
+export interface GroupMateDiskLogFailure {
+  readonly event: 'groupmate.disk_log.failure'
+  readonly code:
+    | 'directory_cap_exceeded'
+    | 'entry_too_large'
+    | 'queue_overflow'
+    | 'serialization_failed'
+    | 'write_failed'
+}
+
+export interface GroupMateDiskLogOptions {
+  readonly directory: string
+  readonly now?: () => Date
+  readonly onFailure?: (failure: GroupMateDiskLogFailure) => void
+  readonly limits?: Partial<typeof GROUPMATE_DISK_LOG_LIMITS>
+}
+
+interface DiskLogEntry {
+  readonly line: string
+  readonly bytes: number
+  readonly date: string
+  readonly recordedAt: Date
+}
+
+interface DiskLogFile {
+  readonly name: string
+  readonly path: string
+  readonly date: string
+  readonly index: number
+  readonly dateStart: number
+  readonly bytes: number
+}
+
+type GroupMateDiskLogFailureCode = GroupMateDiskLogFailure['code']
+
+const FILE_NAME_PATTERN = /^groupmate-(\d{4})-(\d{2})-(\d{2})\.(\d{4})\.jsonl$/
+const FAILURE_LIMIT_MS = 60_000
+
+function localDate (now: Date): string {
+  const year = String(now.getFullYear()).padStart(4, '0')
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function fileName (date: string, index: number): string {
+  return `groupmate-${date}.${String(index).padStart(4, '0')}.jsonl`
+}
+
+function fileMetadata (name: string): Omit<DiskLogFile, 'path' | 'bytes'> | null {
+  const match = FILE_NAME_PATTERN.exec(name)
+  if (match === null) return null
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const dateStart = new Date(year, month - 1, day)
+  if (dateStart.getFullYear() !== year || dateStart.getMonth() !== month - 1 ||
+    dateStart.getDate() !== day) {
+    return null
+  }
+  return {
+    name,
+    date: `${match[1]}-${match[2]}-${match[3]}`,
+    index: Number(match[4]),
+    dateStart: dateStart.getTime()
+  }
+}
+
+function limitFor (
+  key: keyof typeof GROUPMATE_DISK_LOG_LIMITS,
+  overrides: GroupMateDiskLogOptions['limits']
+): number {
+  const maximum = GROUPMATE_DISK_LOG_LIMITS[key]
+  const value = overrides?.[key]
+  if (value === undefined) return maximum
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new TypeError(`disk log ${key} override is invalid`)
+  }
+  return value
+}
+
+export class GroupMateDiskLog {
+  readonly #directory: string
+  readonly #now: () => Date
+  readonly #onFailure?: (failure: GroupMateDiskLogFailure) => void
+  readonly #limits: Readonly<GroupMateDiskLogLimits>
+  readonly #queue: DiskLogEntry[] = []
+  readonly #lastFailureByCode = new Map<GroupMateDiskLogFailureCode, number>()
+  #sequence = 0
+  #pendingBytes = 0
+  #pendingRecords = 0
+  #lastExpiryCleanupDate: string | null = null
+  #pump: Promise<void> | null = null
+
+  constructor (options: GroupMateDiskLogOptions) {
+    this.#directory = options.directory
+    this.#now = options.now ?? (() => new Date())
+    this.#onFailure = options.onFailure
+    this.#limits = Object.freeze({
+      maxFileBytes: limitFor('maxFileBytes', options.limits),
+      retentionMs: limitFor('retentionMs', options.limits),
+      maxDirectoryBytes: limitFor('maxDirectoryBytes', options.limits),
+      maxQueueRecords: limitFor('maxQueueRecords', options.limits),
+      maxQueueBytes: limitFor('maxQueueBytes', options.limits),
+      maxEntryBytes: limitFor('maxEntryBytes', options.limits)
+    })
+  }
+
+  record (event: GroupMateDiskLogEvent): void {
+    const now = this.#safeNow()
+    let line: string
+    try {
+      const serialized = JSON.stringify({
+        schemaVersion: 1,
+        sequence: this.#sequence + 1,
+        recordedAt: now.toISOString(),
+        event
+      })
+      if (typeof serialized !== 'string') throw new TypeError('disk log entry is invalid')
+      line = `${serialized}\n`
+    } catch {
+      this.#reportFailure('serialization_failed')
+      return
+    }
+    const bytes = Buffer.byteLength(line)
+    if (bytes > this.#limits.maxEntryBytes) {
+      this.#reportFailure('entry_too_large')
+      return
+    }
+    if (this.#pendingRecords + 1 > this.#limits.maxQueueRecords ||
+      this.#pendingBytes + bytes > this.#limits.maxQueueBytes) {
+      this.#reportFailure('queue_overflow')
+      return
+    }
+    this.#sequence += 1
+    this.#pendingRecords += 1
+    this.#pendingBytes += bytes
+    this.#queue.push({ line, bytes, date: localDate(now), recordedAt: now })
+    this.#ensurePump()
+  }
+
+  async drain (): Promise<void> {
+    while (this.#pump !== null || this.#queue.length > 0) {
+      this.#ensurePump()
+      const pump = this.#pump
+      if (pump !== null) await pump
+    }
+  }
+
+  #ensurePump (): void {
+    if (this.#pump !== null) return
+    const pump = this.#flush()
+    this.#pump = pump
+    void pump.finally(() => {
+      if (this.#pump !== pump) return
+      this.#pump = null
+      if (this.#queue.length > 0) this.#ensurePump()
+    })
+  }
+
+  async #flush (): Promise<void> {
+    while (this.#queue.length > 0) {
+      const entry = this.#queue.shift() as DiskLogEntry
+      try {
+        await this.#write(entry)
+      } catch {
+        this.#reportFailure('write_failed')
+      } finally {
+        this.#pendingRecords -= 1
+        this.#pendingBytes -= entry.bytes
+      }
+    }
+  }
+
+  async #write (entry: DiskLogEntry): Promise<void> {
+    await mkdir(this.#directory, { recursive: true, mode: 0o700 })
+    if (this.#lastExpiryCleanupDate !== entry.date) {
+      await this.#removeExpiredFiles(entry.recordedAt)
+      this.#lastExpiryCleanupDate = entry.date
+    }
+    const target = await this.#targetFor(entry)
+    if (target === null) {
+      this.#reportFailure('directory_cap_exceeded')
+      return
+    }
+    const file = await open(path.join(this.#directory, target), 'a', 0o600)
+    try {
+      await file.writeFile(entry.line)
+    } finally {
+      await file.close()
+    }
+  }
+
+  async #removeExpiredFiles (now: Date): Promise<void> {
+    const cutoff = now.getTime() - this.#limits.retentionMs
+    for (const file of await this.#matchingFiles()) {
+      if (file.dateStart < cutoff) await unlink(file.path)
+    }
+  }
+
+  async #targetFor (entry: DiskLogEntry): Promise<string | null> {
+    const files = await this.#matchingFiles()
+    const sameDate = files.filter(file => file.date === entry.date)
+    const latest = sameDate.at(-1)
+    let target: string
+    if (latest === undefined) {
+      target = fileName(entry.date, 1)
+    } else if (latest.bytes === 0 || latest.bytes + entry.bytes <= this.#limits.maxFileBytes) {
+      target = latest.name
+    } else if (latest.index < 9_999) {
+      target = fileName(entry.date, latest.index + 1)
+    } else {
+      return null
+    }
+    let totalBytes = files.reduce((total, file) => total + file.bytes, 0)
+    for (const file of files) {
+      if (totalBytes + entry.bytes <= this.#limits.maxDirectoryBytes) break
+      if (file.name === target) continue
+      await unlink(file.path)
+      totalBytes -= file.bytes
+    }
+    return totalBytes + entry.bytes <= this.#limits.maxDirectoryBytes ? target : null
+  }
+
+  async #matchingFiles (): Promise<readonly DiskLogFile[]> {
+    const entries = await readdir(this.#directory, { withFileTypes: true })
+    const files: DiskLogFile[] = []
+    for (const entry of entries) {
+      if (!entry.isFile()) continue
+      const metadata = fileMetadata(entry.name)
+      if (metadata === null) continue
+      const filePath = path.join(this.#directory, entry.name)
+      const details = await stat(filePath)
+      if (!details.isFile()) continue
+      files.push({ ...metadata, path: filePath, bytes: details.size })
+    }
+    files.sort((left, right) => left.name.localeCompare(right.name))
+    return files
+  }
+
+  #safeNow (): Date {
+    try {
+      const value = this.#now()
+      const timestamp = value.getTime()
+      return Number.isFinite(timestamp) ? new Date(timestamp) : new Date(0)
+    } catch {
+      return new Date(0)
+    }
+  }
+
+  #reportFailure (code: GroupMateDiskLogFailureCode): void {
+    const now = this.#safeNow().getTime()
+    const last = this.#lastFailureByCode.get(code)
+    if (last !== undefined && now - last < FAILURE_LIMIT_MS) return
+    this.#lastFailureByCode.set(code, now)
+    try {
+      this.#onFailure?.(Object.freeze({ event: 'groupmate.disk_log.failure', code }))
+    } catch {}
+  }
+}
