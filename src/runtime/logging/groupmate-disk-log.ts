@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, realpath, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
 interface GroupMateDiskLogLimits {
@@ -37,6 +37,7 @@ export interface GroupMateDiskLogFailure {
 
 export interface GroupMateDiskLogOptions {
   readonly directory: string
+  readonly trustedRoot: string
   readonly now?: () => Date
   readonly onFailure?: (failure: GroupMateDiskLogFailure) => void
   readonly limits?: Partial<typeof GROUPMATE_DISK_LOG_LIMITS>
@@ -65,6 +66,52 @@ const FAILURE_LIMIT_MS = 60_000
 const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
 const LOG_FILE_OPEN_FLAGS = constants.O_WRONLY |
   constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK
+
+function isMissingPathError (error: unknown): boolean {
+  return error !== null && typeof error === 'object' &&
+    'code' in error && error.code === 'ENOENT'
+}
+
+function relativeDescendant (root: string, target: string): string {
+  const relative = path.relative(root, target)
+  if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)) {
+    throw new TypeError('disk log directory boundary is invalid')
+  }
+  return relative
+}
+
+async function createDirectoryWithoutSymlinks (
+  directory: string,
+  configuredRoot: string
+): Promise<string> {
+  const relative = relativeDescendant(configuredRoot, directory)
+  let current = await realpath(configuredRoot)
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment)
+    let details
+    try {
+      details = await lstat(current)
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error
+      try {
+        await mkdir(current, { mode: 0o700 })
+      } catch (mkdirError) {
+        if (mkdirError === null || typeof mkdirError !== 'object' ||
+          !('code' in mkdirError) || mkdirError.code !== 'EEXIST') throw mkdirError
+      }
+      details = await lstat(current)
+    }
+    if (details.isSymbolicLink() || !details.isDirectory()) {
+      throw new TypeError('disk log ancestor is invalid')
+    }
+  }
+  return current
+}
+
+function openedDirectoryPath (descriptor: number, fallback: string): string {
+  return process.platform === 'linux' ? `/proc/self/fd/${descriptor}` : fallback
+}
 
 function localDate (now: Date): string {
   const year = String(now.getFullYear()).padStart(4, '0')
@@ -111,6 +158,7 @@ function limitFor (
 
 export class GroupMateDiskLog {
   readonly #directory: string
+  readonly #trustedRoot: string
   readonly #now: () => Date
   readonly #onFailure?: (failure: GroupMateDiskLogFailure) => void
   readonly #limits: Readonly<GroupMateDiskLogLimits>
@@ -123,7 +171,9 @@ export class GroupMateDiskLog {
   #pump: Promise<void> | null = null
 
   constructor (options: GroupMateDiskLogOptions) {
-    this.#directory = options.directory
+    this.#directory = path.resolve(options.directory)
+    this.#trustedRoot = path.resolve(options.trustedRoot)
+    relativeDescendant(this.#trustedRoot, this.#directory)
     this.#now = options.now ?? (() => new Date())
     this.#onFailure = options.onFailure
     this.#limits = Object.freeze({
@@ -203,43 +253,52 @@ export class GroupMateDiskLog {
   }
 
   async #write (entry: DiskLogEntry): Promise<void> {
-    await mkdir(this.#directory, { recursive: true, mode: 0o700 })
-    const directory = await open(this.#directory, DIRECTORY_OPEN_FLAGS)
+    const safeDirectory = await createDirectoryWithoutSymlinks(
+      this.#directory,
+      this.#trustedRoot
+    )
+    const directory = await open(safeDirectory, DIRECTORY_OPEN_FLAGS)
     try {
-      if (!(await directory.stat()).isDirectory()) throw new TypeError('disk log directory is invalid')
+      const opened = await directory.stat()
+      const current = await lstat(safeDirectory)
+      if (!opened.isDirectory() || current.isSymbolicLink() || !current.isDirectory() ||
+        opened.dev !== current.dev || opened.ino !== current.ino) {
+        throw new TypeError('disk log directory is invalid')
+      }
       await directory.chmod(0o700)
+      const operationRoot = openedDirectoryPath(directory.fd, safeDirectory)
+      if (this.#lastExpiryCleanupDate !== entry.date) {
+        await this.#removeExpiredFiles(entry.recordedAt, operationRoot)
+        this.#lastExpiryCleanupDate = entry.date
+      }
+      const target = await this.#targetFor(entry, operationRoot)
+      if (target === null) {
+        this.#reportFailure('directory_cap_exceeded')
+        return
+      }
+      const targetPath = path.join(operationRoot, target)
+      const file = await open(targetPath, LOG_FILE_OPEN_FLAGS, 0o600)
+      try {
+        if (!(await file.stat()).isFile()) throw new TypeError('disk log target is invalid')
+        await file.chmod(0o600)
+        await file.writeFile(entry.line)
+      } finally {
+        await file.close()
+      }
     } finally {
       await directory.close()
     }
-    if (this.#lastExpiryCleanupDate !== entry.date) {
-      await this.#removeExpiredFiles(entry.recordedAt)
-      this.#lastExpiryCleanupDate = entry.date
-    }
-    const target = await this.#targetFor(entry)
-    if (target === null) {
-      this.#reportFailure('directory_cap_exceeded')
-      return
-    }
-    const targetPath = path.join(this.#directory, target)
-    const file = await open(targetPath, LOG_FILE_OPEN_FLAGS, 0o600)
-    try {
-      if (!(await file.stat()).isFile()) throw new TypeError('disk log target is invalid')
-      await file.chmod(0o600)
-      await file.writeFile(entry.line)
-    } finally {
-      await file.close()
-    }
   }
 
-  async #removeExpiredFiles (now: Date): Promise<void> {
+  async #removeExpiredFiles (now: Date, operationRoot: string): Promise<void> {
     const cutoff = now.getTime() - this.#limits.retentionMs
-    for (const file of await this.#matchingFiles()) {
+    for (const file of await this.#matchingFiles(operationRoot)) {
       if (file.dateStart < cutoff) await unlink(file.path)
     }
   }
 
-  async #targetFor (entry: DiskLogEntry): Promise<string | null> {
-    const files = await this.#matchingFiles()
+  async #targetFor (entry: DiskLogEntry, operationRoot: string): Promise<string | null> {
+    const files = await this.#matchingFiles(operationRoot)
     const sameDate = files.filter(file => file.date === entry.date)
     const latest = sameDate.at(-1)
     let target: string
@@ -262,14 +321,14 @@ export class GroupMateDiskLog {
     return totalBytes + entry.bytes <= this.#limits.maxDirectoryBytes ? target : null
   }
 
-  async #matchingFiles (): Promise<readonly DiskLogFile[]> {
-    const entries = await readdir(this.#directory, { withFileTypes: true })
+  async #matchingFiles (operationRoot: string): Promise<readonly DiskLogFile[]> {
+    const entries = await readdir(operationRoot, { withFileTypes: true })
     const files: DiskLogFile[] = []
     for (const entry of entries) {
       if (!entry.isFile()) continue
       const metadata = fileMetadata(entry.name)
       if (metadata === null) continue
-      const filePath = path.join(this.#directory, entry.name)
+      const filePath = path.join(operationRoot, entry.name)
       const details = await stat(filePath)
       if (!details.isFile()) continue
       files.push({ ...metadata, path: filePath, bytes: details.size })

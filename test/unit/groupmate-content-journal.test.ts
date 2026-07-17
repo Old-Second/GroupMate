@@ -466,7 +466,7 @@ test('projects complete normalized request and provider content with legitimate 
   const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-content-journal-'))
   try {
     const diskLog = new GroupMateDiskLog({
-      directory, now: () => new Date(FIXED_TIMESTAMP)
+      directory, trustedRoot: path.dirname(directory), now: () => new Date(FIXED_TIMESTAMP)
     })
     const journal = createGroupMateContentJournal(diskLog)
     const request = requestFixture()
@@ -939,7 +939,7 @@ test('projects exact QQ text and forward content while bounding media resources'
   const directory = await mkdtemp(path.join(os.tmpdir(), 'groupmate-content-journal-'))
   try {
     const diskLog = new GroupMateDiskLog({
-      directory, now: () => new Date(FIXED_TIMESTAMP)
+      directory, trustedRoot: path.dirname(directory), now: () => new Date(FIXED_TIMESTAMP)
     })
     const journal = createGroupMateContentJournal(diskLog)
     const target = Object.freeze({
@@ -1258,6 +1258,48 @@ test('rejects an outbound record Proxy without observing its traps', () => {
   assert.equal(prototypeTraps, 0)
   assert.equal(ownKeysTraps, 0)
   assert.equal(descriptorTraps, 0)
+})
+
+test('rejects a nested buffer Proxy without observing its traps', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const backing = Uint8Array.from([1, 2, 3, 4])
+  let getTraps = 0
+  let prototypeTraps = 0
+  const data = new Proxy(backing, {
+    get: (value, key, receiver) => {
+      getTraps += 1
+      return Reflect.get(value, key, receiver)
+    },
+    getPrototypeOf: value => {
+      prototypeTraps += 1
+      return Reflect.getPrototypeOf(value)
+    }
+  })
+
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: {
+      media: 'picture',
+      resource: { kind: 'buffer', data, mimeType: 'image/png', byteLength: 4 }
+    },
+    attempt: 1,
+    quoteMessageId: null,
+    result: {
+      kind: 'failed_definite', media: 'picture', attempt: 1, code: 'host_rejected'
+    }
+  })
+
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'outbound', code: 'invalid_content' }
+  }])
+  assert.equal(getTraps, 0)
+  assert.equal(prototypeTraps, 0)
 })
 
 test('rejects a hostile 100000-item outbound Array Proxy before whole-array inspection', () => {

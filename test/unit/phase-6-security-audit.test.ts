@@ -58,6 +58,24 @@ test('security audit rejects forbidden trace fields and direct Error logging', a
   assert.equal(logger.passed, false)
 })
 
+test('security audit covers full-content journal loggers and credential fields', async () => {
+  const journalPath = 'src/runtime/logging/groupmate-content-journal.ts'
+  const journalLogger = await auditPhase6SecurityBoundaries(root, fixture(
+    journalPath,
+    `${await source(journalPath)}\nfunction unsafe (logger: any, error: Error) { logger.error(error) }\n`
+  ))
+  assert.deepEqual(journalLogger.unsafeLoggerCalls, [`${journalPath}:direct_error`])
+  assert.equal(journalLogger.passed, false)
+
+  const diskPath = 'src/runtime/logging/groupmate-disk-log.ts'
+  const credential = await auditPhase6SecurityBoundaries(root, fixture(
+    diskPath,
+    `${await source(diskPath)}\nfunction unsafe (logger: any, secret: string) { logger.error({ apiKey: secret }) }\n`
+  ))
+  assert.deepEqual(credential.forbiddenFields, [`${diskPath}:apiKey`])
+  assert.equal(credential.passed, false)
+})
+
 test('security audit rejects trace-wide Redis commands and dynamic metric identity', async () => {
   const redisPath = 'src/runtime/observability/redis-trace-store.ts'
   const redis = await auditPhase6SecurityBoundaries(root, fixture(

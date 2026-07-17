@@ -27,6 +27,7 @@ async function drainFifoInChild (directory: string): Promise<readonly unknown[]>
     `import { GroupMateDiskLog } from ${JSON.stringify(moduleUrl)}`,
     'const failures = []',
     `const log = new GroupMateDiskLog({ directory: ${JSON.stringify(directory)},`,
+    `  trustedRoot: ${JSON.stringify(path.dirname(directory))},`,
     `  now: () => new Date(${JSON.stringify(FIXED_TIMESTAMP)}),`,
     '  onFailure: failure => failures.push(failure) })',
     "log.record({ type: 'fixture', payload: { text: 'current' } })",
@@ -91,6 +92,7 @@ test('writes complete ordered JSONL envelopes', async () => {
   try {
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP)
     })
     log.record({ type: 'fixture', payload: { text: '完整正文' } })
@@ -126,6 +128,7 @@ test('rotates a local-date file before an append crosses the file limit', async 
   try {
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP),
       limits: { maxFileBytes: 180 }
     })
@@ -152,6 +155,7 @@ test('removes expired matching files on the first write without touching other f
     await writeFile(path.join(directory, 'unrelated.txt'), 'preserve\n')
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date('2026-07-17T12:00:00.000Z'),
       limits: { retentionMs: 2 * 24 * 60 * 60 * 1_000 }
     })
@@ -177,6 +181,7 @@ test('prunes oldest inactive matching files for the projected directory cap', as
     await writeFile(path.join(directory, 'unrelated.txt'), 'preserve\n')
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP),
       limits: {
         retentionMs: 10 * 24 * 60 * 60 * 1_000,
@@ -208,6 +213,7 @@ test('globally rate limits failure callbacks while allowing the next callback at
     const failures: unknown[] = []
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => now,
       limits: { maxQueueRecords: 2, maxQueueBytes: 600, maxEntryBytes: 300 },
       onFailure: failure => { failures.push(failure) }
@@ -243,6 +249,7 @@ test('tightens an existing log directory and target file before appending', asyn
     await chmod(target, 0o644)
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP)
     })
 
@@ -271,6 +278,7 @@ test('never follows a matching log-file symlink to an unrelated file', async () 
     const failures: unknown[] = []
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP),
       onFailure: failure => { failures.push(failure) }
     })
@@ -304,6 +312,7 @@ test('rejects a configured log-directory symlink without changing its target', a
     const failures: unknown[] = []
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => new Date(FIXED_TIMESTAMP),
       onFailure: failure => { failures.push(failure) }
     })
@@ -315,6 +324,40 @@ test('rejects a configured log-directory symlink without changing its target', a
     assert.equal((await stat(targetDirectory)).mode & 0o777, beforeMode)
     assert.equal((await lstat(directory)).isSymbolicLink(), true)
     assert.deepEqual(await readdir(targetDirectory), ['victim.txt'])
+    assert.deepEqual(failures, [
+      { event: 'groupmate.disk_log.failure', code: 'write_failed' }
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects a symlink in an ancestor of the configured log directory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'groupmate-disk-log-'))
+  const pluginRoot = path.join(root, 'plugin')
+  const external = path.join(root, 'external')
+  const logsLink = path.join(pluginRoot, 'data', 'logs')
+  const directory = path.join(logsLink, 'groupmate')
+  const marker = path.join(external, 'marker.txt')
+  try {
+    await mkdir(path.join(pluginRoot, 'data'), { recursive: true })
+    await mkdir(external)
+    await writeFile(marker, 'outside bytes\n')
+    await symlink(external, logsLink, 'dir')
+    const failures: unknown[] = []
+    const log = new GroupMateDiskLog({
+      directory,
+      trustedRoot: pluginRoot,
+      now: () => new Date(FIXED_TIMESTAMP),
+      onFailure: failure => { failures.push(failure) }
+    })
+
+    log.record({ type: 'fixture', payload: { text: 'must not escape' } })
+    await assert.doesNotReject(log.drain())
+
+    assert.equal(await readFile(marker, 'utf8'), 'outside bytes\n')
+    assert.deepEqual(await readdir(external), ['marker.txt'])
+    assert.equal((await lstat(logsLink)).isSymbolicLink(), true)
     assert.deepEqual(failures, [
       { event: 'groupmate.disk_log.failure', code: 'write_failed' }
     ])
@@ -359,6 +402,7 @@ test('isolates write failures and reports fixed metadata no more than once per m
     const failures: unknown[] = []
     const log = new GroupMateDiskLog({
       directory,
+      trustedRoot: path.dirname(directory),
       now: () => now,
       onFailure: failure => {
         failures.push(failure)

@@ -1,3 +1,4 @@
+import { types as utilTypes } from 'node:util';
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js';
 import { boundedRecord, CONTENT_JOURNAL_JSON_NODE_LIMIT, createProjectionBudget, exactKeys, ownDataArray, ownDataRecord, projectSessionAddress, safeHttpUrl, safeInteger, text, timestamp } from './content-journal-projection.js';
 const MEDIA = new Set([
@@ -66,7 +67,8 @@ function projectResource(value, budget) {
     const byteLength = safeInteger(input.byteLength, 'outbound resource byte length');
     if (input.kind === 'buffer') {
         exactKeys(input, [...commonKeys, 'data'], [...commonKeys, 'data'], 'outbound buffer resource');
-        if (!(input.data instanceof Uint8Array) || input.data.byteLength !== byteLength) {
+        if (utilTypes.isProxy(input.data) || !(input.data instanceof Uint8Array) ||
+            input.data.byteLength !== byteLength) {
             throw new TypeError('outbound buffer resource is invalid');
         }
         return { kind: input.kind, mimeType, byteLength };

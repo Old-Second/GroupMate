@@ -1,3 +1,4 @@
+import { types as utilTypes } from 'node:util'
 import type { SessionAddress } from '../../agent/contracts/identity.js'
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js'
 import type {
@@ -136,7 +137,8 @@ function projectResource (
       [...commonKeys, 'data'],
       'outbound buffer resource'
     )
-    if (!(input.data instanceof Uint8Array) || input.data.byteLength !== byteLength) {
+    if (utilTypes.isProxy(input.data) || !(input.data instanceof Uint8Array) ||
+      input.data.byteLength !== byteLength) {
       throw new TypeError('outbound buffer resource is invalid')
     }
     return { kind: input.kind, mimeType, byteLength }

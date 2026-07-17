@@ -35,8 +35,27 @@ const FACT_FILES = Object.freeze([
     'src/agent/run/run-observation.ts',
     'src/agent/run/run-trace.ts'
 ]);
+const JOURNAL_FILES = Object.freeze([
+    'src/agent/run/run-content-journal.ts',
+    'src/runtime/logging/content-journal-outbound-projector.ts',
+    'src/runtime/logging/content-journal-projection.ts',
+    'src/runtime/logging/content-journal-request-run-projector.ts',
+    'src/runtime/logging/groupmate-content-journal.ts',
+    'src/runtime/logging/groupmate-disk-log.ts',
+    'src/runtime/logging/journaled-yunzai-outbound.ts'
+]);
+const FORBIDDEN_JOURNAL_FIELDS = Object.freeze([
+    'apiKey',
+    'authorization',
+    'header',
+    'headers',
+    'cookie',
+    'token',
+    'config'
+]);
 const LOGGER_FILES = Object.freeze([
     ...FACT_FILES,
+    ...JOURNAL_FILES,
     'src/runtime/observability/owner-diagnostics.ts',
     'src/runtime/production-yunzai-agent.ts',
     'src/runtime/safe-chat-logging.ts',
@@ -282,6 +301,18 @@ export async function auditPhase6SecurityBoundaries(projectRoot, options = {}) {
         for (const field of FORBIDDEN_FACT_FIELDS) {
             const pattern = new RegExp(`(?:readonly\\s+)?(?:['"])?${escapeRegex(field)}(?:['"])?\\s*[?:]`);
             if (pattern.test(surface))
+                finding(forbiddenFields, relativePath, field);
+        }
+    }
+    for (const relativePath of JOURNAL_FILES) {
+        const source = await readSource(relativePath);
+        if (source === null) {
+            finding(forbiddenProductionEdges, relativePath, 'missing');
+            continue;
+        }
+        for (const field of FORBIDDEN_JOURNAL_FIELDS) {
+            const pattern = new RegExp(`(?:readonly\\s+)?(?:['"])?${escapeRegex(field)}(?:['"])?\\s*[?:]`, 'i');
+            if (pattern.test(source))
                 finding(forbiddenFields, relativePath, field);
         }
     }

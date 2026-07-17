@@ -255,6 +255,7 @@ function createProductionJournalRuntime (
     const contentJournal = options.contentJournal ?? createGroupMateContentJournal(
       (options.diskLogFactory ?? (diskLogOptions => new GroupMateDiskLog(diskLogOptions)))({
         directory: resolvePluginPath('data', 'logs', 'groupmate'),
+        trustedRoot: resolvePluginPath(),
         now: journalNow,
         onFailure: failure => {
           try {

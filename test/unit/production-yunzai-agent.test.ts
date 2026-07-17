@@ -342,6 +342,7 @@ test('default disk journal construction uses plugin data path and fixed failure 
   })
 
   assert.equal(createdOptions?.directory, resolvePluginPath('data', 'logs', 'groupmate'))
+  assert.equal(createdOptions?.trustedRoot, resolvePluginPath())
   assert.equal(createdOptions?.now, journalNow)
   createdOptions?.onFailure?.(Object.freeze({
     event: 'groupmate.disk_log.failure', code: 'queue_overflow'
