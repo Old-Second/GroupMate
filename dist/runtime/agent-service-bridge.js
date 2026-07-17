@@ -25,6 +25,7 @@ import { createPendingIndicatorConfigPort } from './presentation/pending-indicat
 import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
 import { createPresentationSettingsPort } from './presentation/presentation-settings.js';
 import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
+import { materializeYunzaiForwardMessage } from './presentation/yunzai-forward-message.js';
 import { plainTextPart } from './presentation/text-presentation.js';
 import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
@@ -224,7 +225,7 @@ function outboundAtom(segment, atom) {
         ? Reflect.apply(segment.markdown, segment, [atom.markdown])
         : { type: 'markdown', data: { content: atom.markdown } };
 }
-function outboundValue(segment, part) {
+async function outboundValue(receiver, segment, part) {
     if (part.media === 'text') {
         const values = part.atoms.map(atom => outboundAtom(segment, atom));
         if (part.buttons !== undefined)
@@ -255,10 +256,7 @@ function outboundValue(segment, part) {
         return { type: 'dice' };
     if (part.media === 'rps')
         return { type: 'rps', value: part.value };
-    return {
-        type: 'forward',
-        data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
-    };
+    return await materializeYunzaiForwardMessage(receiver, part);
 }
 export function createApprovalOutboundPortFactory(input) {
     const host = Object.freeze({
@@ -275,7 +273,7 @@ export function createApprovalOutboundPortFactory(input) {
             if (typeof record.sendMsg !== 'function')
                 return null;
             return Object.freeze({
-                dispatch: async (part) => await Reflect.apply(record.sendMsg, receiver, [outboundValue(input.segment(), part)]),
+                dispatch: async (part) => await Reflect.apply(record.sendMsg, receiver, [await outboundValue(receiver, input.segment(), part)]),
                 recall: async (messageId) => typeof record.recallMsg === 'function'
                     ? await Reflect.apply(record.recallMsg, receiver, [messageId])
                     : false

@@ -92,6 +92,7 @@ import {
   type YunzaiOutboundHostPort,
   type YunzaiOutboundPortFactory
 } from './presentation/yunzai-outbound-port.js'
+import { materializeYunzaiForwardMessage } from './presentation/yunzai-forward-message.js'
 import { plainTextPart } from './presentation/text-presentation.js'
 import {
   PLAIN_TEXT_PRESENTATION_HOOKS,
@@ -477,7 +478,11 @@ function outboundAtom (segment: YunzaiRecord, atom: SafeTextAtom): unknown {
     : { type: 'markdown', data: { content: atom.markdown } }
 }
 
-function outboundValue (segment: YunzaiRecord, part: OutboundPart): unknown {
+async function outboundValue (
+  receiver: YunzaiRecord,
+  segment: YunzaiRecord,
+  part: OutboundPart
+): Promise<unknown> {
   if (part.media === 'text') {
     const values = part.atoms.map(atom => outboundAtom(segment, atom))
     if (part.buttons !== undefined) values.push({ type: 'button', content: part.buttons })
@@ -505,10 +510,7 @@ function outboundValue (segment: YunzaiRecord, part: OutboundPart): unknown {
   }
   if (part.media === 'dice') return { type: 'dice' }
   if (part.media === 'rps') return { type: 'rps', value: part.value }
-  return {
-    type: 'forward',
-    data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
-  }
+  return await materializeYunzaiForwardMessage(receiver, part)
 }
 
 export function createApprovalOutboundPortFactory (input: {
@@ -529,7 +531,7 @@ export function createApprovalOutboundPortFactory (input: {
         dispatch: async (part: OutboundPart) => await Reflect.apply(
           record.sendMsg,
           receiver,
-          [outboundValue(input.segment(), part)]
+          [await outboundValue(receiver as YunzaiRecord, input.segment(), part)]
         ),
         recall: async (messageId: string) => typeof record.recallMsg === 'function'
           ? await Reflect.apply(record.recallMsg, receiver, [messageId])

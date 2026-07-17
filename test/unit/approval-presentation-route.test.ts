@@ -191,6 +191,52 @@ test('approval outbound selects the bot and target recorded by the original rout
   ])
 })
 
+test('approval outbound materializes a new forward message through the target adapter', async () => {
+  const forwarded: unknown[] = []
+  const sent: unknown[] = []
+  const materialized = Object.freeze({
+    test: true,
+    message: Object.freeze([{ type: 'node' }])
+  })
+  const picker: YunzaiBotPicker = Object.freeze({
+    pick: async () => ({
+      pickGroup: () => ({
+        makeForwardMsg: async (nodes: unknown) => {
+          forwarded.push(nodes)
+          return materialized
+        },
+        sendMsg: async (message: unknown) => {
+          sent.push(message)
+          return { message_id: 'sent-forward' }
+        },
+        recallMsg: async () => true
+      })
+    }) as never
+  })
+  const factory = createApprovalOutboundPortFactory({
+    botPicker: picker,
+    segment: () => ({})
+  })
+
+  const outbound = await factory.forTarget(ordinaryRoute().sessionAddress)
+  const delivered = await outbound.deliver(Object.freeze({
+    media: 'forward' as const,
+    title: '执行过程',
+    nodes: Object.freeze([
+      Object.freeze({ kind: 'text' as const, text: '先搜索资料' }),
+      Object.freeze({ kind: 'text' as const, text: '再整理结果' })
+    ])
+  }), 1)
+
+  assert.equal(delivered.kind, 'sent')
+  assert.deepEqual(forwarded, [[
+    { message: '执行过程' },
+    { message: '先搜索资料' },
+    { message: '再整理结果' }
+  ]])
+  assert.deepEqual(sent, [materialized])
+})
+
 test('approval presentation rejects a result from another run', async () => {
   await assert.rejects(
     buildApprovalPresentationInput({

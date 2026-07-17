@@ -55,6 +55,7 @@ import {
   type SafeTextAtom,
   type YunzaiOutboundHostPort
 } from '../presentation/yunzai-outbound-port.js'
+import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../message-input.js'
 
 type YunzaiValue = string | number
@@ -486,7 +487,11 @@ function safeTextAtomValue (segment: YunzaiRecord, atom: SafeTextAtom): unknown 
     : { type: 'markdown', data: { content: atom.markdown } }
 }
 
-function outboundMessage (segment: YunzaiRecord, part: OutboundPart): unknown {
+async function outboundMessage (
+  receiver: YunzaiRecord,
+  segment: YunzaiRecord,
+  part: OutboundPart
+): Promise<unknown> {
   if (part.media === 'text') {
     const atoms = part.atoms.map(atom => safeTextAtomValue(segment, atom))
     if (part.buttons !== undefined) atoms.push({ type: 'button', content: part.buttons })
@@ -498,10 +503,7 @@ function outboundMessage (segment: YunzaiRecord, part: OutboundPart): unknown {
   if (part.media === 'music') return segment.music(part.provider, part.id)
   if (part.media === 'dice') return magicSegment(segment, 'dice')
   if (part.media === 'rps') return magicSegment(segment, 'rps', part.value)
-  return {
-    type: 'forward',
-    data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
-  }
+  return await materializeYunzaiForwardMessage(receiver, part)
 }
 
 function qqCapabilities (
@@ -520,7 +522,7 @@ function qqCapabilities (
         dispatch: async (part: OutboundPart) => await Reflect.apply(
           sendMethod,
           receiver,
-          [outboundMessage(segment, part)]
+          [await outboundMessage(receiver, segment, part)]
         ),
         recall: async (messageId: string) => {
           if (typeof recallMethod !== 'function') return false

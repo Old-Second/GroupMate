@@ -50,6 +50,9 @@ import {
   buildChatButtonContent
 } from './dist/runtime/yunzai-button-content.js'
 import {
+  materializeYunzaiForwardMessage
+} from './dist/runtime/presentation/yunzai-forward-message.js'
+import {
   initializeProductionYunzaiAgent
 } from './dist/runtime/production-yunzai-agent.js'
 import {
@@ -252,7 +255,7 @@ const buttonPolicy = Object.freeze({
   }
 })
 
-function outboundMessage (part) {
+async function outboundMessage (receiver, part) {
   const segment = globalThis.segment
   if (part.media === 'text') {
     const values = part.atoms.map(textAtomValue)
@@ -282,13 +285,7 @@ function outboundMessage (part) {
   }
   if (part.media === 'dice') return { type: 'dice' }
   if (part.media === 'rps') return { type: 'rps', value: part.value }
-  return {
-    type: 'forward',
-    data: {
-      title: part.title,
-      nodes: part.nodes.map(node => ({ message: node.text }))
-    }
-  }
+  return await materializeYunzaiForwardMessage(receiver, part)
 }
 
 const outboundHost = Object.freeze({
@@ -303,7 +300,7 @@ const outboundHost = Object.freeze({
     return Object.freeze({
       async dispatch (part, quoteMessageId, signal) {
         if (signal?.aborted === true) throw signal.reason
-        const message = outboundMessage(part)
+        const message = await outboundMessage(receiver, part)
         if (quoteMessageId === undefined) return await receiver.sendMsg(message)
         const reply = typeof globalThis.segment.reply === 'function'
           ? globalThis.segment.reply(quoteMessageId)

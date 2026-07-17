@@ -9,6 +9,7 @@ import { resolveCrossChannelAccess } from './cross-channel-policy.js';
 import { createManagementToolDefinitions, createQueryToolRuntime, createToolRuntimeRegistry, createVisibleToolDefinitions } from './tool-runtime-factory.js';
 import { sessionAddressForTarget } from '../../tools/visible-tool-support.js';
 import { createYunzaiOutboundPortFactory } from '../presentation/yunzai-outbound-port.js';
+import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js';
 export class ToolRuntimeConfigurationError extends Error {
     code = 'unknown_policy_profile';
     constructor() {
@@ -361,7 +362,7 @@ function safeTextAtomValue(segment, atom) {
         ? Reflect.apply(segment.markdown, segment, [atom.markdown])
         : { type: 'markdown', data: { content: atom.markdown } };
 }
-function outboundMessage(segment, part) {
+async function outboundMessage(receiver, segment, part) {
     if (part.media === 'text') {
         const atoms = part.atoms.map(atom => safeTextAtomValue(segment, atom));
         if (part.buttons !== undefined)
@@ -380,10 +381,7 @@ function outboundMessage(segment, part) {
         return magicSegment(segment, 'dice');
     if (part.media === 'rps')
         return magicSegment(segment, 'rps', part.value);
-    return {
-        type: 'forward',
-        data: { title: part.title, nodes: part.nodes.map(node => ({ message: node.text })) }
-    };
+    return await materializeYunzaiForwardMessage(receiver, part);
 }
 function qqCapabilities(event, segment, botId) {
     const outboundHost = Object.freeze({
@@ -396,7 +394,7 @@ function qqCapabilities(event, segment, botId) {
             if (typeof sendMethod !== 'function')
                 return null;
             return Object.freeze({
-                dispatch: async (part) => await Reflect.apply(sendMethod, receiver, [outboundMessage(segment, part)]),
+                dispatch: async (part) => await Reflect.apply(sendMethod, receiver, [await outboundMessage(receiver, segment, part)]),
                 recall: async (messageId) => {
                     if (typeof recallMethod !== 'function')
                         return false;
