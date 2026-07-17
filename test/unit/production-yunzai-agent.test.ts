@@ -466,6 +466,109 @@ test('later chats do not multiply an unresolved host group history read', async 
   assert.equal(historyCalls, 1)
 })
 
+test('a stuck group history read does not remove context from another group', async () => {
+  const baseOptions = options(() => undefined)
+  const modelRequests: ModelRequest[] = []
+  const historyCalls: string[] = []
+  const historyDiagnostics: Array<Readonly<Record<string, unknown>>> = []
+  const graph = createProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: {
+      ...baseOptions.bridge,
+      groupHistoryTimeoutMs: 10,
+      logger: Object.freeze({
+        info: event => {
+          if (event.event === 'groupmate.group_history.fail_open') {
+            historyDiagnostics.push(event)
+          }
+        }
+      }),
+      loadGroupHistory: async event => {
+        const groupId = String(event.group_id)
+        historyCalls.push(groupId)
+        if (groupId === 'group-a') return await new Promise(() => {})
+        return Object.freeze([{
+          message_id: 'history-b',
+          raw_message: '群 B 唯一历史',
+          sender: Object.freeze({
+            user_id: 'member-b', card: '群友 B', nickname: '群友 B'
+          }),
+          time: 1_789_000_000
+        }])
+      }
+    },
+    modelFactory: () => Object.freeze({
+      async complete (request: ModelRequest): Promise<ModelTurn> {
+        modelRequests.push(request)
+        return Object.freeze({
+          text: 'fixture', toolCalls: Object.freeze([]), finishReason: 'stop'
+        })
+      },
+      async generate (): Promise<readonly string[]> { return Object.freeze([]) }
+    })
+  })
+  const handle = async (groupId: string): Promise<void> => {
+    const event = {
+      isGroup: true,
+      group_id: groupId,
+      self_id: 'bot',
+      user_id: `actor-${groupId}`,
+      message_id: `current-${groupId}`,
+      sender: {
+        user_id: `actor-${groupId}`, nickname: `member-${groupId}`, role: 'member' as const
+      },
+      message: [{ type: 'text', text: `current request ${groupId}` }],
+      group: {
+        name: groupId,
+        async getChatHistory () { return [] },
+        async getMemberMap () {
+          return new Map([
+            [`actor-${groupId}`, { user_id: `actor-${groupId}`, role: 'member' }],
+            ['bot', { user_id: 'bot', role: 'member' }]
+          ])
+        }
+      }
+    }
+    const messageEvidence = await prepareYunzaiMessageEvidence({
+      event,
+      currentPrompt: `current request ${groupId}`,
+      ocrTexts: []
+    })
+    const prepared = prepareYunzaiPresentationRequest({
+      event,
+      evidence: messageEvidence,
+      requestKind: 'ordinary_chat',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1 as const,
+        kind: 'ordinary' as const,
+        forcePicture: false
+      }),
+      getBotId: () => 'bot'
+    })
+    const result = await graph.bridge.handle(event, messageEvidence, {
+      enableGroupContext: true,
+      presentationRoute: prepared.route
+    })
+    assert.equal(result.kind, 'completed')
+  }
+
+  await handle('group-a')
+  await handle('group-b')
+  await graph.shutdown('unit_test')
+
+  assert.deepEqual(historyCalls, ['group-a', 'group-b'])
+  assert.equal(modelRequests.length, 2)
+  assert.equal(modelRequests[1]?.messages.some(message =>
+    typeof message.content === 'string' && message.content.includes('群 B 唯一历史')
+  ), true)
+  assert.deepEqual(historyDiagnostics, [Object.freeze({
+    event: 'groupmate.group_history.fail_open',
+    code: 'timeout_without_cache'
+  })])
+  assert.equal(JSON.stringify(historyDiagnostics).includes('group-a'), false)
+  assert.equal(JSON.stringify(historyDiagnostics).includes('群 B 唯一历史'), false)
+})
+
 test('default disk journal construction uses plugin data path and fixed failure diagnostics', async () => {
   const failures: Array<Readonly<Record<string, unknown>>> = []
   const recorded: GroupMateDiskLogEvent[] = []

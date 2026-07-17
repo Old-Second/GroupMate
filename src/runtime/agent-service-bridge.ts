@@ -46,6 +46,10 @@ import {
   type ApprovalRecoveryDeferred,
   type RequestObservationContextV1
 } from './request-observation.js'
+import {
+  GroupHistoryReadCoordinator,
+  type GroupHistoryDiagnosticCode
+} from './group-history-read-coordinator.js'
 import { createAgentRunLog } from './safe-chat-logging.js'
 import type { GroupMateContentJournal } from './logging/groupmate-content-journal.js'
 import { TerminalFactCollector } from './terminal-fact-collector.js'
@@ -111,7 +115,6 @@ import type { ObservationEventV1 } from './observability/observation-event.js'
 
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.'
 const RUN_DEADLINE_MS = 240_000
-const DEFAULT_GROUP_HISTORY_TIMEOUT_MS = 3_000
 const MAX_GROUP_CONTEXT_ITEMS = 64
 const MAX_GROUP_CONTEXT_TEXT = 4_096
 
@@ -305,6 +308,40 @@ export function resolveYunzaiGroupHistoryCursor (
     return normalized
   }
   return 0
+}
+
+function groupHistoryIdentifier (value: unknown): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null
+  const normalized = String(value)
+  return normalized.length > 0 && !normalized.includes('\0') &&
+    Buffer.byteLength(normalized, 'utf8') <= 128
+    ? normalized
+    : null
+}
+
+function groupHistoryReadKey (
+  options: YunzaiAgentServiceBridgeOptions,
+  event: YunzaiMessageEvent
+): string | null {
+  const botId = groupHistoryIdentifier(options.getBotId(event))
+  const groupId = groupHistoryIdentifier(event.group_id)
+  return botId === null || groupId === null ? null : `${botId}\0${groupId}`
+}
+
+const GROUP_HISTORY_DIAGNOSTIC_EVENT = 'groupmate.group_history.fail_open'
+
+function reportGroupHistoryDiagnostic (
+  options: YunzaiAgentServiceBridgeOptions,
+  code: GroupHistoryDiagnosticCode
+): void {
+  try {
+    options.logger?.info?.(Object.freeze({
+      event: GROUP_HISTORY_DIAGNOSTIC_EVENT,
+      code
+    }))
+  } catch {
+    // Diagnostics must not alter group history fail-open behavior.
+  }
 }
 
 function configInteger (
@@ -903,7 +940,7 @@ export class YunzaiAgentServiceBridge {
   readonly #createRequestRef: () => string
   readonly #monotonicNow: () => number | 'unavailable'
   readonly #requestJournal?: Pick<GroupMateContentJournal, 'recordRequest'>
-  #groupHistoryInFlight?: Promise<readonly unknown[]>
+  readonly #groupHistory: GroupHistoryReadCoordinator
 
   constructor (input: Readonly<{
     options: YunzaiAgentServiceBridgeOptions
@@ -929,6 +966,10 @@ export class YunzaiAgentServiceBridge {
     this.#createRequestRef = input.options.createRequestRef ?? createRequestRef
     this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()))
     this.#requestJournal = input.requestJournal
+    this.#groupHistory = new GroupHistoryReadCoordinator({
+      timeoutMs: input.options.groupHistoryTimeoutMs,
+      onDiagnostic: code => { reportGroupHistoryDiagnostic(input.options, code) }
+    })
   }
 
   get conversations (): ConversationSessionPort {
@@ -1096,34 +1137,14 @@ export class YunzaiAgentServiceBridge {
     limit: number
   ): Promise<readonly unknown[]> {
     const load = this.#options.loadGroupHistory
-    if (load === undefined || this.#groupHistoryInFlight !== undefined) {
-      return Object.freeze([])
-    }
-    const operation = Promise.resolve().then(async () => await load(event, limit))
-    this.#groupHistoryInFlight = operation
-    void operation.then(
-      () => {
-        if (this.#groupHistoryInFlight === operation) this.#groupHistoryInFlight = undefined
-      },
-      () => {
-        if (this.#groupHistoryInFlight === operation) this.#groupHistoryInFlight = undefined
-      }
-    )
-    const configuredTimeout = this.#options.groupHistoryTimeoutMs
-    const timeoutMs = typeof configuredTimeout === 'number' &&
-      Number.isInteger(configuredTimeout) && configuredTimeout >= 1 && configuredTimeout <= 30_000
-      ? configuredTimeout
-      : DEFAULT_GROUP_HISTORY_TIMEOUT_MS
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('group history read timed out')), timeoutMs)
-        timer.unref?.()
-      })
-      return await Promise.race([operation, timeout])
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-    }
+    if (load === undefined) return Object.freeze([])
+    const key = groupHistoryReadKey(this.#options, event)
+    if (key === null) return Object.freeze([])
+    return await this.#groupHistory.read({
+      key,
+      limit,
+      load: async () => await load(event, limit)
+    })
   }
 
   async displayApprovalOrCancel (

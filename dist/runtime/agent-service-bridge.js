@@ -14,6 +14,7 @@ import { ToolScheduler } from '../agent/run/tool-scheduler.js';
 import { RedisAgentSessionStore } from '../agent/session/redis-agent-session-store.js';
 import { AgentService } from './agent-service.js';
 import { beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
+import { GroupHistoryReadCoordinator } from './group-history-read-coordinator.js';
 import { createAgentRunLog } from './safe-chat-logging.js';
 import { TerminalFactCollector } from './terminal-fact-collector.js';
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js';
@@ -30,7 +31,6 @@ import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.';
 const RUN_DEADLINE_MS = 240_000;
-const DEFAULT_GROUP_HISTORY_TIMEOUT_MS = 3_000;
 const MAX_GROUP_CONTEXT_ITEMS = 64;
 const MAX_GROUP_CONTEXT_TEXT = 4_096;
 export class AgentServiceBridge {
@@ -88,6 +88,32 @@ export function resolveYunzaiGroupHistoryCursor(event) {
         return normalized;
     }
     return 0;
+}
+function groupHistoryIdentifier(value) {
+    if (typeof value !== 'string' && typeof value !== 'number')
+        return null;
+    const normalized = String(value);
+    return normalized.length > 0 && !normalized.includes('\0') &&
+        Buffer.byteLength(normalized, 'utf8') <= 128
+        ? normalized
+        : null;
+}
+function groupHistoryReadKey(options, event) {
+    const botId = groupHistoryIdentifier(options.getBotId(event));
+    const groupId = groupHistoryIdentifier(event.group_id);
+    return botId === null || groupId === null ? null : `${botId}\0${groupId}`;
+}
+const GROUP_HISTORY_DIAGNOSTIC_EVENT = 'groupmate.group_history.fail_open';
+function reportGroupHistoryDiagnostic(options, code) {
+    try {
+        options.logger?.info?.(Object.freeze({
+            event: GROUP_HISTORY_DIAGNOSTIC_EVENT,
+            code
+        }));
+    }
+    catch {
+        // Diagnostics must not alter group history fail-open behavior.
+    }
 }
 function configInteger(config, key, fallback, minimum, maximum) {
     const value = config[key];
@@ -565,7 +591,7 @@ export class YunzaiAgentServiceBridge {
     #createRequestRef;
     #monotonicNow;
     #requestJournal;
-    #groupHistoryInFlight;
+    #groupHistory;
     constructor(input) {
         this.#options = input.options;
         this.#bridge = input.bridge;
@@ -580,6 +606,10 @@ export class YunzaiAgentServiceBridge {
         this.#createRequestRef = input.options.createRequestRef ?? createRequestRef;
         this.#monotonicNow = input.options.monotonicNow ?? (() => Math.trunc(performance.now()));
         this.#requestJournal = input.requestJournal;
+        this.#groupHistory = new GroupHistoryReadCoordinator({
+            timeoutMs: input.options.groupHistoryTimeoutMs,
+            onDiagnostic: code => { reportGroupHistoryDiagnostic(input.options, code); }
+        });
     }
     get conversations() {
         return this.#bridge.conversations;
@@ -708,35 +738,16 @@ export class YunzaiAgentServiceBridge {
     }
     async #readGroupHistory(event, limit) {
         const load = this.#options.loadGroupHistory;
-        if (load === undefined || this.#groupHistoryInFlight !== undefined) {
+        if (load === undefined)
             return Object.freeze([]);
-        }
-        const operation = Promise.resolve().then(async () => await load(event, limit));
-        this.#groupHistoryInFlight = operation;
-        void operation.then(() => {
-            if (this.#groupHistoryInFlight === operation)
-                this.#groupHistoryInFlight = undefined;
-        }, () => {
-            if (this.#groupHistoryInFlight === operation)
-                this.#groupHistoryInFlight = undefined;
+        const key = groupHistoryReadKey(this.#options, event);
+        if (key === null)
+            return Object.freeze([]);
+        return await this.#groupHistory.read({
+            key,
+            limit,
+            load: async () => await load(event, limit)
         });
-        const configuredTimeout = this.#options.groupHistoryTimeoutMs;
-        const timeoutMs = typeof configuredTimeout === 'number' &&
-            Number.isInteger(configuredTimeout) && configuredTimeout >= 1 && configuredTimeout <= 30_000
-            ? configuredTimeout
-            : DEFAULT_GROUP_HISTORY_TIMEOUT_MS;
-        let timer;
-        try {
-            const timeout = new Promise((_resolve, reject) => {
-                timer = setTimeout(() => reject(new Error('group history read timed out')), timeoutMs);
-                timer.unref?.();
-            });
-            return await Promise.race([operation, timeout]);
-        }
-        finally {
-            if (timer !== undefined)
-                clearTimeout(timer);
-        }
     }
     async displayApprovalOrCancel(result) {
         try {
