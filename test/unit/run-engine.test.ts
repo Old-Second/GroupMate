@@ -13,10 +13,12 @@ import type {
   RunContentJournalEvent
 } from '../../src/agent/run/run-content-journal.js'
 import {
+  createInitialRunCheckpoint,
   nextRunCheckpoint,
   parseRunCheckpoint,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
+import { createRunEvent } from '../../src/agent/run/run-events.js'
 import {
   RunEngine,
   type RunEngineOptions,
@@ -148,6 +150,20 @@ function modelTools (
     ...(reasoning === undefined
       ? {}
       : { reasoning: Object.freeze({ text: reasoning, truncated: false }) })
+  })
+}
+
+function deepSeekModelTools (
+  calls: readonly ModelTurn['toolCalls'][number][],
+  reasoning: string
+): ModelTurn {
+  return Object.freeze({
+    ...modelTools(calls, '', reasoning),
+    providerState: Object.freeze({
+      profileId: deepSeekCompatibilityProfile.id,
+      profileVersion: deepSeekCompatibilityProfile.version,
+      payload: Object.freeze({ reasoningContent: reasoning })
+    })
   })
 }
 
@@ -307,6 +323,36 @@ class RetryReservationCrashStore extends InMemoryRunStore {
   }
 }
 
+class RecoveryCommitCrashStore extends InMemoryRunStore {
+  #offline = false
+
+  restoreProcess (): void {
+    this.#offline = false
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    const stored = await super.compareAndSet(expected, next)
+    if (!expected.recoveryUsed && next.recoveryUsed) {
+      this.#offline = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
 function definition (name: string, executionClass: ToolDefinition['executionClass'] = 'read_only'): ToolDefinition {
   return Object.freeze({
     name, version: 1, aliases: Object.freeze([]), description: `${name} fixture`,
@@ -413,6 +459,7 @@ function execution (): ToolExecutionContext {
 
 interface HarnessOptions {
   readonly profile?: typeof standardOpenAIProfile
+  readonly maxOutputTokens?: number
   readonly prepareContext?: StartRunInput['runtime']['prepareContext']
   readonly recoverContext?: StartRunInput['runtime']['recoverContext']
   readonly contextFor?: StartRunInput['runtime']['contextFor']
@@ -429,6 +476,7 @@ function harness (
   items: readonly ScriptedItem[],
   options: HarnessOptions = {}
 ) {
+  const maxOutputTokens = options.maxOutputTokens ?? 256
   const adapter = new ScriptedAdapter(items)
   const tools = new ScriptedToolRuntime()
   const store = options.store ?? new InMemoryRunStore()
@@ -445,7 +493,7 @@ function harness (
         : { monotonicNow: options.toolMonotonicNow })
     }),
     store,
-    budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
+    budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: maxOutputTokens }),
     now: options.now ?? (() => new Date(timestamp)),
     ...(options.monotonicNow === undefined
       ? {}
@@ -488,7 +536,7 @@ function harness (
     }),
     deadlineAt,
     model: Object.freeze({
-      model: 'fixture-model', streaming: false, maxOutputTokens: 256,
+      model: 'fixture-model', streaming: false, maxOutputTokens,
       reasoning: Object.freeze({ enabled: false })
     }),
     runtime: Object.freeze({
@@ -1812,6 +1860,63 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
   ])
 })
 
+test('RunEngine recalculates output capacity after legacy context recovery', async () => {
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const fixture = harness([legacyContext, modelText('恢复后完成')], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '接近容量的旧上下文' }]),
+      estimatedInputTokens: 27_647
+    }),
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简后的请求' }]),
+      estimatedInputTokens: 8
+    })
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '恢复后完成')
+  assert.deepEqual(fixture.adapter.requests.map(request => request.maxOutputTokens), [1, 256])
+})
+
+test('RunEngine persists recovered output capacity across a process restart', async () => {
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const store = new RecoveryCommitCrashStore()
+  const runtimeOptions = {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '接近容量的旧上下文' }]),
+      estimatedInputTokens: 27_647
+    }),
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简后的请求' }]),
+      estimatedInputTokens: 8
+    })
+  }
+  const crashed = harness([legacyContext], { ...runtimeOptions, store })
+
+  await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
+  store.restoreProcess()
+
+  const resumed = harness([modelText('重启后恢复完成')], { ...runtimeOptions, store })
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '重启后恢复完成')
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.equal(resumed.adapter.requests[0]?.maxOutputTokens, 256)
+})
+
 test('RunEngine preserves a pending retry attempt kind across process restart', async () => {
   const store = new RetryReservationCrashStore()
   const unavailable = new ModelProviderError({
@@ -1903,6 +2008,304 @@ test('RunEngine skips Provider journal attempts when a recovered ordinal is unav
   assert.equal(resumed.adapter.requests.length, 1)
   assert.deepEqual(journalEvents.filter(isProviderJournalEvent), [])
   assert.equal(journalEvents.filter(event => event.type === 'run.terminal_committed').length, 1)
+})
+
+test('RunEngine keeps a recovered run on its frozen legacy token budget', async () => {
+  const currentBudget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 256
+  })
+  const fixture = harness([modelText('不应执行')])
+  const checkpoint = createInitialRunCheckpoint({
+    profileId: standardOpenAIProfile.id,
+    profileVersion: standardOpenAIProfile.version,
+    runId: fixture.input.runId,
+    sessionId: fixture.input.sessionId,
+    sessionAddress: fixture.input.sessionAddress,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    requestKind: fixture.input.requestKind,
+    presentationRoute: fixture.input.presentationRoute,
+    observationPolicy: fixture.input.observationPolicy,
+    model: fixture.input.model,
+    toolSnapshot: Object.freeze({
+      id: fixture.input.runtime.snapshot.id,
+      fingerprint: fixture.input.runtime.snapshot.fingerprint,
+      manifest: fixture.input.runtime.snapshot.manifest
+    }),
+    budgetLimits: Object.freeze({
+      ...currentBudget.limits,
+      maxEstimatedTokens: 49_152 as const
+    }),
+    budgetCounters: Object.freeze({
+      ...currentBudget.initialCounters,
+      estimatedTokens: 49_152
+    }),
+    deadlineAt: fixture.input.deadlineAt,
+    createdAt: timestamp,
+    event: createRunEvent({
+      eventId: 'legacy-budget-created',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 0,
+      occurredAt: timestamp,
+      type: 'run.created',
+      payload: Object.freeze({})
+    })
+  })
+  const store = new InMemoryRunStore()
+  store.seedLoadedCheckpoint(checkpoint)
+  const resumed = harness([modelText('不应执行')], { store })
+
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'run_budget_exceeded')
+  assert.equal(resumed.adapter.requests.length, 0)
+})
+
+test('RunEngine clamps a recovered legacy run to its remaining token budget', async () => {
+  const currentBudget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 256
+  })
+  const fixture = harness([modelText('旧运行仍可完成')], {
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '旧运行请求' }]),
+      estimatedInputTokens: 100
+    })
+  })
+  const checkpoint = createInitialRunCheckpoint({
+    profileId: standardOpenAIProfile.id,
+    profileVersion: standardOpenAIProfile.version,
+    runId: fixture.input.runId,
+    sessionId: fixture.input.sessionId,
+    sessionAddress: fixture.input.sessionAddress,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    requestKind: fixture.input.requestKind,
+    presentationRoute: fixture.input.presentationRoute,
+    observationPolicy: fixture.input.observationPolicy,
+    model: fixture.input.model,
+    toolSnapshot: Object.freeze({
+      id: fixture.input.runtime.snapshot.id,
+      fingerprint: fixture.input.runtime.snapshot.fingerprint,
+      manifest: fixture.input.runtime.snapshot.manifest
+    }),
+    budgetLimits: Object.freeze({
+      ...currentBudget.limits,
+      maxEstimatedTokens: 49_152 as const
+    }),
+    budgetCounters: Object.freeze({
+      ...currentBudget.initialCounters,
+      estimatedTokens: 49_000
+    }),
+    deadlineAt: fixture.input.deadlineAt,
+    createdAt: timestamp,
+    event: createRunEvent({
+      eventId: 'legacy-partial-budget-created',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 0,
+      occurredAt: timestamp,
+      type: 'run.created',
+      payload: Object.freeze({})
+    })
+  })
+  const store = new InMemoryRunStore()
+  store.seedLoadedCheckpoint(checkpoint)
+  const resumed = harness([modelText('旧运行仍可完成')], {
+    store,
+    prepareContext: fixture.input.runtime.prepareContext
+  })
+
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '旧运行仍可完成')
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.equal(resumed.adapter.requests[0]?.maxOutputTokens, 52)
+})
+
+test('RunEngine enters the fourth Provider call for the production multi-stage token sequence', async () => {
+  const currentBudget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 4_096
+  })
+  const fixture = harness([modelText('最终总结完成')], { maxOutputTokens: 4_096 })
+  const created = createInitialRunCheckpoint({
+    profileId: standardOpenAIProfile.id,
+    profileVersion: standardOpenAIProfile.version,
+    runId: fixture.input.runId,
+    sessionId: fixture.input.sessionId,
+    sessionAddress: fixture.input.sessionAddress,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    requestKind: fixture.input.requestKind,
+    presentationRoute: fixture.input.presentationRoute,
+    observationPolicy: fixture.input.observationPolicy,
+    model: fixture.input.model,
+    toolSnapshot: Object.freeze({
+      id: fixture.input.runtime.snapshot.id,
+      fingerprint: fixture.input.runtime.snapshot.fingerprint,
+      manifest: fixture.input.runtime.snapshot.manifest
+    }),
+    budgetLimits: currentBudget.limits,
+    budgetCounters: currentBudget.initialCounters,
+    deadlineAt: fixture.input.deadlineAt,
+    createdAt: timestamp,
+    event: createRunEvent({
+      eventId: 'production-sequence-created',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 0,
+      occurredAt: timestamp,
+      type: 'run.created',
+      payload: Object.freeze({})
+    })
+  })
+  const prepared = nextRunCheckpoint(created, 'preparing', {
+    messages: Object.freeze([{ role: 'user' as const, content: '生成最终总结' }]),
+    estimatedInputTokens: 7_660,
+    budgetCounters: Object.freeze({
+      ...currentBudget.initialCounters,
+      modelTurns: 3,
+      estimatedTokens: 42_192
+    })
+  }, [
+    createRunEvent({
+      eventId: 'production-sequence-started',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 1,
+      occurredAt: timestamp,
+      type: 'run.started',
+      payload: Object.freeze({})
+    }),
+    createRunEvent({
+      eventId: 'production-sequence-prepared',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 2,
+      occurredAt: timestamp,
+      type: 'context.prepared',
+      payload: Object.freeze({ messageCount: 1, estimatedInputTokens: 7_660 })
+    })
+  ], timestamp)
+  const store = new TerminalCaptureStore()
+  store.seedLoadedCheckpoint(prepared)
+  const resumed = harness([modelText('最终总结完成')], {
+    store,
+    maxOutputTokens: 4_096
+  })
+
+  const result = await resumed.engine.resume('run-1', resumed.input.runtime)
+
+  assert.equal(outputText(result), '最终总结完成')
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.equal(resumed.adapter.requests[0]?.maxOutputTokens, 4_096)
+  assert.equal(store.terminalCheckpoint?.budgetCounters.modelTurns, 4)
+  assert.equal(store.terminalCheckpoint?.budgetCounters.estimatedTokens, 53_948)
+})
+
+test('RunEngine rejects a normal turn with no context output capacity before Provider', async () => {
+  const fixture = harness([modelText('不应执行')], {
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '超长请求' }]),
+      estimatedInputTokens: 27_648
+    })
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'context_budget_exceeded')
+  assert.equal(fixture.adapter.requests.length, 0)
+  assert.equal(fixture.events.includes('model.started'), false)
+  assert.equal(terminalSnapshot(result)?.counters.modelTurns, 0)
+})
+
+test('RunEngine only reserves tool schema capacity for normal turns', async () => {
+  const fixture = harness([modelText(''), modelText('纠错完成')], {
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '接近容量的请求' }]),
+      estimatedInputTokens: 27_647
+    })
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '纠错完成')
+  assert.deepEqual(fixture.adapter.requests.map(request => ({
+    toolMode: request.toolMode,
+    maxOutputTokens: request.maxOutputTokens
+  })), [
+    { toolMode: 'auto', maxOutputTokens: 1 },
+    { toolMode: 'disabled', maxOutputTokens: 256 }
+  ])
+})
+
+test('RunEngine persists completed tool evidence when the next model turn has no capacity', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([
+    modelTools([toolCall(0, 'capacity-tool-1', 'normalRead')])
+  ], {
+    store,
+    prepareContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '接近容量的工具请求' }]),
+      estimatedInputTokens: 27_647
+    })
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'context_budget_exceeded')
+  assert.equal(fixture.adapter.requests.length, 1)
+  assert.equal(fixture.tools.executions, 1)
+  assert.equal(fixture.events.includes('tool.attempted'), true)
+  assert.equal(fixture.events.includes('tool.completed'), true)
+  assert.equal(terminalSnapshot(result)?.counters.toolAttempts, 1)
+  const terminal = store.terminalCheckpoint
+  const completedCall = terminal?.toolLedgers.at(-1)?.calls[0]
+  assert.equal(terminal?.status, 'failed')
+  assert.equal(completedCall?.status, 'succeeded')
+  assert.deepEqual(completedCall?.result, success('capacity-tool-1'))
+  const toolMessage = terminal?.messages.find(message => (
+    message.role === 'tool' && message.toolCallId === 'capacity-tool-1'
+  ))
+  assert.equal(toolMessage?.role, 'tool')
+  assert.match(toolMessage?.content ?? '', /capacity-tool-1/)
+})
+
+test('RunEngine keeps a stable DeepSeek cache prefix across tool turns', async () => {
+  const fixture = harness([
+    deepSeekModelTools(
+      [toolCall(0, 'cache-call-1', 'normalRead', '第一阶段')],
+      '第一阶段推理'
+    ),
+    deepSeekModelTools(
+      [toolCall(0, 'cache-call-2', 'normalRead', '第二阶段')],
+      '第二阶段推理'
+    ),
+    modelText('多阶段任务完成')
+  ], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '多阶段任务完成')
+  assert.equal(fixture.adapter.requests.length, 3)
+  for (let index = 1; index < fixture.adapter.requests.length; index += 1) {
+    const previous = fixture.adapter.requests[index - 1]
+    const current = fixture.adapter.requests[index]
+    assert.deepEqual(
+      current?.messages.slice(0, previous?.messages.length),
+      previous?.messages
+    )
+  }
+  assert.equal(fixture.tools.executions, 2)
+  assert.deepEqual(fixture.tools.startedCalls, ['cache-call-1', 'cache-call-2'])
 })
 
 test('RunEngine preserves recovery then retry attempt kinds across process restart', async () => {

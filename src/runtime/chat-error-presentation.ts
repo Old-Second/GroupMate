@@ -11,6 +11,7 @@ export type ChatErrorPresentationCode =
   | 'provider_timeout'
   | 'provider_connection_failed'
   | 'provider_protocol_error'
+  | 'context_budget_exceeded'
   | 'run_budget_exceeded'
   | 'checkpoint_conflict'
   | 'checkpoint_invalid'
@@ -130,6 +131,11 @@ const STABLE_ERROR_PRESENTATIONS = new Map<string, Omit<ChatErrorPresentation, '
   ['provider_protocol_error', {
     code: 'provider_protocol_error',
     message: 'AI 服务响应格式异常，请稍后重试',
+    resetConversation: false
+  }],
+  ['context_budget_exceeded', {
+    code: 'context_budget_exceeded',
+    message: '当前请求超出可用上下文范围，请缩短内容后重试',
     resetConversation: false
   }],
   ['run_budget_exceeded', {

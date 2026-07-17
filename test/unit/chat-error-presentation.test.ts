@@ -90,6 +90,7 @@ const stableRunErrorCases = [
   ['provider_unavailable', 'provider_overloaded', 'AI 服务繁忙，请稍后重试'],
   ['provider_timeout', 'provider_timeout', 'AI 服务响应超时，请稍后重试'],
   ['provider_protocol_error', 'provider_protocol_error', 'AI 服务响应格式异常，请稍后重试'],
+  ['context_budget_exceeded', 'context_budget_exceeded', '当前请求超出可用上下文范围，请缩短内容后重试'],
   ['run_budget_exceeded', 'run_budget_exceeded', '任务执行已达到资源上限，请稍后重试'],
   ['checkpoint_conflict', 'checkpoint_conflict', '任务状态已更新，请重试'],
   ['checkpoint_invalid', 'checkpoint_invalid', '任务状态无法恢复，请重新发起'],

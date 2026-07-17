@@ -1,9 +1,10 @@
 import { AgentError } from '../contracts/error.js';
+import { MODEL_TURN_CAPACITY_LIMITS } from './model-turn-capacity.js';
 const ACTIVE_RUNTIME_MS = 240_000;
 const MAX_PROVIDER_TIMEOUT_MS = 120_000;
 const MAX_MODEL_TURNS = 6;
 const MAX_TOOL_CALLS = 8;
-const MAX_ESTIMATED_TOKENS = 49_152;
+const MAX_ESTIMATED_TOKENS = (MODEL_TURN_CAPACITY_LIMITS.contextWindowTokens * MAX_MODEL_TURNS);
 const MAX_PROGRESS_EVENTS = 5;
 const MAX_PROVIDER_RETRIES = 1;
 const MAX_RECOVERY_ATTEMPTS = 1;
@@ -41,6 +42,33 @@ function assertPositiveInteger(value, field) {
         throw new TypeError(`${field} must be a positive integer`);
     }
 }
+function freezeCompatibleLimits(limits) {
+    if (limits.activeRuntimeMs !== ACTIVE_RUNTIME_MS ||
+        !Number.isSafeInteger(limits.providerTimeoutMs) || limits.providerTimeoutMs <= 0 ||
+        limits.providerTimeoutMs > MAX_PROVIDER_TIMEOUT_MS ||
+        limits.maxModelTurns !== MAX_MODEL_TURNS ||
+        limits.maxToolCalls !== MAX_TOOL_CALLS ||
+        (limits.maxEstimatedTokens !== 49_152 &&
+            limits.maxEstimatedTokens !== MAX_ESTIMATED_TOKENS) ||
+        limits.maxProgressEvents !== MAX_PROGRESS_EVENTS ||
+        limits.maxProviderRetries !== MAX_PROVIDER_RETRIES ||
+        limits.maxRecoveryAttempts !== MAX_RECOVERY_ATTEMPTS ||
+        limits.maxCorrectionTurns !== MAX_CORRECTION_TURNS) {
+        throw new TypeError('run budget limits are incompatible');
+    }
+    return Object.freeze({ ...limits });
+}
+function sameLimits(left, right) {
+    return left.activeRuntimeMs === right.activeRuntimeMs &&
+        left.providerTimeoutMs === right.providerTimeoutMs &&
+        left.maxModelTurns === right.maxModelTurns &&
+        left.maxToolCalls === right.maxToolCalls &&
+        left.maxEstimatedTokens === right.maxEstimatedTokens &&
+        left.maxProgressEvents === right.maxProgressEvents &&
+        left.maxProviderRetries === right.maxProviderRetries &&
+        left.maxRecoveryAttempts === right.maxRecoveryAttempts &&
+        left.maxCorrectionTurns === right.maxCorrectionTurns;
+}
 function freezeCounters(counters, changes) {
     return Object.freeze({ ...counters, ...changes });
 }
@@ -57,11 +85,11 @@ class DefaultRunBudget {
     limits;
     initialCounters = INITIAL_COUNTERS;
     #outputTokens;
-    constructor(input) {
+    constructor(input, limits) {
         assertPositiveInteger(input.providerTimeoutMs, 'provider timeout');
         assertPositiveInteger(input.outputTokens, 'output token limit');
         this.#outputTokens = Math.min(input.outputTokens, MAX_ESTIMATED_TOKENS);
-        this.limits = Object.freeze({
+        this.limits = limits === undefined ? Object.freeze({
             activeRuntimeMs: ACTIVE_RUNTIME_MS,
             providerTimeoutMs: Math.min(input.providerTimeoutMs, MAX_PROVIDER_TIMEOUT_MS),
             maxModelTurns: MAX_MODEL_TURNS,
@@ -71,7 +99,16 @@ class DefaultRunBudget {
             maxProviderRetries: MAX_PROVIDER_RETRIES,
             maxRecoveryAttempts: MAX_RECOVERY_ATTEMPTS,
             maxCorrectionTurns: MAX_CORRECTION_TURNS
-        });
+        }) : freezeCompatibleLimits(limits);
+    }
+    withLimits(limits) {
+        const compatible = freezeCompatibleLimits(limits);
+        if (sameLimits(this.limits, compatible))
+            return this;
+        return new DefaultRunBudget({
+            providerTimeoutMs: compatible.providerTimeoutMs,
+            outputTokens: this.#outputTokens
+        }, compatible);
     }
     reserveModelTurn(counters, input) {
         assertNonNegativeInteger(input.estimatedInputTokens, 'estimated input tokens');

@@ -494,7 +494,6 @@ function validateBudgets (limitsValue: unknown, countersValue: unknown): void {
     activeRuntimeMs: 240_000,
     maxModelTurns: 6,
     maxToolCalls: 8,
-    maxEstimatedTokens: 49_152,
     maxProgressEvents: 5,
     maxProviderRetries: 1,
     maxRecoveryAttempts: 1,
@@ -503,15 +502,25 @@ function validateBudgets (limitsValue: unknown, countersValue: unknown): void {
   for (const [key, expected] of Object.entries(fixed)) {
     if (limits[key] !== expected) throw new TypeError('run budget limits are incompatible')
   }
+  const maxEstimatedTokens = limits.maxEstimatedTokens
+  if (typeof maxEstimatedTokens !== 'number' ||
+    !Number.isSafeInteger(maxEstimatedTokens) ||
+    (maxEstimatedTokens !== 49_152 && maxEstimatedTokens !== 196_608)) {
+    throw new TypeError('run budget limits are incompatible')
+  }
   if (!Number.isSafeInteger(limits.providerTimeoutMs) || Number(limits.providerTimeoutMs) <= 0 ||
     Number(limits.providerTimeoutMs) > 120_000) {
     throw new TypeError('run provider timeout is invalid')
   }
   const counters = record(countersValue, 'run budget counters')
   exactKeys(counters, BUDGET_COUNTER_KEYS, BUDGET_COUNTER_KEYS, 'run budget counters')
-  for (const key of BUDGET_COUNTER_KEYS) nonNegative(Number(counters[key]), `run budget counter ${key}`)
+  for (const key of BUDGET_COUNTER_KEYS) {
+    const value = counters[key]
+    if (typeof value !== 'number') throw new TypeError(`run budget counter ${key} is invalid`)
+    nonNegative(value, `run budget counter ${key}`)
+  }
   if (Number(counters.modelTurns) > 6 || Number(counters.toolCalls) > 8 ||
-    Number(counters.estimatedTokens) > 49_152 || Number(counters.progressEvents) > 5 ||
+    Number(counters.estimatedTokens) > maxEstimatedTokens || Number(counters.progressEvents) > 5 ||
     Number(counters.providerRetries) > 1 || Number(counters.recoveryAttempts) > 1 ||
     Number(counters.correctionTurns) > 1 || Number(counters.usedActiveRuntimeMs) > 240_000) {
     throw new TypeError('run budget counters exceed their limits')

@@ -438,6 +438,70 @@ test('codec reads schema v1 and v2, single-writes schema v3 and synchronizes env
   assert.deepEqual(codec.decode(encoded.checkpoint, encoded.events), upgraded)
 })
 
+test('codec keeps the frozen legacy token budget when reading an existing checkpoint', () => {
+  const codec = new RunCheckpointCodec()
+  const legacy = legacyCheckpoint({
+    budgetLimits: Object.freeze({
+      ...budget.limits,
+      maxEstimatedTokens: 49_152 as const
+    }),
+    budgetCounters: Object.freeze({
+      ...budget.initialCounters,
+      estimatedTokens: 49_152
+    })
+  })
+  const { events, ...state } = legacy
+
+  const loaded = codec.decode(JSON.stringify(state), JSON.stringify({
+    schemaVersion: 1,
+    revision: legacy.revision,
+    events
+  }))
+
+  assert.equal(loaded.budgetLimits.maxEstimatedTokens, 49_152)
+  assert.equal(loaded.budgetCounters.estimatedTokens, 49_152)
+})
+
+test('codec rejects string-encoded token budget limits', () => {
+  const codec = new RunCheckpointCodec()
+  const source = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })
+  const { events, ...state } = source
+
+  for (const maxEstimatedTokens of ['49152', '196608']) {
+    assert.throws(() => codec.decode(JSON.stringify({
+      ...state,
+      budgetLimits: {
+        ...state.budgetLimits,
+        maxEstimatedTokens
+      }
+    }), JSON.stringify({
+      schemaVersion: 3,
+      revision: source.revision,
+      events
+    })), /run budget limits are incompatible/i)
+  }
+})
+
+test('codec rejects string-encoded run budget counters', () => {
+  const codec = new RunCheckpointCodec()
+  const source = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })
+  const { events, ...state } = source
+
+  for (const key of Object.keys(state.budgetCounters)) {
+    assert.throws(() => codec.decode(JSON.stringify({
+      ...state,
+      budgetCounters: {
+        ...state.budgetCounters,
+        [key]: String(state.budgetCounters[key as keyof typeof state.budgetCounters])
+      }
+    }), JSON.stringify({
+      schemaVersion: 3,
+      revision: source.revision,
+      events
+    })), new RegExp(`run budget counter ${key} is invalid`, 'i'))
+  }
+})
+
 test('v3 codec requires reasoning segments and rejects unknown or inconsistent fields', () => {
   const codec = new RunCheckpointCodec()
   const upgraded = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })

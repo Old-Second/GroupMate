@@ -109,7 +109,7 @@ function terminalFacts (
   })
 }
 
-test('freezes the confirmed balanced run budget', () => {
+test('freezes the production-adjusted balanced run budget', () => {
   const budget = createDefaultRunBudget({
     providerTimeoutMs: 120_000,
     outputTokens: 4_096
@@ -120,7 +120,7 @@ test('freezes the confirmed balanced run budget', () => {
     providerTimeoutMs: 120_000,
     maxModelTurns: 6,
     maxToolCalls: 8,
-    maxEstimatedTokens: 49_152,
+    maxEstimatedTokens: 196_608,
     maxProgressEvents: 5,
     maxProviderRetries: 1,
     maxRecoveryAttempts: 1,
@@ -128,6 +128,60 @@ test('freezes the confirmed balanced run budget', () => {
   })
   assert.equal(Object.isFrozen(budget.limits), true)
   assert.equal(Object.isFrozen(budget.initialCounters), true)
+})
+
+test('does not exhaust cumulative tokens before six full-context model turns', () => {
+  const budget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 4_096
+  })
+  let counters = budget.initialCounters
+
+  for (let index = 0; index < 5; index += 1) {
+    counters = budget.reserveModelTurn(counters, {
+      kind: 'normal',
+      estimatedInputTokens: 23_552
+    })
+  }
+  counters = budget.recordCorrection(counters)
+  counters = budget.reserveModelTurn(counters, {
+    kind: 'correction',
+    estimatedInputTokens: 29_696,
+    maxOutputTokens: 2_048
+  })
+  assert.equal(counters.estimatedTokens, 169_984)
+  assert.equal(counters.modelTurns, 6)
+
+  const exhausted = budget.recordUsage(budget.initialCounters, {
+    estimatedTokens: 196_608
+  })
+  assert.throws(
+    () => budget.recordUsage(exhausted, { estimatedTokens: 1 }),
+    isRunBudgetExceeded
+  )
+})
+
+test('allows the production multi-stage token sequence to enter final summary', () => {
+  const budget = createDefaultRunBudget({
+    providerTimeoutMs: 120_000,
+    outputTokens: 4_096
+  })
+  let counters = budget.initialCounters
+  for (let index = 0; index < 3; index += 1) {
+    counters = budget.reserveModelTurn(counters, {
+      kind: 'normal',
+      estimatedInputTokens: 9_968
+    })
+  }
+  assert.equal(counters.estimatedTokens, 42_192)
+
+  counters = budget.reserveModelTurn(counters, {
+    kind: 'normal',
+    estimatedInputTokens: 7_660
+  })
+
+  assert.equal(counters.modelTurns, 4)
+  assert.equal(counters.estimatedTokens, 53_948)
 })
 
 test('reserves run budget without mutating earlier counter snapshots', () => {

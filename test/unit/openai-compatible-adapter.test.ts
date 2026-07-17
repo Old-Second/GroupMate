@@ -230,6 +230,77 @@ test('DeepSeek display truncation never truncates tool continuation state', asyn
   })
 })
 
+test('DeepSeek tool continuation keeps the prior wire message prefix and reasoning state', async () => {
+  const captured: Array<Record<string, unknown>> = []
+  const responses = [
+    JSON.stringify({
+      id: 'fixture-deepseek-cache-tool',
+      choices: [{
+        index: 0,
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'cacheable reasoning prefix',
+          tool_calls: [{
+            id: 'call-weather',
+            type: 'function',
+            function: { name: 'weather', arguments: '{"city":"Wuhan"}' }
+          }]
+        }
+      }]
+    }),
+    JSON.stringify({
+      id: 'fixture-deepseek-cache-final',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'fixture final answer' }
+      }]
+    })
+  ]
+  const adapter = adapterWithFetch(async (_url, init) => {
+    captured.push(JSON.parse(init.body) as Record<string, unknown>)
+    const response = responses.shift()
+    if (response === undefined) throw new Error('fixture response exhausted')
+    return fixtureResponse(response)
+  }, deepSeekCompatibilityProfile)
+  const firstRequest = frozenRequest({
+    tools: [fixtureTool()],
+    toolMode: 'auto'
+  })
+
+  const toolTurn = await adapter.complete(firstRequest, new AbortController().signal)
+  assert.ok(toolTurn.providerState)
+  await adapter.complete(frozenRequest({
+    messages: [
+      ...firstRequest.messages,
+      {
+        role: 'assistant',
+        content: toolTurn.text,
+        toolCalls: toolTurn.toolCalls.map(call => ({
+          callId: call.callId,
+          name: call.name,
+          arguments: call.arguments
+        })),
+        providerState: toolTurn.providerState
+      },
+      { role: 'tool', toolCallId: 'call-weather', content: 'fixture weather result' }
+    ],
+    tools: [fixtureTool()],
+    toolMode: 'auto'
+  }), new AbortController().signal)
+
+  const firstMessages = captured[0]?.messages as Array<Record<string, unknown>>
+  const secondMessages = captured[1]?.messages as Array<Record<string, unknown>>
+  assert.deepEqual(secondMessages.slice(0, firstMessages.length), firstMessages)
+  assert.equal(
+    secondMessages[firstMessages.length]?.reasoning_content,
+    'cacheable reasoning prefix'
+  )
+  assert.deepEqual(captured[1]?.tools, captured[0]?.tools)
+})
+
 test('OpenAI-compatible adapter sends standard tools through one HTTP attempt', async () => {
   let attempts = 0
   let body: Record<string, unknown> | undefined

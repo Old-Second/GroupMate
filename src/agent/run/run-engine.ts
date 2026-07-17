@@ -55,6 +55,7 @@ import {
   type RunBudget,
   type RunBudgetCounters
 } from './run-budget.js'
+import { availableModelOutputTokens } from './model-turn-capacity.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
@@ -1563,9 +1564,15 @@ export class RunEngine {
   }
 
   async #beginCorrection (checkpoint: RunCheckpoint): Promise<RunCheckpoint> {
-    let counters = this.#budget.recordCorrection(checkpoint.budgetCounters)
-    const maxOutputTokens = this.#availableOutputTokens(checkpoint, counters)
-    counters = this.#budget.reserveModelTurn(counters, {
+    const budget = this.#runBudget(checkpoint)
+    let counters = budget.recordCorrection(checkpoint.budgetCounters)
+    const maxOutputTokens = this.#availableOutputTokens(
+      checkpoint,
+      counters,
+      checkpoint.estimatedInputTokens,
+      'correction'
+    )
+    counters = budget.reserveModelTurn(counters, {
       kind: 'correction',
       estimatedInputTokens: checkpoint.estimatedInputTokens,
       maxOutputTokens
@@ -1583,8 +1590,13 @@ export class RunEngine {
     checkpoint: RunCheckpoint,
     kind: 'normal' | 'correction'
   ): { readonly counters: RunBudgetCounters; readonly turn: ReservedModelTurn } {
-    const maxOutputTokens = this.#availableOutputTokens(checkpoint, checkpoint.budgetCounters)
-    const counters = this.#budget.reserveModelTurn(checkpoint.budgetCounters, {
+    const maxOutputTokens = this.#availableOutputTokens(
+      checkpoint,
+      checkpoint.budgetCounters,
+      checkpoint.estimatedInputTokens,
+      kind
+    )
+    const counters = this.#runBudget(checkpoint).reserveModelTurn(checkpoint.budgetCounters, {
       kind,
       estimatedInputTokens: checkpoint.estimatedInputTokens,
       maxOutputTokens
@@ -1597,11 +1609,21 @@ export class RunEngine {
 
   #availableOutputTokens (
     checkpoint: RunCheckpoint,
-    counters: RunBudgetCounters
+    counters: RunBudgetCounters,
+    estimatedInputTokens: number,
+    kind: 'normal' | 'correction'
   ): number {
-    const remaining = checkpoint.budgetLimits.maxEstimatedTokens -
-      counters.estimatedTokens - checkpoint.estimatedInputTokens
-    return Math.min(checkpoint.model.maxOutputTokens, Math.max(1, remaining))
+    const perTurnCapacity = availableModelOutputTokens({
+      estimatedInputTokens,
+      requestedOutputTokens: checkpoint.model.maxOutputTokens,
+      toolsEnabled: kind === 'normal'
+    })
+    if (checkpoint.budgetLimits.maxEstimatedTokens !== 49_152) {
+      return perTurnCapacity
+    }
+    const legacyRemaining = checkpoint.budgetLimits.maxEstimatedTokens -
+      counters.estimatedTokens - estimatedInputTokens
+    return Math.min(perTurnCapacity, Math.max(1, legacyRemaining))
   }
 
   async #callModel (
@@ -1716,6 +1738,7 @@ export class RunEngine {
     correction: boolean
   ): Promise<ModelAttemptOutcome> {
     const runtime = this.#runtime(checkpoint.runId)
+    const budget = this.#runBudget(checkpoint)
     this.#assertSnapshot(checkpoint, runtime.snapshot)
     let counters = checkpoint.budgetCounters
     let messages = checkpoint.messages
@@ -1723,6 +1746,7 @@ export class RunEngine {
     let recoveryUsed = checkpoint.recoveryUsed
     let nextAttemptKind = pendingProviderAttemptKind(checkpoint, correction)
     let current = checkpoint
+    let maxOutputTokens = reserved.maxOutputTokens
 
     try {
       while (true) {
@@ -1732,7 +1756,7 @@ export class RunEngine {
           tools: correction ? Object.freeze([]) : modelTools(runtime.snapshot),
           toolMode: correction ? 'disabled' : 'auto',
           streaming: checkpoint.model.streaming,
-          maxOutputTokens: reserved.maxOutputTokens,
+          maxOutputTokens,
           reasoning: checkpoint.model.reasoning,
           ...(checkpoint.model.temperature === undefined
             ? {}
@@ -1764,7 +1788,7 @@ export class RunEngine {
             startedAt,
             this.#safeMonotonicNow()
           )
-          const accounted = this.#recordProviderUsage(counters, activeRuntimeMs)
+          const accounted = this.#recordProviderUsage(budget, counters, activeRuntimeMs)
           counters = accounted.counters
           const aborted = isAbortError(error) || signal.aborted
           const completionOccurredAt = this.#timestamp()
@@ -1828,23 +1852,38 @@ export class RunEngine {
                   recovered.estimatedInputTokens < 0 || !Array.isArray(recovered.messages)) {
                   throw new TypeError('recovered run context is invalid')
                 }
-                counters = this.#budget.recordRecovery(counters)
+                if (recovered.estimatedInputTokens > estimatedInputTokens) {
+                  throw new TypeError('recovered run context must not grow')
+                }
+                counters = budget.recordRecovery(counters)
                 recoveryUsed = true
                 nextAttemptKind = 'recovery'
                 messages = Object.freeze([...recovered.messages])
                 estimatedInputTokens = recovered.estimatedInputTokens
+                const recoveredCapacity = availableModelOutputTokens({
+                  estimatedInputTokens,
+                  requestedOutputTokens: checkpoint.model.maxOutputTokens,
+                  toolsEnabled: reserved.kind === 'normal'
+                })
+                maxOutputTokens = checkpoint.budgetLimits.maxEstimatedTokens === 49_152
+                  ? Math.min(reserved.maxOutputTokens, recoveredCapacity)
+                  : recoveredCapacity
                 current = await this.#commit(current, current.status, {
                   budgetCounters: counters,
                   messages,
                   estimatedInputTokens,
-                  recoveryUsed
+                  recoveryUsed,
+                  modelTurn: Object.freeze({
+                    kind: reserved.kind,
+                    maxOutputTokens
+                  })
                 }, [])
                 continue
               }
             }
             if (error.retryable &&
               counters.providerRetries < checkpoint.budgetLimits.maxProviderRetries) {
-              counters = this.#budget.recordProviderRetry(counters)
+              counters = budget.recordProviderRetry(counters)
               nextAttemptKind = correction ? 'correction' : 'retry'
               current = await this.#commit(current, current.status, {
                 budgetCounters: counters
@@ -1860,6 +1899,7 @@ export class RunEngine {
           this.#safeMonotonicNow()
         )
         const accounted = this.#recordProviderUsage(
+          budget,
           counters,
           activeRuntimeMs,
           turn.usage?.totalTokens ?? 0
@@ -2044,9 +2084,15 @@ export class RunEngine {
     let counters: RunBudgetCounters
     let maxOutputTokens: number
     try {
-      counters = this.#budget.recordCorrection(attempted.counters)
-      maxOutputTokens = this.#availableOutputTokens(checkpoint, counters)
-      counters = this.#budget.reserveModelTurn(counters, {
+      const budget = this.#runBudget(checkpoint)
+      counters = budget.recordCorrection(attempted.counters)
+      maxOutputTokens = this.#availableOutputTokens(
+        checkpoint,
+        counters,
+        attempted.estimatedInputTokens,
+        'correction'
+      )
+      counters = budget.reserveModelTurn(counters, {
         kind: 'correction',
         estimatedInputTokens: attempted.estimatedInputTokens,
         maxOutputTokens
@@ -2084,7 +2130,7 @@ export class RunEngine {
     }
     let counters: RunBudgetCounters
     try {
-      counters = this.#budget.reserveToolBatch(
+      counters = this.#runBudget(checkpoint).reserveToolBatch(
         checkpoint.budgetCounters,
         ledger.calls.length
       )
@@ -2275,7 +2321,17 @@ export class RunEngine {
         messages,
         estimatedInputTokens
       }) as RunCheckpoint
-      const reservation = this.#reserveModelTurn(reservationCheckpoint, 'normal')
+      let reservation: {
+        readonly counters: RunBudgetCounters
+        readonly turn: ReservedModelTurn
+      }
+      try {
+        reservation = this.#reserveModelTurn(reservationCheckpoint, 'normal')
+      } catch (error) {
+        const failed = await this.#fail(checkpoint, asAgentError(error), events, common)
+        this.#startedToolCalls.delete(checkpoint.runId)
+        return failed
+      }
       const next = await this.#commit(checkpoint, 'calling_model', {
         ...common,
         step: checkpoint.step + 1,
@@ -2352,7 +2408,12 @@ export class RunEngine {
     }
   }
 
+  #runBudget (checkpoint: RunCheckpoint): RunBudget {
+    return this.#budget.withLimits(checkpoint.budgetLimits)
+  }
+
   #recordProviderUsage (
+    budget: RunBudget,
     counters: RunBudgetCounters,
     activeRuntimeMs: number,
     providerReportedTokens = 0
@@ -2362,7 +2423,7 @@ export class RunEngine {
     }> {
     const boundedActiveRuntimeMs = Math.min(
       activeRuntimeMs,
-      this.#budget.remainingActiveMs(counters)
+      budget.remainingActiveMs(counters)
     )
     const boundedProviderReportedTokens = Math.min(
       providerReportedTokens,
@@ -2372,7 +2433,7 @@ export class RunEngine {
     if (boundedActiveRuntimeMs !== activeRuntimeMs ||
       boundedProviderReportedTokens !== providerReportedTokens) {
       try {
-        this.#budget.recordUsage(counters, {
+        budget.recordUsage(counters, {
           activeRuntimeMs,
           providerReportedTokens
         })
@@ -2386,7 +2447,7 @@ export class RunEngine {
       }
     }
     return Object.freeze({
-      counters: this.#budget.recordUsage(counters, {
+      counters: budget.recordUsage(counters, {
         activeRuntimeMs: boundedActiveRuntimeMs,
         providerReportedTokens: boundedProviderReportedTokens
       }),
@@ -2399,7 +2460,7 @@ export class RunEngine {
     counters: RunBudgetCounters
   ): number {
     const deadlineRemaining = new Date(checkpoint.deadlineAt).getTime() - this.#now().getTime()
-    const activeRemaining = this.#budget.remainingActiveMs(counters)
+    const activeRemaining = this.#runBudget(checkpoint).remainingActiveMs(counters)
     const timeout = Math.min(
       checkpoint.budgetLimits.providerTimeoutMs,
       deadlineRemaining,
