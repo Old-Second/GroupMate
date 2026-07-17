@@ -1,3 +1,4 @@
+import { types as utilTypes } from 'node:util'
 import {
   parseAgentMessage,
   type AgentContentPart,
@@ -145,7 +146,8 @@ export function ownDataRecord (
   label: string,
   options: OwnDataRecordOptions = {}
 ): UnknownRecord {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+    Array.isArray(value)) {
     throw new TypeError(`${label} is invalid`)
   }
   let prototype: object | null
@@ -185,7 +187,8 @@ export function ownDataArray (
   label: string,
   budget: ProjectionBudget
 ): readonly unknown[] {
-  if (!Array.isArray(value)) {
+  if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+    !Array.isArray(value)) {
     throw new TypeError(`${label} is invalid`)
   }
   let prototype: object | null

@@ -1137,6 +1137,129 @@ test('preserves legal 257-atom node and button collections under the shared hard
   assert.equal(buttonPayload.part.buttons.suggestions[256], 'suggestion-256')
 })
 
+test('rejects a virtual-length outbound Array Proxy without observing its traps', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const atom = Object.freeze({ kind: 'text' as const, text: 'virtual-array-item' })
+  const backing: Array<typeof atom> = []
+  let getTraps = 0
+  let prototypeTraps = 0
+  let ownKeysTraps = 0
+  let descriptorTraps = 0
+  const atoms = new Proxy(backing, {
+    get: (value, key, receiver) => {
+      getTraps += 1
+      if (key === 'length') return 100_000
+      if (typeof key === 'string' && /^(?:0|[1-9]\d*)$/.test(key)) return atom
+      return Reflect.get(value, key, receiver)
+    },
+    getPrototypeOf: value => {
+      prototypeTraps += 1
+      return Reflect.getPrototypeOf(value)
+    },
+    ownKeys: value => {
+      ownKeysTraps += 1
+      return Reflect.ownKeys(value)
+    },
+    getOwnPropertyDescriptor: (value, key) => {
+      descriptorTraps += 1
+      return Reflect.getOwnPropertyDescriptor(value, key)
+    }
+  })
+  assert.equal(atoms.length, 100_000)
+  assert.equal(atoms[99_999], atom)
+  getTraps = 0
+  prototypeTraps = 0
+  ownKeysTraps = 0
+  descriptorTraps = 0
+
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part: { media: 'text', atoms },
+    attempt: 1,
+    quoteMessageId: null,
+    result: {
+      kind: 'failed_definite', media: 'text', attempt: 1, code: 'host_rejected'
+    }
+  })
+
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'outbound', code: 'invalid_content' }
+  }])
+  assert.equal(events.some(event => event.type === 'qq.outbound.deliver'), false)
+  assert.equal(getTraps, 0)
+  assert.equal(prototypeTraps, 0)
+  assert.equal(ownKeysTraps, 0)
+  assert.equal(descriptorTraps, 0)
+})
+
+test('rejects an outbound record Proxy without observing its traps', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const target = Object.freeze({
+    botId: 'bot-1', scope: Object.freeze({ kind: 'group' as const, groupId: 'group-1' })
+  })
+  const backing = Object.freeze({
+    media: 'text' as const,
+    atoms: Object.freeze([Object.freeze({
+      kind: 'text' as const, text: 'record-proxy-item'
+    })])
+  })
+  let getTraps = 0
+  let prototypeTraps = 0
+  let ownKeysTraps = 0
+  let descriptorTraps = 0
+  const part = new Proxy(backing, {
+    get: (value, key, receiver) => {
+      getTraps += 1
+      return Reflect.get(value, key, receiver)
+    },
+    getPrototypeOf: value => {
+      prototypeTraps += 1
+      return Reflect.getPrototypeOf(value)
+    },
+    ownKeys: value => {
+      ownKeysTraps += 1
+      return Reflect.ownKeys(value)
+    },
+    getOwnPropertyDescriptor: (value, key) => {
+      descriptorTraps += 1
+      return Reflect.getOwnPropertyDescriptor(value, key)
+    }
+  })
+  assert.equal(part.media, 'text')
+  getTraps = 0
+  prototypeTraps = 0
+  ownKeysTraps = 0
+  descriptorTraps = 0
+
+  journal.recordOutbound({
+    type: 'qq.outbound.deliver',
+    occurredAt: FIXED_TIMESTAMP,
+    target,
+    part,
+    attempt: 1,
+    quoteMessageId: null,
+    result: {
+      kind: 'failed_definite', media: 'text', attempt: 1, code: 'host_rejected'
+    }
+  })
+
+  assert.deepEqual(events, [{
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'outbound', code: 'invalid_content' }
+  }])
+  assert.equal(events.some(event => event.type === 'qq.outbound.deliver'), false)
+  assert.equal(getTraps, 0)
+  assert.equal(prototypeTraps, 0)
+  assert.equal(ownKeysTraps, 0)
+  assert.equal(descriptorTraps, 0)
+})
+
 test('rejects a hostile 100000-item outbound Array Proxy before whole-array inspection', () => {
   const { journal, events } = inMemoryContentJournal()
   const target = Object.freeze({

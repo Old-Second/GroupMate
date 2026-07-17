@@ -1,3 +1,4 @@
+import { types as utilTypes } from 'node:util';
 import { parseAgentMessage } from '../../agent/contracts/content.js';
 import { parseJsonValue } from '../../agent/model/json-value.js';
 import { canonicalSessionKey } from '../../agent/session/conversation-scope.js';
@@ -90,7 +91,8 @@ export function jsonArray(value, maximum, label) {
     return value;
 }
 export function ownDataRecord(value, label, options = {}) {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+        Array.isArray(value)) {
         throw new TypeError(`${label} is invalid`);
     }
     let prototype;
@@ -126,7 +128,8 @@ export function ownDataRecord(value, label, options = {}) {
     return output;
 }
 export function ownDataArray(value, label, budget) {
-    if (!Array.isArray(value)) {
+    if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+        !Array.isArray(value)) {
         throw new TypeError(`${label} is invalid`);
     }
     let prototype;
