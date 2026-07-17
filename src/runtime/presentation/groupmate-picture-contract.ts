@@ -20,6 +20,11 @@ export interface GroupMatePictureDocumentV1 {
   }
 }
 
+export interface GroupMatePictureAppearance {
+  readonly botName: string
+  readonly toneStyle: 'creative' | 'balanced' | 'precise'
+}
+
 export interface GroupMatePictureRemoteRequestV1 {
   readonly schemaVersion: 1
   readonly replyText: string
@@ -226,6 +231,19 @@ function normalizedDocument (value: GroupMatePictureDocumentV1): GroupMatePictur
   return Object.freeze({ ...request, ...(local === undefined ? {} : { live2d: local }) })
 }
 
+function normalizedAppearance (value: unknown): GroupMatePictureAppearance | null {
+  if (!exactRecord(value, ['botName', 'toneStyle'])) return null
+  const botName = normalizedBoundedText(value.botName, 1, 80, true)
+  if (botName === null || typeof value.toneStyle !== 'string') return null
+  const style = value.toneStyle.trim().toLowerCase()
+  const toneStyle = style === 'balanced'
+    ? 'balanced'
+    : style === 'precise' || style === 'precision'
+      ? 'precise'
+      : 'creative'
+  return Object.freeze({ botName, toneStyle })
+}
+
 function placeholderCount (template: string, placeholder: string): number {
   let count = 0
   let offset = 0
@@ -253,7 +271,8 @@ function renderFailure (): never {
 
 export function renderGroupMateHtml (
   template: string,
-  document: GroupMatePictureDocumentV1
+  document: GroupMatePictureDocumentV1,
+  appearance?: unknown
 ): string {
   const documentPlaceholder = '<!--__GROUPMATE_DOCUMENT__-->'
   const qrPlaceholder = '<!--__GROUPMATE_QR_SCRIPT__-->'
@@ -261,7 +280,11 @@ export function renderGroupMateHtml (
     placeholderCount(template, qrPlaceholder) !== 1) return renderFailure()
   const normalized = normalizedDocument(document)
   if (normalized === null) return renderFailure()
-  const json = safeJson(normalized)
+  const display = appearance === undefined ? undefined : normalizedAppearance(appearance)
+  if (display === null) return renderFailure()
+  const json = safeJson(display === undefined
+    ? normalized
+    : Object.freeze({ ...normalized, appearance: display }))
   if (Buffer.byteLength(json, 'utf8') > MAX_REQUEST_BYTES) return renderFailure()
   return template
     .replace(documentPlaceholder, () => json)

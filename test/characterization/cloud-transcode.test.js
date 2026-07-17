@@ -29,8 +29,12 @@ test('both cloud transcode uploads use the TypeScript timeout boundary', async (
     /import\s*\{\s*withCloudTranscodeTimeout\s*\}\s*from '\.\.\/dist\/runtime\/cloud-transcode\.js'/
   )
   assert.equal(
-    source.match(/withCloudTranscodeTimeout\(signal => fetch\(`/g)?.length,
+    source.match(/withCloudTranscodeTimeout\(timeoutSignal => fetch\(`/g)?.length,
     2
   )
-  assert.equal(source.match(/method:\s*'POST',[\s\S]{0,160}signal/g)?.length, 2)
+  assert.equal(
+    source.match(/method:\s*'POST',[\s\S]{0,200}signal:\s*combinedSignal\(signal, timeoutSignal\)/g)?.length,
+    2
+  )
+  assert.doesNotMatch(source, /resultres\.(?:arrayBuffer|text)\(\)/)
 })

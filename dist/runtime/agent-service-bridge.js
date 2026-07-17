@@ -3,7 +3,6 @@ import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ContextEngine } from '../agent/context/context-engine.js';
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js';
 import { ModelProviderError } from '../agent/model/model-adapter.js';
-import { OpenAICompatibleAdapter } from '../agent/model/openai-compatible-adapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { RunEngine } from '../agent/run/run-engine.js';
@@ -16,17 +15,14 @@ import { beginRequestObservation, createRequestObservationDraft } from './reques
 import { createAgentRunLog } from './safe-chat-logging.js';
 import { TerminalFactCollector } from './terminal-fact-collector.js';
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js';
-import { APPROVAL_RECOVERY_DEFERRED_MESSAGE, RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
-import { RunProgressPresenter } from './run-progress-presenter.js';
+import { RedisApprovalReferenceIndex, RunApprovalRouter, projectYunzaiApprovalReply } from './run-approval-router.js';
 import { ordinaryProfile, proactiveProfile, RECOVERED_LEGACY_PROFILE } from './presentation/presentation-profile.js';
 import { createPendingIndicatorConfigPort } from './presentation/pending-indicator-config.js';
 import { PendingIndicatorPresenter } from './presentation/pending-indicator-presenter.js';
 import { createPresentationSettingsPort } from './presentation/presentation-settings.js';
-import { ReplyPresenter } from './presentation/reply-presenter.js';
-import { TTS_SYNTHESIS_DIAGNOSTIC_EVENT } from './presentation/tts-reply-presentation.js';
 import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
 import { plainTextPart } from './presentation/text-presentation.js';
-import { PLAIN_TEXT_PRESENTATION_HOOKS, UNAVAILABLE_GROUPMATE_PICTURE_RENDERER, UNAVAILABLE_TTS_REPLY_PORT } from './runtime-presentation-hooks.js';
+import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
 import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
@@ -244,29 +240,6 @@ export function createApprovalOutboundPortFactory(input) {
     });
     return createYunzaiOutboundPortFactory(host);
 }
-class ApprovalRoutePresenter {
-    #settings;
-    #presenter;
-    constructor(input) {
-        this.#settings = input.settings;
-        this.#presenter = new ReplyPresenter({
-            outboundFactory: input.outboundFactory,
-            tts: UNAVAILABLE_TTS_REPLY_PORT,
-            ttsDiagnostics: input.ttsDiagnostics,
-            pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
-            random: Math.random,
-            sleep: async (milliseconds) => await new Promise(resolve => setTimeout(resolve, milliseconds)),
-            schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
-        });
-    }
-    async present(context, result) {
-        await this.#presenter.present(await buildApprovalPresentationInput({
-            context,
-            result,
-            settings: this.#settings
-        }));
-    }
-}
 function configNumber(config, key, minimum, maximum) {
     const value = config[key];
     return typeof value === 'number' && Number.isFinite(value)
@@ -329,26 +302,6 @@ function providerConfigurationError(reason) {
         retryable: false,
         userMessage: 'AI 服务配置不完整，请联系机器人主人。',
         details: { reason }
-    });
-}
-function dynamicAdapter(options, profileId) {
-    return Object.freeze({
-        complete: async (request, signal) => {
-            const selected = compatibilityConfig(options.config);
-            if (selected.configuredProfile !== profileId) {
-                throw providerConfigurationError('compatibility_profile_changed');
-            }
-            const endpoint = configText(options.config, 'openAiBaseUrl');
-            const apiKey = configText(options.config, 'apiKey');
-            if (endpoint === '' || apiKey === '')
-                throw providerConfigurationError('endpoint_or_key_missing');
-            return await new OpenAICompatibleAdapter({
-                endpoint,
-                apiKey,
-                profile: selected.profile,
-                ...(options.fetch === undefined ? {} : { fetch: options.fetch })
-            }).complete(request, signal);
-        }
     });
 }
 function reasoningOptions(config, options) {
@@ -589,7 +542,7 @@ export class YunzaiAgentServiceBridge {
     #prepared;
     #approvalTimers = new Map();
     #outboundFactory;
-    #approvalPresenter;
+    #onApprovalOutcome;
     #rememberBot;
     #now;
     #generateId;
@@ -602,7 +555,7 @@ export class YunzaiAgentServiceBridge {
         this.#toolRuntime = input.toolRuntime;
         this.#prepared = input.prepared;
         this.#outboundFactory = input.outboundFactory;
-        this.#approvalPresenter = input.approvalPresenter;
+        this.#onApprovalOutcome = input.onApprovalOutcome;
         this.#rememberBot = input.rememberBot;
         this.#now = input.options.now ?? (() => new Date());
         this.#generateId = input.options.generateId ?? randomUUID;
@@ -612,6 +565,25 @@ export class YunzaiAgentServiceBridge {
     get conversations() {
         return this.#bridge.conversations;
     }
+    get approvalRouter() {
+        return this.#router;
+    }
+    async projectApprovalReply(event) {
+        const masters = await this.#options.getMasterIds();
+        return await projectYunzaiApprovalReply(event, {
+            botId: this.#options.getBotId(event),
+            masterIds: masters,
+            now: this.#now
+        });
+    }
+    async consumeApprovalReply(projection, onResult = this.#onApprovalOutcome) {
+        return await this.#router.route(projection, async (result, reference, context) => {
+            if (result.kind !== 'approval_deferred') {
+                this.#clearApprovalTimer(reference.runId);
+            }
+            await onResult(result, reference, context);
+        });
+    }
     shutdown(reason = 'process_shutdown') {
         const shutdown = this.#bridge.shutdown(reason);
         for (const timer of this.#approvalTimers.values())
@@ -620,28 +592,15 @@ export class YunzaiAgentServiceBridge {
         this.#prepared.clear();
         return shutdown;
     }
-    async handle(event, prompt, options) {
+    async handle(event, messageEvidence, options) {
         this.#rememberBot(event);
-        return await this.#execute(event, prompt, options, 'ordinary_chat');
+        return await this.#execute(event, messageEvidence, options, 'ordinary_chat');
     }
-    async handleEphemeral(event, prompt, options) {
+    async handleEphemeral(event, messageEvidence, options) {
         this.#rememberBot(event);
-        return await this.#execute(event, prompt, options, 'proactive_chat');
+        return await this.#execute(event, messageEvidence, options, 'proactive_chat');
     }
-    async routeApprovalReply(event) {
-        const masters = await this.#options.getMasterIds();
-        const projection = await projectYunzaiApprovalReply(event, {
-            botId: this.#options.getBotId(event),
-            masterIds: masters,
-            now: this.#now
-        });
-        if (projection === null)
-            return false;
-        return await this.#router.route(projection, async (result, reference, context) => {
-            await this.#handleApprovalOutcome(result, reference, context);
-        });
-    }
-    async #execute(event, prompt, options, requestKind) {
+    async #execute(event, messageEvidence, options, requestKind) {
         const requestRef = this.#createRequestRef();
         const requestObservationContext = beginRequestObservation({
             requestRef,
@@ -651,24 +610,33 @@ export class YunzaiAgentServiceBridge {
         const requestId = this.#generateId();
         let request;
         try {
-            if (typeof prompt !== 'string' || prompt.trim() === '') {
+            if (messageEvidence === null || typeof messageEvidence !== 'object' ||
+                typeof messageEvidence.prompt !== 'string' || messageEvidence.prompt.trim() === '') {
                 throw new AgentError({
                     code: 'invalid_request', stage: 'agent.bridge.input', retryable: false,
                     userMessage: '请求内容为空。'
                 });
             }
             const createdAt = this.#now().toISOString();
-            const toolRun = await this.#toolRuntime.prepareAgentRun({ event, prompt });
+            if (options.presentationRoute.requestKind !== requestKind) {
+                throw new AgentError({
+                    code: 'invalid_request', stage: 'agent.bridge.route', retryable: false,
+                    userMessage: '请求格式不正确，请联系机器人主人'
+                });
+            }
+            const toolRun = await this.#toolRuntime.prepareAgentRun({
+                event,
+                prompt: messageEvidence.prompt,
+                messageEvidence
+            });
             const groupContext = await loadGroupContext(this.#options, event, requestId, createdAt, options.enableGroupContext === true);
             const requestModel = modelConfig(this.#options.config, options);
             request = await adaptYunzaiRequest({
                 event,
-                currentPrompt: `${prompt}${toolRun.promptAddition}`,
-                groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
+                messageEvidence,
+                presentationRoute: options.presentationRoute,
                 requestId,
                 requestRef,
-                requestKind,
-                presentationIntent: options.presentationIntent,
                 createdAt,
                 deadlineAt: new Date(new Date(createdAt).getTime() + RUN_DEADLINE_MS).toISOString(),
                 systemInstructions: requestSystemInstructions(this.#options.config, options, toolRun),
@@ -690,10 +658,20 @@ export class YunzaiAgentServiceBridge {
         }
         try {
             const result = requestKind === 'proactive_chat'
-                ? await this.#bridge.handleEphemeral(request, { requestObservationContext })
-                : await this.#bridge.handle(request, { requestObservationContext });
+                ? await this.#bridge.handleEphemeral(request, {
+                    requestObservationContext,
+                    ...(options.presentationLifecycle === undefined
+                        ? {}
+                        : { presentationLifecycle: options.presentationLifecycle })
+                })
+                : await this.#bridge.handle(request, {
+                    requestObservationContext,
+                    ...(options.presentationLifecycle === undefined
+                        ? {}
+                        : { presentationLifecycle: options.presentationLifecycle })
+                });
             if (result.kind === 'paused') {
-                return await this.#displayApprovalOrCancel(result);
+                return await this.displayApprovalOrCancel(result);
             }
             return result;
         }
@@ -701,7 +679,7 @@ export class YunzaiAgentServiceBridge {
             this.#prepared.delete(requestId);
         }
     }
-    async #displayApprovalOrCancel(result) {
+    async displayApprovalOrCancel(result) {
         try {
             await this.#displayApproval(result.interruption);
             return result;
@@ -737,7 +715,12 @@ export class YunzaiAgentServiceBridge {
         this.#clearApprovalTimer(displayed.runId);
         const timer = setTimeout(() => {
             this.#approvalTimers.delete(displayed.runId);
-            void this.#router.expire(displayed.approvalAddress, messageId, this.#now().toISOString(), async (result, reference, context) => await this.#handleApprovalOutcome(result, reference, context)).catch(() => undefined);
+            void this.#router.expire(displayed.approvalAddress, messageId, this.#now().toISOString(), async (result, reference, context) => {
+                if (result.kind !== 'approval_deferred') {
+                    this.#clearApprovalTimer(reference.runId);
+                }
+                await this.#onApprovalOutcome(result, reference, context);
+            }).catch(() => undefined);
         }, ttlSeconds * 1_000);
         timer.unref?.();
         this.#approvalTimers.set(displayed.runId, timer);
@@ -748,33 +731,7 @@ export class YunzaiAgentServiceBridge {
             clearTimeout(timer);
         this.#approvalTimers.delete(runId);
     }
-    async #handleApprovalOutcome(result, reference, context) {
-        if (result.kind === 'approval_deferred') {
-            try {
-                const outbound = await this.#outboundFactory.forTarget(reference.approvalAddress);
-                await deliverWithDefiniteRetry(outbound, plainTextPart(APPROVAL_RECOVERY_DEFERRED_MESSAGE));
-            }
-            catch { }
-            return;
-        }
-        this.#clearApprovalTimer(reference.runId);
-        try {
-            if (result.kind === 'paused') {
-                const displayed = await this.#displayApprovalOrCancel(result);
-                if (displayed.kind !== 'paused') {
-                    await this.#approvalPresenter.present(context, displayed);
-                }
-                return;
-            }
-            await this.#approvalPresenter.present(context, result);
-        }
-        catch {
-            this.#options.logger?.warn?.('运行结果发送失败，请检查原始会话是否可用。');
-        }
-    }
 }
-let processSingleton;
-let yunzaiProcessSingleton;
 const shutdownProcessPort = Object.freeze({
     pid: process.pid,
     listenerCount: (signal) => process.listenerCount(signal),
@@ -844,12 +801,6 @@ export function bindYunzaiShutdownSignals(target, port = shutdownProcessPort, gr
         detach();
     };
 }
-export function getAgentServiceBridge(createService) {
-    if (processSingleton === undefined) {
-        processSingleton = new AgentServiceBridge(createService());
-    }
-    return processSingleton;
-}
 function createBotAccess(options) {
     const remembered = new Map();
     const remember = (event) => {
@@ -901,32 +852,31 @@ function createBotAccess(options) {
     });
     return Object.freeze({ picker, remember });
 }
-export function createYunzaiAgentServiceBridge(options) {
+export function createYunzaiAgentServiceBridge(options, dependencies) {
     const selected = compatibilityConfig(options.config);
     const now = options.now ?? (() => new Date());
     const generateId = options.generateId ?? randomUUID;
     const prepared = new Map();
     const botAccess = createBotAccess(options);
-    const outboundFactory = createApprovalOutboundPortFactory({
-        botPicker: botAccess.picker,
-        segment: options.segment
+    const fallbackPresentation = () => {
+        const outboundFactory = createApprovalOutboundPortFactory({
+            botPicker: botAccess.picker,
+            segment: options.segment
+        });
+        return Object.freeze({
+            outboundFactory,
+            settings: createPresentationSettingsPort(presentationSettingsSource(options)),
+            pendingConfig: createPendingIndicatorConfigPort(options.redis),
+            pendingIndicator: new PendingIndicatorPresenter({
+                onDeliveryFailure: failure => options.logger?.warn?.(`运行提示发送失败：${failure.resultCode}`)
+            })
+        });
+    };
+    const presentation = options.presentationRuntime ?? Object.freeze({
+        ...fallbackPresentation(),
+        onApprovalOutcome: async () => undefined
     });
-    const ttsDiagnostics = Object.freeze({
-        reportSynthesisFailure: (code) => options.logger?.error?.(Object.freeze({
-            event: TTS_SYNTHESIS_DIAGNOSTIC_EVENT,
-            code
-        }))
-    });
-    const settings = createPresentationSettingsPort(presentationSettingsSource(options));
-    const pendingConfig = createPendingIndicatorConfigPort(options.redis);
-    const pendingIndicator = new PendingIndicatorPresenter({
-        onDeliveryFailure: failure => options.logger?.warn?.(`运行提示发送失败：${failure.resultCode}`)
-    });
-    const approvalPresenter = new ApprovalRoutePresenter({
-        settings,
-        outboundFactory,
-        ttsDiagnostics
-    });
+    const { outboundFactory, settings, pendingConfig, pendingIndicator } = presentation;
     const toolRuntime = createYunzaiToolRuntimeBridge({
         ...options,
         config: options.config,
@@ -939,10 +889,7 @@ export function createYunzaiAgentServiceBridge(options) {
         now,
         generateId
     });
-    const progressPresenter = new RunProgressPresenter({
-        onDeliveryFailure: failure => options.logger?.warn?.(`运行进度发送失败：${failure.eventType}`)
-    });
-    const adapter = dynamicAdapter(options, selected.configuredProfile);
+    const progressPresenter = dependencies.progressPresenter;
     const scheduler = new ToolScheduler({
         runtime: toolRuntime.runtime,
         maxPerRunConcurrency: 2,
@@ -966,7 +913,7 @@ export function createYunzaiAgentServiceBridge(options) {
         }),
         progressPresenter,
         createEngine: observer => new RunEngine({
-            adapter,
+            adapter: dependencies.modelAdapter,
             profile: selected.profile,
             scheduler,
             store: runStore,
@@ -1046,19 +993,7 @@ export function createYunzaiAgentServiceBridge(options) {
         toolRuntime,
         prepared,
         outboundFactory,
-        approvalPresenter,
+        onApprovalOutcome: presentation.onApprovalOutcome,
         rememberBot: botAccess.remember
     });
-}
-export function getYunzaiAgentServiceBridge(options) {
-    if (yunzaiProcessSingleton === undefined) {
-        yunzaiProcessSingleton = createYunzaiAgentServiceBridge(options);
-        bindYunzaiShutdownSignals(yunzaiProcessSingleton);
-    }
-    return yunzaiProcessSingleton;
-}
-export async function routeYunzaiApprovalReply(event) {
-    if (yunzaiProcessSingleton === undefined)
-        return false;
-    return await yunzaiProcessSingleton.routeApprovalReply(event);
 }

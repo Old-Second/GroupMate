@@ -62,7 +62,7 @@ export function buildGuobaSchemas ({
 }: BuildGuobaSchemasOptions): GuobaSchema[] {
   return [
     divider('基础与运行'),
-    field('toggleMode', '触发方式', 'at 模式仅在机器人被提及时回复；前缀模式使用 #chat 触发。', 'Select', {
+    field('toggleMode', '触发方式', 'at 模式仅在机器人被提及时回复；前缀模式使用 #chat 触发。修改后需重启以重建入口规则。', 'Select', {
       options: [
         { label: 'at', value: 'at' },
         { label: '#chat', value: 'prefix' }
@@ -77,14 +77,14 @@ export function buildGuobaSchemas ({
       'Switch'
     ),
     field('enableRobotAt', '允许真实 @ 群友', '开启后，回复文本中的群成员提及会转换成真正的 QQ @。', 'Switch'),
-    field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；修改后建议重启。'),
+    field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；普通网络请求立即生效，Chromium 启动参数需重启后生效。'),
     field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),
     field('debug', '调试日志', '输出脱敏的请求、响应和工具元数据；排障时开启，日常运行可关闭。', 'Switch'),
 
     divider('模型与会话'),
-    field('apiKey', 'API Key', 'OpenAI-compatible Chat Completions 服务的访问密钥，只会保存到本机真实配置。', 'InputPassword'),
-    field('openAiBaseUrl', 'API Base URL', '填写兼容 Chat Completions 的 /v1 地址，例如 https://api.example.com/v1。'),
-    field('openAiCompatibilityProfile', 'API 兼容配置', '显式选择标准 OpenAI-compatible 或 DeepSeek 方言；不会根据 API 地址或模型名自动猜测。使用 DeepSeek 官方 API 时请选择 DeepSeek。', 'Select', {
+    field('apiKey', 'API Key', 'OpenAI-compatible Chat Completions 服务的访问密钥，只会保存到本机真实配置；修改后必须重启，重启前新请求会安全拒绝。', 'InputPassword'),
+    field('openAiBaseUrl', 'API Base URL', '填写兼容 Chat Completions 的 /v1 地址，例如 https://api.example.com/v1；修改后必须重启，重启前新请求会安全拒绝。'),
+    field('openAiCompatibilityProfile', 'API 兼容配置', '显式选择标准 OpenAI-compatible 或 DeepSeek 方言；不会根据 API 地址或模型名自动猜测。使用 DeepSeek 官方 API 时请选择 DeepSeek；修改后必须重启，重启前新请求会安全拒绝而不会混用两种协议。', 'Select', {
       options: [
         { label: '标准 OpenAI-compatible', value: 'standard' },
         { label: 'DeepSeek', value: 'deepseek' }
@@ -181,12 +181,12 @@ export function buildGuobaSchemas ({
     field('autoUsePicture', '长回复自动转图片', '文字超过阈值时自动改用图片回复。', 'Switch'),
     field('autoUsePictureThreshold', '图片回复字数阈值', '开启长回复自动转图片后，达到该字符数触发图片渲染。', 'InputNumber', { min: 1 }),
     field('chatViewWidth', '图片回复宽度', '聊天回复图片的渲染视口宽度。', 'InputNumber', { min: 320 }),
-    field('toneStyle', '图片回复风格', '传递给聊天图片模板的风格名称；模板不支持时保持默认效果。'),
-    field('chatViewBotName', '图片中的机器人名称', '覆盖聊天图片模板显示的机器人名称；留空时使用当前 Bot 名称。'),
+    field('toneStyle', '图片回复风格', '本机 Chromium 聊天图片使用的风格；支持 Creative、Balanced 和 Precision，其他值按 Creative 处理。远端安全渲染保持固定外观。'),
+    field('chatViewBotName', '图片中的机器人名称', '覆盖本机 Chromium 聊天图片显示的机器人名称；留空时依次使用助手称呼和 GroupMate。远端安全渲染固定显示 GroupMate。'),
     field('cloudDPR', '图片渲染 DPR', '图片渲染设备像素比；数值越高越清晰，也越消耗内存。', 'InputNumber', { min: 0.5, max: 4, step: 0.1 }),
     field('closeBrowserAfterRender', '图片渲染后释放 Chromium', '降低常驻内存；独占浏览器会关闭，共享浏览器只断开连接，下一次渲染会稍慢。', 'Switch'),
-    field('headless', 'Chromium 无头模式', '控制插件自启 Chromium 时是否使用无头模式；连接共享浏览器时可能不生效。', 'Switch'),
-    field('chromePath', 'Chromium 路径', '留空时使用 Puppeteer 默认 Chromium；填写可执行文件绝对路径可指定本机浏览器。'),
+    field('headless', 'Chromium 无头模式', '控制插件自启 Chromium 时是否使用无头模式；连接共享浏览器时可能不生效，修改后需重启。', 'Switch'),
+    field('chromePath', 'Chromium 路径', '留空时使用 Puppeteer 默认 Chromium；填写可执行文件绝对路径可指定本机浏览器，修改后需重启。'),
     field('chromeTimeoutMS', 'Chromium 超时毫秒', '页面加载和图片渲染使用的浏览器超时时间。', 'InputNumber', { min: 1 }),
 
     divider('渲染服务与外观'),
@@ -197,13 +197,13 @@ export function buildGuobaSchemas ({
     field('showQRCode', '图片显示访问二维码', '在渲染图片中加入缓存页面二维码；二维码可能让持有者访问对应的渲染内容。', 'Switch'),
     field('enableToolbox', '开启旧管理面板', '启动 Fastify 旧管理面板，会增加端口、文件监听和内存占用；修改后需重启。', 'Switch'),
     field('groupAdminPage', '允许群内获取旧面板地址', '开启后可在群聊中获取旧管理面板地址；关闭时仅允许私聊获取。', 'Switch'),
-    field('live2d', '图片显示 Live2D', '在支持的本地聊天图片模板中启用 Live2D，可能显著增加渲染资源消耗。', 'Switch'),
-    field('live2dModel', 'Live2D 模型路径', '相对于旧管理面板静态资源的 Live2D model3.json 路径。'),
-    field('live2dOption_scale', 'Live2D 缩放', '聊天图片中 Live2D 模型的缩放比例。', 'InputNumber', { min: 0 }),
-    field('live2dOption_positionX', 'Live2D 横向位置', '聊天图片中 Live2D 模型的横向偏移。', 'InputNumber'),
-    field('live2dOption_positionY', 'Live2D 纵向位置', '聊天图片中 Live2D 模型的纵向偏移。', 'InputNumber'),
-    field('live2dOption_rotation', 'Live2D 旋转角度', '聊天图片中 Live2D 模型的旋转角度。', 'InputNumber'),
-    field('live2dOption_alpha', 'Live2D 透明度', '聊天图片中 Live2D 模型的透明度，范围 0 到 1。', 'InputNumber', { min: 0, max: 1, step: 0.1 }),
+    field('live2d', '图片显示 Live2D（暂不可用）', '新安全图片链尚未接入可审计的独立 Live2D renderer；当前固定降级为无装饰图片，配置保留但不可编辑。', 'Switch', { disabled: true }),
+    field('live2dModel', 'Live2D 模型路径（暂不可用）', '配置仅为后续独立 Live2D renderer 保留，当前不会加载；真实配置中的原值不会被删除。', 'Input', { disabled: true }),
+    field('live2dOption_scale', 'Live2D 缩放（暂不可用）', '配置仅为后续独立 Live2D renderer 保留。', 'InputNumber', { min: 0, disabled: true }),
+    field('live2dOption_positionX', 'Live2D 横向位置（暂不可用）', '配置仅为后续独立 Live2D renderer 保留。', 'InputNumber', { disabled: true }),
+    field('live2dOption_positionY', 'Live2D 纵向位置（暂不可用）', '配置仅为后续独立 Live2D renderer 保留。', 'InputNumber', { disabled: true }),
+    field('live2dOption_rotation', 'Live2D 旋转角度（暂不可用）', '配置仅为后续独立 Live2D renderer 保留。', 'InputNumber', { disabled: true }),
+    field('live2dOption_alpha', 'Live2D 透明度（暂不可用）', '配置仅为后续独立 Live2D renderer 保留。', 'InputNumber', { min: 0, max: 1, step: 0.1, disabled: true }),
 
     divider('语音回复'),
     field('defaultUseTTS', '默认语音回复', '将普通模型回复默认转换为语音；可通过聊天命令临时切换。', 'Switch'),

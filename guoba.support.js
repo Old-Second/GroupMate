@@ -8,6 +8,15 @@ import { createPendingIndicatorConfigPort } from './dist/runtime/presentation/pe
 import { pluginId, repositoryUrl } from './dist/runtime/plugin-context.js'
 
 const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
+const RESTART_REQUIRED_CONFIG_FIELDS = new Set([
+  'toggleMode',
+  'apiKey',
+  'openAiBaseUrl',
+  'openAiCompatibilityProfile',
+  'proxy',
+  'headless',
+  'chromePath'
+])
 
 function roleOption (name) {
   return { label: name, value: name }
@@ -52,12 +61,14 @@ export function supportGuoba () {
           keyPath,
           normalizeGuobaConfigValue(keyPath, rawValue)
         ])
+        let restartRequired = false
         for (const [keyPath, value] of normalized) {
           if (keyPath === 'turnConfirm') {
             await pendingIndicatorConfig.setEnabled(value)
             continue
           }
           if (Config[keyPath] !== value) {
+            if (RESTART_REQUIRED_CONFIG_FIELDS.has(keyPath)) restartRequired = true
             Config[keyPath] = value
           }
         }
@@ -68,7 +79,9 @@ export function supportGuoba () {
         if (azureSpeaker) {
           Config.azureTTSSpeaker = azureSpeaker.code
         }
-        return Result.ok({}, '保存成功~')
+        return Result.ok({}, restartRequired
+          ? '保存成功；部分模型传输、运行入口或 Chromium 配置将在重启后生效~'
+          : '保存成功~')
       }
     }
   }

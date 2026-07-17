@@ -11,23 +11,34 @@ async function readSource (file: string): Promise<string> {
 
 test('BYM and auxiliary callers use only the configured OpenAI-compatible API', async () => {
   const bym = await readSource('apps/bym.js')
-  const auxiliary = await Promise.all([
+  const [randomMessage, legacyChat, translation, auxiliaryCompletion, index] = await Promise.all([
     readSource('utils/randomMessage.js'),
-    readSource('utils/translate.js'),
-    readSource('utils/chat.js')
+    readSource('utils/chat.js'),
+    readSource('src/runtime/translation-service.ts'),
+    readSource('src/runtime/auxiliary-completion-service.ts'),
+    readSource('index.js')
   ])
 
-  assert.match(bym, /dist\/runtime\/agent-service-bridge\.js/)
-  assert.match(bym, /handleEphemeral\(e,\s*trigger\.prompt,/)
-  assert.match(bym, /systemInstructions:\s*\[system\]/)
+  assert.match(bym, /dist\/runtime\/production-yunzai-agent\.js/)
+  assert.match(bym, /bymController\.bym\(event\)/)
   assert.doesNotMatch(bym, /model\/core\.js|core\.sendMessage/)
   assert.doesNotMatch(bym, /bymMode|\b(?:bing|claude2?|gemini|qwen|chatglm4?|xh):\s*system/)
 
-  for (const source of auxiliary) {
-    assert.match(source, /dist\/runtime\/completion-facade\.js/)
-    assert.doesNotMatch(source, /ChatGPTAPI|chat\/completions/)
+  for (const source of [randomMessage, legacyChat]) {
+    assert.match(source, /dist\/runtime\/auxiliary-completion-service\.js/)
+    assert.doesNotMatch(source, /completion-facade|ChatGPTAPI|chat\/completions/)
   }
-  assert.doesNotMatch(auxiliary.join('\n'), /translateSource|CustomGoogleGeminiClient|XinghuoClient|QwenApi|gpt-3\.5-turbo/)
+  assert.doesNotMatch(
+    [translation, auxiliaryCompletion].join('\n'),
+    /completion-facade|OpenAICompatibleAdapter|chat\/completions/
+  )
+  assert.equal((index.match(/new OpenAICompatibleAdapter\(/g) ?? []).length, 1)
+  assert.match(index, /configureAuxiliaryCompletionService\([\s\S]*?adapter:\s*modelPort/)
+  assert.match(index, /configureTranslationService\([\s\S]*?adapter:\s*modelPort/)
+  assert.doesNotMatch(
+    [randomMessage, legacyChat, translation, auxiliaryCompletion].join('\n'),
+    /translateSource|CustomGoogleGeminiClient|XinghuoClient|QwenApi|gpt-3\.5-turbo/
+  )
 })
 
 test('prompt, history, buttons and entertainment expose no removed provider path', async () => {

@@ -3,14 +3,113 @@ import querystring from 'querystring'
 import fetch, { File, fileFromSync, FormData } from 'node-fetch'
 import fs from 'fs'
 import os from 'os'
-import util from 'util'
-import stream from 'stream'
 import crypto from 'crypto'
 import child_process from 'child_process'
 import { Config } from './config.js'
 import path from 'path'
 import { mkdirs, getUin } from './common.js'
 import { withCloudTranscodeTimeout } from '../dist/runtime/cloud-transcode.js'
+const MAX_AUDIO_BYTES = 8 * 1024 * 1024
+const MAX_CLOUD_JSON_BYTES = 64 * 1024
+
+function combinedSignal (first, second) {
+  if (!first) return second
+  if (!second) return first
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([first, second])
+  const controller = new AbortController()
+  const abort = source => controller.abort(source.reason)
+  if (first.aborted) abort(first)
+  else if (second.aborted) abort(second)
+  else {
+    first.addEventListener('abort', () => abort(first), { once: true })
+    second.addEventListener('abort', () => abort(second), { once: true })
+  }
+  return controller.signal
+}
+
+async function raceWithSignal (operation, signal) {
+  if (signal === undefined) return await operation
+  if (signal.aborted) throw signal.reason
+  return await new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', abort)
+      callback(value)
+    }
+    const abort = () => finish(reject, signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    Promise.resolve(operation).then(
+      value => finish(resolve, value),
+      error => finish(reject, error)
+    )
+  })
+}
+
+async function readBoundedBytes (response, maximumBytes) {
+  const contentLength = response.headers?.get?.('content-length')
+  if (contentLength !== null && contentLength !== undefined) {
+    const normalized = String(contentLength).trim()
+    if (!/^(?:0|[1-9][0-9]*)$/.test(normalized) || Number(normalized) > maximumBytes) {
+      throw new Error('audio response is too large')
+    }
+  }
+  if (response.body?.[Symbol.asyncIterator] === undefined) {
+    throw new Error('audio response body is unavailable')
+  }
+  const chunks = []
+  let byteLength = 0
+  for await (const chunk of response.body) {
+    const bytes = Buffer.from(chunk)
+    byteLength += bytes.byteLength
+    if (byteLength > maximumBytes) {
+      response.body.destroy?.()
+      throw new Error('audio response is too large')
+    }
+    chunks.push(bytes)
+  }
+  if (byteLength === 0) throw new Error('audio response is empty')
+  return Buffer.concat(chunks, byteLength)
+}
+
+function boundedBase64Buffer (value) {
+  if (typeof value !== 'string' || value.length > Math.ceil(MAX_AUDIO_BYTES * 4 / 3) + 4) {
+    throw new Error('audio base64 payload is too large')
+  }
+  const buffer = Buffer.from(value, 'base64')
+  if (buffer.byteLength === 0 || buffer.byteLength > MAX_AUDIO_BYTES) {
+    throw new Error('audio base64 payload is invalid')
+  }
+  return buffer
+}
+
+async function assertBoundedAudioFile (file) {
+  const stat = await fs.promises.stat(file)
+  if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_AUDIO_BYTES) {
+    throw new Error('audio file size is invalid')
+  }
+}
+
+function boundedAudioBuffer (value) {
+  let buffer
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    buffer = Buffer.from(value)
+  } else if (Array.isArray(value)) {
+    buffer = Buffer.from(value)
+  } else {
+    throw new Error('audio buffer is invalid')
+  }
+  if (buffer.byteLength === 0 || buffer.byteLength > MAX_AUDIO_BYTES) {
+    throw new Error('audio buffer size is invalid')
+  }
+  return buffer
+}
+
+async function unlinkQuietly (file) {
+  if (!file) return
+  await fs.promises.unlink(file).catch(() => undefined)
+}
 let module
 try {
   module = await import('oicq')
@@ -31,7 +130,7 @@ if (module) {
     if (Config.cloudTranscode) {
       logger.warn('未安装node-silk，将尝试使用云转码服务进行合成')
     } else {
-      Config.debug && logger.error(e)
+      Config.debug && logger.error('groupmate.tts.silk_module_unavailable')
       logger.warn('未安装node-silk，如ffmpeg不支持amr编码请安装node-silk以支持语音模式')
     }
   }
@@ -40,7 +139,8 @@ if (module) {
 // import { pcm2slk } from 'node-silk'
 let errors = {}
 
-async function uploadRecord (recordUrl, ttsMode = 'vits-uma-genshin-honkai', ignoreEncode = false) {
+async function uploadRecord (recordUrl, ttsMode = 'vits-uma-genshin-honkai', ignoreEncode = false, signal) {
+  if (signal?.aborted === true) throw signal.reason
   let recordType = 'url'
   let tmpFile = ''
   if (ttsMode === 'azure') {
@@ -49,233 +149,227 @@ async function uploadRecord (recordUrl, ttsMode = 'vits-uma-genshin-honkai', ign
     recordType = 'buffer'
     tmpFile = `data/chatgpt/tts/tmp/${crypto.randomUUID()}.wav`
   }
-  if (ignoreEncode) {
-    return segment.record(recordUrl)
-  }
-  let result
-  if (pcm2slk) {
-    result = await getPttBuffer(recordUrl, Bot.config.ffmpeg_path)
-  } else if (Config.cloudTranscode) {
-    logger.mark('使用云转码silk进行高清语音生成:"')
-    try {
+  try {
+    if (ignoreEncode) {
+      if (recordUrl instanceof Uint8Array) boundedAudioBuffer(recordUrl)
+      if (typeof recordUrl === 'string' && recordUrl.startsWith('base64://')) {
+        boundedBase64Buffer(recordUrl.slice('base64://'.length))
+      } else if (typeof recordUrl === 'string' && !/^https?:\/\//i.test(recordUrl)) {
+        await assertBoundedAudioFile(recordUrl.replace(/^file:\/{2}/, ''))
+      }
+      return segment.record(recordUrl)
+    }
+    let result
+    if (pcm2slk) {
+      result = await getPttBuffer(recordUrl, Bot.config.ffmpeg_path, signal)
+    } else if (Config.cloudTranscode) {
+      logger.mark('groupmate.tts.cloud_transcode_started')
       if (recordType === 'buffer') {
-        // save it as a file
+        const input = boundedAudioBuffer(recordUrl)
         mkdirs('data/chatgpt/tts/tmp')
-        fs.writeFileSync(tmpFile, recordUrl)
+        await fs.promises.writeFile(tmpFile, input)
         recordType = 'file'
         recordUrl = tmpFile
       }
       if (recordType === 'file' || Config.cloudMode === 'file') {
-        if (!recordUrl) {
-          logger.error('云转码错误：recordUrl 异常')
-          return false
-        }
+        if (typeof recordUrl !== 'string' || recordUrl === '') return false
         const formData = new FormData()
-        let buffer
-        if (!recordUrl.startsWith('http')) {
-          // 本地文件
+        if (!/^https?:\/\//i.test(recordUrl)) {
+          await assertBoundedAudioFile(recordUrl)
           formData.append('file', fileFromSync(recordUrl))
         } else {
-          let response = await fetch(recordUrl, {
+          const response = await fetch(recordUrl, {
             method: 'GET',
+            signal,
             headers: {
               'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 12; MI 9 Build/SKQ1.211230.001)'
             }
           })
-          const blob = await response.blob()
-          const arrayBuffer = await blob.arrayBuffer()
-          buffer = Buffer.from(arrayBuffer)
+          if (!response.ok) throw new Error('audio download was rejected')
+          const buffer = await readBoundedBytes(response, MAX_AUDIO_BYTES)
           formData.append('file', new File([buffer], 'audio.wav'))
         }
         const cloudUrl = new URL(Config.cloudTranscode)
-        const resultres = await withCloudTranscodeTimeout(signal => fetch(`${cloudUrl}audio`, {
+        const resultres = await withCloudTranscodeTimeout(timeoutSignal => fetch(`${cloudUrl}audio`, {
           method: 'POST',
           body: formData,
-          signal
+          signal: combinedSignal(signal, timeoutSignal)
         }))
-        let t = await resultres.arrayBuffer()
-        try {
-          result = {
-            buffer: {
-              data: t
-            }
-          }
-        } catch (e) {
-          logger.error(t)
-          throw e
-        }
+        if (!resultres.ok) throw new Error('cloud transcoding was rejected')
+        result = { buffer: await readBoundedBytes(resultres, MAX_AUDIO_BYTES) }
       } else {
         const cloudUrl = new URL(Config.cloudTranscode)
-        const resultres = await withCloudTranscodeTimeout(signal => fetch(`${cloudUrl}audio`, {
+        const resultres = await withCloudTranscodeTimeout(timeoutSignal => fetch(`${cloudUrl}audio`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({ recordUrl }),
-          signal
+          signal: combinedSignal(signal, timeoutSignal)
         }))
-        let t = await resultres.text()
-        try {
-          result = JSON.parse(t)
-        } catch (e) {
-          logger.error(t)
-          throw e
-        }
+        if (!resultres.ok) throw new Error('cloud transcoding was rejected')
+        const payload = await readBoundedBytes(resultres, MAX_CLOUD_JSON_BYTES)
+        result = JSON.parse(payload.toString('utf8'))
       }
-      if (result.error) {
-        logger.error('云转码API报错：' + result.error)
-        return false
+      if (result?.error !== undefined) return false
+      result = {
+        buffer: boundedAudioBuffer(result?.buffer?.data ?? result?.buffer)
       }
-      result.buffer = Buffer.from(result.buffer.data)
-    } catch (err) {
-      logger.error('云转码API报错：' + err)
+    } else {
       return false
     }
-  } else {
-    return false
-  }
-  if (!result.buffer) {
-    return false
-  }
-  let buf = Buffer.from(result.buffer)
-  const hash = md5(buf)
-  const codec = String(buf.slice(0, 7)).includes('SILK') ? 1 : 0
-  const body = core.pb.encode({
-    1: 3,
-    2: 3,
-    5: {
-      1: Contactable.target,
-      2: getUin(),
-      3: 0,
-      4: hash,
-      5: buf.length,
-      6: hash,
-      7: 5,
-      8: 9,
-      9: 4,
-      11: 0,
-      10: Bot.apk.version,
-      12: 1,
-      13: 1,
-      14: 0,
-      15: 1
+    if (!result?.buffer) return false
+    const buf = boundedAudioBuffer(result.buffer)
+    if (signal?.aborted === true) throw signal.reason
+    const hash = md5(buf)
+    const codec = String(buf.slice(0, 7)).includes('SILK') ? 1 : 0
+    const body = core.pb.encode({
+      1: 3,
+      2: 3,
+      5: {
+        1: Contactable.target,
+        2: getUin(),
+        3: 0,
+        4: hash,
+        5: buf.length,
+        6: hash,
+        7: 5,
+        8: 9,
+        9: 4,
+        11: 0,
+        10: Bot.apk.version,
+        12: 1,
+        13: 1,
+        14: 0,
+        15: 1
+      }
+    })
+    const payload = await raceWithSignal(Bot.sendUni('PttStore.GroupPttUp', body), signal)
+    const rsp = core.pb.decode(payload)[5]
+    rsp[2] && (0, errors.drop)(rsp[2], rsp[3])
+    const ip = rsp[5]?.[0] || rsp[5]; const port = rsp[6]?.[0] || rsp[6]
+    const ukey = rsp[7].toHex(); const filekey = rsp[11].toHex()
+    const params = {
+      ver: 4679,
+      ukey,
+      filekey,
+      filesize: buf.length,
+      bmd5: hash.toString('hex'),
+      mType: 'pttDu',
+      voice_encodec: codec
     }
-  })
-  const payload = await Bot.sendUni('PttStore.GroupPttUp', body)
-  const rsp = core.pb.decode(payload)[5]
-  rsp[2] && (0, errors.drop)(rsp[2], rsp[3])
-  const ip = rsp[5]?.[0] || rsp[5]; const port = rsp[6]?.[0] || rsp[6]
-  const ukey = rsp[7].toHex(); const filekey = rsp[11].toHex()
-  const params = {
-    ver: 4679,
-    ukey,
-    filekey,
-    filesize: buf.length,
-    bmd5: hash.toString('hex'),
-    mType: 'pttDu',
-    voice_encodec: codec
-  }
-  const url = `http://${int32ip2str(ip)}:${port}/?` + querystring.stringify(params)
-  const headers = {
-    'User-Agent': `QQ/${Bot.apk.version} CFNetwork/1126`,
-    'Net-Type': 'Wifi'
-  }
-  await fetch(url, {
-    method: 'POST', // post请求
-    headers,
-    body: buf
-  })
+    const url = `http://${int32ip2str(ip)}:${port}/?` + querystring.stringify(params)
+    const headers = {
+      'User-Agent': `QQ/${Bot.apk.version} CFNetwork/1126`,
+      'Net-Type': 'Wifi'
+    }
+    const upload = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: buf,
+      signal
+    })
+    if (!upload.ok) throw new Error('voice upload was rejected')
 
-  const fid = rsp[11].toBuffer()
-  const b = core.pb.encode({
-    1: 4,
-    2: getUin(),
-    3: fid,
-    4: hash,
-    5: hash.toString('hex') + '.amr',
-    6: buf.length,
-    11: 1,
-    18: fid,
-    30: Buffer.from([8, 0, 40, 0, 56, 0])
-  })
-  if (tmpFile) {
-    try {
-      fs.unlinkSync(tmpFile)
-    } catch (err) {
-      logger.warn('fail to delete temp audio file')
+    const fid = rsp[11].toBuffer()
+    const b = core.pb.encode({
+      1: 4,
+      2: getUin(),
+      3: fid,
+      4: hash,
+      5: hash.toString('hex') + '.amr',
+      6: buf.length,
+      11: 1,
+      18: fid,
+      30: Buffer.from([8, 0, 40, 0, 56, 0])
+    })
+    return {
+      type: 'record', file: 'protobuf://' + Buffer.from(b).toString('base64')
     }
-  }
-  return {
-    type: 'record', file: 'protobuf://' + Buffer.from(b).toString('base64')
+  } catch {
+    if (signal?.aborted === true) throw signal.reason
+    logger.error('groupmate.tts.audio_upload_failed')
+    return false
+  } finally {
+    await unlinkQuietly(tmpFile)
   }
 }
 
 export default uploadRecord
 
-async function getPttBuffer (file, ffmpeg = 'ffmpeg') {
+async function getPttBuffer (file, ffmpeg = 'ffmpeg', signal) {
+  if (signal?.aborted === true) throw signal.reason
   let buffer
   let time
-  if (file instanceof Buffer || file.startsWith('base64://')) {
+  if (file instanceof Uint8Array || (typeof file === 'string' && file.startsWith('base64://'))) {
     // Buffer或base64
-    const buf = file instanceof Buffer ? file : Buffer.from(file.slice(9), 'base64')
+    const buf = file instanceof Uint8Array
+      ? boundedAudioBuffer(file)
+      : boundedBase64Buffer(file.slice(9))
     const head = buf.slice(0, 7).toString()
     if (head.includes('SILK') || head.includes('AMR')) {
-      return buf
+      return { buffer: buf, time }
     } else {
-      const tmpfile = TMP_DIR + '/' + (0, uuid)()
-      await fs.promises.writeFile(tmpfile, buf)
-      return audioTrans(tmpfile, ffmpeg)
+      buffer = await transcodeBuffer(buf, ffmpeg, signal)
     }
-  } else if (file.startsWith('http://') || file.startsWith('https://')) {
-    try {
-      const headers = {
-        'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 12; MI 9 Build/SKQ1.211230.001)'
-      }
-      let response = await fetch(file, {
-        method: 'GET', // post请求
-        headers
-      })
-      const buf = Buffer.from(await response.arrayBuffer())
-      const tmpfile = TMP_DIR + '/' + (0, uuid)()
-      await fs.promises.writeFile(tmpfile, buf)
-      // await (0, pipeline)(readable.pipe(new DownloadTransform), fs.createWriteStream(tmpfile));
-      const head = await read7Bytes(tmpfile)
-      if (head.includes('SILK') || head.includes('AMR')) {
-        fs.unlink(tmpfile, NOOP)
-        buffer = buf
-      } else {
-        buffer = await audioTrans(tmpfile, ffmpeg)
-      }
-    } catch (err) {}
+  } else if (typeof file === 'string' && (file.startsWith('http://') || file.startsWith('https://'))) {
+    const headers = {
+      'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 12; MI 9 Build/SKQ1.211230.001)'
+    }
+    const response = await fetch(file, { method: 'GET', headers, signal })
+    if (!response.ok) throw new Error('audio download was rejected')
+    const buf = await readBoundedBytes(response, MAX_AUDIO_BYTES)
+    const head = buf.slice(0, 7).toString()
+    buffer = head.includes('SILK') || head.includes('AMR')
+      ? buf
+      : await transcodeBuffer(buf, ffmpeg, signal)
   } else {
     // 本地文件
     file = String(file).replace(/^file:\/{2}/, '')
     IS_WIN && file.startsWith('/') && (file = file.slice(1))
+    await assertBoundedAudioFile(file)
     const head = await read7Bytes(file)
     if (head.includes('SILK') || head.includes('AMR')) {
       buffer = await fs.promises.readFile(file)
     } else {
-      buffer = await audioTrans(file, ffmpeg)
+      buffer = await audioTrans(file, ffmpeg, signal)
     }
   }
-  return { buffer, time }
+  return { buffer: boundedAudioBuffer(buffer), time }
 }
 
-async function audioTrans (file, ffmpeg = 'ffmpeg') {
+async function transcodeBuffer (buffer, ffmpeg, signal) {
   const tmpfile = path.join(TMP_DIR, uuid())
-  const cmd = IS_WIN
-    ? `${ffmpeg} -i "${file}" -f s16le -ac 1 -ar 24000 "${tmpfile}"`
-    : `exec ${ffmpeg} -i "${file}" -f s16le -ac 1 -ar 24000 "${tmpfile}"`
+  try {
+    await fs.promises.writeFile(tmpfile, boundedAudioBuffer(buffer))
+    return await audioTrans(tmpfile, ffmpeg, signal)
+  } finally {
+    await unlinkQuietly(tmpfile)
+  }
+}
+
+async function audioTrans (file, ffmpeg = 'ffmpeg', signal) {
+  if (signal?.aborted === true) throw signal.reason
+  const tmpfile = path.join(TMP_DIR, uuid())
   return new Promise((resolve, reject) => {
-    // 隐藏windows下调用ffmpeg的cmd弹窗
-    const options = IS_WIN ? { windowsHide: true, stdio: 'ignore' } : {}
-    child_process.exec(cmd, options, async (error, stdout, stderr) => {
+    child_process.execFile(ffmpeg, [
+      '-i', file, '-f', 's16le', '-ac', '1', '-ar', '24000', tmpfile
+    ], {
+      windowsHide: true,
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
+      maxBuffer: 64 * 1024,
+      signal
+    }, async error => {
       try {
-        resolve(pcm2slk(fs.readFileSync(tmpfile)))
+        if (error) throw error
+        await assertBoundedAudioFile(tmpfile)
+        const encoded = pcm2slk(await fs.promises.readFile(tmpfile))
+        resolve(boundedAudioBuffer(encoded))
       } catch {
         reject(new core.ApiRejection(ErrorCode.FFmpegPttTransError, '音频转码到pcm失败，请确认你的ffmpeg可以处理此转换'))
       } finally {
-        fs.unlink(tmpfile, NOOP)
+        await unlinkQuietly(tmpfile)
       }
     })
   })
@@ -283,9 +377,11 @@ async function audioTrans (file, ffmpeg = 'ffmpeg') {
 
 async function read7Bytes (file) {
   const fd = await fs.promises.open(file, 'r')
-  const buf = (await fd.read(Buffer.alloc(7), 0, 7, 0)).buffer
-  fd.close()
-  return buf
+  try {
+    return (await fd.read(Buffer.alloc(7), 0, 7, 0)).buffer
+  } finally {
+    await fd.close()
+  }
 }
 
 function uuid () {
@@ -305,9 +401,6 @@ function int32ip2str (ip) {
 const IS_WIN = os.platform() === 'win32'
 /** 系统临时目录，用于临时存放下载的图片等内容 */
 const TMP_DIR = os.tmpdir()
-/** no operation */
-const NOOP = () => { }
-(0, util.promisify)(stream.pipeline)
 /** md5 hash */
 const md5 = (data) => (0, crypto.createHash)('md5').update(data).digest()
 

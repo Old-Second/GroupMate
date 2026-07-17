@@ -7,7 +7,10 @@ import type { AgentEvent } from '../agent/contracts/event.js'
 import type { AgentContentPart, AgentMessage } from '../agent/contracts/content.js'
 import type { SessionPersistenceOutcome } from '../agent/contracts/completion.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
-import type { RunAdvanceResult } from '../agent/contracts/result.js'
+import {
+  parseRunAdvanceResult,
+  type RunAdvanceResult
+} from '../agent/contracts/result.js'
 import type { AbortOptions, ListOptions, SaveOptions } from '../agent/contracts/storage.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
@@ -76,6 +79,7 @@ import {
   type RequestObservationDraftV1,
   type RequestObservationOutcome
 } from './request-observation.js'
+import type { FinalPresentationProjection } from './request-observation-completion.js'
 import type {
   YunzaiAgentRequest,
   YunzaiAgentRequestDraft
@@ -91,20 +95,93 @@ type WithFinalObservationMetadata<T> = T & {
   readonly sessionPersistence: SessionPersistenceOutcome
 }
 
-export type FinalChatReplyEnvelope =
-  | WithFinalObservationMetadata<
-      Extract<RunAdvanceResult, { readonly kind: 'completed' }>
-    > & {
-      /** @deprecated Phase 6B Task 6 removes this compatibility projection. */
-      readonly text: string | null
-      /** @deprecated Phase 6B Task 6 removes this compatibility projection. */
-      readonly visibleOutput: boolean
-    }
-  | WithFinalObservationMetadata<
-      Extract<RunAdvanceResult, { readonly kind: 'failed' | 'cancelled' }>
-    >
+export type FinalChatReplyEnvelope = WithFinalObservationMetadata<
+Exclude<RunAdvanceResult, { readonly kind: 'paused' }>
+>
 
 export type ChatReplyEnvelope = PausedChatReplyEnvelope | FinalChatReplyEnvelope
+
+export function projectRunAdvanceResult (
+  envelope: ChatReplyEnvelope
+): RunAdvanceResult {
+  if (envelope.kind === 'completed') {
+    return parseRunAdvanceResult(Object.freeze({
+      kind: envelope.kind,
+      runId: envelope.runId,
+      runRef: envelope.runRef,
+      completion: envelope.completion,
+      output: envelope.output,
+      terminal: envelope.terminal
+    }))
+  }
+  if (envelope.kind === 'paused') {
+    return parseRunAdvanceResult(Object.freeze({
+      kind: envelope.kind,
+      runId: envelope.runId,
+      runRef: envelope.runRef,
+      interruption: envelope.interruption
+    }))
+  }
+  if (envelope.kind === 'failed') {
+    return parseRunAdvanceResult(Object.freeze({
+      kind: envelope.kind,
+      runId: envelope.runId,
+      runRef: envelope.runRef,
+      error: envelope.error,
+      terminal: envelope.terminal
+    }))
+  }
+  return parseRunAdvanceResult(Object.freeze({
+    kind: envelope.kind,
+    runId: envelope.runId,
+    runRef: envelope.runRef,
+    reason: envelope.reason,
+    terminal: envelope.terminal
+  }))
+}
+
+export function projectFinalPresentation (
+  envelope: FinalChatReplyEnvelope
+): FinalPresentationProjection {
+  const result = projectRunAdvanceResult(envelope)
+  if (result.kind === 'paused') {
+    throw new TypeError('final presentation cannot project a paused run')
+  }
+  const draft = envelope.requestObservationDraft
+  if (draft === null || typeof draft !== 'object') {
+    throw new TypeError('final presentation request observation draft is invalid')
+  }
+  if (draft.runRef !== result.runRef) {
+    throw new TypeError('final presentation run reference does not match')
+  }
+  const terminalObservationId = result.terminal?.snapshot.observationId
+  if (terminalObservationId !== undefined &&
+    draft.terminalObservationId !== terminalObservationId) {
+    throw new TypeError('final presentation terminal observation does not match')
+  }
+  if (terminalObservationId === undefined &&
+    draft.terminalObservationId !== 'unavailable' &&
+    draft.terminalObservationId !== 'not_attempted') {
+    throw new TypeError('final presentation terminal observation is unavailable')
+  }
+
+  const persistence = envelope.sessionPersistence
+  const completedOrdinary = result.kind === 'completed' &&
+    draft.requestKind === 'ordinary_chat'
+  const validPersistence = persistence === 'saved'
+    ? completedOrdinary && draft.outcome === 'completed' &&
+      draft.sessionSaveDurationMs !== 'not_attempted'
+    : persistence === 'failed'
+      ? completedOrdinary && draft.outcome === 'failed_session_save'
+      : persistence === 'not_attempted'
+        ? draft.outcome !== 'failed_session_save' &&
+          draft.sessionSaveDurationMs === 'not_attempted'
+        : false
+  if (!validPersistence) {
+    throw new TypeError('final presentation session persistence is invalid')
+  }
+  return Object.freeze({ result, sessionPersistence: persistence })
+}
 
 export interface ActivePresentationContext {
   readonly runRef: string
@@ -114,6 +191,7 @@ export interface ActivePresentationContext {
 
 export interface AgentServiceRequestOptions extends RunControlOptions {
   readonly requestObservationContext?: RequestObservationContextV1
+  readonly presentationLifecycle?: RunPresentationLifecycle
 }
 
 export interface AgentServiceRunRuntime {
@@ -616,20 +694,8 @@ function finalEnvelope (
   requestObservationDraft: RequestObservationDraftV1,
   sessionPersistence: SessionPersistenceOutcome
 ): FinalChatReplyEnvelope {
-  if (result.kind !== 'completed') {
-    return Object.freeze({
-      ...result,
-      requestObservationDraft,
-      sessionPersistence
-    })
-  }
-  const text = result.completion.kind === 'reply_text'
-    ? result.completion.text
-    : null
   return Object.freeze({
     ...result,
-    visibleOutput: result.completion.kind === 'already_visible',
-    text,
     requestObservationDraft,
     sessionPersistence
   })
@@ -1057,10 +1123,8 @@ export class AgentService {
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       let binding = this.#bindingFor(runId, request, session, runtime)
-      const presentationLifecycle = await this.#lifecycleFor(
-        request.presentationRoute,
-        runtime.progress
-      )
+      const presentationLifecycle = options.presentationLifecycle ??
+        await this.#lifecycleFor(request.presentationRoute, runtime.progress)
       let presentationStarted = false
       let result: RunAdvanceResult | undefined
       try {

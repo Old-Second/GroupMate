@@ -1,6 +1,35 @@
 import { Config } from '../config.js'
 import { newFetch } from '../proxy.js'
 
+const MAX_VOICEVOX_JSON_BYTES = 256 * 1024
+const MAX_VOICEVOX_AUDIO_BYTES = 8 * 1024 * 1024
+
+async function readBoundedBytes (response, maximumBytes) {
+  const contentLength = response.headers?.get?.('content-length')
+  if (contentLength !== null && contentLength !== undefined) {
+    const normalized = String(contentLength).trim()
+    if (!/^(?:0|[1-9][0-9]*)$/.test(normalized) || Number(normalized) > maximumBytes) {
+      throw new Error('VOICEVOX response is too large')
+    }
+  }
+  if (response.body?.[Symbol.asyncIterator] === undefined) {
+    throw new Error('VOICEVOX response body is unavailable')
+  }
+  const chunks = []
+  let byteLength = 0
+  for await (const chunk of response.body) {
+    const bytes = Buffer.from(chunk)
+    byteLength += bytes.byteLength
+    if (byteLength > maximumBytes) {
+      response.body.destroy?.()
+      throw new Error('VOICEVOX response is too large')
+    }
+    chunks.push(bytes)
+  }
+  if (byteLength === 0) throw new Error('VOICEVOX response is empty')
+  return Buffer.concat(chunks, byteLength)
+}
+
 /**
  * 生成voxTTSMode下的wav音频
  * @param text
@@ -21,24 +50,33 @@ async function generateAudio (text, options = {}) {
     style = match[2]
   }
   speaker = supportConfigurations.find(s => s.name === speaker)
+  if (!speaker) throw new Error('VOICEVOX speaker is invalid')
   let speakerId
   if (style) {
     speakerId = speaker.styles.find(s => s.name === style).id
   } else {
     speakerId = speaker.styles[Math.floor(Math.random() * speaker?.styles.length)].id
   }
-  logger.info(`使用${speaker.name}的${speaker.styles.find(s => s.id === speakerId).name}风格基于文本${text}生成语音。`)
+  if (!Number.isSafeInteger(speakerId)) {
+    throw new Error('VOICEVOX speaker is invalid')
+  }
+  logger.info('groupmate.tts.voicevox.synthesis_started')
   const accentPhrasesResponse = await newFetch(`${host}/accent_phrases?text=${encodeURIComponent(text)}&speaker=${speakerId}`, {
-    method: 'POST'
+    method: 'POST',
+    signal: options.signal
   })
-
-  const accentPhrases = await accentPhrasesResponse.json()
+  if (!accentPhrasesResponse.ok) throw new Error('VOICEVOX accent request was rejected')
+  const accentPhrases = JSON.parse((await readBoundedBytes(
+    accentPhrasesResponse,
+    MAX_VOICEVOX_JSON_BYTES
+  )).toString('utf8'))
 
   const synthesisResponse = await newFetch(`${host}/synthesis?speaker=${speakerId}&enable_interrogative_upspeak=false`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
+    signal: options.signal,
     body: JSON.stringify({
       accent_phrases: accentPhrases,
       speedScale: 1,
@@ -52,8 +90,8 @@ async function generateAudio (text, options = {}) {
     })
   })
 
-  const synthesisResponseData = await synthesisResponse.arrayBuffer()
-  return Buffer.from(synthesisResponseData)
+  if (!synthesisResponse.ok) throw new Error('VOICEVOX synthesis request was rejected')
+  return await readBoundedBytes(synthesisResponse, MAX_VOICEVOX_AUDIO_BYTES)
 }
 
 export const supportConfigurations = [

@@ -167,6 +167,20 @@ function normalizedDocument(value) {
         return null;
     return Object.freeze({ ...request, ...(local === undefined ? {} : { live2d: local }) });
 }
+function normalizedAppearance(value) {
+    if (!exactRecord(value, ['botName', 'toneStyle']))
+        return null;
+    const botName = normalizedBoundedText(value.botName, 1, 80, true);
+    if (botName === null || typeof value.toneStyle !== 'string')
+        return null;
+    const style = value.toneStyle.trim().toLowerCase();
+    const toneStyle = style === 'balanced'
+        ? 'balanced'
+        : style === 'precise' || style === 'precision'
+            ? 'precise'
+            : 'creative';
+    return Object.freeze({ botName, toneStyle });
+}
 function placeholderCount(template, placeholder) {
     let count = 0;
     let offset = 0;
@@ -189,7 +203,7 @@ function renderFailure() {
         code: 'render_failed'
     });
 }
-export function renderGroupMateHtml(template, document) {
+export function renderGroupMateHtml(template, document, appearance) {
     const documentPlaceholder = '<!--__GROUPMATE_DOCUMENT__-->';
     const qrPlaceholder = '<!--__GROUPMATE_QR_SCRIPT__-->';
     if (typeof template !== 'string' || placeholderCount(template, documentPlaceholder) !== 1 ||
@@ -198,7 +212,12 @@ export function renderGroupMateHtml(template, document) {
     const normalized = normalizedDocument(document);
     if (normalized === null)
         return renderFailure();
-    const json = safeJson(normalized);
+    const display = appearance === undefined ? undefined : normalizedAppearance(appearance);
+    if (display === null)
+        return renderFailure();
+    const json = safeJson(display === undefined
+        ? normalized
+        : Object.freeze({ ...normalized, appearance: display }));
     if (Buffer.byteLength(json, 'utf8') > MAX_REQUEST_BYTES)
         return renderFailure();
     return template

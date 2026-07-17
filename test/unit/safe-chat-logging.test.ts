@@ -209,7 +209,7 @@ test('safe chat error logging does not invoke hostile metadata accessors', async
 test('active chat sources do not pass raw conversation values to loggers', () => {
   const checks = [
     {
-      file: 'apps/chat.js',
+      file: 'src/runtime/yunzai-chat-controller.ts',
       patterns: [
         /logger\.info\(`chatgpt prompt: \$\{prompt\}`\)/,
         /logger\.(?:info|mark)\(\{ previousConversation \}\)/,
@@ -233,12 +233,17 @@ test('active chat sources do not pass raw conversation values to loggers', () =>
 })
 
 test('active chat and run summaries use only the safe logging boundary', () => {
-  const chatSource = readFileSync(path.join(projectRoot, 'apps', 'chat.js'), 'utf8')
+  const chatSource = readFileSync(
+    path.join(projectRoot, 'src', 'runtime', 'yunzai-chat-controller.ts'),
+    'utf8'
+  )
   const serviceSource = readFileSync(path.join(projectRoot, 'src', 'runtime', 'agent-service.ts'), 'utf8')
   const bridgeSource = readFileSync(path.join(projectRoot, 'src', 'runtime', 'agent-service-bridge.ts'), 'utf8')
 
-  assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatRequestLog/)
-  assert.match(chatSource, /if \(Config\.debug\) \{\s*logger\.info\(createChatResponseLog/)
+  assert.match(chatSource, /createChatRequestLog\(/)
+  assert.match(chatSource, /createChatResponseLog\(/)
+  assert.match(chatSource, /createChatErrorLog\(/)
+  assert.doesNotMatch(chatSource, /\bConfig\b|logger\./)
   assert.doesNotMatch(serviceSource, /#runStore\.load\(result\.runId\)/)
   assert.match(bridgeSource, /createAgentRunLog\(snapshot, receipt\)/)
   assert.doesNotMatch(

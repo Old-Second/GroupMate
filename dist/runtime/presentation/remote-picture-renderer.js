@@ -497,7 +497,6 @@ export function createCloudScreenshotPort(input) {
     return Object.freeze(port);
 }
 export function createRemoteGroupMatePictureRenderer(input) {
-    const width = boundedWidth(input.chatViewWidth);
     return Object.freeze({
         async render(request, signal) {
             const projected = safeRemoteRequest({
@@ -522,7 +521,9 @@ export function createRemoteGroupMatePictureRenderer(input) {
             }
             const captureInput = Object.freeze({
                 pageUrl: created.pageUrl,
-                width,
+                width: boundedWidth(typeof input.chatViewWidth === 'function'
+                    ? input.chatViewWidth()
+                    : input.chatViewWidth),
                 deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor),
                 timeoutMs: 120000,
                 maxContentHeightCssPx: 4096

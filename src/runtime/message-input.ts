@@ -2,6 +2,9 @@ import { normalizeMessageContent } from './message-content.js'
 import type { QuotedMessageSnapshot } from '../agent/contracts/content.js'
 
 const MAX_FIELD_CHARACTERS = 500
+const MAX_MESSAGE_ID_BYTES = 128
+const MAX_OCR_ENTRIES = 8
+const MAX_OCR_CODE_POINTS = 2_000
 
 type UnknownRecord = Record<string, unknown>
 
@@ -40,6 +43,27 @@ export interface ModelMessageInput {
   replySegmentCount: number
 }
 
+export type DeepReadonly<T> =
+  T extends string | number | boolean | bigint | symbol | null | undefined
+    ? T
+    : T extends readonly (infer U)[]
+      ? readonly DeepReadonly<U>[]
+      : { readonly [K in keyof T]: DeepReadonly<T[K]> }
+
+export interface PreparedYunzaiMessageEvidenceV1 {
+  readonly schemaVersion: 1
+  readonly prompt: string
+  readonly imageUrls: readonly string[]
+  readonly currentMessageId: string | null
+  readonly quotedMessageId: string | null
+  readonly quotedMessage?: DeepReadonly<QuotedMessageSnapshot>
+  readonly hasReply: boolean
+  readonly replyResolved: boolean
+  readonly currentSegmentCount: number
+  readonly replySegmentCount: number
+  readonly ocrTexts: readonly string[]
+}
+
 interface BuildModelMessageInputOptions {
   event: MessageEventLike
   currentPrompt: string
@@ -52,6 +76,20 @@ function isRecord (value: unknown): value is UnknownRecord {
 function getBoundedScalar (value: unknown): string | undefined {
   if (!['string', 'number', 'boolean'].includes(typeof value)) return undefined
   const result = String(value).trim().slice(0, MAX_FIELD_CHARACTERS)
+  return result || undefined
+}
+
+function getBoundedMessageId (value: unknown): string | undefined {
+  if (!['string', 'number', 'boolean'].includes(typeof value)) return undefined
+  const source = String(value).normalize('NFC').trim()
+  let byteLength = 0
+  let result = ''
+  for (const codePoint of source) {
+    const codePointBytes = Buffer.byteLength(codePoint, 'utf8')
+    if (byteLength + codePointBytes > MAX_MESSAGE_ID_BYTES) break
+    result += codePoint
+    byteLength += codePointBytes
+  }
   return result || undefined
 }
 
@@ -163,6 +201,52 @@ function mergeImageUrls (...groups: string[][]): string[] {
   return [...new Set(groups.flat())]
 }
 
+function normalizedOcrTexts (values: readonly string[]): readonly string[] {
+  if (!Array.isArray(values)) throw new TypeError('OCR texts must be an array')
+  const normalized: string[] = []
+  for (const value of values) {
+    if (typeof value !== 'string') throw new TypeError('OCR text must be a string')
+    const text = Array.from(value.normalize('NFC').trim())
+      .slice(0, MAX_OCR_CODE_POINTS)
+      .join('')
+    if (text.length === 0) continue
+    normalized.push(text)
+    if (normalized.length === MAX_OCR_ENTRIES) break
+  }
+  return Object.freeze(normalized)
+}
+
+function copyQuotedMessage (
+  value: QuotedMessageSnapshot | undefined
+): DeepReadonly<QuotedMessageSnapshot> | undefined {
+  if (value === undefined) return undefined
+  const parts = value.parts.map(part => {
+    if (part.type === 'text') {
+      return Object.freeze({ type: 'text' as const, text: part.text })
+    }
+    if (part.type === 'resource_ref') {
+      return Object.freeze({
+        type: 'resource_ref' as const,
+        resourceType: part.resourceType,
+        resourceId: part.resourceId,
+        ...(part.mimeType === undefined ? {} : { mimeType: part.mimeType }),
+        ...(part.expiresAt === undefined ? {} : { expiresAt: part.expiresAt })
+      })
+    }
+    throw new TypeError('quoted message evidence contains an unsupported part')
+  })
+  return Object.freeze({
+    messageId: value.messageId,
+    sender: Object.freeze({
+      userId: value.sender.userId,
+      ...(value.sender.displayName === undefined
+        ? {}
+        : { displayName: value.sender.displayName })
+    }),
+    parts: Object.freeze(parts)
+  })
+}
+
 export async function buildModelMessageInput ({
   event,
   currentPrompt
@@ -170,7 +254,7 @@ export async function buildModelMessageInput ({
   const current = normalizeMessageContent(event.message, { textOverride: currentPrompt })
   const replyResult = await findReplyMessage(event)
   const { hasReply } = replyResult
-  const currentMessageId = getBoundedScalar(event.message_id ?? event.seq) ?? null
+  const currentMessageId = getBoundedMessageId(event.message_id ?? event.seq) ?? null
 
   if (!hasReply) {
     return {
@@ -198,11 +282,11 @@ export async function buildModelMessageInput ({
     ? {
         status: 'available',
         sender: projectSender(reply.sender),
-        messageId: getBoundedScalar(reply.message_id),
+        messageId: getBoundedMessageId(reply.message_id),
         content: quoted.text || '[空消息]'
       }
     : { status: 'unavailable' }
-  const quotedMessageId = getBoundedScalar(
+  const quotedMessageId = getBoundedMessageId(
     reply?.message_id ?? replyResult.source?.message_id ?? replyResult.source?.seq ??
       replyResult.source?.id
   ) ?? null
@@ -246,4 +330,36 @@ export async function buildModelMessageInput ({
     currentSegmentCount: current.segmentCount,
     replySegmentCount: quoted.segmentCount
   }
+}
+
+export async function prepareYunzaiMessageEvidence (input: {
+  readonly event: MessageEventLike
+  readonly currentPrompt: string
+  readonly ocrTexts: readonly string[]
+}): Promise<PreparedYunzaiMessageEvidenceV1> {
+  if (typeof input.currentPrompt !== 'string') {
+    throw new TypeError('current prompt must be a string')
+  }
+  const ocrTexts = normalizedOcrTexts(input.ocrTexts)
+  const currentPrompt = ocrTexts.length === 0
+    ? input.currentPrompt
+    : `${input.currentPrompt}"${ocrTexts.join('')} "`
+  const messageInput = await buildModelMessageInput({
+    event: input.event,
+    currentPrompt
+  })
+  const quotedMessage = copyQuotedMessage(messageInput.quotedMessage)
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    prompt: messageInput.prompt,
+    imageUrls: Object.freeze([...messageInput.imageUrls]),
+    currentMessageId: messageInput.currentMessageId,
+    quotedMessageId: messageInput.quotedMessageId,
+    ...(quotedMessage === undefined ? {} : { quotedMessage }),
+    hasReply: messageInput.hasReply,
+    replyResolved: messageInput.replyResolved,
+    currentSegmentCount: messageInput.currentSegmentCount,
+    replySegmentCount: messageInput.replySegmentCount,
+    ocrTexts
+  })
 }

@@ -10,7 +10,7 @@ import { Config } from './config.js'
 import { convertSpeaker, generateVitsAudio, speakers as vitsRoleList } from './tts.js'
 import VoiceVoxTTS, { supportConfigurations as voxRoleList } from './tts/voicevox.js'
 import AzureTTS, { supportConfigurations as azureRoleList } from './tts/microsoft-azure.js'
-import { translate } from './translate.js'
+import { translate } from '../dist/runtime/translation-service.js'
 import uploadRecord from './uploadRecord.js'
 import Version from './version.js'
 import {

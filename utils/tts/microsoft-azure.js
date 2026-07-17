@@ -1,7 +1,8 @@
 import crypto from 'crypto'
+import fs from 'node:fs'
 import { getDefaultReplySetting, mkdirs } from '../common.js'
 import { Config } from '../config.js'
-import { translate } from '../translate.js'
+import { translate } from '../../dist/runtime/translation-service.js'
 
 let sdk
 try {
@@ -17,78 +18,91 @@ try {
  * @param ssml
  * @returns {Promise<string>}
  */
-async function generateAudio (pendingText, option = {}, ssml = '') {
+async function generateAudio (pendingText, option = {}, ssml = '', signal) {
   if (!sdk) {
     throw new Error('未安装microsoft-cognitiveservices-speech-sdk，无法使用微软Azure语音源')
   }
+  if (signal?.aborted === true) throw signal.reason
   let subscriptionKey = Config.azureTTSKey
   let serviceRegion = Config.azureTTSRegion
   let speechConfig = sdk.SpeechConfig.fromSubscription(subscriptionKey, serviceRegion)
   const _path = process.cwd()
   mkdirs(`${_path}/data/chatgpt/tts/azure`)
   let filename = `${_path}/data/chatgpt/tts/azure/${crypto.randomUUID()}.wav`
-  let audioConfig = sdk.AudioConfig.fromAudioFileOutput(filename)
   let synthesizer
-  let speaker = option?.speaker || '随机'
-  let context = pendingText
-  // 打招呼用
-  if (speaker === '随机') {
-    speaker = supportConfigurations[Math.floor(Math.random() * supportConfigurations.length)].code
-    let languagePrefix = supportConfigurations.find(config => config.code === speaker).languageDetail.charAt(0)
-    languagePrefix = languagePrefix.startsWith('E') ? '英' : languagePrefix
-    context = (await translate(context, languagePrefix)).replace('\n', '')
+  let completed = false
+  try {
+    const audioConfig = sdk.AudioConfig.fromAudioFileOutput(filename)
+    let speaker = option?.speaker || '随机'
+    let context = pendingText
+    // 打招呼用
+    if (speaker === '随机') {
+      speaker = supportConfigurations[Math.floor(Math.random() * supportConfigurations.length)].code
+      let languagePrefix = supportConfigurations.find(config => config.code === speaker).languageDetail.charAt(0)
+      languagePrefix = languagePrefix.startsWith('E') ? '英' : languagePrefix
+      context = (await translate(context, languagePrefix, 'auto', signal)).replace('\n', '')
+    }
+    if (ssml) {
+      synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig)
+      await speakSsmlAsync(synthesizer, ssml, signal)
+    } else { // 打招呼用
+      speechConfig.speechSynthesisLanguage = option?.language || supportConfigurations.find(config => config.code === speaker).language
+      speechConfig.speechSynthesisVoiceName = speaker
+      synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig)
+      await speakTextAsync(synthesizer, context, signal)
+    }
+    completed = true
+    return filename
+  } finally {
+    try { synthesizer?.close() } catch {}
+    if (!completed) await fs.promises.unlink(filename).catch(() => undefined)
   }
-  if (ssml) {
-    synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig)
-    await speakSsmlAsync(synthesizer, ssml)
-  } else { // 打招呼用
-    speechConfig.speechSynthesisLanguage = option?.language || supportConfigurations.find(config => config.code === speaker).language
-    speechConfig.speechSynthesisVoiceName = speaker
-    logger.info('using speaker: ' + speaker)
-    logger.info('using language: ' + speechConfig.speechSynthesisLanguage)
-    synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig)
-    await speakTextAsync(synthesizer, context)
-  }
-
-  console.log('synthesis finished.')
-  synthesizer.close()
-  return filename
 }
 
-async function speakTextAsync (synthesizer, pendingText) {
+function runSynthesis (synthesizer, invoke, signal) {
   return new Promise((resolve, reject) => {
-    synthesizer.speakTextAsync(pendingText, result => {
+    let settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', abort)
+      callback(value)
+    }
+    const abort = () => {
+      try { synthesizer.close() } catch {}
+      finish(reject, signal?.reason ?? new DOMException('Azure TTS aborted', 'AbortError'))
+    }
+    if (signal?.aborted === true) {
+      abort()
+      return
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    invoke(result => {
       if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
-        logger.info('speakTextAsync: true')
-        resolve()
+        finish(resolve)
       } else {
-        console.error('Speech synthesis canceled, ' + result.errorDetails +
-            '\nDid you update the subscription info?')
-        reject(result.errorDetails)
+        finish(reject, new Error('Azure TTS synthesis was cancelled'))
       }
     }, err => {
-      console.error('err - ' + err)
-      reject(err)
+      finish(reject, new Error('Azure TTS synthesis failed'))
     })
   })
 }
 
-async function speakSsmlAsync (synthesizer, ssml) {
-  return new Promise((resolve, reject) => {
-    synthesizer.speakSsmlAsync(ssml, result => {
-      if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
-        logger.info('speakSsmlAsync: true')
-        resolve()
-      } else {
-        console.error('Speech synthesis canceled, ' + result.errorDetails +
-            '\nDid you update the subscription info?')
-        reject(result.errorDetails)
-      }
-    }, err => {
-      console.error('err - ' + err)
-      reject(err)
-    })
-  })
+async function speakTextAsync (synthesizer, pendingText, signal) {
+  return await runSynthesis(
+    synthesizer,
+    (resolve, reject) => synthesizer.speakTextAsync(pendingText, resolve, reject),
+    signal
+  )
+}
+
+async function speakSsmlAsync (synthesizer, ssml, signal) {
+  return await runSynthesis(
+    synthesizer,
+    (resolve, reject) => synthesizer.speakSsmlAsync(ssml, resolve, reject),
+    signal
+  )
 }
 async function generateSsml (pendingText, option = {}) {
   let speaker = option?.speaker || '随机'
@@ -101,8 +115,7 @@ async function generateSsml (pendingText, option = {}) {
       const keys = Object.keys(role.emotion)
       emotion = keys[Math.floor(Math.random() * keys.length)]
     }
-    logger.info('using speaker: ' + speaker)
-    logger.info('using emotion: ' + emotion)
+    logger.info('groupmate.tts.azure.voice_selected')
     emotionDegree = 2
   } else {
     emotion = option.emotion

@@ -4,11 +4,37 @@ import { pathToFileURL } from 'node:url';
 import { validResource } from '../../tools/visible-tool-support.js';
 import { renderGroupMateHtml } from './groupmate-picture-contract.js';
 let lowMemoryRenderTail = Promise.resolve();
-async function runLowMemoryRender(operation) {
+const LOW_MEMORY_RENDER_ABORTED = Symbol('low-memory-render-aborted');
+async function waitForRenderSlot(previous, signal) {
+    if (signal?.aborted === true)
+        return false;
+    if (signal === undefined) {
+        await previous;
+        return true;
+    }
+    return await new Promise(resolve => {
+        let settled = false;
+        const finish = (acquired) => {
+            if (settled)
+                return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            resolve(acquired);
+        };
+        const onAbort = () => finish(false);
+        signal.addEventListener('abort', onAbort, { once: true });
+        previous.then(() => finish(true), () => finish(true));
+    });
+}
+async function runLowMemoryRender(operation, signal) {
     const previous = lowMemoryRenderTail;
     let release;
-    lowMemoryRenderTail = new Promise(resolve => { release = resolve; });
-    await previous;
+    const own = new Promise(resolve => { release = resolve; });
+    lowMemoryRenderTail = previous.then(() => own, () => own);
+    if (!await waitForRenderSlot(previous, signal)) {
+        void previous.then(release, release);
+        throw LOW_MEMORY_RENDER_ABORTED;
+    }
     try {
         return await operation();
     }
@@ -116,63 +142,75 @@ function localDocument(input, live2dAssets, includeLive2d) {
     });
 }
 export function createGroupMatePictureRenderer(input) {
-    const width = boundedWidth(input.chatViewWidth);
     const renderer = {
         async render(request, signal) {
-            return await runLowMemoryRender(async () => {
-                if (signal?.aborted === true)
+            try {
+                return await runLowMemoryRender(async () => {
+                    if (signal?.aborted === true)
+                        return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
+                    const remoteRequestBytes = Buffer.byteLength(JSON.stringify({
+                        schemaVersion: 1,
+                        replyText: request.replyText,
+                        citations: request.citations,
+                        reasoningView: request.reasoningView,
+                        showQRCode: request.settings.showQRCode
+                    }), 'utf8');
+                    if (remoteRequestBytes > 64 * 1024) {
+                        return Object.freeze({ kind: 'not_rendered', code: 'document_too_large' });
+                    }
+                    if (input.remote !== null) {
+                        try {
+                            const remote = safeRendered(await input.remote.render(request, signal));
+                            if (remote.kind === 'rendered')
+                                return remote;
+                        }
+                        catch { }
+                    }
+                    const renderLocal = async (includeLive2d) => {
+                        let html;
+                        const document = localDocument(request, input.live2dAssets, includeLive2d);
+                        try {
+                            html = renderGroupMateHtml(input.template, document, typeof input.appearance === 'function'
+                                ? input.appearance()
+                                : input.appearance);
+                        }
+                        catch {
+                            return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
+                        }
+                        try {
+                            const width = boundedWidth(typeof input.chatViewWidth === 'function'
+                                ? input.chatViewWidth()
+                                : input.chatViewWidth);
+                            return safeRendered(await input.browser.render({
+                                html,
+                                viewport: Object.freeze({
+                                    width,
+                                    deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor)
+                                }),
+                                maxContentHeightCssPx: 4096,
+                                timeoutMs: 120000,
+                                closeBrowserAfterRender: request.settings.closeBrowserAfterRender,
+                                live2d: document.live2d ?? null,
+                                live2dReadinessFlag: '__GROUPMATE_LIVE2D_READY__'
+                            }, signal), 'local');
+                        }
+                        catch {
+                            return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
+                        }
+                    };
+                    const withDecoration = await renderLocal(true);
+                    if (withDecoration.kind === 'not_rendered' && withDecoration.code === 'live2d_unavailable' &&
+                        request.settings.live2d !== null)
+                        return await renderLocal(false);
+                    return withDecoration;
+                }, signal);
+            }
+            catch (error) {
+                if (error === LOW_MEMORY_RENDER_ABORTED) {
                     return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
-                const remoteRequestBytes = Buffer.byteLength(JSON.stringify({
-                    schemaVersion: 1,
-                    replyText: request.replyText,
-                    citations: request.citations,
-                    reasoningView: request.reasoningView,
-                    showQRCode: request.settings.showQRCode
-                }), 'utf8');
-                if (remoteRequestBytes > 64 * 1024) {
-                    return Object.freeze({ kind: 'not_rendered', code: 'document_too_large' });
                 }
-                if (input.remote !== null) {
-                    try {
-                        const remote = safeRendered(await input.remote.render(request, signal));
-                        if (remote.kind === 'rendered')
-                            return remote;
-                    }
-                    catch { }
-                }
-                const renderLocal = async (includeLive2d) => {
-                    let html;
-                    const document = localDocument(request, input.live2dAssets, includeLive2d);
-                    try {
-                        html = renderGroupMateHtml(input.template, document);
-                    }
-                    catch {
-                        return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
-                    }
-                    try {
-                        return safeRendered(await input.browser.render({
-                            html,
-                            viewport: Object.freeze({
-                                width,
-                                deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor)
-                            }),
-                            maxContentHeightCssPx: 4096,
-                            timeoutMs: 120000,
-                            closeBrowserAfterRender: request.settings.closeBrowserAfterRender,
-                            live2d: document.live2d ?? null,
-                            live2dReadinessFlag: '__GROUPMATE_LIVE2D_READY__'
-                        }, signal), 'local');
-                    }
-                    catch {
-                        return Object.freeze({ kind: 'not_rendered', code: 'render_failed' });
-                    }
-                };
-                const withDecoration = await renderLocal(true);
-                if (withDecoration.kind === 'not_rendered' && withDecoration.code === 'live2d_unavailable' &&
-                    request.settings.live2d !== null)
-                    return await renderLocal(false);
-                return withDecoration;
-            });
+                throw error;
+            }
         }
     };
     return Object.freeze(renderer);

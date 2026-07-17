@@ -110,3 +110,23 @@ test('GroupMate HTML preserves replacement tokens without duplicating template c
   assert.equal(html.includes('<!--__GROUPMATE_DOCUMENT__-->'), false)
   assert.equal(html.includes('<!--__GROUPMATE_QR_SCRIPT__-->'), false)
 })
+
+test('GroupMate HTML accepts only bounded display appearance outside the remote request', () => {
+  const template = '<script type="application/json"><!--__GROUPMATE_DOCUMENT__--></script>' +
+    '<script><!--__GROUPMATE_QR_SCRIPT__--></script>'
+  const html = renderGroupMateHtml(template, request, {
+    botName: '  小伙伴 <GroupMate>  ',
+    toneStyle: 'Precision'
+  })
+  const json = html.match(/<script type="application\/json">([\s\S]*?)<\/script>/)?.[1] ?? ''
+  const document = JSON.parse(json) as { appearance?: { botName: string, toneStyle: string } }
+
+  assert.deepEqual(document.appearance, {
+    botName: '小伙伴 <GroupMate>',
+    toneStyle: 'precise'
+  })
+  assert.equal(parseGroupMatePictureRemoteRequest(JSON.stringify({
+    ...request,
+    appearance: document.appearance
+  })), null)
+})

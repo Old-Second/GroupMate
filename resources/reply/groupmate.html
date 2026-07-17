@@ -8,7 +8,9 @@
     :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
     body { margin: 0; padding: 36px; color: #1f2937; background: #eef2f7; }
-    main { max-width: 1120px; margin: 0 auto; padding: 34px; border-radius: 22px; background: #fff; box-shadow: 0 12px 36px rgba(15,23,42,.08); }
+    main { max-width: 1120px; margin: 0 auto; padding: 34px; border-radius: 22px; background: #fff; box-shadow: 0 12px 36px rgba(15,23,42,.08); border-top: 6px solid #8b5cf6; }
+    body[data-tone-style="balanced"] main { border-top-color: #0ea5e9; background: #f8fafc; }
+    body[data-tone-style="precise"] main { border-top-color: #334155; border-radius: 10px; box-shadow: 0 6px 18px rgba(15,23,42,.08); }
     header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
     h1 { margin: 0; font-size: 30px; letter-spacing: .02em; }
     #groupmate-reply { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 22px; line-height: 1.72; }
@@ -24,7 +26,7 @@
 <body>
   <main>
     <header>
-      <h1>GroupMate</h1>
+      <h1 id="groupmate-bot-name">GroupMate</h1>
       <div id="groupmate-qr" hidden aria-label="当前回复页面二维码"></div>
     </header>
     <p id="groupmate-reply"></p>
@@ -46,6 +48,13 @@
       try { value = JSON.parse(source.textContent || '') } catch { return }
       const reply = document.getElementById('groupmate-reply')
       if (reply) reply.textContent = value.replyText
+      const botName = document.getElementById('groupmate-bot-name')
+      if (botName && value.appearance && typeof value.appearance.botName === 'string') {
+        botName.textContent = value.appearance.botName
+      }
+      if (value.appearance && ['creative', 'balanced', 'precise'].includes(value.appearance.toneStyle)) {
+        document.body.dataset.toneStyle = value.appearance.toneStyle
+      }
       const list = document.getElementById('groupmate-citations')
       const citationSection = document.getElementById('groupmate-citations-section')
       if (list && citationSection && Array.isArray(value.citations) && value.citations.length > 0) {

@@ -1,5 +1,8 @@
 import { normalizeMessageContent } from './message-content.js';
 const MAX_FIELD_CHARACTERS = 500;
+const MAX_MESSAGE_ID_BYTES = 128;
+const MAX_OCR_ENTRIES = 8;
+const MAX_OCR_CODE_POINTS = 2_000;
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -7,6 +10,21 @@ function getBoundedScalar(value) {
     if (!['string', 'number', 'boolean'].includes(typeof value))
         return undefined;
     const result = String(value).trim().slice(0, MAX_FIELD_CHARACTERS);
+    return result || undefined;
+}
+function getBoundedMessageId(value) {
+    if (!['string', 'number', 'boolean'].includes(typeof value))
+        return undefined;
+    const source = String(value).normalize('NFC').trim();
+    let byteLength = 0;
+    let result = '';
+    for (const codePoint of source) {
+        const codePointBytes = Buffer.byteLength(codePoint, 'utf8');
+        if (byteLength + codePointBytes > MAX_MESSAGE_ID_BYTES)
+            break;
+        result += codePoint;
+        byteLength += codePointBytes;
+    }
     return result || undefined;
 }
 function projectSender(value) {
@@ -104,11 +122,58 @@ async function findReplyMessage(event) {
 function mergeImageUrls(...groups) {
     return [...new Set(groups.flat())];
 }
+function normalizedOcrTexts(values) {
+    if (!Array.isArray(values))
+        throw new TypeError('OCR texts must be an array');
+    const normalized = [];
+    for (const value of values) {
+        if (typeof value !== 'string')
+            throw new TypeError('OCR text must be a string');
+        const text = Array.from(value.normalize('NFC').trim())
+            .slice(0, MAX_OCR_CODE_POINTS)
+            .join('');
+        if (text.length === 0)
+            continue;
+        normalized.push(text);
+        if (normalized.length === MAX_OCR_ENTRIES)
+            break;
+    }
+    return Object.freeze(normalized);
+}
+function copyQuotedMessage(value) {
+    if (value === undefined)
+        return undefined;
+    const parts = value.parts.map(part => {
+        if (part.type === 'text') {
+            return Object.freeze({ type: 'text', text: part.text });
+        }
+        if (part.type === 'resource_ref') {
+            return Object.freeze({
+                type: 'resource_ref',
+                resourceType: part.resourceType,
+                resourceId: part.resourceId,
+                ...(part.mimeType === undefined ? {} : { mimeType: part.mimeType }),
+                ...(part.expiresAt === undefined ? {} : { expiresAt: part.expiresAt })
+            });
+        }
+        throw new TypeError('quoted message evidence contains an unsupported part');
+    });
+    return Object.freeze({
+        messageId: value.messageId,
+        sender: Object.freeze({
+            userId: value.sender.userId,
+            ...(value.sender.displayName === undefined
+                ? {}
+                : { displayName: value.sender.displayName })
+        }),
+        parts: Object.freeze(parts)
+    });
+}
 export async function buildModelMessageInput({ event, currentPrompt }) {
     const current = normalizeMessageContent(event.message, { textOverride: currentPrompt });
     const replyResult = await findReplyMessage(event);
     const { hasReply } = replyResult;
-    const currentMessageId = getBoundedScalar(event.message_id ?? event.seq) ?? null;
+    const currentMessageId = getBoundedMessageId(event.message_id ?? event.seq) ?? null;
     if (!hasReply) {
         return {
             prompt: currentPrompt,
@@ -134,11 +199,11 @@ export async function buildModelMessageInput({ event, currentPrompt }) {
         ? {
             status: 'available',
             sender: projectSender(reply.sender),
-            messageId: getBoundedScalar(reply.message_id),
+            messageId: getBoundedMessageId(reply.message_id),
             content: quoted.text || '[空消息]'
         }
         : { status: 'unavailable' };
-    const quotedMessageId = getBoundedScalar(reply?.message_id ?? replyResult.source?.message_id ?? replyResult.source?.seq ??
+    const quotedMessageId = getBoundedMessageId(reply?.message_id ?? replyResult.source?.message_id ?? replyResult.source?.seq ??
         replyResult.source?.id) ?? null;
     const projectedSender = projectSender(reply?.sender);
     const quotedSnapshot = reply !== undefined &&
@@ -179,4 +244,31 @@ export async function buildModelMessageInput({ event, currentPrompt }) {
         currentSegmentCount: current.segmentCount,
         replySegmentCount: quoted.segmentCount
     };
+}
+export async function prepareYunzaiMessageEvidence(input) {
+    if (typeof input.currentPrompt !== 'string') {
+        throw new TypeError('current prompt must be a string');
+    }
+    const ocrTexts = normalizedOcrTexts(input.ocrTexts);
+    const currentPrompt = ocrTexts.length === 0
+        ? input.currentPrompt
+        : `${input.currentPrompt}"${ocrTexts.join('')} "`;
+    const messageInput = await buildModelMessageInput({
+        event: input.event,
+        currentPrompt
+    });
+    const quotedMessage = copyQuotedMessage(messageInput.quotedMessage);
+    return Object.freeze({
+        schemaVersion: 1,
+        prompt: messageInput.prompt,
+        imageUrls: Object.freeze([...messageInput.imageUrls]),
+        currentMessageId: messageInput.currentMessageId,
+        quotedMessageId: messageInput.quotedMessageId,
+        ...(quotedMessage === undefined ? {} : { quotedMessage }),
+        hasReply: messageInput.hasReply,
+        replyResolved: messageInput.replyResolved,
+        currentSegmentCount: messageInput.currentSegmentCount,
+        replySegmentCount: messageInput.replySegmentCount,
+        ocrTexts
+    });
 }

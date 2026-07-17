@@ -41,12 +41,46 @@ export interface Live2dAssetResolver {
 }
 
 let lowMemoryRenderTail: Promise<void> = Promise.resolve()
+const LOW_MEMORY_RENDER_ABORTED = Symbol('low-memory-render-aborted')
 
-async function runLowMemoryRender<T> (operation: () => Promise<T>): Promise<T> {
+async function waitForRenderSlot (
+  previous: Promise<void>,
+  signal?: AbortSignal
+): Promise<boolean> {
+  if (signal?.aborted === true) return false
+  if (signal === undefined) {
+    await previous
+    return true
+  }
+  return await new Promise<boolean>(resolve => {
+    let settled = false
+    const finish = (acquired: boolean): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      resolve(acquired)
+    }
+    const onAbort = (): void => finish(false)
+    signal.addEventListener('abort', onAbort, { once: true })
+    previous.then(
+      () => finish(true),
+      () => finish(true)
+    )
+  })
+}
+
+async function runLowMemoryRender<T> (
+  operation: () => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
   const previous = lowMemoryRenderTail
   let release!: () => void
-  lowMemoryRenderTail = new Promise<void>(resolve => { release = resolve })
-  await previous
+  const own = new Promise<void>(resolve => { release = resolve })
+  lowMemoryRenderTail = previous.then(() => own, () => own)
+  if (!await waitForRenderSlot(previous, signal)) {
+    void previous.then(release, release)
+    throw LOW_MEMORY_RENDER_ABORTED
+  }
   try {
     return await operation()
   } finally {
@@ -161,64 +195,80 @@ export function createGroupMatePictureRenderer (input: {
   readonly remote: RemoteGroupMatePictureRenderer | null
   readonly live2dAssets: Live2dAssetResolver
   /** Private bootstrap adapter for legacy chatViewWidth; never part of PresentationSettings. */
-  readonly chatViewWidth?: unknown
+  readonly chatViewWidth?: unknown | (() => unknown)
+  /** Safe display-only legacy settings; never enter the remote request contract. */
+  readonly appearance?: unknown | (() => unknown)
 }): GroupMatePictureRenderer {
-  const width = boundedWidth(input.chatViewWidth)
   const renderer: GroupMatePictureRenderer = {
     async render (request, signal): Promise<PictureRenderResult> {
-      return await runLowMemoryRender(async () => {
-        if (signal?.aborted === true) return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
-        const remoteRequestBytes = Buffer.byteLength(JSON.stringify({
-          schemaVersion: 1,
-          replyText: request.replyText,
-          citations: request.citations,
-          reasoningView: request.reasoningView,
-          showQRCode: request.settings.showQRCode
-        }), 'utf8')
-        if (remoteRequestBytes > 64 * 1024) {
-          return Object.freeze({ kind: 'not_rendered', code: 'document_too_large' })
-        }
-        if (input.remote !== null) {
-          try {
-            const remote = safeRendered(await input.remote.render(request, signal))
-            if (remote.kind === 'rendered') return remote
-          } catch {}
-        }
-
-        const renderLocal = async (includeLive2d: boolean): Promise<PictureRenderResult> => {
-          let html: string
-          const document = localDocument(request, input.live2dAssets, includeLive2d)
-          try {
-            html = renderGroupMateHtml(
-              input.template,
-              document
-            )
-          } catch {
-            return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+      try {
+        return await runLowMemoryRender(async () => {
+          if (signal?.aborted === true) return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+          const remoteRequestBytes = Buffer.byteLength(JSON.stringify({
+            schemaVersion: 1,
+            replyText: request.replyText,
+            citations: request.citations,
+            reasoningView: request.reasoningView,
+            showQRCode: request.settings.showQRCode
+          }), 'utf8')
+          if (remoteRequestBytes > 64 * 1024) {
+            return Object.freeze({ kind: 'not_rendered', code: 'document_too_large' })
           }
-          try {
-            return safeRendered(await input.browser.render({
-              html,
-              viewport: Object.freeze({
-                width,
-                deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor)
-              }),
-              maxContentHeightCssPx: 4096,
-              timeoutMs: 120000,
-              closeBrowserAfterRender: request.settings.closeBrowserAfterRender,
-              live2d: document.live2d ?? null,
-              live2dReadinessFlag: '__GROUPMATE_LIVE2D_READY__'
-            }, signal), 'local')
-          } catch {
-            return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+          if (input.remote !== null) {
+            try {
+              const remote = safeRendered(await input.remote.render(request, signal))
+              if (remote.kind === 'rendered') return remote
+            } catch {}
           }
-        }
 
-        const withDecoration = await renderLocal(true)
-        if (withDecoration.kind === 'not_rendered' && withDecoration.code === 'live2d_unavailable' &&
-          request.settings.live2d !== null) return await renderLocal(false)
-        return withDecoration
-      })
+          const renderLocal = async (includeLive2d: boolean): Promise<PictureRenderResult> => {
+            let html: string
+            const document = localDocument(request, input.live2dAssets, includeLive2d)
+            try {
+              html = renderGroupMateHtml(
+                input.template,
+                document,
+                typeof input.appearance === 'function'
+                  ? input.appearance()
+                  : input.appearance
+              )
+            } catch {
+              return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+            }
+            try {
+              const width = boundedWidth(
+                typeof input.chatViewWidth === 'function'
+                  ? input.chatViewWidth()
+                  : input.chatViewWidth
+              )
+              return safeRendered(await input.browser.render({
+                html,
+                viewport: Object.freeze({
+                  width,
+                  deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor)
+                }),
+                maxContentHeightCssPx: 4096,
+                timeoutMs: 120000,
+                closeBrowserAfterRender: request.settings.closeBrowserAfterRender,
+                live2d: document.live2d ?? null,
+                live2dReadinessFlag: '__GROUPMATE_LIVE2D_READY__'
+              }, signal), 'local')
+            } catch {
+              return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+            }
+          }
+
+          const withDecoration = await renderLocal(true)
+          if (withDecoration.kind === 'not_rendered' && withDecoration.code === 'live2d_unavailable' &&
+            request.settings.live2d !== null) return await renderLocal(false)
+          return withDecoration
+        }, signal)
+      } catch (error) {
+        if (error === LOW_MEMORY_RENDER_ABORTED) {
+          return Object.freeze({ kind: 'not_rendered', code: 'render_failed' })
+        }
+        throw error
+      }
     }
   }
   return Object.freeze(renderer)

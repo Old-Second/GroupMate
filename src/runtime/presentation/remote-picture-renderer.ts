@@ -558,9 +558,8 @@ export function createRemoteGroupMatePictureRenderer (input: {
   readonly localBrowser: RemotePageBrowserPort
   readonly cloud: CloudScreenshotPort | null
   /** Private bootstrap adapter for legacy chatViewWidth. */
-  readonly chatViewWidth?: unknown
+  readonly chatViewWidth?: unknown | (() => unknown)
 }): RemoteGroupMatePictureRenderer {
-  const width = boundedWidth(input.chatViewWidth)
   return Object.freeze({
     async render (
       request: Parameters<RemoteGroupMatePictureRenderer['render']>[0],
@@ -587,7 +586,11 @@ export function createRemoteGroupMatePictureRenderer (input: {
       }
       const captureInput = Object.freeze({
         pageUrl: created.pageUrl,
-        width,
+        width: boundedWidth(
+          typeof input.chatViewWidth === 'function'
+            ? input.chatViewWidth()
+            : input.chatViewWidth
+        ),
         deviceScaleFactor: boundedDpr(request.settings.deviceScaleFactor),
         timeoutMs: 120000 as const,
         maxContentHeightCssPx: 4096 as const

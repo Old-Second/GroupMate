@@ -1,5 +1,5 @@
 import plugin from '../../../lib/plugins/plugin.js'
-import { routeYunzaiApprovalReply } from '../dist/runtime/agent-service-bridge.js'
+import { getProductionYunzaiAgent } from '../dist/runtime/production-yunzai-agent.js'
 
 export class approval extends plugin {
   constructor () {
@@ -15,6 +15,6 @@ export class approval extends plugin {
   }
 
   async confirmToolOperation (event) {
-    return await routeYunzaiApprovalReply(event)
+    return await getProductionYunzaiAgent().approvalController.confirmToolOperation(event)
   }
 }

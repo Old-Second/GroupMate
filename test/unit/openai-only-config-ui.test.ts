@@ -386,6 +386,32 @@ test('Guoba exposes only explicit standard and DeepSeek compatibility profiles',
     ['standard', 'deepseek']
   )
   assert.match(field?.bottomHelpMessage ?? '', /不会.*自动猜测/)
+  assert.match(field?.bottomHelpMessage ?? '', /重启/)
+})
+
+test('Guoba accurately marks restart-only and deferred rendering settings', async () => {
+  const fields = new Map(buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).flatMap(schema => schema.field ? [[schema.field, schema] as const] : []))
+
+  for (const field of [
+    'toggleMode', 'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile',
+    'proxy', 'headless', 'chromePath'
+  ]) {
+    assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
+  }
+  for (const field of [
+    'live2d', 'live2dModel', 'live2dOption_scale', 'live2dOption_positionX',
+    'live2dOption_positionY', 'live2dOption_rotation', 'live2dOption_alpha'
+  ]) {
+    const schema = fields.get(field)
+    assert.equal(schema?.componentProps?.disabled, true)
+    assert.match(`${schema?.label ?? ''}${schema?.bottomHelpMessage ?? ''}`, /暂不可用|后续/)
+  }
+
+  const support = await readSource('guoba.support.js')
+  assert.match(support, /RESTART_REQUIRED_CONFIG_FIELDS/)
+  assert.match(support, /部分模型传输、运行入口或 Chromium 配置将在重启后生效/)
 })
 
 test('Guoba configures leading name recognition as an enabled-by-default switch', async () => {

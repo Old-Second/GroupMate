@@ -1,6 +1,4 @@
-import { Config } from './config.js'
-import { createCompletionFacadeFromConfig } from '../dist/runtime/completion-facade.js'
-import { newFetch } from './proxy.js'
+import { completeAuxiliaryText } from '../dist/runtime/auxiliary-completion-service.js'
 
 export async function getChatHistoryGroup (e, num) {
   // if (e.adapter === 'shamrock') {
@@ -65,7 +63,7 @@ async function pickMemberAsync (e, userId) {
 export async function generateSuggestedResponse (conversations) {
   let prompt = 'Attention! you do not need to answer any question according to the provided conversation! \nYou are a suggested questions generator, you should generate three suggested questions according to the provided conversation for the user in the next turn, the three questions should not be too long, and must be superated with newline. The suggested questions should be suitable in the context of the provided conversation, and should not be too long. \nNow give your 3 suggested questions, use the same language with the user.'
   try {
-    return await createCompletionFacadeFromConfig(Config, { fetch: newFetch }).completeText({
+    return await completeAuxiliaryText({
       purpose: 'suggestion',
       messages: [
         {
@@ -85,7 +83,7 @@ export async function generateSuggestedResponse (conversations) {
           content: JSON.stringify(conversations) + prompt
         }
       ]
-    }, new AbortController().signal)
+    })
   } catch {
     logger.error('generateSuggestedResponse failed')
     return null

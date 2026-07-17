@@ -18,7 +18,8 @@ test('bounded GroupMate Fastify route isolates JSON parsing TTL capacity and hea
   t.after(async () => await server.close())
   await server.register(groupMateReplyRoute, {
     now: () => now,
-    randomBytes: () => Buffer.from((++tokenIndex).toString(16).padStart(32, '0'), 'hex')
+    randomBytes: () => Buffer.from((++tokenIndex).toString(16).padStart(32, '0'), 'hex'),
+    appearance: () => ({ botName: 'REMOTE-CONFIG-MUST-NOT-BE-CACHED', toneStyle: 'precise' })
   })
   server.post('/sibling-json', async request => ({ objectBody: typeof request.body === 'object' }))
   await server.ready()
@@ -57,6 +58,7 @@ test('bounded GroupMate Fastify route isolates JSON parsing TTL capacity and hea
     "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:"
   )
   assert.match(visible.body, /安全最终正文/)
+  assert.doesNotMatch(visible.body, /REMOTE-CONFIG-MUST-NOT-BE-CACHED/)
   assert.doesNotMatch(
     visible.body,
     /"(?:actorId|requestMessageId|inputReplySnapshot|apiKey|cookie|model)"\s*:/

@@ -79,6 +79,80 @@ test('local picture rendering works with toolbox disabled and enforces 4096px', 
   assert.equal(call.closeBrowserAfterRender, true)
 })
 
+test('local picture renderer rereads safe appearance and width for every render', async () => {
+  let width = 640
+  let botName = '第一名称'
+  let toneStyle = 'Balanced'
+  const calls: Array<{ html: string, viewport: { width: number } }> = []
+  const renderer = createGroupMatePictureRenderer({
+    template,
+    remote: null,
+    live2dAssets: { resolve: () => null },
+    chatViewWidth: () => width,
+    appearance: () => ({ botName, toneStyle }),
+    browser: {
+      render: async input => {
+        calls.push(input)
+        return { kind: 'rendered', resource: png, source: 'local' }
+      }
+    }
+  })
+
+  await renderer.render(renderInput())
+  width = 960
+  botName = '第二名称'
+  toneStyle = 'Precision'
+  await renderer.render(renderInput())
+
+  assert.deepEqual(calls.map(call => call.viewport.width), [640, 960])
+  assert.match(calls[0]?.html ?? '', /"botName":"第一名称"/)
+  assert.match(calls[0]?.html ?? '', /"toneStyle":"balanced"/)
+  assert.match(calls[1]?.html ?? '', /"botName":"第二名称"/)
+  assert.match(calls[1]?.html ?? '', /"toneStyle":"precise"/)
+})
+
+test('queued local picture render settles on caller abort without entering Chromium', async () => {
+  let releaseFirst!: () => void
+  let markFirstStarted!: () => void
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
+  let browserCalls = 0
+  const renderer = createGroupMatePictureRenderer({
+    template,
+    remote: null,
+    live2dAssets: { resolve: () => null },
+    browser: {
+      render: async () => {
+        browserCalls += 1
+        if (browserCalls === 1) {
+          markFirstStarted()
+          await firstGate
+        }
+        return { kind: 'rendered', resource: png, source: 'local' }
+      }
+    }
+  })
+
+  const first = renderer.render(renderInput())
+  await firstStarted
+  const controller = new AbortController()
+  const second = renderer.render(renderInput(), controller.signal)
+  controller.abort(new DOMException('cancelled while queued', 'AbortError'))
+  const settlement = await Promise.race([
+    second.then(value => ({ kind: 'value' as const, value })),
+    new Promise<{ readonly kind: 'sentinel' }>(resolve => {
+      setTimeout(() => resolve({ kind: 'sentinel' }), 50)
+    })
+  ])
+
+  releaseFirst()
+  await first
+  const secondResult = await second
+  assert.equal(settlement.kind, 'value')
+  assert.deepEqual(secondResult, { kind: 'not_rendered', code: 'render_failed' })
+  assert.equal(browserCalls, 1)
+})
+
 test('Live2D stays local and rejects traversal outside static live2d', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'groupmate-live2d-'))
   const modelDir = path.join(root, 'safe')
@@ -640,6 +714,34 @@ test('cloud screenshot failure falls back to local browser without duplicate del
   assert.equal(result.kind, 'rendered')
   assert.equal(cloudCalls, 1)
   assert.equal(browserCalls, 1)
+})
+
+test('remote picture renderer rereads viewport width without rebuilding the graph', async () => {
+  let width = 700
+  const widths: number[] = []
+  const renderer = createRemoteGroupMatePictureRenderer({
+    page: {
+      createPage: async () => ({
+        kind: 'created', pageUrl: `https://93.184.216.34/groupmate/reply/v1/${'c'.repeat(32)}`
+      })
+    },
+    cloud: {
+      capture: async input => {
+        widths.push(input.width)
+        return { kind: 'rendered', resource: png, source: 'remote_page_cloud_browser' }
+      }
+    },
+    localBrowser: {
+      capture: async () => { throw new Error('cloud success must not fall back') }
+    },
+    chatViewWidth: () => width
+  })
+
+  await renderer.render(renderInput())
+  width = 1_100
+  await renderer.render(renderInput())
+
+  assert.deepEqual(widths, [700, 1_100])
 })
 
 test('cloud renderer never receives loopback or noncanonical remote page URLs', async () => {

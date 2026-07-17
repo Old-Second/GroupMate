@@ -1,8 +1,6 @@
 import { parseAgentMessage } from '../agent/contracts/content.js';
 import { parsePresentationRoute } from '../agent/contracts/interaction.js';
-import { resolveConversationScope } from '../agent/session/conversation-scope.js';
 import { RUN_REF_PATTERN } from '../agent/run/run-reference.js';
-import { buildModelMessageInput } from './message-input.js';
 function identifier(value, label) {
     if ((typeof value !== 'string' && typeof value !== 'number') ||
         String(value).length === 0 || String(value).length > 128) {
@@ -60,7 +58,8 @@ function frozenBudget(input) {
         maxBytes: input.maxBytes
     });
 }
-function frozenPresentationRoute(requestKind, intent, sessionAddress, actorId, requestMessageId) {
+function frozenPresentationRoute(input) {
+    const { requestKind, intent, sessionAddress, actorId, requestMessageId } = input;
     const profile = requestKind === 'ordinary_chat' ? 'ordinary' : 'proactive';
     parsePresentationRoute({
         schemaVersion: 1,
@@ -93,6 +92,117 @@ function frozenPresentationRoute(requestKind, intent, sessionAddress, actorId, r
     });
     return parsePresentationRoute(raw);
 }
+function eventSessionAddress(input) {
+    if (input.event.isGroup !== true) {
+        return Object.freeze({
+            botId: input.botId,
+            scope: Object.freeze({ kind: 'private', userId: input.actorId })
+        });
+    }
+    const groupId = identifier(input.event.group_id, 'group identity');
+    return Object.freeze({
+        botId: input.botId,
+        scope: input.groupMerge
+            ? Object.freeze({ kind: 'group', groupId })
+            : Object.freeze({
+                kind: 'group_user',
+                groupId,
+                userId: input.actorId
+            })
+    });
+}
+function assertPreparedEvidence(evidence) {
+    const required = [
+        'schemaVersion', 'prompt', 'imageUrls', 'currentMessageId', 'quotedMessageId',
+        'hasReply', 'replyResolved', 'currentSegmentCount', 'replySegmentCount', 'ocrTexts'
+    ];
+    const allowed = new Set([...required, 'quotedMessage']);
+    if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence) ||
+        Reflect.ownKeys(evidence).some(key => typeof key !== 'string' || !allowed.has(key)) ||
+        required.some(key => !Object.hasOwn(evidence, key))) {
+        throw new TypeError('prepared message evidence is invalid');
+    }
+    if (evidence.schemaVersion !== 1 || typeof evidence.prompt !== 'string' ||
+        !Array.isArray(evidence.imageUrls) ||
+        evidence.imageUrls.some(value => typeof value !== 'string') ||
+        (evidence.currentMessageId !== null && typeof evidence.currentMessageId !== 'string') ||
+        (evidence.quotedMessageId !== null && typeof evidence.quotedMessageId !== 'string') ||
+        typeof evidence.hasReply !== 'boolean' || typeof evidence.replyResolved !== 'boolean' ||
+        !Number.isSafeInteger(evidence.currentSegmentCount) || evidence.currentSegmentCount < 0 ||
+        !Number.isSafeInteger(evidence.replySegmentCount) || evidence.replySegmentCount < 0 ||
+        !Array.isArray(evidence.ocrTexts) || evidence.ocrTexts.length > 8 ||
+        evidence.ocrTexts.some(value => typeof value !== 'string' ||
+            value !== value.normalize('NFC').trim() || Array.from(value).length > 2_000)) {
+        throw new TypeError('prepared message evidence is invalid');
+    }
+    if (!Object.isFrozen(evidence) || !Object.isFrozen(evidence.imageUrls) ||
+        !Object.isFrozen(evidence.ocrTexts)) {
+        throw new TypeError('prepared message evidence must be frozen');
+    }
+    if (evidence.quotedMessage !== undefined && (!Object.isFrozen(evidence.quotedMessage) ||
+        !Object.isFrozen(evidence.quotedMessage.sender) ||
+        !Object.isFrozen(evidence.quotedMessage.parts) ||
+        evidence.quotedMessage.parts.some(part => !Object.isFrozen(part)))) {
+        throw new TypeError('prepared quoted message evidence must be frozen');
+    }
+    return evidence;
+}
+function assertRouteMatchesEvent(route, event, evidence) {
+    const rawBotId = event.self_id ?? event.bot?.uin;
+    const botId = rawBotId === undefined || rawBotId === null || String(rawBotId) === ''
+        ? route.sessionAddress.botId
+        : identifier(rawBotId, 'bot identity');
+    const actorId = identifier(event.sender?.user_id ?? event.user_id, 'actor identity');
+    if (route.sessionAddress.botId !== botId || route.actorId !== actorId) {
+        throw new TypeError('presentation route identity does not match event');
+    }
+    if (event.isGroup === true) {
+        const groupId = identifier(event.group_id, 'group identity');
+        const scope = route.sessionAddress.scope;
+        const matchesGroup = scope.kind === 'group' && scope.groupId === groupId;
+        const matchesActorGroup = scope.kind === 'group_user' &&
+            scope.groupId === groupId && scope.userId === actorId;
+        if (!matchesGroup && !matchesActorGroup) {
+            throw new TypeError('presentation route session does not match event');
+        }
+    }
+    else {
+        const scope = route.sessionAddress.scope;
+        if (scope.kind !== 'private' || scope.userId !== actorId) {
+            throw new TypeError('presentation route session does not match event');
+        }
+    }
+    const hasRequestMessageId = Object.hasOwn(route, 'requestMessageId');
+    if (hasRequestMessageId !== (evidence.currentMessageId !== null) ||
+        (hasRequestMessageId && route.requestMessageId !== evidence.currentMessageId)) {
+        throw new TypeError('presentation route message does not match evidence');
+    }
+}
+function assertFrozenPresentationRoute(route) {
+    if (!Object.isFrozen(route) || !Object.isFrozen(route.presentationIntent) ||
+        !Object.isFrozen(route.sessionAddress) || !Object.isFrozen(route.sessionAddress.scope)) {
+        throw new TypeError('prepared presentation route must be frozen');
+    }
+}
+export function prepareYunzaiPresentationRequest(input) {
+    const evidence = assertPreparedEvidence(input.evidence);
+    const botId = identifier(input.getBotId(input.event), 'bot identity');
+    const actorId = identifier(input.event.sender?.user_id ?? input.event.user_id, 'actor identity');
+    const sessionAddress = eventSessionAddress({
+        event: input.event,
+        botId,
+        actorId,
+        groupMerge: input.groupMerge === true
+    });
+    const route = frozenPresentationRoute({
+        requestKind: input.requestKind,
+        intent: input.presentationIntent,
+        sessionAddress,
+        actorId,
+        requestMessageId: evidence.currentMessageId
+    });
+    return Object.freeze({ route, evidence });
+}
 export async function adaptYunzaiRequest(input) {
     const createdAt = timestamp(input.createdAt, 'request creation timestamp');
     const deadlineAt = timestamp(input.deadlineAt, 'request deadline');
@@ -103,20 +213,15 @@ export async function adaptYunzaiRequest(input) {
     if (typeof input.requestRef !== 'string' || !RUN_REF_PATTERN.test(input.requestRef)) {
         throw new TypeError('request reference is invalid');
     }
-    const botId = identifier(input.event.self_id ?? input.event.bot?.uin, 'bot identity');
+    const messageInput = assertPreparedEvidence(input.messageEvidence);
+    const presentationRoute = parsePresentationRoute(input.presentationRoute);
+    assertFrozenPresentationRoute(presentationRoute);
+    assertRouteMatchesEvent(presentationRoute, input.event, messageInput);
+    const botId = presentationRoute.sessionAddress.botId;
     const actorId = identifier(input.event.sender?.user_id ?? input.event.user_id, 'actor identity');
     const isGroup = input.event.isGroup === true;
     const groupId = isGroup ? identifier(input.event.group_id, 'group identity') : undefined;
-    const scope = resolveConversationScope({
-        isGroup,
-        groupId,
-        userId: actorId,
-        groupMerge: input.groupMerge
-    });
-    const sessionAddress = Object.freeze({
-        botId,
-        scope: Object.freeze({ ...scope })
-    });
+    const sessionAddress = presentationRoute.sessionAddress;
     const channel = isGroup
         ? Object.freeze({ kind: 'group', botId, groupId: groupId })
         : Object.freeze({ kind: 'private', botId, userId: actorId });
@@ -127,10 +232,6 @@ export async function adaptYunzaiRequest(input) {
             ? { displayName: displayName.slice(0, 256) }
             : {}),
         role: actorRole(input.event.sender?.role)
-    });
-    const messageInput = await buildModelMessageInput({
-        event: input.event,
-        currentPrompt: input.currentPrompt
     });
     const messageId = messageInput.currentMessageId ?? requestId;
     const parts = [Object.freeze({
@@ -166,11 +267,10 @@ export async function adaptYunzaiRequest(input) {
         input.sessionTtlSeconds <= 0)) {
         throw new TypeError('session TTL is invalid');
     }
-    const presentationRoute = frozenPresentationRoute(input.requestKind, input.presentationIntent, sessionAddress, actorId, messageInput.currentMessageId);
     return Object.freeze({
         requestId,
         requestRef: input.requestRef,
-        requestKind: input.requestKind,
+        requestKind: presentationRoute.requestKind,
         presentationRoute,
         createdAt,
         deadlineAt,

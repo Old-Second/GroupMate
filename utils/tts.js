@@ -5,6 +5,7 @@ import { wrapTextByLanguage } from './common.js'
 import { getProxy } from './proxy.js'
 import { buildVitsGenerateRequest } from '../dist/runtime/vits-gradio.js'
 let proxy = getProxy()
+const MAX_VITS_RESPONSE_BYTES = 64 * 1024
 
 const newFetch = (url, options = {}) => {
   const defaultOptions = Config.proxy
@@ -19,6 +20,32 @@ const newFetch = (url, options = {}) => {
   }
 
   return fetch(url, mergedOptions)
+}
+
+async function readBoundedText (response, maximumBytes) {
+  const contentLength = response.headers?.get?.('content-length')
+  if (contentLength !== null && contentLength !== undefined) {
+    const normalized = String(contentLength).trim()
+    if (!/^(?:0|[1-9][0-9]*)$/.test(normalized) || Number(normalized) > maximumBytes) {
+      throw new Error('VITS response is too large')
+    }
+  }
+  if (response.body?.[Symbol.asyncIterator] === undefined) {
+    throw new Error('VITS response body is unavailable')
+  }
+  const chunks = []
+  let byteLength = 0
+  for await (const chunk of response.body) {
+    const bytes = Buffer.from(chunk)
+    byteLength += bytes.byteLength
+    if (byteLength > maximumBytes) {
+      response.body.destroy?.()
+      throw new Error('VITS response is too large')
+    }
+    chunks.push(bytes)
+  }
+  if (byteLength === 0) throw new Error('VITS response is empty')
+  return Buffer.concat(chunks, byteLength).toString('utf8')
 }
 
 function randomNum (minNum, maxNum) {
@@ -42,13 +69,14 @@ function randomNum (minNum, maxNum) {
  * @param lengthScale
  * @returns {Promise<string>}
  */
-export async function generateVitsAudio (text, speaker = '随机', language = '中日混合（中文用[ZH][ZH]包裹起来，日文用[JA][JA]包裹起来）', noiseScale = parseFloat(Config.noiseScale), noiseScaleW = parseFloat(Config.noiseScaleW), lengthScale = parseFloat(Config.lengthScale)) {
+export async function generateVitsAudio (text, speaker = '随机', language = '中日混合（中文用[ZH][ZH]包裹起来，日文用[JA][JA]包裹起来）', noiseScale = parseFloat(Config.noiseScale), noiseScaleW = parseFloat(Config.noiseScaleW), lengthScale = parseFloat(Config.lengthScale), signal) {
+  if (signal?.aborted === true) throw signal.reason
   if (!speaker || speaker === '随机') {
-    logger.info('随机角色！这次哪个角色这么幸运会被选到呢……')
+    logger.info('groupmate.tts.vits.voice_selected')
     speaker = speakers[randomNum(0, speakers.length)]
   }
   text = wrapTextByLanguage(text)
-  logger.info(`正在使用${speaker}，基于文本：'${text}'生成语音`)
+  logger.info('groupmate.tts.vits.synthesis_started')
   let body = {
     data: [
       text, language, speaker,
@@ -58,50 +86,48 @@ export async function generateVitsAudio (text, speaker = '随机', language = '�
   let space = Config.ttsSpace
   if (space.endsWith('/api/generate')) {
     let trimmedSpace = space.substring(0, space.length - 13)
-    logger.warn(`vits api 当前为${space}，已校正为${trimmedSpace}`)
+    logger.warn('groupmate.tts.vits.endpoint_suffix_normalized')
     space = trimmedSpace
   }
   if (space.endsWith('/')) {
     let trimmedSpace = _.trimEnd(space, '/')
-    logger.warn(`vits api 当前为${space}，已校正为${trimmedSpace}`)
+    logger.warn('groupmate.tts.vits.endpoint_slash_normalized')
     space = trimmedSpace
   }
   let url = `${space}/api/generate`
   if (Config.huggingFaceReverseProxy) {
     url = `${Config.huggingFaceReverseProxy}/api/generate?space=${_.trimStart(space, 'https://')}`
   }
-  logger.info(`正在使用接口${url}`)
   let response = await newFetch(url, {
     method: 'POST',
     body: JSON.stringify(buildVitsGenerateRequest(body.data)),
+    signal,
     headers: {
       'content-type': 'application/json'
     }
   })
-  let responseBody = await response.text()
+  let responseBody = await readBoundedText(response, MAX_VITS_RESPONSE_BYTES)
   try {
     let json = JSON.parse(responseBody)
-    if (Config.debug) {
-      logger.info(json)
-    }
     if (response.status > 299) {
-      logger.info(json)
-      throw new Error(JSON.stringify(json))
+      throw new Error('VITS request was rejected')
     }
-    let [message, audioInfo, take] = json?.data
-    logger.info(message, take)
+    let [, audioInfo] = json?.data
+    if (typeof audioInfo?.name !== 'string' || audioInfo.name === '') {
+      throw new Error('VITS response is invalid')
+    }
     let audioLink = `${space}/file=${audioInfo.name}`
     if (Config.huggingFaceReverseProxy) {
       if (Config.debug) {
-        logger.info('使用huggingface加速反代下载生成音频' + Config.huggingFaceReverseProxy)
+        logger.info('groupmate.tts.vits.reverse_proxy_enabled')
       }
       let spaceHost = _.trimStart(space, 'https://')
       audioLink = `${Config.huggingFaceReverseProxy}/file=${audioInfo.name}?space=${spaceHost}`
     }
     return audioLink
   } catch (err) {
-    logger.error('生成语音api发生错误，请检查是否配置了正确的api，且仓库是否开放为public', response.status)
-    throw new Error(responseBody)
+    logger.error('groupmate.tts.vits.synthesis_failed')
+    throw new Error('VITS synthesis failed')
   }
 }
 export function convertSpeaker (speaker) {

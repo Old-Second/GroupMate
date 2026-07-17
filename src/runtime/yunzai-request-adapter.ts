@@ -15,12 +15,11 @@ import {
   type TrustedRequestKind
 } from '../agent/contracts/interaction.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
-import { resolveConversationScope } from '../agent/session/conversation-scope.js'
 import type { RunModelConfig } from '../agent/run/run-checkpoint.js'
 import { RUN_REF_PATTERN } from '../agent/run/run-reference.js'
 import {
-  buildModelMessageInput,
-  type MessageEventLike
+  type MessageEventLike,
+  type PreparedYunzaiMessageEvidenceV1
 } from './message-input.js'
 
 export interface YunzaiRequestEvent extends MessageEventLike {
@@ -38,18 +37,21 @@ export interface YunzaiRequestEvent extends MessageEventLike {
 
 export interface AdaptYunzaiRequestInput {
   readonly event: YunzaiRequestEvent
-  readonly currentPrompt: string
-  readonly groupMerge: boolean
+  readonly messageEvidence: PreparedYunzaiMessageEvidenceV1
+  readonly presentationRoute: PresentationRouteV1
   readonly requestId: string
   readonly requestRef: string
-  readonly requestKind: TrustedRequestKind
-  readonly presentationIntent: PresentationIntentV1
   readonly createdAt: string
   readonly deadlineAt: string
   readonly systemInstructions: readonly string[]
   readonly model: RunModelConfig
   readonly contextBudget: ContextBudget
   readonly sessionTtlSeconds?: number
+}
+
+export interface YunzaiPreparedPresentationRequest {
+  readonly route: PresentationRouteV1
+  readonly evidence: PreparedYunzaiMessageEvidenceV1
 }
 
 export interface YunzaiAgentRequestDraft {
@@ -138,13 +140,14 @@ function frozenBudget (input: ContextBudget): ContextBudget {
   })
 }
 
-function frozenPresentationRoute (
-  requestKind: TrustedRequestKind,
-  intent: PresentationIntentV1,
-  sessionAddress: SessionAddress,
-  actorId: string,
-  requestMessageId: string | null
-): PresentationRouteV1 {
+function frozenPresentationRoute (input: {
+  readonly requestKind: TrustedRequestKind
+  readonly intent: PresentationIntentV1
+  readonly sessionAddress: SessionAddress
+  readonly actorId: string
+  readonly requestMessageId: string | null
+}): PresentationRouteV1 {
+  const { requestKind, intent, sessionAddress, actorId, requestMessageId } = input
   const profile = requestKind === 'ordinary_chat' ? 'ordinary' : 'proactive'
   parsePresentationRoute({
     schemaVersion: 1,
@@ -178,6 +181,147 @@ function frozenPresentationRoute (
   return parsePresentationRoute(raw)
 }
 
+function eventSessionAddress (input: {
+  readonly event: YunzaiRequestEvent
+  readonly botId: string
+  readonly actorId: string
+  readonly groupMerge: boolean
+}): SessionAddress {
+  if (input.event.isGroup !== true) {
+    return Object.freeze({
+      botId: input.botId,
+      scope: Object.freeze({ kind: 'private' as const, userId: input.actorId })
+    })
+  }
+  const groupId = identifier(input.event.group_id, 'group identity')
+  return Object.freeze({
+    botId: input.botId,
+    scope: input.groupMerge
+      ? Object.freeze({ kind: 'group' as const, groupId })
+      : Object.freeze({
+          kind: 'group_user' as const,
+          groupId,
+          userId: input.actorId
+        })
+  })
+}
+
+function assertPreparedEvidence (
+  evidence: PreparedYunzaiMessageEvidenceV1
+): PreparedYunzaiMessageEvidenceV1 {
+  const required = [
+    'schemaVersion', 'prompt', 'imageUrls', 'currentMessageId', 'quotedMessageId',
+    'hasReply', 'replyResolved', 'currentSegmentCount', 'replySegmentCount', 'ocrTexts'
+  ]
+  const allowed = new Set([...required, 'quotedMessage'])
+  if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence) ||
+    Reflect.ownKeys(evidence).some(key => typeof key !== 'string' || !allowed.has(key)) ||
+    required.some(key => !Object.hasOwn(evidence, key))) {
+    throw new TypeError('prepared message evidence is invalid')
+  }
+  if (evidence.schemaVersion !== 1 || typeof evidence.prompt !== 'string' ||
+    !Array.isArray(evidence.imageUrls) ||
+    evidence.imageUrls.some(value => typeof value !== 'string') ||
+    (evidence.currentMessageId !== null && typeof evidence.currentMessageId !== 'string') ||
+    (evidence.quotedMessageId !== null && typeof evidence.quotedMessageId !== 'string') ||
+    typeof evidence.hasReply !== 'boolean' || typeof evidence.replyResolved !== 'boolean' ||
+    !Number.isSafeInteger(evidence.currentSegmentCount) || evidence.currentSegmentCount < 0 ||
+    !Number.isSafeInteger(evidence.replySegmentCount) || evidence.replySegmentCount < 0 ||
+    !Array.isArray(evidence.ocrTexts) || evidence.ocrTexts.length > 8 ||
+    evidence.ocrTexts.some(value => typeof value !== 'string' ||
+      value !== value.normalize('NFC').trim() || Array.from(value).length > 2_000)) {
+    throw new TypeError('prepared message evidence is invalid')
+  }
+  if (!Object.isFrozen(evidence) || !Object.isFrozen(evidence.imageUrls) ||
+    !Object.isFrozen(evidence.ocrTexts)) {
+    throw new TypeError('prepared message evidence must be frozen')
+  }
+  if (evidence.quotedMessage !== undefined && (
+    !Object.isFrozen(evidence.quotedMessage) ||
+    !Object.isFrozen(evidence.quotedMessage.sender) ||
+    !Object.isFrozen(evidence.quotedMessage.parts) ||
+    evidence.quotedMessage.parts.some(part => !Object.isFrozen(part))
+  )) {
+    throw new TypeError('prepared quoted message evidence must be frozen')
+  }
+  return evidence
+}
+
+function assertRouteMatchesEvent (
+  route: PresentationRouteV1,
+  event: YunzaiRequestEvent,
+  evidence: PreparedYunzaiMessageEvidenceV1
+): void {
+  const rawBotId = event.self_id ?? event.bot?.uin
+  const botId = rawBotId === undefined || rawBotId === null || String(rawBotId) === ''
+    ? route.sessionAddress.botId
+    : identifier(rawBotId, 'bot identity')
+  const actorId = identifier(
+    event.sender?.user_id ?? event.user_id,
+    'actor identity'
+  )
+  if (route.sessionAddress.botId !== botId || route.actorId !== actorId) {
+    throw new TypeError('presentation route identity does not match event')
+  }
+  if (event.isGroup === true) {
+    const groupId = identifier(event.group_id, 'group identity')
+    const scope = route.sessionAddress.scope
+    const matchesGroup = scope.kind === 'group' && scope.groupId === groupId
+    const matchesActorGroup = scope.kind === 'group_user' &&
+      scope.groupId === groupId && scope.userId === actorId
+    if (!matchesGroup && !matchesActorGroup) {
+      throw new TypeError('presentation route session does not match event')
+    }
+  } else {
+    const scope = route.sessionAddress.scope
+    if (scope.kind !== 'private' || scope.userId !== actorId) {
+      throw new TypeError('presentation route session does not match event')
+    }
+  }
+  const hasRequestMessageId = Object.hasOwn(route, 'requestMessageId')
+  if (hasRequestMessageId !== (evidence.currentMessageId !== null) ||
+    (hasRequestMessageId && route.requestMessageId !== evidence.currentMessageId)) {
+    throw new TypeError('presentation route message does not match evidence')
+  }
+}
+
+function assertFrozenPresentationRoute (route: PresentationRouteV1): void {
+  if (!Object.isFrozen(route) || !Object.isFrozen(route.presentationIntent) ||
+    !Object.isFrozen(route.sessionAddress) || !Object.isFrozen(route.sessionAddress.scope)) {
+    throw new TypeError('prepared presentation route must be frozen')
+  }
+}
+
+export function prepareYunzaiPresentationRequest (input: {
+  readonly event: YunzaiRequestEvent
+  readonly evidence: PreparedYunzaiMessageEvidenceV1
+  readonly requestKind: TrustedRequestKind
+  readonly presentationIntent: PresentationIntentV1
+  readonly getBotId: (event: YunzaiRequestEvent) => string
+  readonly groupMerge?: boolean
+}): YunzaiPreparedPresentationRequest {
+  const evidence = assertPreparedEvidence(input.evidence)
+  const botId = identifier(input.getBotId(input.event), 'bot identity')
+  const actorId = identifier(
+    input.event.sender?.user_id ?? input.event.user_id,
+    'actor identity'
+  )
+  const sessionAddress = eventSessionAddress({
+    event: input.event,
+    botId,
+    actorId,
+    groupMerge: input.groupMerge === true
+  })
+  const route = frozenPresentationRoute({
+    requestKind: input.requestKind,
+    intent: input.presentationIntent,
+    sessionAddress,
+    actorId,
+    requestMessageId: evidence.currentMessageId
+  })
+  return Object.freeze({ route, evidence })
+}
+
 export async function adaptYunzaiRequest (
   input: AdaptYunzaiRequestInput
 ): Promise<YunzaiAgentRequestDraft> {
@@ -190,23 +334,18 @@ export async function adaptYunzaiRequest (
   if (typeof input.requestRef !== 'string' || !RUN_REF_PATTERN.test(input.requestRef)) {
     throw new TypeError('request reference is invalid')
   }
-  const botId = identifier(input.event.self_id ?? input.event.bot?.uin, 'bot identity')
+  const messageInput = assertPreparedEvidence(input.messageEvidence)
+  const presentationRoute = parsePresentationRoute(input.presentationRoute)
+  assertFrozenPresentationRoute(presentationRoute)
+  assertRouteMatchesEvent(presentationRoute, input.event, messageInput)
+  const botId = presentationRoute.sessionAddress.botId
   const actorId = identifier(
     input.event.sender?.user_id ?? input.event.user_id,
     'actor identity'
   )
   const isGroup = input.event.isGroup === true
   const groupId = isGroup ? identifier(input.event.group_id, 'group identity') : undefined
-  const scope = resolveConversationScope({
-    isGroup,
-    groupId,
-    userId: actorId,
-    groupMerge: input.groupMerge
-  })
-  const sessionAddress: SessionAddress = Object.freeze({
-    botId,
-    scope: Object.freeze({ ...scope })
-  })
+  const sessionAddress = presentationRoute.sessionAddress
   const channel: ChannelIdentity = isGroup
     ? Object.freeze({ kind: 'group', botId, groupId: groupId as string })
     : Object.freeze({ kind: 'private', botId, userId: actorId })
@@ -217,10 +356,6 @@ export async function adaptYunzaiRequest (
       ? { displayName: displayName.slice(0, 256) }
       : {}),
     role: actorRole(input.event.sender?.role)
-  })
-  const messageInput = await buildModelMessageInput({
-    event: input.event,
-    currentPrompt: input.currentPrompt
   })
   const messageId = messageInput.currentMessageId ?? requestId
   const parts: AgentContentPart[] = [Object.freeze({
@@ -258,17 +393,10 @@ export async function adaptYunzaiRequest (
     input.sessionTtlSeconds <= 0)) {
     throw new TypeError('session TTL is invalid')
   }
-  const presentationRoute = frozenPresentationRoute(
-    input.requestKind,
-    input.presentationIntent,
-    sessionAddress,
-    actorId,
-    messageInput.currentMessageId
-  )
   return Object.freeze({
     requestId,
     requestRef: input.requestRef,
-    requestKind: input.requestKind,
+    requestKind: presentationRoute.requestKind,
     presentationRoute,
     createdAt,
     deadlineAt,

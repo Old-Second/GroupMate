@@ -6,21 +6,14 @@ import {
 import type {
   PresentationRouteV1,
   RecoveredLegacyPresentationRoute,
-  PresentationIntentV1,
   TrustedRequestKind
 } from '../agent/contracts/interaction.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
 import type { ContextItem } from '../agent/context/context-item.js'
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'
-import type {
-  ModelAdapter,
-  ModelRequest,
-  ModelTurn
-} from '../agent/model/model-adapter.js'
+import type { ModelAdapter } from '../agent/model/model-adapter.js'
 import { ModelProviderError } from '../agent/model/model-adapter.js'
-import { OpenAICompatibleAdapter } from '../agent/model/openai-compatible-adapter.js'
-import type { OpenAIFetch } from '../agent/model/openai-wire.js'
 import type { ApprovalInterruption } from '../agent/run/interruption.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../agent/run/run-budget.js'
@@ -54,12 +47,11 @@ import { createAgentRunLog } from './safe-chat-logging.js'
 import { TerminalFactCollector } from './terminal-fact-collector.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js'
 import {
-  APPROVAL_RECOVERY_DEFERRED_MESSAGE,
   RedisApprovalReferenceIndex,
   RunApprovalRouter,
   projectYunzaiApprovalReply,
-  type ApprovalReference,
-  type ApprovalRouteOutcome,
+  type ApprovalReplyProjection,
+  type ApprovalRouteResultHandler,
   type YunzaiApprovalReplyEvent
 } from './run-approval-router.js'
 import {
@@ -83,11 +75,6 @@ import {
   type PresentationSettingsPort,
   type PresentationSettingsSource
 } from './presentation/presentation-settings.js'
-import { ReplyPresenter } from './presentation/reply-presenter.js'
-import {
-  TTS_SYNTHESIS_DIAGNOSTIC_EVENT,
-  type TtsPresentationDiagnosticPort
-} from './presentation/tts-reply-presentation.js'
 import {
   createYunzaiOutboundPortFactory,
   deliverWithDefiniteRetry,
@@ -99,11 +86,10 @@ import {
 import { plainTextPart } from './presentation/text-presentation.js'
 import {
   PLAIN_TEXT_PRESENTATION_HOOKS,
-  UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
-  UNAVAILABLE_TTS_REPLY_PORT,
   type PresentationInput
 } from './runtime-presentation-hooks.js'
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js'
+import type { RunPresentationLifecycle } from './run-presentation-lifecycle.js'
 import type { RedisToolClient } from './tools/redis-tool-client.js'
 import {
   createYunzaiToolRuntimeBridge,
@@ -116,6 +102,7 @@ import {
   type YunzaiAgentRequestDraft,
   type YunzaiRequestEvent
 } from './yunzai-request-adapter.js'
+import type { PreparedYunzaiMessageEvidenceV1 } from './message-input.js'
 
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.'
 const RUN_DEADLINE_MS = 240_000
@@ -148,7 +135,6 @@ export interface YunzaiAgentServiceBridgeOptions extends Omit<
 > {
   readonly config: RuntimeConfig
   readonly redis: ProductionRedisClient
-  readonly fetch?: OpenAIFetch
   readonly loadGroupHistory?: (
     event: YunzaiMessageEvent,
     limit: number
@@ -163,6 +149,7 @@ export interface YunzaiAgentServiceBridgeOptions extends Omit<
   readonly createRequestRef?: () => string
   readonly monotonicNow?: () => number | 'unavailable'
   readonly botPicker?: YunzaiBotPicker
+  readonly presentationRuntime?: YunzaiBridgePresentationRuntime
 }
 
 export interface YunzaiAgentHandleOptions {
@@ -172,7 +159,21 @@ export interface YunzaiAgentHandleOptions {
   readonly reasoningEffort?: unknown
   readonly progress?: ProgressDelivery
   readonly sessionTtlSeconds?: number
-  readonly presentationIntent: PresentationIntentV1
+  readonly presentationRoute: PresentationRouteV1
+  readonly presentationLifecycle?: RunPresentationLifecycle
+}
+
+export interface YunzaiAgentServiceBridgeDependencies {
+  readonly progressPresenter: RunProgressPresenter
+  readonly modelAdapter: ModelAdapter
+}
+
+export interface YunzaiBridgePresentationRuntime {
+  readonly outboundFactory: YunzaiOutboundPortFactory
+  readonly settings: PresentationSettingsPort
+  readonly pendingConfig: PendingIndicatorConfigPort
+  readonly pendingIndicator: PendingIndicatorPresenter
+  readonly onApprovalOutcome: ApprovalRouteResultHandler
 }
 
 type ShutdownSignal = 'SIGINT' | 'SIGTERM'
@@ -467,39 +468,6 @@ export function createApprovalOutboundPortFactory (input: {
   return createYunzaiOutboundPortFactory(host)
 }
 
-class ApprovalRoutePresenter {
-  readonly #settings: PresentationSettingsPort
-  readonly #presenter: ReplyPresenter
-
-  constructor (input: {
-    readonly settings: PresentationSettingsPort
-    readonly outboundFactory: YunzaiOutboundPortFactory
-    readonly ttsDiagnostics: TtsPresentationDiagnosticPort
-  }) {
-    this.#settings = input.settings
-    this.#presenter = new ReplyPresenter({
-      outboundFactory: input.outboundFactory,
-      tts: UNAVAILABLE_TTS_REPLY_PORT,
-      ttsDiagnostics: input.ttsDiagnostics,
-      pictureRenderer: UNAVAILABLE_GROUPMATE_PICTURE_RENDERER,
-      random: Math.random,
-      sleep: async milliseconds => await new Promise(resolve => setTimeout(resolve, milliseconds)),
-      schedule: (callback, milliseconds) => setTimeout(callback, milliseconds)
-    })
-  }
-
-  async present (
-    context: ActivePresentationContext,
-    result: FinalChatReplyEnvelope
-  ): Promise<void> {
-    await this.#presenter.present(await buildApprovalPresentationInput({
-      context,
-      result,
-      settings: this.#settings
-    }))
-  }
-}
-
 function configNumber (
   config: RuntimeConfig,
   key: string,
@@ -610,29 +578,6 @@ function providerConfigurationError (reason: string): ModelProviderError {
     retryable: false,
     userMessage: 'AI 服务配置不完整，请联系机器人主人。',
     details: { reason }
-  })
-}
-
-function dynamicAdapter (
-  options: YunzaiAgentServiceBridgeOptions,
-  profileId: string
-): ModelAdapter {
-  return Object.freeze({
-    complete: async (request: ModelRequest, signal: AbortSignal): Promise<ModelTurn> => {
-      const selected = compatibilityConfig(options.config)
-      if (selected.configuredProfile !== profileId) {
-        throw providerConfigurationError('compatibility_profile_changed')
-      }
-      const endpoint = configText(options.config, 'openAiBaseUrl')
-      const apiKey = configText(options.config, 'apiKey')
-      if (endpoint === '' || apiKey === '') throw providerConfigurationError('endpoint_or_key_missing')
-      return await new OpenAICompatibleAdapter({
-        endpoint,
-        apiKey,
-        profile: selected.profile,
-        ...(options.fetch === undefined ? {} : { fetch: options.fetch })
-      }).complete(request, signal)
-    }
   })
 }
 
@@ -917,7 +862,7 @@ export class YunzaiAgentServiceBridge {
   readonly #prepared: Map<string, PreparedRuntime>
   readonly #approvalTimers = new Map<string, ReturnType<typeof setTimeout>>()
   readonly #outboundFactory: YunzaiOutboundPortFactory
-  readonly #approvalPresenter: ApprovalRoutePresenter
+  readonly #onApprovalOutcome: ApprovalRouteResultHandler
   readonly #rememberBot: (event: YunzaiMessageEvent) => void
   readonly #now: () => Date
   readonly #generateId: () => string
@@ -931,7 +876,7 @@ export class YunzaiAgentServiceBridge {
     toolRuntime: ReturnType<typeof createYunzaiToolRuntimeBridge>
     prepared: Map<string, PreparedRuntime>
     outboundFactory: YunzaiOutboundPortFactory
-    approvalPresenter: ApprovalRoutePresenter
+    onApprovalOutcome: ApprovalRouteResultHandler
     rememberBot: (event: YunzaiMessageEvent) => void
   }>) {
     this.#options = input.options
@@ -940,7 +885,7 @@ export class YunzaiAgentServiceBridge {
     this.#toolRuntime = input.toolRuntime
     this.#prepared = input.prepared
     this.#outboundFactory = input.outboundFactory
-    this.#approvalPresenter = input.approvalPresenter
+    this.#onApprovalOutcome = input.onApprovalOutcome
     this.#rememberBot = input.rememberBot
     this.#now = input.options.now ?? (() => new Date())
     this.#generateId = input.options.generateId ?? randomUUID
@@ -950,6 +895,36 @@ export class YunzaiAgentServiceBridge {
 
   get conversations (): ConversationSessionPort {
     return this.#bridge.conversations
+  }
+
+  get approvalRouter (): RunApprovalRouter {
+    return this.#router
+  }
+
+  async projectApprovalReply (
+    event: YunzaiMessageEvent
+  ): Promise<ApprovalReplyProjection | null> {
+    const masters = await this.#options.getMasterIds()
+    return await projectYunzaiApprovalReply(event, {
+      botId: this.#options.getBotId(event),
+      masterIds: masters,
+      now: this.#now
+    })
+  }
+
+  async consumeApprovalReply (
+    projection: ApprovalReplyProjection,
+    onResult: ApprovalRouteResultHandler = this.#onApprovalOutcome
+  ): Promise<boolean> {
+    return await this.#router.route(
+      projection,
+      async (result, reference, context) => {
+        if (result.kind !== 'approval_deferred') {
+          this.#clearApprovalTimer(reference.runId)
+        }
+        await onResult(result, reference, context)
+      }
+    )
   }
 
   shutdown (reason = 'process_shutdown'): Promise<number> {
@@ -962,38 +937,25 @@ export class YunzaiAgentServiceBridge {
 
   async handle (
     event: YunzaiMessageEvent,
-    prompt: string,
+    messageEvidence: PreparedYunzaiMessageEvidenceV1,
     options: YunzaiAgentHandleOptions
   ): Promise<ChatReplyEnvelope> {
     this.#rememberBot(event)
-    return await this.#execute(event, prompt, options, 'ordinary_chat')
+    return await this.#execute(event, messageEvidence, options, 'ordinary_chat')
   }
 
   async handleEphemeral (
     event: YunzaiMessageEvent,
-    prompt: string,
+    messageEvidence: PreparedYunzaiMessageEvidenceV1,
     options: YunzaiAgentHandleOptions
   ): Promise<ChatReplyEnvelope> {
     this.#rememberBot(event)
-    return await this.#execute(event, prompt, options, 'proactive_chat')
-  }
-
-  async routeApprovalReply (event: YunzaiMessageEvent): Promise<boolean> {
-    const masters = await this.#options.getMasterIds()
-    const projection = await projectYunzaiApprovalReply(event, {
-      botId: this.#options.getBotId(event),
-      masterIds: masters,
-      now: this.#now
-    })
-    if (projection === null) return false
-    return await this.#router.route(projection, async (result, reference, context) => {
-      await this.#handleApprovalOutcome(result, reference, context)
-    })
+    return await this.#execute(event, messageEvidence, options, 'proactive_chat')
   }
 
   async #execute (
     event: YunzaiMessageEvent,
-    prompt: string,
+    messageEvidence: PreparedYunzaiMessageEvidenceV1,
     options: YunzaiAgentHandleOptions,
     requestKind: TrustedRequestKind
   ): Promise<ChatReplyEnvelope> {
@@ -1006,14 +968,25 @@ export class YunzaiAgentServiceBridge {
     const requestId = this.#generateId()
     let request: YunzaiAgentRequestDraft
     try {
-      if (typeof prompt !== 'string' || prompt.trim() === '') {
+      if (messageEvidence === null || typeof messageEvidence !== 'object' ||
+        typeof messageEvidence.prompt !== 'string' || messageEvidence.prompt.trim() === '') {
         throw new AgentError({
           code: 'invalid_request', stage: 'agent.bridge.input', retryable: false,
           userMessage: '请求内容为空。'
         })
       }
       const createdAt = this.#now().toISOString()
-      const toolRun = await this.#toolRuntime.prepareAgentRun({ event, prompt })
+      if (options.presentationRoute.requestKind !== requestKind) {
+        throw new AgentError({
+          code: 'invalid_request', stage: 'agent.bridge.route', retryable: false,
+          userMessage: '请求格式不正确，请联系机器人主人'
+        })
+      }
+      const toolRun = await this.#toolRuntime.prepareAgentRun({
+        event,
+        prompt: messageEvidence.prompt,
+        messageEvidence
+      })
       const groupContext = await loadGroupContext(
         this.#options,
         event,
@@ -1024,12 +997,10 @@ export class YunzaiAgentServiceBridge {
       const requestModel = modelConfig(this.#options.config, options)
       request = await adaptYunzaiRequest({
         event,
-        currentPrompt: `${prompt}${toolRun.promptAddition}`,
-        groupMerge: configBoolean(this.#options.config, 'groupMerge', false),
+        messageEvidence,
+        presentationRoute: options.presentationRoute,
         requestId,
         requestRef,
-        requestKind,
-        presentationIntent: options.presentationIntent,
         createdAt,
         deadlineAt: new Date(new Date(createdAt).getTime() + RUN_DEADLINE_MS).toISOString(),
         systemInstructions: requestSystemInstructions(this.#options.config, options, toolRun),
@@ -1050,10 +1021,20 @@ export class YunzaiAgentServiceBridge {
     }
     try {
       const result = requestKind === 'proactive_chat'
-        ? await this.#bridge.handleEphemeral(request, { requestObservationContext })
-        : await this.#bridge.handle(request, { requestObservationContext })
+        ? await this.#bridge.handleEphemeral(request, {
+            requestObservationContext,
+            ...(options.presentationLifecycle === undefined
+              ? {}
+              : { presentationLifecycle: options.presentationLifecycle })
+          })
+        : await this.#bridge.handle(request, {
+            requestObservationContext,
+            ...(options.presentationLifecycle === undefined
+              ? {}
+              : { presentationLifecycle: options.presentationLifecycle })
+          })
       if (result.kind === 'paused') {
-        return await this.#displayApprovalOrCancel(result)
+        return await this.displayApprovalOrCancel(result)
       }
       return result
     } finally {
@@ -1061,7 +1042,7 @@ export class YunzaiAgentServiceBridge {
     }
   }
 
-  async #displayApprovalOrCancel (
+  async displayApprovalOrCancel (
     result: Extract<ChatReplyEnvelope, { readonly kind: 'paused' }>
   ): Promise<ChatReplyEnvelope> {
     try {
@@ -1111,11 +1092,12 @@ export class YunzaiAgentServiceBridge {
         displayed.approvalAddress,
         messageId,
         this.#now().toISOString(),
-        async (result, reference, context) => await this.#handleApprovalOutcome(
-          result,
-          reference,
-          context
-        )
+        async (result, reference, context) => {
+          if (result.kind !== 'approval_deferred') {
+            this.#clearApprovalTimer(reference.runId)
+          }
+          await this.#onApprovalOutcome(result, reference, context)
+        }
       ).catch(() => undefined)
     }, ttlSeconds * 1_000)
     timer.unref?.()
@@ -1128,39 +1110,7 @@ export class YunzaiAgentServiceBridge {
     this.#approvalTimers.delete(runId)
   }
 
-  async #handleApprovalOutcome (
-    result: ApprovalRouteOutcome,
-    reference: ApprovalReference,
-    context: ActivePresentationContext
-  ): Promise<void> {
-    if (result.kind === 'approval_deferred') {
-      try {
-        const outbound = await this.#outboundFactory.forTarget(reference.approvalAddress)
-        await deliverWithDefiniteRetry(
-          outbound,
-          plainTextPart(APPROVAL_RECOVERY_DEFERRED_MESSAGE)
-        )
-      } catch {}
-      return
-    }
-    this.#clearApprovalTimer(reference.runId)
-    try {
-      if (result.kind === 'paused') {
-        const displayed = await this.#displayApprovalOrCancel(result)
-        if (displayed.kind !== 'paused') {
-          await this.#approvalPresenter.present(context, displayed)
-        }
-        return
-      }
-      await this.#approvalPresenter.present(context, result)
-    } catch {
-      this.#options.logger?.warn?.('运行结果发送失败，请检查原始会话是否可用。')
-    }
-  }
 }
-
-let processSingleton: AgentServiceBridge | undefined
-let yunzaiProcessSingleton: YunzaiAgentServiceBridge | undefined
 
 const shutdownProcessPort: ShutdownProcessPort = Object.freeze({
   pid: process.pid,
@@ -1237,15 +1187,6 @@ export function bindYunzaiShutdownSignals (
   }
 }
 
-export function getAgentServiceBridge (
-  createService: () => AgentService
-): AgentServiceBridge {
-  if (processSingleton === undefined) {
-    processSingleton = new AgentServiceBridge(createService())
-  }
-  return processSingleton
-}
-
 function createBotAccess (options: YunzaiAgentServiceBridgeOptions): Readonly<{
   picker: YunzaiBotPicker
   remember(event: YunzaiMessageEvent): void
@@ -1292,37 +1233,38 @@ function createBotAccess (options: YunzaiAgentServiceBridgeOptions): Readonly<{
 }
 
 export function createYunzaiAgentServiceBridge (
-  options: YunzaiAgentServiceBridgeOptions
+  options: YunzaiAgentServiceBridgeOptions,
+  dependencies: YunzaiAgentServiceBridgeDependencies
 ): YunzaiAgentServiceBridge {
   const selected = compatibilityConfig(options.config)
   const now = options.now ?? (() => new Date())
   const generateId = options.generateId ?? randomUUID
   const prepared = new Map<string, PreparedRuntime>()
   const botAccess = createBotAccess(options)
-  const outboundFactory = createApprovalOutboundPortFactory({
-    botPicker: botAccess.picker,
-    segment: options.segment
+  const fallbackPresentation = (): Omit<
+  YunzaiBridgePresentationRuntime,
+  'onApprovalOutcome'
+  > => {
+    const outboundFactory = createApprovalOutboundPortFactory({
+      botPicker: botAccess.picker,
+      segment: options.segment
+    })
+    return Object.freeze({
+      outboundFactory,
+      settings: createPresentationSettingsPort(presentationSettingsSource(options)),
+      pendingConfig: createPendingIndicatorConfigPort(options.redis),
+      pendingIndicator: new PendingIndicatorPresenter({
+        onDeliveryFailure: failure => options.logger?.warn?.(
+          `运行提示发送失败：${failure.resultCode}`
+        )
+      })
+    })
+  }
+  const presentation = options.presentationRuntime ?? Object.freeze({
+    ...fallbackPresentation(),
+    onApprovalOutcome: async () => undefined
   })
-  const ttsDiagnostics: TtsPresentationDiagnosticPort = Object.freeze({
-    reportSynthesisFailure: (
-      code: Parameters<TtsPresentationDiagnosticPort['reportSynthesisFailure']>[0]
-    ) => options.logger?.error?.(Object.freeze({
-      event: TTS_SYNTHESIS_DIAGNOSTIC_EVENT,
-      code
-    }))
-  })
-  const settings = createPresentationSettingsPort(presentationSettingsSource(options))
-  const pendingConfig: PendingIndicatorConfigPort = createPendingIndicatorConfigPort(options.redis)
-  const pendingIndicator = new PendingIndicatorPresenter({
-    onDeliveryFailure: failure => options.logger?.warn?.(
-      `运行提示发送失败：${failure.resultCode}`
-    )
-  })
-  const approvalPresenter = new ApprovalRoutePresenter({
-    settings,
-    outboundFactory,
-    ttsDiagnostics
-  })
+  const { outboundFactory, settings, pendingConfig, pendingIndicator } = presentation
   const toolRuntime = createYunzaiToolRuntimeBridge({
     ...options,
     config: options.config,
@@ -1335,12 +1277,7 @@ export function createYunzaiAgentServiceBridge (
     now,
     generateId
   })
-  const progressPresenter = new RunProgressPresenter({
-    onDeliveryFailure: failure => options.logger?.warn?.(
-      `运行进度发送失败：${failure.eventType}`
-    )
-  })
-  const adapter = dynamicAdapter(options, selected.configuredProfile)
+  const progressPresenter = dependencies.progressPresenter
   const scheduler = new ToolScheduler({
     runtime: toolRuntime.runtime,
     maxPerRunConcurrency: 2,
@@ -1370,7 +1307,7 @@ export function createYunzaiAgentServiceBridge (
     }),
     progressPresenter,
     createEngine: observer => new RunEngine({
-      adapter,
+      adapter: dependencies.modelAdapter,
       profile: selected.profile,
       scheduler,
       store: runStore,
@@ -1459,24 +1396,7 @@ export function createYunzaiAgentServiceBridge (
     toolRuntime,
     prepared,
     outboundFactory,
-    approvalPresenter,
+    onApprovalOutcome: presentation.onApprovalOutcome,
     rememberBot: botAccess.remember
   })
-}
-
-export function getYunzaiAgentServiceBridge (
-  options: YunzaiAgentServiceBridgeOptions
-): YunzaiAgentServiceBridge {
-  if (yunzaiProcessSingleton === undefined) {
-    yunzaiProcessSingleton = createYunzaiAgentServiceBridge(options)
-    bindYunzaiShutdownSignals(yunzaiProcessSingleton)
-  }
-  return yunzaiProcessSingleton
-}
-
-export async function routeYunzaiApprovalReply (
-  event: YunzaiMessageEvent
-): Promise<boolean> {
-  if (yunzaiProcessSingleton === undefined) return false
-  return await yunzaiProcessSingleton.routeApprovalReply(event)
 }

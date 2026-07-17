@@ -57,3 +57,11 @@ test('rejects empty and non-text input before an agent run', () => {
     explicitlyAddressed: false
   })
 })
+
+test('keeps the original prompt intact for the controller-owned request preparation', () => {
+  const prompt = ' 你好，GroupMate，请看这段原文。 '
+  assert.deepEqual(decide({ message: prompt }), {
+    prompt,
+    explicitlyAddressed: true
+  })
+})

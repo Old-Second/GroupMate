@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
+import { parseRunAdvanceResult } from '../agent/contracts/result.js';
 import { recoveredLegacyRoute } from '../agent/contracts/interaction.js';
 import { RunAdmissionRejectionError } from '../agent/run/run-admission.js';
 import { RunReferenceConflictError } from '../agent/run/run-store.js';
@@ -9,6 +10,81 @@ import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
 import { progressResumeStateFromEvents } from './run-progress-presenter.js';
 import { activateRequestObservation, beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
+export function projectRunAdvanceResult(envelope) {
+    if (envelope.kind === 'completed') {
+        return parseRunAdvanceResult(Object.freeze({
+            kind: envelope.kind,
+            runId: envelope.runId,
+            runRef: envelope.runRef,
+            completion: envelope.completion,
+            output: envelope.output,
+            terminal: envelope.terminal
+        }));
+    }
+    if (envelope.kind === 'paused') {
+        return parseRunAdvanceResult(Object.freeze({
+            kind: envelope.kind,
+            runId: envelope.runId,
+            runRef: envelope.runRef,
+            interruption: envelope.interruption
+        }));
+    }
+    if (envelope.kind === 'failed') {
+        return parseRunAdvanceResult(Object.freeze({
+            kind: envelope.kind,
+            runId: envelope.runId,
+            runRef: envelope.runRef,
+            error: envelope.error,
+            terminal: envelope.terminal
+        }));
+    }
+    return parseRunAdvanceResult(Object.freeze({
+        kind: envelope.kind,
+        runId: envelope.runId,
+        runRef: envelope.runRef,
+        reason: envelope.reason,
+        terminal: envelope.terminal
+    }));
+}
+export function projectFinalPresentation(envelope) {
+    const result = projectRunAdvanceResult(envelope);
+    if (result.kind === 'paused') {
+        throw new TypeError('final presentation cannot project a paused run');
+    }
+    const draft = envelope.requestObservationDraft;
+    if (draft === null || typeof draft !== 'object') {
+        throw new TypeError('final presentation request observation draft is invalid');
+    }
+    if (draft.runRef !== result.runRef) {
+        throw new TypeError('final presentation run reference does not match');
+    }
+    const terminalObservationId = result.terminal?.snapshot.observationId;
+    if (terminalObservationId !== undefined &&
+        draft.terminalObservationId !== terminalObservationId) {
+        throw new TypeError('final presentation terminal observation does not match');
+    }
+    if (terminalObservationId === undefined &&
+        draft.terminalObservationId !== 'unavailable' &&
+        draft.terminalObservationId !== 'not_attempted') {
+        throw new TypeError('final presentation terminal observation is unavailable');
+    }
+    const persistence = envelope.sessionPersistence;
+    const completedOrdinary = result.kind === 'completed' &&
+        draft.requestKind === 'ordinary_chat';
+    const validPersistence = persistence === 'saved'
+        ? completedOrdinary && draft.outcome === 'completed' &&
+            draft.sessionSaveDurationMs !== 'not_attempted'
+        : persistence === 'failed'
+            ? completedOrdinary && draft.outcome === 'failed_session_save'
+            : persistence === 'not_attempted'
+                ? draft.outcome !== 'failed_session_save' &&
+                    draft.sessionSaveDurationMs === 'not_attempted'
+                : false;
+    if (!validPersistence) {
+        throw new TypeError('final presentation session persistence is invalid');
+    }
+    return Object.freeze({ result, sessionPersistence: persistence });
+}
 function isApprovalRecoveryDeferred(value) {
     return 'kind' in value && value.kind === 'approval_deferred';
 }
@@ -382,20 +458,8 @@ function freshSession(request, sessionId, timestamp) {
     });
 }
 function finalEnvelope(result, requestObservationDraft, sessionPersistence) {
-    if (result.kind !== 'completed') {
-        return Object.freeze({
-            ...result,
-            requestObservationDraft,
-            sessionPersistence
-        });
-    }
-    const text = result.completion.kind === 'reply_text'
-        ? result.completion.text
-        : null;
     return Object.freeze({
         ...result,
-        visibleOutput: result.completion.kind === 'already_visible',
-        text,
         requestObservationDraft,
         sessionPersistence
     });
@@ -721,7 +785,8 @@ export class AgentService {
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
             let binding = this.#bindingFor(runId, request, session, runtime);
-            const presentationLifecycle = await this.#lifecycleFor(request.presentationRoute, runtime.progress);
+            const presentationLifecycle = options.presentationLifecycle ??
+                await this.#lifecycleFor(request.presentationRoute, runtime.progress);
             let presentationStarted = false;
             let result;
             try {

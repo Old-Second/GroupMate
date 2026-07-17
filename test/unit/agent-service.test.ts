@@ -44,9 +44,19 @@ import type {
 import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
 import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
-import { AgentService } from '../../src/runtime/agent-service.js'
-import { getAgentServiceBridge } from '../../src/runtime/agent-service-bridge.js'
+import {
+  AgentService,
+  projectFinalPresentation,
+  projectRunAdvanceResult,
+  type FinalChatReplyEnvelope
+} from '../../src/runtime/agent-service.js'
+import { AgentServiceBridge } from '../../src/runtime/agent-service-bridge.js'
 import { RunProgressPresenter } from '../../src/runtime/run-progress-presenter.js'
+import {
+  activateRequestObservation,
+  beginRequestObservation,
+  createRequestObservationDraft
+} from '../../src/runtime/request-observation.js'
 import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
@@ -599,10 +609,233 @@ test('terminal session-save failure preserves every completed disposition and co
       outcome.requestObservationDraft.terminalObservationId,
       original.terminal.snapshot.observationId
     )
-    assert.equal(outcome.text, completion.kind === 'reply_text' ? completion.text : null)
-    assert.equal(outcome.visibleOutput, completion.kind === 'already_visible')
+    assert.equal(Object.hasOwn(outcome, 'text'), false)
+    assert.equal(Object.hasOwn(outcome, 'visibleOutput'), false)
     assert.deepEqual(observed, ['snapshot', 'receipt', 'session_save'])
   }
+})
+
+test('chat reply envelope projects exact RunAdvanceResult without text or visibleOutput', () => {
+  const runRef = '7'.repeat(32)
+  const result = completedResult(
+    'projection-completed',
+    runRef,
+    Object.freeze({ kind: 'reply_text', text: '投影正文' })
+  )
+  const context = activateRequestObservation({
+    context: beginRequestObservation({
+      requestRef: '6'.repeat(32),
+      requestKind: 'ordinary_chat',
+      startedAtMonotonicMs: 10
+    }),
+    runRef,
+    queueDurationMs: 1,
+    sessionLoadDurationMs: 2
+  })
+  const completedDraft = createRequestObservationDraft({
+    context,
+    outcome: 'completed',
+    admissionRejectionReason: 'not_applicable',
+    sessionSaveDurationMs: 3,
+    terminalObservationId: result.terminal.snapshot.observationId
+  })
+  const wrapped = Object.freeze({
+    ...result,
+    requestObservationDraft: completedDraft,
+    sessionPersistence: 'saved' as const,
+    text: 'legacy leak',
+    visibleOutput: true
+  }) as unknown as FinalChatReplyEnvelope
+
+  const projected = projectRunAdvanceResult(wrapped)
+  if (projected.kind !== 'completed') assert.fail('completed projection changed kind')
+  assert.deepEqual(Reflect.ownKeys(projected), [
+    'kind', 'runId', 'runRef', 'completion', 'output', 'terminal'
+  ])
+  assert.equal(Object.hasOwn(projected, 'requestObservationDraft'), false)
+  assert.equal(Object.hasOwn(projected, 'sessionPersistence'), false)
+  assert.equal(Object.hasOwn(projected, 'text'), false)
+  assert.equal(Object.hasOwn(projected, 'visibleOutput'), false)
+  assert.equal(projected.completion, result.completion)
+  assert.equal(projected.terminal, result.terminal)
+
+  const presentation = projectFinalPresentation(wrapped)
+  assert.deepEqual(presentation.result, projected)
+  if (presentation.result.kind !== 'completed') assert.fail('completed projection changed kind')
+  assert.equal(presentation.result.completion, result.completion)
+  assert.equal(presentation.result.output, result.output)
+  assert.equal(presentation.result.terminal, result.terminal)
+  assert.equal(presentation.sessionPersistence, 'saved')
+  assert.deepEqual(Reflect.ownKeys(presentation), ['result', 'sessionPersistence'])
+
+  assert.throws(() => projectFinalPresentation(Object.freeze({
+    ...wrapped,
+    sessionPersistence: 'failed'
+  }) as FinalChatReplyEnvelope), /session persistence/i)
+  assert.throws(() => projectFinalPresentation(Object.freeze({
+    ...wrapped,
+    sessionPersistence: 'not_attempted'
+  }) as FinalChatReplyEnvelope), /session persistence/i)
+
+  const noSaveDraft = createRequestObservationDraft({
+    context,
+    outcome: 'completed',
+    admissionRejectionReason: 'not_applicable',
+    sessionSaveDurationMs: 'not_attempted',
+    terminalObservationId: result.terminal.snapshot.observationId
+  })
+  assert.equal(projectFinalPresentation(Object.freeze({
+    ...result,
+    requestObservationDraft: noSaveDraft,
+    sessionPersistence: 'not_attempted'
+  })).sessionPersistence, 'not_attempted')
+  assert.throws(() => projectFinalPresentation(Object.freeze({
+    ...result,
+    requestObservationDraft: noSaveDraft,
+    sessionPersistence: 'saved'
+  })), /session persistence/i)
+
+  assert.throws(() => projectFinalPresentation(Object.freeze({
+    kind: 'failed',
+    runId: result.runId,
+    runRef,
+    error: Object.freeze({
+      code: 'internal_error',
+      stage: 'agent.service',
+      retryable: false,
+      userMessage: '处理请求时出现异常，请稍后重试',
+      details: Object.freeze({})
+    }),
+    terminal: null,
+    requestObservationDraft: noSaveDraft,
+    sessionPersistence: 'not_attempted'
+  })), /terminal observation/i)
+
+  const failedSaveDraft = createRequestObservationDraft({
+    context,
+    outcome: 'failed_session_save',
+    admissionRejectionReason: 'not_applicable',
+    sessionSaveDurationMs: 4,
+    terminalObservationId: result.terminal.snapshot.observationId
+  })
+  assert.equal(projectFinalPresentation(Object.freeze({
+    ...result,
+    requestObservationDraft: failedSaveDraft,
+    sessionPersistence: 'failed'
+  })).sessionPersistence, 'failed')
+
+  const proactiveContext = activateRequestObservation({
+    context: beginRequestObservation({
+      requestRef: '5'.repeat(32),
+      requestKind: 'proactive_chat',
+      startedAtMonotonicMs: 15
+    }),
+    runRef,
+    queueDurationMs: 1,
+    sessionLoadDurationMs: 'not_attempted'
+  })
+  const proactiveDraft = createRequestObservationDraft({
+    context: proactiveContext,
+    outcome: 'completed',
+    admissionRejectionReason: 'not_applicable',
+    sessionSaveDurationMs: 'not_attempted',
+    terminalObservationId: result.terminal.snapshot.observationId
+  })
+  assert.equal(projectFinalPresentation(Object.freeze({
+    ...result,
+    requestObservationDraft: proactiveDraft,
+    sessionPersistence: 'not_attempted'
+  })).sessionPersistence, 'not_attempted')
+})
+
+test('request-scoped presentation lifecycle owns the initial claimed run', async () => {
+  const runId = 'request-scoped-lifecycle'
+  const runRef = '4'.repeat(32)
+  const calls: string[] = []
+  let fallbackFactoryCalls = 0
+  const interruption = Object.freeze({
+    schemaVersion: 1 as const,
+    approvalId: 'request-scoped-approval',
+    runId,
+    step: 0,
+    callId: 'request-scoped-call',
+    toolFingerprint: 'a'.repeat(64),
+    argumentHash: 'b'.repeat(64),
+    action: 'website',
+    target: 'none',
+    keyParameters: Object.freeze([]),
+    requester: Object.freeze({ userId: 'actor-1', role: 'bot_master' as const }),
+    approverPolicy: Object.freeze({
+      profile: 'safe' as const,
+      allowedRoles: Object.freeze(['bot_master'] as const),
+      eligibleActorIds: Object.freeze(['actor-1']),
+      requireDifferentActor: false
+    }),
+    approvalAddress: request('request-scoped-address', 'unused').sessionAddress,
+    createdAt
+  })
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      start: async (_input, options) => {
+        await options?.afterCheckpointCreated?.({
+          runId,
+          runRef,
+          observationPolicy: Object.freeze({
+            schemaVersion: 1,
+            levelAtStart: 'basic',
+            sampledSuccess: false
+          })
+        })
+        return Object.freeze({
+          kind: 'paused' as const,
+          runId,
+          runRef,
+          interruption
+        })
+      }
+    }),
+    createRuntime: async () => contractRuntime(),
+    createPresentationLifecycle: async () => {
+      fallbackFactoryCalls += 1
+      throw new Error('fallback lifecycle must not be constructed')
+    },
+    generateId: () => runId,
+    createRunRef: () => runRef
+  })
+  const lifecycle = Object.freeze({
+    async onRunStarted (input: {
+      readonly runId: string
+      readonly runRef: string
+    }) {
+      calls.push(`start:${input.runId}:${input.runRef}`)
+    },
+    async onRunSettled (input: {
+      readonly runId: string
+      readonly status: 'paused' | 'terminal'
+    }) {
+      calls.push(`settle:${input.runId}:${input.status}`)
+    }
+  })
+
+  const output = await service.handle(
+    request('request-scoped-lifecycle', '需要审批'),
+    { presentationLifecycle: lifecycle }
+  )
+
+  assert.equal(output.kind, 'paused')
+  assert.equal(fallbackFactoryCalls, 0)
+  assert.deepEqual(calls, [
+    `start:${runId}:${runRef}`,
+    `settle:${runId}:paused`
+  ])
 })
 
 test('same-process resume reuses one active request context and creates one final draft', async () => {
@@ -1100,7 +1333,9 @@ test('AgentService owns context, progress, run execution and terminal session wr
     signal: new AbortController().signal
   })
   assert.equal(completed.kind, 'completed')
-  assert.equal(completed.kind === 'completed' ? completed.text : '', '任务完成。')
+  assert.equal(completed.kind === 'completed' && completed.completion.kind === 'reply_text'
+    ? completed.completion.text
+    : '', '任务完成。')
   assert.equal(completed.kind === 'completed' ? completed.sessionPersistence : null, 'saved')
   assert.equal(
     completed.kind === 'completed' ? completed.requestObservationDraft.outcome : null,
@@ -1172,8 +1407,9 @@ test('AgentService owns context, progress, run execution and terminal session wr
     { signal: new AbortController().signal }
   )
   assert.equal(committedBeforeSessionFailure.kind, 'completed')
-  assert.equal(committedBeforeSessionFailure.kind === 'completed'
-    ? committedBeforeSessionFailure.text
+  assert.equal(committedBeforeSessionFailure.kind === 'completed' &&
+    committedBeforeSessionFailure.completion.kind === 'reply_text'
+    ? committedBeforeSessionFailure.completion.text
     : null, '终态已提交。')
   assert.equal(committedBeforeSessionFailure.kind === 'completed'
     ? committedBeforeSessionFailure.sessionPersistence
@@ -1187,18 +1423,11 @@ test('AgentService owns context, progress, run execution and terminal session wr
   assert.equal(await runStore.load(committedBeforeSessionFailure.runId), null)
   assert.deepEqual(terminalOrder, ['snapshot', 'receipt', 'session_save'])
 
-  let bridgeCreations = 0
-  const firstBridge = getAgentServiceBridge(() => {
-    bridgeCreations += 1
-    return service
-  })
-  const secondBridge = getAgentServiceBridge(() => {
-    bridgeCreations += 1
-    return service
-  })
-  assert.equal(firstBridge, secondBridge)
+  const firstBridge = new AgentServiceBridge(service)
+  const secondBridge = new AgentServiceBridge(service)
+  assert.notEqual(firstBridge, secondBridge)
   assert.equal(firstBridge.conversations, service.conversations)
-  assert.equal(bridgeCreations, 1)
+  assert.equal(secondBridge.conversations, service.conversations)
 })
 
 test('AgentService retries one runRef collision and fails the second with zero model or tool calls', async () => {
@@ -1468,7 +1697,9 @@ test('AgentService cancellation releases a paused run before the next session tu
 
   const next = await service.handle(request('cancel-2', '继续下一轮'))
   assert.equal(next.kind, 'completed')
-  assert.equal(next.kind === 'completed' ? next.text : null, '取消后可继续。')
+  assert.equal(next.kind === 'completed' && next.completion.kind === 'reply_text'
+    ? next.completion.text
+    : null, '取消后可继续。')
 
   turns.push(Object.freeze({
     text: '', finishReason: 'tool_calls',
