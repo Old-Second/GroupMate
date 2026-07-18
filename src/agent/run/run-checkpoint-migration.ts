@@ -6,8 +6,11 @@ import {
   parseRunCheckpoint,
   type RunCheckpointV1,
   type RunCheckpointV2,
-  type RunCheckpointV3
+  type RunCheckpointV3,
+  type RunCheckpointV4
 } from './run-checkpoint.js'
+import { parseModelCapabilitySnapshot } from '../model/model-capability.js'
+import { createUnavailableRunUsageSummary } from './run-usage.js'
 import type { RunObservationCountersV1 } from './run-observation.js'
 
 export function upgradeCompletionFromRunCheckpointV1 (
@@ -76,11 +79,11 @@ function legacyObservationCounters (
 export function upgradeRunCheckpointV1 (
   checkpoint: RunCheckpointV1,
   input: { readonly runRef: string; readonly requestRef: string }
-): RunCheckpointV3 {
+): RunCheckpointV4 {
   const { schemaVersion: _schemaVersion, visibleOutput: _visibleOutput, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
-    schemaVersion: 3,
+    schemaVersion: 4,
     revision: checkpoint.revision + 1,
     runRef: input.runRef,
     requestRef: input.requestRef,
@@ -95,18 +98,50 @@ export function upgradeRunCheckpointV1 (
       levelAtStart: 'off',
       sampledSuccess: false
     }),
-    reasoningSegments: Object.freeze([])
+    reasoningSegments: Object.freeze([]),
+    modelCapability: legacyModelCapability(),
+    modelPrice: null,
+    usage: createUnavailableRunUsageSummary()
   })
 }
 
 export function upgradeRunCheckpointV2 (
   checkpoint: RunCheckpointV2
-): RunCheckpointV3 {
+): RunCheckpointV4 {
   const { schemaVersion: _schemaVersion, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
-    schemaVersion: 3,
+    schemaVersion: 4,
     revision: checkpoint.revision + 1,
-    reasoningSegments: Object.freeze([])
+    reasoningSegments: Object.freeze([]),
+    modelCapability: legacyModelCapability(),
+    modelPrice: null,
+    usage: createUnavailableRunUsageSummary()
+  })
+}
+
+function legacyModelCapability () {
+  return parseModelCapabilitySnapshot({
+    schemaVersion: 1,
+    source: 'safe_default',
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+  })
+}
+
+export function upgradeRunCheckpointV3 (
+  checkpoint: RunCheckpointV3
+): RunCheckpointV4 {
+  const { schemaVersion: _schemaVersion, ...state } = checkpoint
+  return parseRunCheckpoint({
+    ...state,
+    schemaVersion: 4,
+    revision: checkpoint.revision + 1,
+    modelCapability: legacyModelCapability(),
+    modelPrice: null,
+    usage: createUnavailableRunUsageSummary()
   })
 }

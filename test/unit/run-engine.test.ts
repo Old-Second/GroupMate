@@ -49,6 +49,7 @@ import { ToolRegistry, type ToolSnapshot } from '../../src/agent/tools/tool-regi
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
 import type { ToolRuntime } from '../../src/agent/tools/tool-runtime.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 
 const timestamp = '2026-07-14T00:00:00.000Z'
 const deadlineAt = '2026-07-14T00:04:00.000Z'
@@ -1235,8 +1236,22 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const reserved = await fixture.store.load('run-1')
-    assert.equal(reserved?.schemaVersion, 3)
-    if (reserved?.schemaVersion !== 3) throw new TypeError('reserved checkpoint is missing')
+    assert.equal(reserved?.schemaVersion, 4)
+    if (reserved?.schemaVersion !== 4) throw new TypeError('reserved checkpoint is missing')
+    assert.deepEqual(reserved.modelCapability, FIXTURE_MODEL_CAPABILITY)
+    assert.equal(reserved.modelPrice, null)
+    assert.deepEqual(reserved.usage, {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      turnsWithUsage: 0,
+      turnsWithoutUsage: 0,
+      cacheUsageComplete: true
+    })
     assert.deepEqual(reserved.providerDispatch, { state: 'reserved' })
     assert.equal(reserved.observationCounters.providerAttempts, 1)
     assert.deepEqual({
@@ -1267,6 +1282,43 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   }, {
     attempts: 1, modelTurns: 1, input: 7, output: 3, total: 10
   })
+})
+
+test('RunEngine freezes DeepSeek capability and canonical alias price at creation time', async () => {
+  let fixture: ReturnType<typeof harness>
+  fixture = harness([async () => {
+    const checkpoint = await fixture.store.load('run-1')
+    if (checkpoint?.schemaVersion !== 4) throw new TypeError('checkpoint is missing')
+    assert.equal(checkpoint.model.model, 'deepseek-reasoner')
+    assert.deepEqual(checkpoint.modelCapability, {
+      schemaVersion: 1,
+      source: 'profile',
+      contextWindowTokens: 1_000_000,
+      maxOutputTokens: 384_000,
+      promptCaching: 'deepseek_disk',
+      usageExtensions: ['prompt_cache_hit_tokens', 'prompt_cache_miss_tokens'],
+      priceCatalogVersion: 'deepseek-cny-2026-07-19'
+    })
+    assert.deepEqual(checkpoint.modelPrice, {
+      schemaVersion: 1,
+      catalogVersion: 'deepseek-cny-2026-07-19',
+      model: 'deepseek-v4-flash',
+      inputCacheHitPicoYuanPerMillionTokens: 20_000_000_000,
+      inputCacheMissPicoYuanPerMillionTokens: 1_000_000_000_000,
+      outputPicoYuanPerMillionTokens: 2_000_000_000_000
+    })
+    return modelText('完成')
+  }], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile
+  })
+  const result = await fixture.engine.start(Object.freeze({
+    ...fixture.input,
+    model: Object.freeze({
+      ...fixture.input.model,
+      model: 'deepseek-reasoner'
+    })
+  }))
+  assert.equal(result.kind, 'completed')
 })
 
 test('RunEngine returns a concurrent terminal before Provider wire when dispatch reservation CAS loses', async () => {
@@ -2032,8 +2084,8 @@ test('RunEngine skips Provider journal attempts when a recovered ordinal is unav
   const crashed = harness([unavailable], { store: crashStore })
   await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
   const loaded = await crashStore.load('run-1')
-  assert.equal(loaded?.schemaVersion, 3)
-  if (loaded?.schemaVersion !== 3) throw new TypeError('recovered checkpoint is missing')
+  assert.equal(loaded?.schemaVersion, 4)
+  if (loaded?.schemaVersion !== 4) throw new TypeError('recovered checkpoint is missing')
 
   const recovered = parseRunCheckpoint({
     ...loaded,
@@ -2076,6 +2128,8 @@ test('RunEngine keeps a recovered run on its frozen legacy token budget', async 
     presentationRoute: fixture.input.presentationRoute,
     observationPolicy: fixture.input.observationPolicy,
     model: fixture.input.model,
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: fixture.input.runtime.snapshot.id,
       fingerprint: fixture.input.runtime.snapshot.fingerprint,
@@ -2135,6 +2189,8 @@ test('RunEngine clamps a recovered legacy run to its remaining token budget', as
     presentationRoute: fixture.input.presentationRoute,
     observationPolicy: fixture.input.observationPolicy,
     model: fixture.input.model,
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: fixture.input.runtime.snapshot.id,
       fingerprint: fixture.input.runtime.snapshot.fingerprint,
@@ -2192,6 +2248,8 @@ test('RunEngine enters the fourth Provider call for the production multi-stage t
     presentationRoute: fixture.input.presentationRoute,
     observationPolicy: fixture.input.observationPolicy,
     model: fixture.input.model,
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: fixture.input.runtime.snapshot.id,
       fingerprint: fixture.input.runtime.snapshot.fingerprint,

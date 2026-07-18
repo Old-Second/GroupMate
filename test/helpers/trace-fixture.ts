@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
 import type { AgentEventType } from '../../src/agent/contracts/event.js'
+import { parseModelCapabilitySnapshot } from '../../src/agent/model/model-capability.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
@@ -25,6 +26,15 @@ import {
 const DEFAULT_FINISHED_AT = '2026-07-16T00:00:00.000Z'
 const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
 const emptyFingerprint = createHash('sha256').update('[]').digest('hex')
+export const FIXTURE_MODEL_CAPABILITY = parseModelCapabilitySnapshot({
+  schemaVersion: 1,
+  source: 'safe_default',
+  contextWindowTokens: 32_768,
+  maxOutputTokens: 8_192,
+  promptCaching: 'unknown',
+  usageExtensions: [],
+  priceCatalogVersion: null
+})
 
 export function traceRunRef (sampledSuccess: boolean, seed = 0): string {
   for (let index = seed; index < seed + 10_000; index += 1) {
@@ -96,6 +106,8 @@ function initialCheckpoint (input: {
       maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'fixture-snapshot',
       fingerprint: emptyFingerprint,

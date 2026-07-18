@@ -605,11 +605,11 @@ export class RedisRunStore {
         }
     }
     async upgrade(expected, next) {
-        if ((expected.schemaVersion !== 1 && expected.schemaVersion !== 2) ||
-            next.schemaVersion !== 3 ||
+        if ((expected.schemaVersion !== 1 && expected.schemaVersion !== 2 &&
+            expected.schemaVersion !== 3) || next.schemaVersion !== 4 ||
             next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
             next.revision !== expected.revision + 1 ||
-            (expected.schemaVersion === 2 &&
+            (expected.schemaVersion !== 1 &&
                 (next.runRef !== expected.runRef || next.requestRef !== expected.requestRef))) {
             throw new RunStoreConflictError();
         }
@@ -784,7 +784,7 @@ export class RedisRunStore {
         }
     }
     #encodeLoaded(checkpoint, operation) {
-        if (checkpoint.schemaVersion === 3)
+        if (checkpoint.schemaVersion === 4)
             return this.#encode(checkpoint, operation);
         try {
             const { events, ...state } = checkpoint;

@@ -182,6 +182,7 @@ export const deepSeekCompatibilityProfile = Object.freeze({
         requiresReasoningStateForToolCalls: true
     }),
     resolveModelCapability: resolveDeepSeekModelCapability,
+    resolveModelPrice: resolveModelPriceSnapshot,
     encodeToolControls: (input) => input.enabled
         ? Object.freeze({ tools: Object.freeze([...input.tools]) })
         : EMPTY_OBJECT,

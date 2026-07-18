@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type {
   ModelMessage
 } from '../agent/model/model-adapter.js'
+import { parseModelCapabilitySnapshot } from '../agent/model/model-capability.js'
 import type {
   OpenAIFetch,
   OpenAIFetchInit,
@@ -21,6 +22,16 @@ import {
 export const PHASE_5_MEMORY_SCENARIOS = Object.freeze([
   'idle', 'singleRun', 'dualRun', 'checkpointRecovery'
 ] as const)
+
+const FIXTURE_MODEL_CAPABILITY = parseModelCapabilitySnapshot({
+  schemaVersion: 1,
+  source: 'safe_default',
+  contextWindowTokens: 32_768,
+  maxOutputTokens: 8_192,
+  promptCaching: 'unknown',
+  usageExtensions: [],
+  priceCatalogVersion: null
+})
 
 export type Phase5MemoryScenarioName = typeof PHASE_5_MEMORY_SCENARIOS[number]
 
@@ -107,6 +118,8 @@ function checkpointFixture (): ReturnType<RunCheckpointCodec['decode']> {
       maxOutputTokens: 64,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'memory-snapshot',
       fingerprint: createHash('sha256').update('[]').digest('hex'),

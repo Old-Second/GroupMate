@@ -8,12 +8,14 @@ import {
   RunCheckpointCodec,
   type RunCheckpointV1,
   type RunCheckpointV2,
-  type RunCheckpointV3
+  type RunCheckpointV3,
+  type RunCheckpointV4
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   upgradeCompletionFromRunCheckpointV1,
   upgradeRunCheckpointV1,
-  upgradeRunCheckpointV2
+  upgradeRunCheckpointV2,
+  upgradeRunCheckpointV3
 } from '../../src/agent/run/run-checkpoint-migration.js'
 import {
   createFrozenObservationPolicy,
@@ -230,6 +232,20 @@ function checkpointV2 (
   })
 }
 
+function checkpointV3 (
+  changes: Partial<RunCheckpointV3> = {}
+): RunCheckpointV3 {
+  const source = checkpointV2()
+  const { schemaVersion: _schemaVersion, ...state } = source
+  return Object.freeze({
+    ...state,
+    schemaVersion: 3,
+    revision: source.revision + 1,
+    reasoningSegments: Object.freeze([]),
+    ...changes
+  })
+}
+
 test('frozen observation policy uses the locked SHA-256 sample and off fails closed', () => {
   assert.deepEqual(createFrozenObservationPolicy({
     levelAtStart: 'basic',
@@ -306,11 +322,11 @@ test('observation counter sentinels are field-specific and initial values are ex
   }
 })
 
-test('v1 migration preserves the full state, increments revision and maps only provable facts', () => {
+test('v1 migration upgrades directly to v4 once and marks historical usage unavailable', () => {
   const active = legacyCheckpoint()
   const upgraded = upgradeRunCheckpointV1(active, { runRef, requestRef })
 
-  assert.equal(upgraded.schemaVersion, 3)
+  assert.equal(upgraded.schemaVersion, 4)
   assert.deepEqual(upgraded.reasoningSegments, [])
   assert.equal(upgraded.revision, active.revision + 1)
   assert.equal(upgraded.runId, active.runId)
@@ -352,9 +368,31 @@ test('v1 migration preserves the full state, increments revision and maps only p
   assert.deepEqual(upgraded.providerDispatch, { state: 'idle' })
   assert.deepEqual(upgraded.engineActivity, { state: 'idle' })
   assert.equal(Object.hasOwn(upgraded, 'visibleOutput'), false)
+  assert.deepEqual(upgraded.modelCapability, {
+    schemaVersion: 1,
+    source: 'safe_default',
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+  })
+  assert.equal(upgraded.modelPrice, null)
+  assert.deepEqual(upgraded.usage, {
+    schemaVersion: 1,
+    availability: 'unavailable',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 0,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
 })
 
-test('v2 migration preserves references, approval state and ledgers without inventing reasoning', () => {
+test('v2 migration upgrades directly to v4 once and preserves references and ledgers', () => {
   const pending = pendingApprovalState()
   const source = checkpointV2({
     status: 'waiting_approval',
@@ -363,7 +401,7 @@ test('v2 migration preserves references, approval state and ledgers without inve
 
   const upgraded = upgradeRunCheckpointV2(source)
 
-  assert.equal(upgraded.schemaVersion, 3)
+  assert.equal(upgraded.schemaVersion, 4)
   assert.equal(upgraded.revision, source.revision + 1)
   assert.equal(upgraded.runRef, source.runRef)
   assert.equal(upgraded.requestRef, source.requestRef)
@@ -372,6 +410,16 @@ test('v2 migration preserves references, approval state and ledgers without inve
   assert.deepEqual(upgraded.preparedBatch, source.preparedBatch)
   assert.deepEqual(upgraded.toolLedgers, source.toolLedgers)
   assert.deepEqual(upgraded.observationPolicy, source.observationPolicy)
+})
+
+test('v3 migration upgrades directly to v4 once without changing legacy model config', () => {
+  const source = checkpointV3()
+  const upgraded = upgradeRunCheckpointV3(source)
+  assert.equal(upgraded.schemaVersion, 4)
+  assert.equal(upgraded.revision, source.revision + 1)
+  assert.deepEqual(upgraded.model, source.model)
+  assert.deepEqual(upgraded.reasoningSegments, source.reasoningSegments)
+  assert.equal(upgraded.usage.availability, 'unavailable')
 })
 
 test('v1 completion upgrade covers text, visible output, failed, cancelled, active and approval states', () => {
@@ -408,7 +456,7 @@ test('v1 completion upgrade covers text, visible output, failed, cancelled, acti
   }
 })
 
-test('codec reads schema v1 and v2, single-writes schema v3 and synchronizes envelope revision', () => {
+test('codec reads schema v1, v2 and v3, single-writes schema v4 and synchronizes envelope revision', () => {
   const codec = new RunCheckpointCodec()
   const legacy = legacyCheckpoint()
   const { events, ...legacyState } = legacy
@@ -427,11 +475,19 @@ test('codec reads schema v1 and v2, single-writes schema v3 and synchronizes env
     events: v2Events
   })).schemaVersion, 2)
 
+  const sourceV3 = checkpointV3()
+  const { events: v3Events, ...v3State } = sourceV3
+  assert.equal(codec.decode(JSON.stringify(v3State), JSON.stringify({
+    schemaVersion: 3,
+    revision: sourceV3.revision,
+    events: v3Events
+  })).schemaVersion, 3)
+
   const upgraded = upgradeRunCheckpointV1(legacy, { runRef, requestRef })
   const encoded = codec.encode(upgraded)
-  assert.equal(JSON.parse(encoded.checkpoint).schemaVersion, 3)
+  assert.equal(JSON.parse(encoded.checkpoint).schemaVersion, 4)
   assert.deepEqual(JSON.parse(encoded.events), {
-    schemaVersion: 3,
+    schemaVersion: 4,
     revision: upgraded.revision,
     events: upgraded.events
   })
@@ -475,7 +531,7 @@ test('codec rejects string-encoded token budget limits', () => {
         maxEstimatedTokens
       }
     }), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: source.revision,
       events
     })), /run budget limits are incompatible/i)
@@ -495,14 +551,14 @@ test('codec rejects string-encoded run budget counters', () => {
         [key]: String(state.budgetCounters[key as keyof typeof state.budgetCounters])
       }
     }), JSON.stringify({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: source.revision,
       events
     })), new RegExp(`run budget counter ${key} is invalid`, 'i'))
   }
 })
 
-test('v3 codec requires reasoning segments and rejects unknown or inconsistent fields', () => {
+test('v4 codec requires frozen capability, price and usage with a consistent catalog', () => {
   const codec = new RunCheckpointCodec()
   const upgraded = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })
   const ordinaryRoute = Object.freeze({
@@ -529,24 +585,24 @@ test('v3 codec requires reasoning segments and rejects unknown or inconsistent f
   assert.throws(() => codec.encode({
     ...upgraded,
     secret: 'must-not-persist'
-  } as unknown as RunCheckpointV3), /unknown checkpoint key/i)
+  } as unknown as RunCheckpointV4), /unknown checkpoint key/i)
   const { reasoningSegments: _reasoningSegments, ...missingReasoning } = upgraded
   assert.throws(() => codec.encode(
-    missingReasoning as unknown as RunCheckpointV3
+    missingReasoning as unknown as RunCheckpointV4
   ), /reasoning|missing/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     requestKind: 'ordinary_chat',
     presentationRoute: null
-  } as RunCheckpointV3), /route|request kind|matrix/i)
+  } as RunCheckpointV4), /route|request kind|matrix/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     presentationRoute: ordinaryRoute
-  } as RunCheckpointV3), /legacy|route/i)
+  } as RunCheckpointV4), /legacy|route/i)
   assert.throws(() => codec.encode({
     ...ordinary,
     requestKind: 'proactive_chat'
-  } as RunCheckpointV3), /route|matrix/i)
+  } as RunCheckpointV4), /route|matrix/i)
   assert.throws(() => codec.encode({
     ...ordinary,
     presentationRoute: {
@@ -556,13 +612,13 @@ test('v3 codec requires reasoning segments and rejects unknown or inconsistent f
         scope: { kind: 'group', groupId: 'another-group' }
       }
     }
-  } as RunCheckpointV3), /route|matrix/i)
+  } as RunCheckpointV4), /route|matrix/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     status: 'completed',
     completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
     output: assistantOutput('不应同时存在')
-  } as RunCheckpointV3), /completion|output/i)
+  } as RunCheckpointV4), /completion|output/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     observationPolicy: Object.freeze({
@@ -573,5 +629,17 @@ test('v3 codec requires reasoning segments and rejects unknown or inconsistent f
         runRef: upgraded.runRef
       }).sampledSuccess
     })
-  } as RunCheckpointV3), /policy|sample/i)
+  } as RunCheckpointV4), /policy|sample/i)
+  assert.throws(() => codec.encode({
+    ...upgraded,
+    modelCapability: {
+      ...upgraded.modelCapability,
+      priceCatalogVersion: 'catalog-v1'
+    },
+    modelPrice: null
+  } as RunCheckpointV4), /price|catalog/i)
+  assert.throws(() => codec.encode({
+    ...upgraded,
+    usage: { ...upgraded.usage, extra: true }
+  } as unknown as RunCheckpointV4), /usage/i)
 })

@@ -26,6 +26,7 @@ import {
 import { FakeRedis } from '../helpers/fake-redis.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
 import { registerRunStoreContract } from '../helpers/run-store-contract.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 
 const timestamp = '2026-07-16T00:00:00.000Z'
 const finishedAt = '2026-07-16T00:00:01.000Z'
@@ -112,6 +113,8 @@ function terminalCheckpoint (): RunCheckpoint {
       maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'snapshot-private-value',
       fingerprint: emptyManifestFingerprint,

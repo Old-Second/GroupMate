@@ -13,8 +13,10 @@ import {
   nextRunCheckpoint,
   type RunCheckpoint,
   type RunCheckpointV1,
-  type RunCheckpointV2
+  type RunCheckpointV2,
+  type RunCheckpointV3
 } from '../../src/agent/run/run-checkpoint.js'
+import { upgradeRunCheckpointV3 } from '../../src/agent/run/run-checkpoint-migration.js'
 import {
   RunEngine,
   type RunRuntimeBinding,
@@ -25,9 +27,11 @@ import { createFrozenObservationPolicy } from '../../src/agent/run/run-observati
 import { RedisRunStore, redisRunKeys } from '../../src/agent/run/redis-run-store.js'
 import {
   RunReferenceConflictError,
+  RunStoreConflictError,
   type RunStore
 } from '../../src/agent/run/run-store.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 import { applyToolPreflight, createToolExecutionLedger } from '../../src/agent/run/tool-ledger.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
 import type { ToolExecutionContext, ToolPreparationContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
@@ -136,6 +140,8 @@ function initial (runId = 'run-1', toolSnapshot = snapshot()): RunCheckpoint {
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: toolSnapshot.id, fingerprint: toolSnapshot.fingerprint,
       manifest: toolSnapshot.manifest
@@ -158,6 +164,9 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     engineActivity: _engineActivity,
     observationPolicy: _observationPolicy,
     reasoningSegments: _reasoningSegments,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
@@ -167,10 +176,40 @@ function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
   const {
     schemaVersion: _schemaVersion,
     reasoningSegments: _reasoningSegments,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 2 })
 }
+
+function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
+  const {
+    schemaVersion: _schemaVersion,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 3 })
+}
+
+test('InMemoryRunStore rejects a stale v3 upgrade without rewriting the checkpoint', async () => {
+  const store = new InMemoryRunStore()
+  const source = checkpointV3(initial('run-v3-upgrade-conflict'))
+  store.seedLoadedCheckpoint(source)
+  const stale = Object.freeze({
+    ...source,
+    updatedAt: '2026-07-14T00:00:01.000Z'
+  })
+
+  await assert.rejects(
+    store.upgrade(stale, upgradeRunCheckpointV3(source)),
+    RunStoreConflictError
+  )
+  assert.deepEqual(await store.load(source.runId), source)
+})
 
 async function persistLegacy (
   redis: FakeRedis,
@@ -427,7 +466,7 @@ test('RunEngine upgrades v2 without allocating or changing its request reference
 
   const upgraded = await engine.loadCheckpoint(source.runId)
 
-  assert.equal(upgraded?.schemaVersion, 3)
+  assert.equal(upgraded?.schemaVersion, 4)
   assert.equal(upgraded?.runRef, source.runRef)
   assert.equal(upgraded?.requestRef, source.requestRef)
   assert.deepEqual(upgraded?.reasoningSegments, [])
@@ -458,8 +497,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
     ),
     executePrepared: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 3)
-      if (checkpoint?.schemaVersion !== 3) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 4)
+      if (checkpoint?.schemaVersion !== 4) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       toolObservedUpgrade = true
@@ -469,8 +508,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
   const adapter: ModelAdapter = Object.freeze({
     complete: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 3)
-      if (checkpoint?.schemaVersion !== 3) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 4)
+      if (checkpoint?.schemaVersion !== 4) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       providerObservedUpgrade = true
@@ -777,7 +816,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   )
   assert.equal(paused.kind, 'paused')
   const waiting = await store.load(source.runId)
-  if (waiting?.schemaVersion !== 3 || waiting.status !== 'waiting_approval') {
+  if (waiting?.schemaVersion !== 4 || waiting.status !== 'waiting_approval') {
     throw new TypeError('waiting approval fixture is missing')
   }
   assert.equal(waiting.engineActivity.state, 'idle')
@@ -805,7 +844,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
 
   const recoveredResult = await recoveryEngine.resume(source.runId)
   const recovered = await store.load(source.runId)
-  assert.deepEqual(recovered?.schemaVersion === 3 ? {
+  assert.deepEqual(recovered?.schemaVersion === 4 ? {
     resultKind: recoveredResult.kind,
     revision: recovered.revision,
     providerDispatch: recovered.providerDispatch.state,
@@ -824,7 +863,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
     })
   })
 
-  if (recovered?.schemaVersion !== 3) {
+  if (recovered?.schemaVersion !== 4) {
     throw new TypeError('recovered waiting checkpoint is missing')
   }
   const idleRevision = recovered.revision
@@ -833,7 +872,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   assert.equal(idleResult.kind, 'paused')
   assert.equal(stillIdle?.revision, idleRevision)
   assert.equal(
-    stillIdle?.schemaVersion === 3 ? stillIdle.engineActivity.state : null,
+    stillIdle?.schemaVersion === 4 ? stillIdle.engineActivity.state : null,
     'idle'
   )
   assert.equal(recoveryClockCalls, 0)

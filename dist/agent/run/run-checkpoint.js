@@ -4,6 +4,8 @@ import { completionFromTerminalOutput, parseCompletionDisposition } from '../con
 import { isAgentErrorCode } from '../contracts/error.js';
 import { parsePresentationRoute } from '../contracts/interaction.js';
 import { parseAgentEvent } from '../contracts/event.js';
+import { parseModelCapabilitySnapshot } from '../model/model-capability.js';
+import { parseModelPriceSnapshot } from '../model/model-price-catalog.js';
 import { parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from './provider-state.js';
 import { parseApprovalInterruption } from './interruption.js';
@@ -15,6 +17,7 @@ import { parseToolResult } from '../tools/tool-result.js';
 import { RUN_REF_PATTERN } from './run-reference.js';
 import { createFrozenObservationPolicy, createInitialRunObservationCounters, parseFrozenObservationPolicy, parseRunObservationCounters } from './run-observation.js';
 import { parseRunReasoningSegments } from './run-reasoning-segment.js';
+import { createInitialRunUsageSummary, parseRunUsageSummary } from './run-usage.js';
 const CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROFILE = /^[a-z][a-z0-9_.-]{0,63}$/;
 function timestamp(value, label) {
@@ -79,6 +82,10 @@ const CHECKPOINT_V2_KEYS = Object.freeze([
 const CHECKPOINT_V3_KEYS = Object.freeze([
     ...CHECKPOINT_V2_KEYS,
     'reasoningSegments'
+]);
+const CHECKPOINT_V4_KEYS = Object.freeze([
+    ...CHECKPOINT_V3_KEYS,
+    'modelCapability', 'modelPrice', 'usage'
 ]);
 const MODEL_KEYS = Object.freeze([
     'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
@@ -377,7 +384,7 @@ function validateObservationState(value, label) {
         throw new TypeError(`${label} is invalid`);
     }
 }
-function validateCheckpointV2OrV3(parsed) {
+function validateCheckpointV2OrLater(parsed) {
     if (!RUN_REF_PATTERN.test(parsed.runRef) || !RUN_REF_PATTERN.test(parsed.requestRef)) {
         throw new TypeError('run checkpoint reference is invalid');
     }
@@ -443,7 +450,9 @@ function parseLoadedRunCheckpoint(value) {
             ? CHECKPOINT_V2_KEYS
             : unparsed.schemaVersion === 3
                 ? CHECKPOINT_V3_KEYS
-                : undefined;
+                : unparsed.schemaVersion === 4
+                    ? CHECKPOINT_V4_KEYS
+                    : undefined;
     if (checkpointKeys === undefined)
         throw new TypeError('run checkpoint schema version is invalid');
     exactKeys(unparsed, checkpointKeys, checkpointKeys, 'checkpoint');
@@ -453,7 +462,7 @@ function parseLoadedRunCheckpoint(value) {
         throw new TypeError('run event count limit exceeded');
     }
     const parsed = unparsed;
-    const reasoningSegments = parsed.schemaVersion === 3
+    const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4
         ? parseRunReasoningSegments(parsed.reasoningSegments)
         : undefined;
     const split = splitCheckpoint(parsed);
@@ -538,7 +547,16 @@ function parseLoadedRunCheckpoint(value) {
         }
     }
     else {
-        validateCheckpointV2OrV3(parsed);
+        validateCheckpointV2OrLater(parsed);
+    }
+    if (parsed.schemaVersion === 4) {
+        const capability = parseModelCapabilitySnapshot(parsed.modelCapability);
+        const price = parsed.modelPrice === null ? null : parseModelPriceSnapshot(parsed.modelPrice);
+        parseRunUsageSummary(parsed.usage);
+        if ((capability.priceCatalogVersion === null) !== (price === null) ||
+            (price !== null && price.catalogVersion !== capability.priceCatalogVersion)) {
+            throw new TypeError('run model price catalog is inconsistent');
+        }
     }
     if (parsed.status === 'failed' && (parsed.error === null || parsed.cancellationReason !== null)) {
         throw new TypeError('failed run checkpoint is invalid');
@@ -550,14 +568,25 @@ function parseLoadedRunCheckpoint(value) {
         (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
         throw new TypeError('run approval checkpoint state is invalid');
     }
+    if (parsed.schemaVersion === 4) {
+        return Object.freeze({
+            ...parsed,
+            reasoningSegments,
+            modelCapability: parseModelCapabilitySnapshot(parsed.modelCapability),
+            modelPrice: parsed.modelPrice === null
+                ? null
+                : parseModelPriceSnapshot(parsed.modelPrice),
+            usage: parseRunUsageSummary(parsed.usage)
+        });
+    }
     return parsed.schemaVersion === 3
         ? Object.freeze({ ...parsed, reasoningSegments })
         : parsed;
 }
 export function parseRunCheckpoint(value) {
     const parsed = parseLoadedRunCheckpoint(value);
-    if (parsed.schemaVersion !== 3) {
-        throw new TypeError('runtime run checkpoint must use schema version 3');
+    if (parsed.schemaVersion !== 4) {
+        throw new TypeError('runtime run checkpoint must use schema version 4');
     }
     return parsed;
 }
@@ -613,7 +642,7 @@ export function createInitialRunCheckpoint(input) {
     timestamp(input.createdAt, 'run creation time');
     validateEvents([input.event], 0, input.runId, input.sessionId);
     return freezeCheckpoint({
-        schemaVersion: 3,
+        schemaVersion: 4,
         kernelVersion: 1,
         profileId: input.profileId,
         profileVersion: input.profileVersion,
@@ -628,6 +657,9 @@ export function createInitialRunCheckpoint(input) {
         status: 'created',
         step: 0,
         model: input.model,
+        modelCapability: input.modelCapability,
+        modelPrice: input.modelPrice,
+        usage: createInitialRunUsageSummary(),
         messages: Object.freeze([]),
         estimatedInputTokens: 0,
         modelTurn: null,
@@ -676,6 +708,7 @@ export function nextRunCheckpoint(checkpoint, status, changes, events, updatedAt
 const CHECKPOINT_V1_STATE_KEYS = Object.freeze(CHECKPOINT_V1_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V2_STATE_KEYS = Object.freeze(CHECKPOINT_V2_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V3_STATE_KEYS = Object.freeze(CHECKPOINT_V3_KEYS.filter(key => key !== 'events'));
+const CHECKPOINT_V4_STATE_KEYS = Object.freeze(CHECKPOINT_V4_KEYS.filter(key => key !== 'events'));
 const EVENT_ENVELOPE_KEYS = Object.freeze([
     'schemaVersion', 'revision', 'events'
 ]);
@@ -695,7 +728,7 @@ export class RunCheckpointCodec {
         const parsed = parseRunCheckpoint(value);
         const split = splitCheckpoint(parsed);
         const envelope = Object.freeze({
-            schemaVersion: 3,
+            schemaVersion: 4,
             revision: parsed.revision,
             events: split.events
         });
@@ -717,7 +750,9 @@ export class RunCheckpointCodec {
                 ? CHECKPOINT_V2_STATE_KEYS
                 : state.schemaVersion === 3
                     ? CHECKPOINT_V3_STATE_KEYS
-                    : undefined;
+                    : state.schemaVersion === 4
+                        ? CHECKPOINT_V4_STATE_KEYS
+                        : undefined;
         if (checkpointKeys === undefined) {
             throw new TypeError('run checkpoint schema version is invalid');
         }

@@ -7,6 +7,7 @@ import {
   type ModelRequest,
   type ModelTurn
 } from '../agent/model/model-adapter.js'
+import { parseModelCapabilitySnapshot } from '../agent/model/model-capability.js'
 import { createDefaultRunBudget } from '../agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
@@ -52,6 +53,16 @@ import {
 } from '../runtime/observability/redis-trace-store.js'
 import type { BymPolicySnapshot } from '../runtime/yunzai-bym-controller.js'
 import type { RedisToolClient } from '../runtime/tools/redis-tool-client.js'
+
+const FIXTURE_MODEL_CAPABILITY = parseModelCapabilitySnapshot({
+  schemaVersion: 1,
+  source: 'safe_default',
+  contextWindowTokens: 32_768,
+  maxOutputTokens: 8_192,
+  promptCaching: 'unknown',
+  usageExtensions: [],
+  priceCatalogVersion: null
+})
 
 export const PHASE_6_RESOURCE_SCENARIOS = Object.freeze([
   'idle',
@@ -841,6 +852,8 @@ export function createPhase6SmallTraceCandidate (
       model: 'fixture-model', streaming: false, maxOutputTokens: 64,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'phase6-resource-snapshot', fingerprint: EMPTY_FINGERPRINT, manifest: Object.freeze([])
     }),

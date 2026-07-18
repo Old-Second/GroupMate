@@ -226,6 +226,7 @@ export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.free
     requiresReasoningStateForToolCalls: true
   }),
   resolveModelCapability: resolveDeepSeekModelCapability,
+  resolveModelPrice: resolveModelPriceSnapshot,
   encodeToolControls: (input: ToolControlInput) => input.enabled
     ? Object.freeze({ tools: Object.freeze([...input.tools]) })
     : EMPTY_OBJECT,

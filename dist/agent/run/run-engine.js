@@ -4,6 +4,7 @@ import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
 import { parseProviderAttemptEventPayload } from '../contracts/event.js';
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js';
+import { resolveModelCapabilitySnapshot } from '../model/model-capability.js';
 import { canonicalSessionKey } from '../session/conversation-scope.js';
 import { completedPreparedCall } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
@@ -12,7 +13,7 @@ import { boundedMonotonicDurationMs } from './run-budget.js';
 import { availableModelOutputTokens } from './model-turn-capacity.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { snapshotModelRequestForJournal, snapshotModelTurnForJournal, snapshotRunCheckpointForJournal, snapshotTerminalReceiptForJournal } from './run-content-journal.js';
-import { upgradeRunCheckpointV1, upgradeRunCheckpointV2 } from './run-checkpoint-migration.js';
+import { upgradeRunCheckpointV1, upgradeRunCheckpointV2, upgradeRunCheckpointV3 } from './run-checkpoint-migration.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
@@ -513,14 +514,16 @@ export class RunEngine {
     }
     async loadCheckpoint(runId) {
         const loaded = await this.#store.load(runId);
-        if (loaded === null || loaded.schemaVersion === 3)
+        if (loaded === null || loaded.schemaVersion === 4)
             return loaded;
         const upgraded = loaded.schemaVersion === 1
             ? upgradeRunCheckpointV1(loaded, {
                 runRef: this.#createRunRef(),
                 requestRef: this.#createRequestRef()
             })
-            : upgradeRunCheckpointV2(loaded);
+            : loaded.schemaVersion === 2
+                ? upgradeRunCheckpointV2(loaded)
+                : upgradeRunCheckpointV3(loaded);
         return await this.#store.upgrade(loaded, upgraded);
     }
     async pendingApproval(runId, approvalId) {
@@ -794,6 +797,15 @@ export class RunEngine {
             ...(input.model.temperature === undefined ? {} : { temperature: input.model.temperature }),
             ...(input.model.topP === undefined ? {} : { topP: input.model.topP })
         });
+        const snapshotAt = new Date(createdAt);
+        const modelCapability = resolveModelCapabilitySnapshot({
+            profile: this.#profile,
+            model: model.model,
+            now: snapshotAt
+        });
+        const modelPrice = modelCapability.priceCatalogVersion === null
+            ? null
+            : this.#profile.resolveModelPrice(model.model, snapshotAt) ?? null;
         const checkpoint = createInitialRunCheckpoint({
             profileId: this.#profile.id,
             profileVersion: this.#profile.version,
@@ -806,6 +818,8 @@ export class RunEngine {
             presentationRoute: input.presentationRoute,
             observationPolicy: input.observationPolicy,
             model,
+            modelCapability,
+            modelPrice,
             toolSnapshot: Object.freeze({
                 id: input.runtime.snapshot.id,
                 fingerprint: input.runtime.snapshot.fingerprint,

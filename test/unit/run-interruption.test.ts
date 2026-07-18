@@ -429,6 +429,9 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     engineActivity: _engineActivity,
     observationPolicy: _observationPolicy,
     reasoningSegments: _reasoningSegments,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
@@ -459,8 +462,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const undisplayed = await source.store.load(paused.runId)
-  assert.equal(undisplayed?.schemaVersion, 3)
-  if (undisplayed?.schemaVersion !== 3) throw new TypeError('approval checkpoint is missing')
+  assert.equal(undisplayed?.schemaVersion, 4)
+  if (undisplayed?.schemaVersion !== 4) throw new TypeError('approval checkpoint is missing')
   await displayCurrent(
     source,
     paused.interruption,
@@ -468,8 +471,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
     '2026-07-14T00:00:01.000Z'
   )
   const displayed = await source.store.load(paused.runId)
-  assert.equal(displayed?.schemaVersion, 3)
-  if (displayed?.schemaVersion !== 3) throw new TypeError('displayed checkpoint is missing')
+  assert.equal(displayed?.schemaVersion, 4)
+  if (displayed?.schemaVersion !== 4) throw new TypeError('displayed checkpoint is missing')
 
   const recovered = (
     legacy: RunCheckpointV1,
@@ -592,15 +595,15 @@ test('RunEngine resolves ordered approvals in one run without executing an undec
   assert.equal(JSON.stringify(fixture.adapter.requests[1]?.messages).includes('approval-generated'), false)
 })
 
-test('RunEngine restores approval reasoning from a V3 checkpoint without duplicating it', async () => {
+test('RunEngine restores approval reasoning from a V4 checkpoint without duplicating it', async () => {
   const store = new InMemoryRunStore()
   const source = approvalHarness({ store })
   const paused = await source.engine.start(source.input)
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const stored = await store.load(paused.runId)
-  assert.equal(stored?.schemaVersion, 3)
-  if (stored?.schemaVersion !== 3) throw new TypeError('V3 approval checkpoint is missing')
+  assert.equal(stored?.schemaVersion, 4)
+  if (stored?.schemaVersion !== 4) throw new TypeError('V4 approval checkpoint is missing')
   assert.deepEqual(stored.reasoningSegments.map(item => item.text), [
     '审批前思考'
   ])

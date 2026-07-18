@@ -10,6 +10,7 @@ export const standardOpenAIProfile = Object.freeze({
         requiresReasoningStateForToolCalls: false
     }),
     resolveModelCapability: () => undefined,
+    resolveModelPrice: () => undefined,
     encodeToolControls: (input) => input.enabled
         ? Object.freeze({
             tools: Object.freeze([...input.tools]),

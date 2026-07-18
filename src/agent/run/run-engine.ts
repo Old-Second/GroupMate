@@ -30,6 +30,7 @@ import type {
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js'
 import type { JsonObject, JsonValue } from '../model/json-value.js'
 import type { OpenAICompatibleProfile } from '../model/openai-compatible-profile.js'
+import { resolveModelCapabilitySnapshot } from '../model/model-capability.js'
 import { canonicalSessionKey } from '../session/conversation-scope.js'
 import type { ToolExecutionContext, ToolPreparationContext } from '../tools/tool-context.js'
 import type { ToolCall } from '../tools/tool-call.js'
@@ -75,7 +76,8 @@ import {
 } from './run-content-journal.js'
 import {
   upgradeRunCheckpointV1,
-  upgradeRunCheckpointV2
+  upgradeRunCheckpointV2,
+  upgradeRunCheckpointV3
 } from './run-checkpoint-migration.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
 import {
@@ -843,13 +845,15 @@ export class RunEngine {
 
   async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
     const loaded = await this.#store.load(runId)
-    if (loaded === null || loaded.schemaVersion === 3) return loaded
+    if (loaded === null || loaded.schemaVersion === 4) return loaded
     const upgraded = loaded.schemaVersion === 1
       ? upgradeRunCheckpointV1(loaded, {
           runRef: this.#createRunRef(),
           requestRef: this.#createRequestRef()
         })
-      : upgradeRunCheckpointV2(loaded)
+      : loaded.schemaVersion === 2
+        ? upgradeRunCheckpointV2(loaded)
+        : upgradeRunCheckpointV3(loaded)
     return await this.#store.upgrade(loaded, upgraded)
   }
 
@@ -1174,6 +1178,15 @@ export class RunEngine {
       ...(input.model.temperature === undefined ? {} : { temperature: input.model.temperature }),
       ...(input.model.topP === undefined ? {} : { topP: input.model.topP })
     })
+    const snapshotAt = new Date(createdAt)
+    const modelCapability = resolveModelCapabilitySnapshot({
+      profile: this.#profile,
+      model: model.model,
+      now: snapshotAt
+    })
+    const modelPrice = modelCapability.priceCatalogVersion === null
+      ? null
+      : this.#profile.resolveModelPrice(model.model, snapshotAt) ?? null
     const checkpoint = createInitialRunCheckpoint({
       profileId: this.#profile.id,
       profileVersion: this.#profile.version,
@@ -1186,6 +1199,8 @@ export class RunEngine {
       presentationRoute: input.presentationRoute,
       observationPolicy: input.observationPolicy,
       model,
+      modelCapability,
+      modelPrice,
       toolSnapshot: Object.freeze({
         id: input.runtime.snapshot.id,
         fingerprint: input.runtime.snapshot.fingerprint,

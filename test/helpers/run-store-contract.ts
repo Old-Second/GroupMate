@@ -24,6 +24,7 @@ import {
   RunStoreConflictError,
   type RunStore
 } from '../../src/agent/run/run-store.js'
+import { FIXTURE_MODEL_CAPABILITY } from './trace-fixture.js'
 
 const createdAt = '2026-07-16T00:00:00.000Z'
 const finishedAt = '2026-07-16T00:00:01.000Z'
@@ -90,6 +91,8 @@ function initialCheckpoint (runId: string): RunCheckpoint {
       maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'snapshot-private-value',
       fingerprint: emptyManifestFingerprint,

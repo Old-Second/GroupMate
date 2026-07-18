@@ -10,11 +10,13 @@ import {
   RunCheckpointCodec,
   type RunCheckpointV1,
   type RunCheckpointV2,
+  type RunCheckpointV3,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   upgradeRunCheckpointV1,
-  upgradeRunCheckpointV2
+  upgradeRunCheckpointV2,
+  upgradeRunCheckpointV3
 } from '../../src/agent/run/run-checkpoint-migration.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
@@ -23,6 +25,7 @@ import {
   createRunTerminalSnapshot
 } from '../../src/agent/run/run-observation.js'
 import { RunReferenceConflictError } from '../../src/agent/run/run-store.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 import {
   RedisRunStore,
   RUN_STORE_LUA_MARKER,
@@ -113,6 +116,8 @@ function checkpoint (runId = 'run-1'): RunCheckpoint {
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'snapshot-1', fingerprint: emptyManifestFingerprint,
       manifest: Object.freeze([])
@@ -138,6 +143,9 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     engineActivity: _engineActivity,
     observationPolicy: _observationPolicy,
     reasoningSegments: _reasoningSegments,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
     ...state
   } = source
   return Object.freeze({
@@ -151,9 +159,23 @@ function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
   const {
     schemaVersion: _schemaVersion,
     reasoningSegments: _reasoningSegments,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 2 })
+}
+
+function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
+  const {
+    schemaVersion: _schemaVersion,
+    modelCapability: _modelCapability,
+    modelPrice: _modelPrice,
+    usage: _usage,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 3 })
 }
 
 function preparing (
@@ -227,7 +249,7 @@ test('RedisRunStore claims runRef atomically and upgrades one exact v1 checkpoin
     requestRef: v2.requestRef
   })
   assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
-  assert.equal((await store.load(legacy.runId))?.schemaVersion, 3)
+  assert.equal((await store.load(legacy.runId))?.schemaVersion, 4)
   assert.equal(await redis.get(redisRunReferenceKey(upgraded.runRef)), upgraded.runId)
   assert.equal(await redis.ttl(redisRunReferenceKey(upgraded.runRef)), 300)
 })
@@ -261,6 +283,35 @@ test('RedisRunStore upgrades v2 through CAS without duplicating its runRef', asy
   assert.equal(await redis.get(referenceKey), source.runId)
   assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|')[5], '1')
   assert.equal(redis.evalCalls.some(call => call.operation === 'cas'), true)
+})
+
+test('RedisRunStore upgrades one exact v3 through CAS and leaves conflicts untouched', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const source = checkpointV3(checkpoint('run-v3-upgrade'))
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 3,
+    revision: source.revision,
+    events
+  }), { EX: 300 })
+  await redis.set(referenceKey, source.runId, { EX: 300 })
+
+  const loaded = await store.load(source.runId)
+  assert.equal(loaded?.schemaVersion, 3)
+  if (loaded?.schemaVersion !== 3) throw new TypeError('v3 fixture was not loaded')
+  const upgraded = upgradeRunCheckpointV3(loaded)
+  await assert.rejects(store.upgrade(loaded, Object.freeze({
+    ...upgraded,
+    requestRef: 'f'.repeat(32)
+  })), error => error instanceof AgentError && error.code === 'checkpoint_conflict')
+  assert.deepEqual(await store.load(source.runId), source)
+  assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
+  assert.deepEqual(await store.load(source.runId), upgraded)
+  assert.equal(await redis.get(referenceKey), source.runId)
 })
 
 test('RedisRunStore create is NX and exactly one revision CAS wins', async () => {

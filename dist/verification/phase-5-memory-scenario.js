@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { parseModelCapabilitySnapshot } from '../agent/model/model-capability.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { createInitialRunCheckpoint, RunCheckpointCodec } from '../agent/run/run-checkpoint.js';
 import { createRunEvent } from '../agent/run/run-events.js';
@@ -6,6 +7,15 @@ import { createOpenAICompatibleCompletionFacade } from '../runtime/completion-fa
 export const PHASE_5_MEMORY_SCENARIOS = Object.freeze([
     'idle', 'singleRun', 'dualRun', 'checkpointRecovery'
 ]);
+const FIXTURE_MODEL_CAPABILITY = parseModelCapabilitySnapshot({
+    schemaVersion: 1,
+    source: 'safe_default',
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+});
 const FIXTURE_MESSAGES = Object.freeze([
     Object.freeze({ role: 'system', content: 'Return one fixture answer.' }),
     Object.freeze({ role: 'user', content: 'fixture prompt' })
@@ -69,6 +79,8 @@ function checkpointFixture() {
             maxOutputTokens: 64,
             reasoning: Object.freeze({ enabled: false })
         }),
+        modelCapability: FIXTURE_MODEL_CAPABILITY,
+        modelPrice: null,
         toolSnapshot: Object.freeze({
             id: 'memory-snapshot',
             fingerprint: createHash('sha256').update('[]').digest('hex'),

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ModelProviderError } from '../agent/model/model-adapter.js';
+import { parseModelCapabilitySnapshot } from '../agent/model/model-capability.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint } from '../agent/run/run-checkpoint.js';
 import { createRunEvent } from '../agent/run/run-events.js';
@@ -10,6 +11,15 @@ import { createFrozenObservationPolicy, createRunTerminalSnapshot } from '../age
 import { createTraceCandidate } from '../agent/run/run-trace.js';
 import { createProductionYunzaiAgent } from '../runtime/production-yunzai-agent.js';
 import { TRACE_BYTES_KEY, TRACE_FAILURE_INDEX_KEY, TRACE_GENERATION_KEY, TRACE_KEY_PREFIX, TRACE_STORE_LUA_MARKER, TRACE_STORE_LIMITS, TRACE_SUCCESS_INDEX_KEY } from '../runtime/observability/redis-trace-store.js';
+const FIXTURE_MODEL_CAPABILITY = parseModelCapabilitySnapshot({
+    schemaVersion: 1,
+    source: 'safe_default',
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+});
 export const PHASE_6_RESOURCE_SCENARIOS = Object.freeze([
     'idle',
     'singleTextRun',
@@ -693,6 +703,8 @@ export function createPhase6SmallTraceCandidate(seed, status = 'completed', fini
             model: 'fixture-model', streaming: false, maxOutputTokens: 64,
             reasoning: Object.freeze({ enabled: false })
         }),
+        modelCapability: FIXTURE_MODEL_CAPABILITY,
+        modelPrice: null,
         toolSnapshot: Object.freeze({
             id: 'phase6-resource-snapshot', fingerprint: EMPTY_FINGERPRINT, manifest: Object.freeze([])
         }),

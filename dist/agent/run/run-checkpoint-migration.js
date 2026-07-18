@@ -1,5 +1,7 @@
 import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { parseRunCheckpoint } from './run-checkpoint.js';
+import { parseModelCapabilitySnapshot } from '../model/model-capability.js';
+import { createUnavailableRunUsageSummary } from './run-usage.js';
 export function upgradeCompletionFromRunCheckpointV1(checkpoint) {
     if (checkpoint.status !== 'completed')
         return null;
@@ -56,7 +58,7 @@ export function upgradeRunCheckpointV1(checkpoint, input) {
     const { schemaVersion: _schemaVersion, visibleOutput: _visibleOutput, ...state } = checkpoint;
     return parseRunCheckpoint({
         ...state,
-        schemaVersion: 3,
+        schemaVersion: 4,
         revision: checkpoint.revision + 1,
         runRef: input.runRef,
         requestRef: input.requestRef,
@@ -71,15 +73,43 @@ export function upgradeRunCheckpointV1(checkpoint, input) {
             levelAtStart: 'off',
             sampledSuccess: false
         }),
-        reasoningSegments: Object.freeze([])
+        reasoningSegments: Object.freeze([]),
+        modelCapability: legacyModelCapability(),
+        modelPrice: null,
+        usage: createUnavailableRunUsageSummary()
     });
 }
 export function upgradeRunCheckpointV2(checkpoint) {
     const { schemaVersion: _schemaVersion, ...state } = checkpoint;
     return parseRunCheckpoint({
         ...state,
-        schemaVersion: 3,
+        schemaVersion: 4,
         revision: checkpoint.revision + 1,
-        reasoningSegments: Object.freeze([])
+        reasoningSegments: Object.freeze([]),
+        modelCapability: legacyModelCapability(),
+        modelPrice: null,
+        usage: createUnavailableRunUsageSummary()
+    });
+}
+function legacyModelCapability() {
+    return parseModelCapabilitySnapshot({
+        schemaVersion: 1,
+        source: 'safe_default',
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 8_192,
+        promptCaching: 'unknown',
+        usageExtensions: [],
+        priceCatalogVersion: null
+    });
+}
+export function upgradeRunCheckpointV3(checkpoint) {
+    const { schemaVersion: _schemaVersion, ...state } = checkpoint;
+    return parseRunCheckpoint({
+        ...state,
+        schemaVersion: 4,
+        revision: checkpoint.revision + 1,
+        modelCapability: legacyModelCapability(),
+        modelPrice: null,
+        usage: createUnavailableRunUsageSummary()
     });
 }

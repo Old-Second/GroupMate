@@ -27,6 +27,7 @@ import { parseToolResult } from '../../src/agent/tools/tool-result.js'
 import {
   createGroupMateContentJournal
 } from '../../src/runtime/logging/groupmate-content-journal.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 import type {
   GroupMateContentJournal,
   GroupMateOutboundJournalEvent
@@ -262,6 +263,8 @@ function terminalJournalFixture (): Readonly<{
       model: 'fixture-model', streaming: false, maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'snapshot-1',
       fingerprint: createHash('sha256').update('[]').digest('hex'),

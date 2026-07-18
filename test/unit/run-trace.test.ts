@@ -32,6 +32,7 @@ import {
   parsePresentationObservation,
   type PresentationObservationV1
 } from '../../src/runtime/observability/observation-event.js'
+import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 
 const timestamp = '2026-07-16T00:00:00.000Z'
 const runRef = '1'.repeat(32)
@@ -93,6 +94,8 @@ function initial (): RunCheckpoint {
       maxOutputTokens: 256,
       reasoning: Object.freeze({ enabled: false })
     }),
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
     toolSnapshot: Object.freeze({
       id: 'private-snapshot-id',
       fingerprint: emptyFingerprint,
