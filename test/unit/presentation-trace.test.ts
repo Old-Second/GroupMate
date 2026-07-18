@@ -60,6 +60,52 @@ function utf8Bytes (value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8')
 }
 
+const completeUsage = Object.freeze({
+  schemaVersion: 1 as const,
+  availability: 'complete' as const,
+  inputTokens: 100,
+  outputTokens: 20,
+  totalTokens: 120,
+  cacheHitTokens: 80,
+  cacheMissTokens: 20,
+  turnsWithUsage: 1,
+  turnsWithoutUsage: 0,
+  cacheUsageComplete: true
+})
+
+const frozenPrice = Object.freeze({
+  schemaVersion: 1 as const,
+  catalogVersion: 'deepseek-cny-2026-07-19',
+  model: 'deepseek-v4-flash',
+  inputCacheHitPicoYuanPerMillionTokens: 20_000_000_000,
+  inputCacheMissPicoYuanPerMillionTokens: 1_000_000_000_000,
+  outputPicoYuanPerMillionTokens: 2_000_000_000_000
+})
+
+const emptyUsage = Object.freeze({
+  ...completeUsage,
+  inputTokens: 0,
+  outputTokens: 0,
+  totalTokens: 0,
+  cacheHitTokens: 0,
+  cacheMissTokens: 0,
+  turnsWithUsage: 0,
+  cacheUsageComplete: true
+})
+
+type BuilderInput = Parameters<typeof buildPresentationTrace>[0]
+
+function buildTrace (
+  input: Omit<BuilderInput, 'usage' | 'modelPrice'> &
+  Partial<Pick<BuilderInput, 'usage' | 'modelPrice'>>
+) {
+  return buildPresentationTrace({
+    ...input,
+    usage: input.usage ?? emptyUsage,
+    modelPrice: input.modelPrice ?? null
+  })
+}
+
 test('presentation trace parser accepts only the exact bounded v1 contract', () => {
   const parsed = parsePresentationTrace({
     schemaVersion: 1,
@@ -82,6 +128,190 @@ test('presentation trace parser accepts only the exact bounded v1 contract', () 
       parsed.segments[0]
     ))
   }), /segment|limit/i)
+})
+
+test('presentation trace parser keeps strict V1 compatibility and accepts only nested V2 usage', () => {
+  const v1 = {
+    schemaVersion: 1,
+    truncated: false,
+    segments: []
+  } as const
+  assert.deepEqual(parsePresentationTrace(v1), EMPTY_PRESENTATION_TRACE)
+  assert.throws(() => parsePresentationTrace({
+    ...v1,
+    usage: {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: 1,
+      outputTokens: 1,
+      totalTokens: 2,
+      cacheHitTokens: 0,
+      cacheMissTokens: 1,
+      cacheUsageComplete: true,
+      cost: {
+        kind: 'unavailable', catalogVersion: null, billingAuthority: false
+      }
+    }
+  }), /unknown|key|version/i)
+
+  const v2 = parsePresentationTrace({
+    schemaVersion: 2,
+    truncated: false,
+    segments: [],
+    usage: {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      cacheHitTokens: 80,
+      cacheMissTokens: 20,
+      cacheUsageComplete: true,
+      cost: {
+        kind: 'exact',
+        currency: 'CNY',
+        picoYuan: '61600000',
+        catalogVersion: 'deepseek-cny-2026-07-19',
+        billingAuthority: false
+      }
+    }
+  })
+  assert.equal(v2.schemaVersion, 2)
+  assert.equal(v2.usage?.cost.kind, 'exact')
+  assert.equal(JSON.stringify(v2).includes('61600000'), true)
+  assert.doesNotMatch(JSON.stringify(v2), /\d+n/)
+})
+
+test('presentation usage codec rejects noncanonical costs, cross-state values and hostile records', () => {
+  const usage = {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    cacheHitTokens: 80,
+    cacheMissTokens: 20,
+    cacheUsageComplete: true,
+    cost: {
+      kind: 'exact', currency: 'CNY', picoYuan: '61600000',
+      catalogVersion: 'catalog-v1', billingAuthority: false
+    }
+  } as const
+  const trace = (candidate: unknown) => ({
+    schemaVersion: 2, truncated: false, segments: [], usage: candidate
+  })
+  for (const picoYuan of [
+    '-1', '01', '1e3', '1.0', '', '9'.repeat(129)
+  ]) {
+    assert.throws(() => parsePresentationTrace(trace({
+      ...usage, cost: { ...usage.cost, picoYuan }
+    })), /cost|pico|canonical|invalid|limit/i)
+  }
+  for (const candidate of [
+    { ...usage, totalTokens: 121 },
+    { ...usage, cacheMissTokens: 19 },
+    { ...usage, inputTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { ...usage, availability: 'partial' },
+    { ...usage, cost: { ...usage.cost, kind: 'upper_bound' } },
+    { ...usage, cost: { ...usage.cost, picoYuan: 1n } },
+    Object.fromEntries(Object.entries(usage).filter(([key]) => key !== 'totalTokens')),
+    { ...usage, extra: true }
+  ]) {
+    assert.throws(() => parsePresentationTrace(trace(candidate)), TypeError)
+  }
+
+  let reads = 0
+  const hostile = Object.create(null)
+  for (const [key, value] of Object.entries(usage)) {
+    Object.defineProperty(hostile, key, key === 'inputTokens'
+      ? { enumerable: true, get: () => { reads += 1; return value } }
+      : { enumerable: true, value })
+  }
+  assert.throws(() => parsePresentationTrace(trace(hostile)), TypeError)
+  assert.equal(reads, 0)
+
+  let proxyTraps = 0
+  const proxied = new Proxy(usage, {
+    ownKeys: target => {
+      proxyTraps += 1
+      return Reflect.ownKeys(target)
+    },
+    getOwnPropertyDescriptor: (target, key) => {
+      proxyTraps += 1
+      return Reflect.getOwnPropertyDescriptor(target, key)
+    }
+  })
+  assert.throws(() => parsePresentationTrace(trace(proxied)), TypeError)
+  assert.equal(proxyTraps, 0)
+  const sparse = new Array(1)
+  assert.throws(() => parsePresentationTrace({
+    schemaVersion: 2, truncated: false, segments: sparse
+  }), TypeError)
+})
+
+test('presentation builder always emits V2 and projects exact, upper-bound and unavailable costs', () => {
+  const exact = buildTrace({
+    reasoningSegments: [],
+    toolLedgers: [],
+    usage: completeUsage,
+    modelPrice: frozenPrice
+  })
+  assert.deepEqual(exact, {
+    schemaVersion: 2,
+    truncated: false,
+    segments: [],
+    usage: {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      cacheHitTokens: 80,
+      cacheMissTokens: 20,
+      cacheUsageComplete: true,
+      cost: {
+        kind: 'exact',
+        currency: 'CNY',
+        picoYuan: '61600000',
+        catalogVersion: 'deepseek-cny-2026-07-19',
+        billingAuthority: false
+      }
+    }
+  })
+  assert.doesNotThrow(() => JSON.stringify(exact))
+
+  const upperBound = buildTrace({
+    reasoningSegments: [],
+    toolLedgers: [],
+    usage: Object.freeze({ ...completeUsage, cacheUsageComplete: false }),
+    modelPrice: frozenPrice
+  })
+  assert.equal(upperBound.schemaVersion, 2)
+  assert.equal(upperBound.usage?.cost.kind, 'upper_bound')
+  assert.equal(upperBound.usage?.cost.kind === 'upper_bound'
+    ? upperBound.usage.cost.picoYuan
+    : null, '140000000')
+
+  for (const [availability, modelPrice] of [
+    ['partial', frozenPrice],
+    ['unavailable', frozenPrice],
+    ['complete', null]
+  ] as const) {
+    const projected = buildTrace({
+      reasoningSegments: [],
+      toolLedgers: [],
+      usage: Object.freeze({
+        ...completeUsage,
+        availability,
+        ...(availability === 'partial' ? { turnsWithoutUsage: 1 } : {}),
+        cacheUsageComplete: false
+      }),
+      modelPrice
+    })
+    assert.equal(projected.schemaVersion, 2)
+    assert.equal(projected.usage?.cost.kind, 'unavailable')
+    assert.equal(projected.usage?.inputTokens, 100)
+  }
 })
 
 test('presentation trace parser enforces tool fields, closed outcomes and field limits', () => {
@@ -162,7 +392,7 @@ test('presentation trace parser rejects accessors and non-NFC text without invok
 })
 
 test('presentation trace builder redacts credentials but preserves safe task details', () => {
-  const trace = buildPresentationTrace({
+  const trace = buildTrace({
     reasoningSegments: [{ step: 0, turn: 1, text: '先搜索', truncated: false }],
     toolLedgers: [ledgerWith(Object.freeze({
       api_key: 'secret-a',
@@ -205,7 +435,7 @@ test('presentation trace builder masks every fixed sensitive key without masking
     private_key: 'sensitive-value-13',
     max_tokens: 64
   }
-  const trace = buildPresentationTrace({
+  const trace = buildTrace({
     reasoningSegments: [],
     toolLedgers: [ledgerWith(
       Object.freeze(sensitiveArguments) as JsonObject,
@@ -232,7 +462,7 @@ test('presentation trace builder maps every terminal tool outcome and visible re
     status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
     userMessage: '结果待确认', retryable: false
   })
-  const trace = buildPresentationTrace({
+  const trace = buildTrace({
     reasoningSegments: [],
     toolLedgers: [
       ledgerWith({}, successResult([], 'none'), { step: 0, toolName: 'empty' }),
@@ -276,7 +506,7 @@ test('presentation trace builder drops hostile nodes without executing accessors
       return { leaked: true }
     }
   })
-  const trace = buildPresentationTrace({
+  const trace = buildTrace({
     reasoningSegments: [],
     toolLedgers: [
       ledgerWith(hostileArguments as JsonObject, successResult([]), {
@@ -294,10 +524,13 @@ test('presentation trace builder drops hostile nodes without executing accessors
   assert.deepEqual(trace.segments.map(segment => (
     segment.kind === 'tool' ? segment.toolName : segment.kind
   )), ['safe'])
-  assert.deepEqual(buildPresentationTrace({
+  const hostileOnly = buildTrace({
     reasoningSegments: [],
     toolLedgers: [ledgerWith(hostileArguments as JsonObject, successResult([]))]
-  }), EMPTY_PRESENTATION_TRACE)
+  })
+  assert.equal(hostileOnly.schemaVersion, 2)
+  assert.equal(hostileOnly.truncated, true)
+  assert.deepEqual(hostileOnly.segments, [])
 })
 
 test('presentation trace builder preserves only a bounded chronological prefix', () => {
@@ -313,7 +546,7 @@ test('presentation trace builder preserves only a bounded chronological prefix',
     { step: index, index: 0, toolName: `tool_${index}` }
   ))
 
-  const trace = buildPresentationTrace({ reasoningSegments, toolLedgers })
+  const trace = buildTrace({ reasoningSegments, toolLedgers })
 
   assert.ok(utf8Bytes(trace) <= PRESENTATION_TRACE_MAX_BYTES)
   assert.ok(trace.segments.length <= PRESENTATION_TRACE_MAX_SEGMENTS)
@@ -329,8 +562,50 @@ test('presentation trace builder preserves only a bounded chronological prefix',
   }
 })
 
+test('presentation builder budgets full V2 bytes, retains usage on truncation and degrades only usage', () => {
+  const reasoningSegments = Array.from({ length: 6 }, (_, index) => ({
+    step: index,
+    turn: index + 1,
+    text: '思'.repeat(2_000),
+    truncated: false
+  }))
+  const trace = buildTrace({
+    reasoningSegments,
+    toolLedgers: [],
+    usage: completeUsage,
+    modelPrice: frozenPrice
+  })
+  assert.equal(trace.schemaVersion, 2)
+  assert.ok(utf8Bytes(trace) <= PRESENTATION_TRACE_MAX_BYTES)
+  assert.equal(trace.truncated, true)
+  assert.equal(trace.usage?.inputTokens, 100)
+  assert.ok(trace.segments.length > 0)
+  assert.ok(trace.segments.length <= PRESENTATION_TRACE_MAX_SEGMENTS)
+
+  let getterReads = 0
+  const hostileUsage = Object.defineProperty({ ...completeUsage }, 'inputTokens', {
+    enumerable: true,
+    get: () => {
+      getterReads += 1
+      return 100
+    }
+  })
+  const degraded = buildTrace({
+    reasoningSegments: [{ step: 0, turn: 1, text: '仍需保留', truncated: false }],
+    toolLedgers: [],
+    usage: hostileUsage as typeof completeUsage,
+    modelPrice: frozenPrice
+  })
+  assert.equal(getterReads, 0)
+  assert.equal(degraded.schemaVersion, 2)
+  assert.equal(Object.hasOwn(degraded, 'usage'), false)
+  assert.equal(degraded.segments[0]?.kind === 'reasoning'
+    ? degraded.segments[0].text
+    : null, '仍需保留')
+})
+
 test('presentation trace builder keeps at most eight chronological tool nodes', () => {
-  const trace = buildPresentationTrace({
+  const trace = buildTrace({
     reasoningSegments: [],
     toolLedgers: Array.from({ length: 9 }, (_, index) => ledgerWith(
       { index },

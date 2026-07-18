@@ -1,4 +1,8 @@
-import { EMPTY_PRESENTATION_TRACE, PRESENTATION_TRACE_MAX_ARGUMENT_CODE_POINTS, PRESENTATION_TRACE_MAX_BYTES, PRESENTATION_TRACE_MAX_REASONING_SEGMENTS, PRESENTATION_TRACE_MAX_RESULT_CODE_POINTS, PRESENTATION_TRACE_MAX_SEGMENTS, PRESENTATION_TRACE_MAX_TOOL_SEGMENTS, parsePresentationTrace } from '../contracts/presentation-trace.js';
+import { types as utilTypes } from 'node:util';
+import { PRESENTATION_TRACE_MAX_ARGUMENT_CODE_POINTS, PRESENTATION_TRACE_MAX_BYTES, PRESENTATION_TRACE_MAX_REASONING_SEGMENTS, PRESENTATION_TRACE_MAX_RESULT_CODE_POINTS, PRESENTATION_TRACE_MAX_SEGMENTS, PRESENTATION_TRACE_MAX_TOOL_SEGMENTS, parsePresentationTrace, parsePresentationUsageSummary } from '../contracts/presentation-trace.js';
+import { calculateModelCost } from '../model/model-cost.js';
+import { parseModelPriceSnapshot } from '../model/model-price-catalog.js';
+import { parseRunUsageSummary } from './run-usage.js';
 const REDACTED = '[已隐藏]';
 const TRUNCATION_MARKER = '…（内容已截断）';
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
@@ -9,6 +13,17 @@ const SENSITIVE_KEYS = new Set([
     'apikey', 'token', 'accesstoken', 'refreshtoken', 'authtoken',
     'secret', 'clientsecret', 'password', 'passwd', 'authorization',
     'cookie', 'credential', 'privatekey'
+]);
+const RUN_USAGE_KEYS = Object.freeze([
+    'schemaVersion', 'availability', 'inputTokens', 'outputTokens', 'totalTokens',
+    'cacheHitTokens', 'cacheMissTokens', 'turnsWithUsage', 'turnsWithoutUsage',
+    'cacheUsageComplete'
+]);
+const MODEL_PRICE_KEYS = Object.freeze([
+    'schemaVersion', 'catalogVersion', 'model',
+    'inputCacheHitPicoYuanPerMillionTokens',
+    'inputCacheMissPicoYuanPerMillionTokens',
+    'outputPicoYuanPerMillionTokens'
 ]);
 function normalizedKey(key) {
     return key.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -24,7 +39,8 @@ function ownDataValue(value, key, label) {
     return descriptor.value;
 }
 function exactDataRecord(value, keys, optionalKeys = []) {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+        utilTypes.isProxy(value)) {
         throw new TypeError('trace projection record is invalid');
     }
     const ownKeys = Reflect.ownKeys(value);
@@ -42,12 +58,19 @@ function exactDataRecord(value, keys, optionalKeys = []) {
     return Object.freeze(result);
 }
 function ownArrayValues(value) {
-    if (!Array.isArray(value) || value.length > MAX_SAFE_JSON_ARRAY_ITEMS) {
+    if (!Array.isArray(value) || utilTypes.isProxy(value)) {
         throw new TypeError('trace projection array is invalid');
     }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (lengthDescriptor === undefined || !Object.hasOwn(lengthDescriptor, 'value') ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        Number(lengthDescriptor.value) > MAX_SAFE_JSON_ARRAY_ITEMS) {
+        throw new TypeError('trace projection array is invalid');
+    }
+    const length = Number(lengthDescriptor.value);
     const allowedKeys = new Set(['length']);
     const result = [];
-    for (let index = 0; index < value.length; index += 1) {
+    for (let index = 0; index < length; index += 1) {
         const key = String(index);
         allowedKeys.add(key);
         result.push(ownDataValue(value, key, 'trace projection array'));
@@ -102,6 +125,8 @@ function safeJsonValue(value, state, depth = 0) {
     }
     if (typeof value !== 'object')
         throw new TypeError('trace projection value is unsupported');
+    if (utilTypes.isProxy(value))
+        throw new TypeError('trace projection proxy is invalid');
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
         throw new TypeError('trace projection object prototype is invalid');
@@ -264,14 +289,15 @@ function segmentWithMarker(segment, retainedCodePoints) {
         ? Object.freeze({ ...segment, text: marked, truncated: true })
         : Object.freeze({ ...segment, resultSummary: marked, truncated: true });
 }
-function traceBytes(segments, truncated) {
+function traceBytes(segments, truncated, usage) {
     return Buffer.byteLength(JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         truncated,
-        segments
+        segments,
+        ...(usage === undefined ? {} : { usage })
     }), 'utf8');
 }
-function fitMarkedSegment(prefix, segment) {
+function fitMarkedSegment(prefix, segment, usage) {
     const field = segment.kind === 'reasoning' ? segment.text : segment.resultSummary;
     let low = 0;
     let high = [...field].length;
@@ -279,7 +305,7 @@ function fitMarkedSegment(prefix, segment) {
     while (low <= high) {
         const middle = Math.floor((low + high) / 2);
         const candidate = segmentWithMarker(segment, middle);
-        if (traceBytes([...prefix, candidate], true) <= PRESENTATION_TRACE_MAX_BYTES) {
+        if (traceBytes([...prefix, candidate], true, usage) <= PRESENTATION_TRACE_MAX_BYTES) {
             fitted = candidate;
             low = middle + 1;
         }
@@ -289,28 +315,100 @@ function fitMarkedSegment(prefix, segment) {
     }
     return fitted;
 }
-function finalizeTruncatedPrefix(prefix, candidate) {
+function finalizeTruncatedPrefix(prefix, usage, candidate) {
     if (candidate !== undefined) {
-        const fitted = fitMarkedSegment(prefix, candidate);
+        const fitted = fitMarkedSegment(prefix, candidate, usage);
         if (fitted !== null) {
             return parsePresentationTrace({
-                schemaVersion: 1,
+                schemaVersion: 2,
                 truncated: true,
-                segments: [...prefix, fitted]
+                segments: [...prefix, fitted],
+                ...(usage === undefined ? {} : { usage })
             });
         }
     }
     const previous = prefix.at(-1);
-    if (previous === undefined)
-        return EMPTY_PRESENTATION_TRACE;
+    if (previous === undefined) {
+        return parsePresentationTrace({
+            schemaVersion: 2,
+            truncated: true,
+            segments: [],
+            ...(usage === undefined ? {} : { usage })
+        });
+    }
     const earlier = prefix.slice(0, -1);
-    const fittedPrevious = fitMarkedSegment(earlier, previous);
-    if (fittedPrevious === null)
-        return EMPTY_PRESENTATION_TRACE;
+    const fittedPrevious = fitMarkedSegment(earlier, previous, usage);
+    if (fittedPrevious === null) {
+        return parsePresentationTrace({
+            schemaVersion: 2,
+            truncated: true,
+            segments: [],
+            ...(usage === undefined ? {} : { usage })
+        });
+    }
     return parsePresentationTrace({
-        schemaVersion: 1,
+        schemaVersion: 2,
         truncated: true,
-        segments: [...earlier, fittedPrevious]
+        segments: [...earlier, fittedPrevious],
+        ...(usage === undefined ? {} : { usage })
+    });
+}
+function detachedDataRecord(value, keys, label) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+        utilTypes.isProxy(value)) {
+        throw new TypeError(`${label} is invalid`);
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== keys.length || ownKeys.some(key => (typeof key !== 'string' || !keys.includes(key))) || keys.some(key => !ownKeys.includes(key))) {
+        throw new TypeError(`${label} keys are invalid`);
+    }
+    const result = {};
+    for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor === undefined || !descriptor.enumerable ||
+            !Object.hasOwn(descriptor, 'value')) {
+            throw new TypeError(`${label} must contain enumerable own data properties`);
+        }
+        result[key] = descriptor.value;
+    }
+    return Object.freeze(result);
+}
+function projectUsage(usageValue, priceValue) {
+    const usage = parseRunUsageSummary(detachedDataRecord(usageValue, RUN_USAGE_KEYS, 'presentation run usage'));
+    const price = priceValue === null
+        ? null
+        : parseModelPriceSnapshot(detachedDataRecord(priceValue, MODEL_PRICE_KEYS, 'presentation model price'));
+    const cost = usage.availability !== 'complete'
+        ? Object.freeze({
+            kind: 'unavailable',
+            catalogVersion: price?.catalogVersion ?? null,
+            billingAuthority: false
+        })
+        : calculateModelCost(price ?? undefined, {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            totalTokens: usage.totalTokens,
+            ...(usage.cacheUsageComplete
+                ? {
+                    inputCache: Object.freeze({
+                        hitTokens: usage.cacheHitTokens,
+                        missTokens: usage.cacheMissTokens
+                    })
+                }
+                : {})
+        });
+    return parsePresentationUsageSummary({
+        schemaVersion: 1,
+        availability: usage.availability,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        cacheHitTokens: usage.cacheHitTokens,
+        cacheMissTokens: usage.cacheMissTokens,
+        cacheUsageComplete: usage.cacheUsageComplete,
+        cost: cost.kind === 'unavailable'
+            ? cost
+            : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) })
     });
 }
 function candidateOrder(left, right) {
@@ -329,6 +427,13 @@ function candidateOrder(left, right) {
     return leftIndex - rightIndex || left.ordinal - right.ordinal;
 }
 export function buildPresentationTrace(input) {
+    let usage;
+    try {
+        usage = projectUsage(input.usage, input.modelPrice);
+    }
+    catch {
+        usage = undefined;
+    }
     try {
         const candidates = [];
         let projectionTruncated = false;
@@ -390,11 +495,11 @@ export function buildPresentationTrace(input) {
             if (prefix.length >= PRESENTATION_TRACE_MAX_SEGMENTS ||
                 (isReasoning && reasoningCount >= PRESENTATION_TRACE_MAX_REASONING_SEGMENTS) ||
                 (!isReasoning && toolCount >= PRESENTATION_TRACE_MAX_TOOL_SEGMENTS)) {
-                return finalizeTruncatedPrefix(prefix);
+                return finalizeTruncatedPrefix(prefix, usage);
             }
-            if (traceBytes([...prefix, candidate.segment], projectionTruncated) >
+            if (traceBytes([...prefix, candidate.segment], projectionTruncated, usage) >
                 PRESENTATION_TRACE_MAX_BYTES) {
-                return finalizeTruncatedPrefix(prefix, candidate.segment);
+                return finalizeTruncatedPrefix(prefix, usage, candidate.segment);
             }
             prefix.push(candidate.segment);
             if (isReasoning)
@@ -404,15 +509,19 @@ export function buildPresentationTrace(input) {
             if (candidate.segment.truncated)
                 projectionTruncated = true;
         }
-        if (prefix.length === 0)
-            return EMPTY_PRESENTATION_TRACE;
         return parsePresentationTrace({
-            schemaVersion: 1,
+            schemaVersion: 2,
             truncated: projectionTruncated,
-            segments: prefix
+            segments: prefix,
+            ...(usage === undefined ? {} : { usage })
         });
     }
     catch {
-        return EMPTY_PRESENTATION_TRACE;
+        return parsePresentationTrace({
+            schemaVersion: 2,
+            truncated: true,
+            segments: [],
+            ...(usage === undefined ? {} : { usage })
+        });
     }
 }

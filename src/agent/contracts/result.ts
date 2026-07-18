@@ -20,7 +20,7 @@ import {
 } from '../run/run-store.js'
 import {
   parsePresentationTrace,
-  type PresentationTraceV1
+  type PresentationTrace
 } from './presentation-trace.js'
 
 export type AgentResult =
@@ -40,7 +40,7 @@ export type RunAdvanceResult =
       readonly runRef: string
       readonly completion: CompletionDisposition
       readonly output: AgentMessage | null
-      readonly presentationTrace: PresentationTraceV1
+      readonly presentationTrace: PresentationTrace
       readonly terminal: TerminalFactsV1
     }
   | {

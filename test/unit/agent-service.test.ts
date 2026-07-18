@@ -4,7 +4,10 @@ import { test } from 'node:test'
 import type { AgentMessage } from '../../src/agent/contracts/content.js'
 import type { CompletionDisposition } from '../../src/agent/contracts/completion.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
-import { EMPTY_PRESENTATION_TRACE } from '../../src/agent/contracts/presentation-trace.js'
+import {
+  EMPTY_PRESENTATION_TRACE,
+  parsePresentationTrace
+} from '../../src/agent/contracts/presentation-trace.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
 import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
@@ -786,6 +789,66 @@ test('chat reply envelope projects exact RunAdvanceResult without text or visibl
     requestObservationDraft: proactiveDraft,
     sessionPersistence: 'not_attempted'
   })).sessionPersistence, 'not_attempted')
+})
+
+test('agent service projection passes nested presentation V2 through unchanged', () => {
+  const base = completedResult(
+    'projection-v2',
+    '9'.repeat(32),
+    Object.freeze({ kind: 'reply_text', text: '带用量投影' })
+  )
+  const presentationTrace = parsePresentationTrace({
+    schemaVersion: 2,
+    truncated: false,
+    segments: [{
+      kind: 'reasoning', step: 0, turn: 1,
+      text: '投影思考', truncated: false
+    }],
+    usage: {
+      schemaVersion: 1,
+      availability: 'partial',
+      inputTokens: 5,
+      outputTokens: 2,
+      totalTokens: 7,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      cacheUsageComplete: false,
+      cost: {
+        kind: 'unavailable', catalogVersion: null, billingAuthority: false
+      }
+    }
+  })
+  const draft = createRequestObservationDraft({
+    context: activateRequestObservation({
+      context: beginRequestObservation({
+        requestRef: '8'.repeat(32),
+        requestKind: 'ordinary_chat',
+        startedAtMonotonicMs: 0
+      }),
+      runRef: base.runRef,
+      queueDurationMs: 0,
+      sessionLoadDurationMs: 0
+    }),
+    outcome: 'completed',
+    admissionRejectionReason: 'not_applicable',
+    sessionSaveDurationMs: 0,
+    terminalObservationId: base.terminal.snapshot.observationId
+  })
+  const envelope = Object.freeze({
+    ...base,
+    presentationTrace,
+    requestObservationDraft: draft,
+    sessionPersistence: 'saved' as const
+  })
+  const projected = projectRunAdvanceResult(envelope)
+  assert.equal(projected.kind, 'completed')
+  if (projected.kind !== 'completed') return
+  assert.deepEqual(projected.presentationTrace, presentationTrace)
+  assert.equal(projected.presentationTrace.schemaVersion, 2)
+  assert.equal(projected.presentationTrace.usage?.inputTokens, 5)
+  assert.deepEqual(Reflect.ownKeys(projected), [
+    'kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal'
+  ])
 })
 
 test('request-scoped presentation lifecycle owns the initial claimed run', async () => {

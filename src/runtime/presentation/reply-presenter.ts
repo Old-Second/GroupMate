@@ -1,7 +1,7 @@
 import { getChatErrorPresentation } from '../chat-error-presentation.js'
 import {
   EMPTY_PRESENTATION_TRACE,
-  type PresentationTraceV1
+  type PresentationTrace
 } from '../../agent/contracts/presentation-trace.js'
 import {
   aggregatePresentationResults,
@@ -245,7 +245,7 @@ async function presentOrdinary (
   dependencies: ReplyPresenterDependencies,
   input: PresentationInput,
   text: string,
-  executionTrace: PresentationTraceV1
+  executionTrace: PresentationTrace
 ): Promise<PresentationResult> {
   const profile = input.profile
   if (profile.kind !== 'ordinary') return failedWithoutDelivery()

@@ -1,5 +1,5 @@
+import { types as utilTypes } from 'node:util'
 import {
-  EMPTY_PRESENTATION_TRACE,
   PRESENTATION_TRACE_MAX_ARGUMENT_CODE_POINTS,
   PRESENTATION_TRACE_MAX_BYTES,
   PRESENTATION_TRACE_MAX_REASONING_SEGMENTS,
@@ -7,12 +7,23 @@ import {
   PRESENTATION_TRACE_MAX_SEGMENTS,
   PRESENTATION_TRACE_MAX_TOOL_SEGMENTS,
   parsePresentationTrace,
+  parsePresentationUsageSummary,
   type PresentationTraceSegmentV1,
+  type PresentationTraceV2,
   type PresentationTraceToolOutcomeV1,
-  type PresentationTraceV1
+  type PresentationUsageSummaryV1
 } from '../contracts/presentation-trace.js'
 import type { JsonValue } from '../model/json-value.js'
+import { calculateModelCost } from '../model/model-cost.js'
+import {
+  parseModelPriceSnapshot,
+  type ModelPriceSnapshotV1
+} from '../model/model-price-catalog.js'
 import type { RunReasoningSegment } from './run-reasoning-segment.js'
+import {
+  parseRunUsageSummary,
+  type RunUsageSummaryV1
+} from './run-usage.js'
 import type {
   TerminalToolLedgerStatus,
   ToolExecutionLedger,
@@ -22,6 +33,8 @@ import type {
 export interface BuildPresentationTraceInput {
   readonly reasoningSegments: readonly RunReasoningSegment[]
   readonly toolLedgers: readonly ToolExecutionLedger[]
+  readonly usage: RunUsageSummaryV1
+  readonly modelPrice: ModelPriceSnapshotV1 | null
 }
 
 const REDACTED = '[已隐藏]'
@@ -50,6 +63,18 @@ interface ProjectionState {
   nodes: number
 }
 
+const RUN_USAGE_KEYS = Object.freeze([
+  'schemaVersion', 'availability', 'inputTokens', 'outputTokens', 'totalTokens',
+  'cacheHitTokens', 'cacheMissTokens', 'turnsWithUsage', 'turnsWithoutUsage',
+  'cacheUsageComplete'
+])
+const MODEL_PRICE_KEYS = Object.freeze([
+  'schemaVersion', 'catalogVersion', 'model',
+  'inputCacheHitPicoYuanPerMillionTokens',
+  'inputCacheMissPicoYuanPerMillionTokens',
+  'outputPicoYuanPerMillionTokens'
+])
+
 function normalizedKey (key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '')
 }
@@ -71,7 +96,8 @@ function exactDataRecord (
   keys: readonly string[],
   optionalKeys: readonly string[] = []
 ): Readonly<Record<string, unknown>> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    utilTypes.isProxy(value)) {
     throw new TypeError('trace projection record is invalid')
   }
   const ownKeys = Reflect.ownKeys(value)
@@ -89,12 +115,19 @@ function exactDataRecord (
 }
 
 function ownArrayValues (value: unknown): readonly unknown[] {
-  if (!Array.isArray(value) || value.length > MAX_SAFE_JSON_ARRAY_ITEMS) {
+  if (!Array.isArray(value) || utilTypes.isProxy(value)) {
     throw new TypeError('trace projection array is invalid')
   }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
+  if (lengthDescriptor === undefined || !Object.hasOwn(lengthDescriptor, 'value') ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    Number(lengthDescriptor.value) > MAX_SAFE_JSON_ARRAY_ITEMS) {
+    throw new TypeError('trace projection array is invalid')
+  }
+  const length = Number(lengthDescriptor.value)
   const allowedKeys = new Set(['length'])
   const result: unknown[] = []
-  for (let index = 0; index < value.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const key = String(index)
     allowedKeys.add(key)
     result.push(ownDataValue(value, key, 'trace projection array'))
@@ -153,6 +186,7 @@ function safeJsonValue (
     )))
   }
   if (typeof value !== 'object') throw new TypeError('trace projection value is unsupported')
+  if (utilTypes.isProxy(value)) throw new TypeError('trace projection proxy is invalid')
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError('trace projection object prototype is invalid')
@@ -332,18 +366,21 @@ function segmentWithMarker (
 
 function traceBytes (
   segments: readonly PresentationTraceSegmentV1[],
-  truncated: boolean
+  truncated: boolean,
+  usage: PresentationUsageSummaryV1 | undefined
 ): number {
   return Buffer.byteLength(JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     truncated,
-    segments
+    segments,
+    ...(usage === undefined ? {} : { usage })
   }), 'utf8')
 }
 
 function fitMarkedSegment (
   prefix: readonly PresentationTraceSegmentV1[],
-  segment: PresentationTraceSegmentV1
+  segment: PresentationTraceSegmentV1,
+  usage: PresentationUsageSummaryV1 | undefined
 ): PresentationTraceSegmentV1 | null {
   const field = segment.kind === 'reasoning' ? segment.text : segment.resultSummary
   let low = 0
@@ -352,7 +389,7 @@ function fitMarkedSegment (
   while (low <= high) {
     const middle = Math.floor((low + high) / 2)
     const candidate = segmentWithMarker(segment, middle)
-    if (traceBytes([...prefix, candidate], true) <= PRESENTATION_TRACE_MAX_BYTES) {
+    if (traceBytes([...prefix, candidate], true, usage) <= PRESENTATION_TRACE_MAX_BYTES) {
       fitted = candidate
       low = middle + 1
     } else {
@@ -364,27 +401,121 @@ function fitMarkedSegment (
 
 function finalizeTruncatedPrefix (
   prefix: readonly PresentationTraceSegmentV1[],
+  usage: PresentationUsageSummaryV1 | undefined,
   candidate?: PresentationTraceSegmentV1
-): PresentationTraceV1 {
+): PresentationTraceV2 {
   if (candidate !== undefined) {
-    const fitted = fitMarkedSegment(prefix, candidate)
+    const fitted = fitMarkedSegment(prefix, candidate, usage)
     if (fitted !== null) {
       return parsePresentationTrace({
-        schemaVersion: 1,
+        schemaVersion: 2,
         truncated: true,
-        segments: [...prefix, fitted]
-      })
+        segments: [...prefix, fitted],
+        ...(usage === undefined ? {} : { usage })
+      }) as PresentationTraceV2
     }
   }
   const previous = prefix.at(-1)
-  if (previous === undefined) return EMPTY_PRESENTATION_TRACE
+  if (previous === undefined) {
+    return parsePresentationTrace({
+      schemaVersion: 2,
+      truncated: true,
+      segments: [],
+      ...(usage === undefined ? {} : { usage })
+    }) as PresentationTraceV2
+  }
   const earlier = prefix.slice(0, -1)
-  const fittedPrevious = fitMarkedSegment(earlier, previous)
-  if (fittedPrevious === null) return EMPTY_PRESENTATION_TRACE
+  const fittedPrevious = fitMarkedSegment(earlier, previous, usage)
+  if (fittedPrevious === null) {
+    return parsePresentationTrace({
+      schemaVersion: 2,
+      truncated: true,
+      segments: [],
+      ...(usage === undefined ? {} : { usage })
+    }) as PresentationTraceV2
+  }
   return parsePresentationTrace({
-    schemaVersion: 1,
+    schemaVersion: 2,
     truncated: true,
-    segments: [...earlier, fittedPrevious]
+    segments: [...earlier, fittedPrevious],
+    ...(usage === undefined ? {} : { usage })
+  }) as PresentationTraceV2
+}
+
+function detachedDataRecord (
+  value: unknown,
+  keys: readonly string[],
+  label: string
+): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    utilTypes.isProxy(value)) {
+    throw new TypeError(`${label} is invalid`)
+  }
+  const ownKeys = Reflect.ownKeys(value)
+  if (ownKeys.length !== keys.length || ownKeys.some(key => (
+    typeof key !== 'string' || !keys.includes(key)
+  )) || keys.some(key => !ownKeys.includes(key))) {
+    throw new TypeError(`${label} keys are invalid`)
+  }
+  const result: Record<string, unknown> = {}
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined || !descriptor.enumerable ||
+      !Object.hasOwn(descriptor, 'value')) {
+      throw new TypeError(`${label} must contain enumerable own data properties`)
+    }
+    result[key] = descriptor.value
+  }
+  return Object.freeze(result)
+}
+
+function projectUsage (
+  usageValue: RunUsageSummaryV1,
+  priceValue: ModelPriceSnapshotV1 | null
+): PresentationUsageSummaryV1 {
+  const usage = parseRunUsageSummary(detachedDataRecord(
+    usageValue,
+    RUN_USAGE_KEYS,
+    'presentation run usage'
+  ))
+  const price = priceValue === null
+    ? null
+    : parseModelPriceSnapshot(detachedDataRecord(
+        priceValue,
+        MODEL_PRICE_KEYS,
+        'presentation model price'
+      ))
+  const cost = usage.availability !== 'complete'
+    ? Object.freeze({
+        kind: 'unavailable' as const,
+        catalogVersion: price?.catalogVersion ?? null,
+        billingAuthority: false as const
+      })
+    : calculateModelCost(price ?? undefined, {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        ...(usage.cacheUsageComplete
+          ? {
+              inputCache: Object.freeze({
+                hitTokens: usage.cacheHitTokens,
+                missTokens: usage.cacheMissTokens
+              })
+            }
+          : {})
+      })
+  return parsePresentationUsageSummary({
+    schemaVersion: 1,
+    availability: usage.availability,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+    cacheHitTokens: usage.cacheHitTokens,
+    cacheMissTokens: usage.cacheMissTokens,
+    cacheUsageComplete: usage.cacheUsageComplete,
+    cost: cost.kind === 'unavailable'
+      ? cost
+      : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) })
   })
 }
 
@@ -406,7 +537,13 @@ function candidateOrder (left: CandidateSegment, right: CandidateSegment): numbe
 
 export function buildPresentationTrace (
   input: BuildPresentationTraceInput
-): PresentationTraceV1 {
+): PresentationTraceV2 {
+  let usage: PresentationUsageSummaryV1 | undefined
+  try {
+    usage = projectUsage(input.usage, input.modelPrice)
+  } catch {
+    usage = undefined
+  }
   try {
     const candidates: CandidateSegment[] = []
     let projectionTruncated = false
@@ -465,24 +602,29 @@ export function buildPresentationTrace (
       if (prefix.length >= PRESENTATION_TRACE_MAX_SEGMENTS ||
         (isReasoning && reasoningCount >= PRESENTATION_TRACE_MAX_REASONING_SEGMENTS) ||
         (!isReasoning && toolCount >= PRESENTATION_TRACE_MAX_TOOL_SEGMENTS)) {
-        return finalizeTruncatedPrefix(prefix)
+        return finalizeTruncatedPrefix(prefix, usage)
       }
-      if (traceBytes([...prefix, candidate.segment], projectionTruncated) >
+      if (traceBytes([...prefix, candidate.segment], projectionTruncated, usage) >
         PRESENTATION_TRACE_MAX_BYTES) {
-        return finalizeTruncatedPrefix(prefix, candidate.segment)
+        return finalizeTruncatedPrefix(prefix, usage, candidate.segment)
       }
       prefix.push(candidate.segment)
       if (isReasoning) reasoningCount += 1
       else toolCount += 1
       if (candidate.segment.truncated) projectionTruncated = true
     }
-    if (prefix.length === 0) return EMPTY_PRESENTATION_TRACE
     return parsePresentationTrace({
-      schemaVersion: 1,
+      schemaVersion: 2,
       truncated: projectionTruncated,
-      segments: prefix
-    })
+      segments: prefix,
+      ...(usage === undefined ? {} : { usage })
+    }) as PresentationTraceV2
   } catch {
-    return EMPTY_PRESENTATION_TRACE
+    return parsePresentationTrace({
+      schemaVersion: 2,
+      truncated: true,
+      segments: [],
+      ...(usage === undefined ? {} : { usage })
+    }) as PresentationTraceV2
   }
 }

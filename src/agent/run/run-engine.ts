@@ -739,7 +739,9 @@ function terminalResult (
       output: checkpoint.output,
       presentationTrace: buildPresentationTrace({
         reasoningSegments: checkpoint.reasoningSegments,
-        toolLedgers: checkpoint.toolLedgers
+        toolLedgers: checkpoint.toolLedgers,
+        usage: checkpoint.usage,
+        modelPrice: checkpoint.modelPrice
       }),
       terminal
     })

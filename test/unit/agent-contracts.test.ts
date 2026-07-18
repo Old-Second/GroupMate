@@ -203,6 +203,44 @@ test('result parsers use one completion contract and freeze run references on ev
   }).runRef, 'unavailable')
 })
 
+test('completed result accepts nested presentation V2 without adding result-level usage keys', () => {
+  const completed = {
+    kind: 'completed',
+    runId: 'run-v2',
+    runRef: terminalRunRef,
+    completion: { kind: 'already_visible', source: 'tool_output' },
+    output: null,
+    presentationTrace: {
+      schemaVersion: 2,
+      truncated: false,
+      segments: [],
+      usage: {
+        schemaVersion: 1,
+        availability: 'complete',
+        inputTokens: 1,
+        outputTokens: 1,
+        totalTokens: 2,
+        cacheHitTokens: 0,
+        cacheMissTokens: 1,
+        cacheUsageComplete: true,
+        cost: {
+          kind: 'exact', currency: 'CNY', picoYuan: '3',
+          catalogVersion: 'catalog-v1', billingAuthority: false
+        }
+      }
+    },
+    terminal: visibleTerminalFacts()
+  } as const
+  assert.deepEqual(parseRunAdvanceResult(completed), completed)
+  assert.throws(() => parseRunAdvanceResult({
+    ...completed,
+    usage: completed.presentationTrace.usage
+  }), /unknown key/i)
+  assert.deepEqual(Reflect.ownKeys(completed), [
+    'kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal'
+  ])
+})
+
 test('AgentError serializes only safe fields', () => {
   const error = new AgentError({
     code: 'storage_unavailable',

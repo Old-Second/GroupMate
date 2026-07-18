@@ -7,7 +7,7 @@ import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import {
   EMPTY_PRESENTATION_TRACE,
   parsePresentationTrace,
-  type PresentationTraceV1
+  type PresentationTrace
 } from '../../src/agent/contracts/presentation-trace.js'
 import { serializeAgentError, AgentError } from '../../src/agent/contracts/error.js'
 import { createInitialRunObservationCounters, terminalObservationId } from '../../src/agent/run/run-observation.js'
@@ -179,7 +179,7 @@ function output (text: string) {
 
 function completed (
   completion: CompletionDisposition,
-  presentationTrace: PresentationTraceV1 = EMPTY_PRESENTATION_TRACE
+  presentationTrace: PresentationTrace = EMPTY_PRESENTATION_TRACE
 ): Extract<RunAdvanceResult, { kind: 'completed' }> {
   return Object.freeze({
     kind: 'completed', runId: 'run-1', runRef, completion,
@@ -214,6 +214,31 @@ const toolOnlyTrace = parsePresentationTrace({
     argumentsSummary: '{"text":"已处理"}',
     resultSummary: '结果已通过工具发送', truncated: false
   }]
+})
+
+const usageTrace = parsePresentationTrace({
+  schemaVersion: 2,
+  truncated: false,
+  segments: providerTrace.segments,
+  usage: {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    cacheHitTokens: 80,
+    cacheMissTokens: 20,
+    cacheUsageComplete: true,
+    cost: {
+      kind: 'exact', currency: 'CNY', picoYuan: '61600000',
+      catalogVersion: 'deepseek-cny-2026-07-19', billingAuthority: false
+    }
+  }
+})
+
+const usageOnlyTrace = parsePresentationTrace({
+  ...usageTrace,
+  segments: []
 })
 
 const failed: Extract<RunAdvanceResult, { kind: 'failed' }> = Object.freeze({
@@ -889,6 +914,95 @@ test('ordinary success appends one selected execution trace after text, TTS or p
   }))
   assert.deepEqual(picture.calls.map(call => call.part.media), ['picture', 'forward'])
   assert.equal((picture.pictureCalls[0] as { reasoningView?: unknown } | undefined)?.reasoningView, null)
+})
+
+test('usage stays in the one execution forward after text, TTS, picture and already-visible output', async () => {
+  const cases = [
+    {
+      name: 'text',
+      completion: { kind: 'reply_text' as const, text: '文本正文' },
+      trace: usageTrace,
+      settings: settings(),
+      expectedMedia: ['text', 'forward']
+    },
+    {
+      name: 'tts',
+      completion: { kind: 'reply_text' as const, text: '语音正文' },
+      trace: usageTrace,
+      settings: settings({
+        tts: Object.freeze({ ...settings().tts, enabled: true, mode: 'azure' })
+      }),
+      expectedMedia: ['voice', 'forward']
+    },
+    {
+      name: 'picture',
+      completion: { kind: 'reply_text' as const, text: '图片正文' },
+      trace: usageTrace,
+      settings: settings({
+        picture: Object.freeze({ ...settings().picture, userEnabled: true })
+      }),
+      expectedMedia: ['picture', 'forward']
+    },
+    {
+      name: 'already-visible',
+      completion: { kind: 'already_visible' as const, source: 'tool_output' as const },
+      trace: parsePresentationTrace({ ...usageTrace, segments: toolOnlyTrace.segments }),
+      settings: settings(),
+      expectedMedia: ['forward']
+    }
+  ]
+  for (const item of cases) {
+    const f = fixture()
+    await f.presenter.present(input(completed(item.completion, item.trace), {
+      settings: item.settings,
+      hooks: f.hooks
+    }))
+    assert.deepEqual(f.calls.map(call => call.part.media), item.expectedMedia, item.name)
+    const forwards = f.calls.filter(call => call.part.media === 'forward')
+    assert.equal(forwards.length, 1, item.name)
+    assert.equal(forwards[0]?.part.media === 'forward'
+      ? forwards[0].part.nodes.filter(node => /Token 与费用/.test(node.text)).length
+      : 0, 1, item.name)
+  }
+})
+
+test('usage-only, switches-off, blocked and ordinary no-trace replies send zero execution forwards', async () => {
+  const cases = [
+    {
+      name: 'usage-only',
+      trace: usageOnlyTrace,
+      settings: settings(),
+      text: 'usage only'
+    },
+    {
+      name: 'both switches off',
+      trace: usageTrace,
+      settings: settings({ forwardReasoning: false, forwardToolDetails: false }),
+      text: 'switches off'
+    },
+    {
+      name: 'blocked',
+      trace: usageTrace,
+      settings: settings({ blockWords: Object.freeze(['屏蔽']) }),
+      text: '需要屏蔽'
+    },
+    {
+      name: 'ordinary no trace',
+      trace: EMPTY_PRESENTATION_TRACE,
+      settings: settings(),
+      text: 'normal'
+    }
+  ]
+  for (const item of cases) {
+    const f = fixture()
+    await f.presenter.present(input(completed({
+      kind: 'reply_text', text: item.text
+    }, item.trace), {
+      settings: item.settings,
+      hooks: f.hooks
+    }))
+    assert.equal(f.calls.filter(call => call.part.media === 'forward').length, 0, item.name)
+  }
 })
 
 test('already-visible success sends only its tool trace before a persistence notice', async () => {

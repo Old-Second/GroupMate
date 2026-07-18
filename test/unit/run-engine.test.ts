@@ -2199,6 +2199,103 @@ test('RunEngine freezes DeepSeek capability and canonical alias price at creatio
   assert.equal(result.kind, 'completed')
 })
 
+test('RunEngine projects completed usage from the terminal checkpoint frozen price', async () => {
+  const fixture = harness([Object.freeze({
+    ...modelText('带参考费用完成'),
+    usage: Object.freeze({
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      inputCache: Object.freeze({ hitTokens: 80, missTokens: 20 })
+    })
+  })], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile
+  })
+  const result = await fixture.engine.start(Object.freeze({
+    ...fixture.input,
+    model: Object.freeze({ ...fixture.input.model, model: 'deepseek-reasoner' })
+  }))
+  assert.equal(result.kind, 'completed')
+  if (result.kind !== 'completed') return
+  assert.equal(result.presentationTrace.schemaVersion, 2)
+  assert.deepEqual(result.presentationTrace.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    cacheHitTokens: 80,
+    cacheMissTokens: 20,
+    cacheUsageComplete: true,
+    cost: {
+      kind: 'exact', currency: 'CNY', picoYuan: '61600000',
+      catalogVersion: 'deepseek-cny-2026-07-19', billingAuthority: false
+    }
+  })
+  assert.equal(Object.hasOwn(result, 'usage'), false)
+  assert.equal(Object.hasOwn(result.terminal.snapshot, 'usage'), false)
+})
+
+test('RunEngine active resume keeps accumulated usage and the original frozen alias price', async () => {
+  const store = new PostSuccessCasCrashStore()
+  const first = harness([Object.freeze({
+    ...modelTools([toolCall(0, 'priced-resume', 'normalRead')]),
+    usage: Object.freeze({
+      inputTokens: 60,
+      outputTokens: 10,
+      totalTokens: 70,
+      inputCache: Object.freeze({ hitTokens: 40, missTokens: 20 })
+    })
+  })], {
+    store,
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    now: () => new Date('2026-07-14T00:00:00.000Z')
+  })
+  await assert.rejects(first.engine.start(Object.freeze({
+    ...first.input,
+    model: Object.freeze({ ...first.input.model, model: 'deepseek-reasoner' })
+  })), error => error === store.crash)
+  const checkpoint = await store.load(first.input.runId)
+  assert.equal(checkpoint?.schemaVersion === 4
+    ? checkpoint.modelPrice?.catalogVersion
+    : null, 'deepseek-cny-2026-07-19')
+
+  const second = harness([Object.freeze({
+    ...modelText('恢复后完成'),
+    usage: Object.freeze({
+      inputTokens: 40,
+      outputTokens: 10,
+      totalTokens: 50,
+      inputCache: Object.freeze({ hitTokens: 30, missTokens: 10 })
+    })
+  })], {
+    store,
+    profile: Object.freeze({
+      ...deepSeekCompatibilityProfile,
+      resolveModelPrice: () => undefined
+    }) as typeof standardOpenAIProfile,
+    now: () => new Date('2026-07-14T00:01:00.000Z')
+  })
+  const resumed = await second.engine.resume(first.input.runId, second.input.runtime)
+  assert.equal(resumed.kind, 'completed')
+  if (resumed.kind !== 'completed') return
+  assert.equal(resumed.presentationTrace.schemaVersion, 2)
+  assert.deepEqual(resumed.presentationTrace.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    cacheHitTokens: 70,
+    cacheMissTokens: 30,
+    cacheUsageComplete: true,
+    cost: {
+      kind: 'exact', currency: 'CNY', picoYuan: '71400000',
+      catalogVersion: 'deepseek-cny-2026-07-19', billingAuthority: false
+    }
+  })
+})
+
 test('RunEngine returns a concurrent terminal before Provider wire when dispatch reservation CAS loses', async () => {
   const store = new TerminalRaceRunStore('provider_reservation')
   const journalEvents: RunContentJournalEvent[] = []
@@ -2224,6 +2321,10 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
   assert.deepEqual(fixture.events, [
     'run.created', 'run.started', 'context.prepared', 'model.started'
   ])
+  assert.equal(Object.hasOwn(result, 'presentationTrace'), false)
+  assert.equal(Object.hasOwn(result, 'usage'), false)
+  const tombstone = await store.loadTombstone(fixture.input.runId)
+  assert.equal(Object.hasOwn(tombstone ?? {}, 'usage'), false)
 })
 
 test('RunEngine stops downstream tool work when the atomic success transition loses to a terminal', async () => {
