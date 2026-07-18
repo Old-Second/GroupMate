@@ -393,6 +393,40 @@ function detachModelUsage (value: ModelUsage | undefined): ModelUsage | undefine
   })
 }
 
+function modelTurnUsageDataProperty (turn: ModelTurn): ModelUsage | undefined {
+  if (turn === null || typeof turn !== 'object' || Array.isArray(turn)) {
+    throw new TypeError('model turn is invalid')
+  }
+  let descriptor: PropertyDescriptor | undefined
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(turn, 'usage')
+  } catch {
+    throw new TypeError('model turn usage cannot be inspected safely')
+  }
+  if (descriptor === undefined) return undefined
+  if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+    throw new TypeError('model turn usage must be a data property')
+  }
+  return descriptor.value as ModelUsage | undefined
+}
+
+function sameModelUsage (
+  left: ModelUsage | undefined,
+  right: ModelUsage | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right
+  if (left.inputTokens !== right.inputTokens ||
+    left.outputTokens !== right.outputTokens ||
+    left.totalTokens !== right.totalTokens) {
+    return false
+  }
+  const leftCache = left.inputCache
+  const rightCache = right.inputCache
+  if (leftCache === undefined || rightCache === undefined) return leftCache === rightCache
+  return leftCache.hitTokens === rightCache.hitTokens &&
+    leftCache.missTokens === rightCache.missTokens
+}
+
 function synchronizedObservationCounters (
   current: RunObservationCountersV1,
   budget: RunBudgetCounters,
@@ -2057,8 +2091,9 @@ export class RunEngine {
       })
     }
     let plan: ModelTurnTransitionPlan
+    let journalTurn: ModelTurn | null = null
     try {
-      const usage = detachModelUsage(attempted.turn.usage)
+      const usage = detachModelUsage(modelTurnUsageDataProperty(attempted.turn))
       const recordedUsage = recordRunUsage(checkpoint.usage, usage)
       const accounted = this.#recordProviderUsage(
         this.#runBudget(checkpoint),
@@ -2097,22 +2132,39 @@ export class RunEngine {
         recoveryUsed: attempted.recoveryUsed,
         modelTurn: null
       })
-      if (budgetError !== null) {
+      try {
+        const detachedTurn = snapshotModelTurnForJournal(attempted.turn)
+        const detachedUsage = detachModelUsage(detachedTurn.usage)
+        if (!sameModelUsage(usage, detachedUsage)) {
+          throw new TypeError('model turn usage changed during detachment')
+        }
+        journalTurn = detachedTurn
+        if (budgetError !== null) {
+          plan = Object.freeze({
+            kind: 'fail',
+            error: budgetError,
+            changes: common,
+            drafts: Object.freeze([attemptedEvent])
+          })
+        } else {
+          plan = this.#planSuccessfulModelTurn(
+            checkpoint,
+            attempted,
+            detachedTurn,
+            counters,
+            correction,
+            common,
+            attemptedEvent
+          )
+        }
+      } catch (error) {
+        journalTurn = null
         plan = Object.freeze({
           kind: 'fail',
-          error: budgetError,
+          error: asAgentError(error),
           changes: common,
           drafts: Object.freeze([attemptedEvent])
         })
-      } else {
-        plan = this.#planSuccessfulModelTurn(
-          checkpoint,
-          attempted,
-          counters,
-          correction,
-          common,
-          attemptedEvent
-        )
       }
     } catch (error) {
       plan = Object.freeze({
@@ -2130,15 +2182,18 @@ export class RunEngine {
       })
     }
 
-    this.#recordContentJournal(() => Object.freeze({
-      type: 'provider.response',
-      occurredAt: attempted.occurredAt,
-      runRef: checkpoint.runRef,
-      requestRef: checkpoint.requestRef,
-      ordinal: this.#providerAttemptOrdinal(checkpoint),
-      attemptKind: attempted.attemptKind,
-      turn: snapshotModelTurnForJournal(attempted.turn)
-    }))
+    if (journalTurn !== null) {
+      const detachedTurn = journalTurn
+      this.#recordContentJournal(() => Object.freeze({
+        type: 'provider.response',
+        occurredAt: attempted.occurredAt,
+        runRef: checkpoint.runRef,
+        requestRef: checkpoint.requestRef,
+        ordinal: this.#providerAttemptOrdinal(checkpoint),
+        attemptKind: attempted.attemptKind,
+        turn: detachedTurn
+      }))
+    }
 
     return await this.#persistSuccessfulModelTurn(
       checkpoint,
@@ -2150,6 +2205,7 @@ export class RunEngine {
   #planSuccessfulModelTurn (
     checkpoint: RunCheckpoint,
     attempted: ModelAttemptResult,
+    turn: ModelTurn,
     counters: RunBudgetCounters,
     correction: boolean,
     initialCommon: RunCheckpointChanges,
@@ -2157,7 +2213,6 @@ export class RunEngine {
   ): ModelTurnTransitionPlan {
     let common = initialCommon
     try {
-      const { turn } = attempted
       const reasoningSegments = appendRunReasoningSegment(
         checkpoint.reasoningSegments,
         {
@@ -2367,7 +2422,7 @@ export class RunEngine {
         occurredAt
       )
     } catch (error) {
-      if (error instanceof ConcurrentTerminalError || isAbortError(error)) throw error
+      if (error instanceof ConcurrentTerminalError) throw error
       throw new ModelSuccessPersistenceError(error)
     }
   }

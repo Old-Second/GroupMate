@@ -440,6 +440,50 @@ class SuccessCommitSentinelStore extends TerminalCaptureStore {
   }
 }
 
+class AbortNamedStoreError extends Error {
+  constructor () {
+    super('success store abort-named sentinel')
+    this.name = 'AbortError'
+  }
+}
+
+class SuccessCommitAbortNamedStore extends TerminalCaptureStore {
+  readonly sentinel = new AbortNamedStoreError()
+  thrown = false
+
+  constructor (readonly phase: 'compareAndSet' | 'commitTerminal') {
+    super()
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (!this.thrown && this.phase === 'compareAndSet' &&
+      expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' &&
+      next.events.slice(expected.events.length).some(event => event.type === 'model.completed')) {
+      this.thrown = true
+      throw this.sentinel
+    }
+    return await super.compareAndSet(expected, next)
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (!this.thrown && this.phase === 'commitTerminal' &&
+      expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle') {
+      this.thrown = true
+      throw this.sentinel
+    }
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
 class OverflowUsageReservationStore extends TerminalCaptureStore {
   override async compareAndSet (
     expected: RunCheckpoint,
@@ -1582,6 +1626,7 @@ test('RunEngine fails a successful response planning exception against its reser
 
 test('RunEngine contains nested tool-call Proxy traps inside the reserved success boundary', async () => {
   const store = new TerminalCaptureStore()
+  const journalEvents: RunContentJournalEvent[] = []
   const nestedTrap = new Error('nested toolCalls length trap')
   const toolCalls = new Proxy([], {
     get: (target, property, receiver) => {
@@ -1595,7 +1640,10 @@ test('RunEngine contains nested tool-call Proxy traps inside the reserved succes
     finishReason: 'tool_calls',
     usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
   })
-  const fixture = harness([turn], { store })
+  const fixture = harness([turn], {
+    store,
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -1618,6 +1666,7 @@ test('RunEngine contains nested tool-call Proxy traps inside the reserved succes
   assert.deepEqual(store.terminalCheckpoint?.events
     .filter(event => event.type === 'model.attempted')
     .map(event => event.payload.outcome), ['succeeded'])
+  assert.equal(journalEvents.some(event => event.type === 'provider.response'), false)
 })
 
 test('RunEngine rejects nested usage accessors without leaving the succeeded-attempt path', async () => {
@@ -1661,13 +1710,37 @@ test('RunEngine rejects nested usage accessors without leaving the succeeded-att
     .map(event => event.payload.outcome), ['succeeded'])
 })
 
+test('RunEngine inspects optional turn usage without invoking a top-level accessor', async () => {
+  const store = new TerminalCaptureStore()
+  let getterReads = 0
+  const turn = Object.defineProperty({
+    ...modelText('top-level usage accessor')
+  }, 'usage', {
+    enumerable: true,
+    get: () => {
+      getterReads += 1
+      throw new Error('top-level usage getter')
+    }
+  }) as unknown as ModelTurn
+  const fixture = harness([turn], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(getterReads, 0)
+  assert.equal(store.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(store.terminalCheckpoint?.events
+    .filter(event => event.type === 'model.attempted')
+    .map(event => event.payload.outcome), ['succeeded'])
+})
+
 test('RunEngine detaches successful tool protocol state before persistence validation', async () => {
   const delayedTrap = new Error('successful turn was traversed after planning')
   let argumentInspections = 0
   const argumentsValue = new Proxy({ value: 'normalRead' }, {
     ownKeys: target => {
       argumentInspections += 1
-      if (argumentInspections > 3) throw delayedTrap
+      if (argumentInspections > 2) throw delayedTrap
       return Reflect.ownKeys(target)
     }
   })
@@ -1679,7 +1752,7 @@ test('RunEngine detaches successful tool protocol state before persistence valid
   }, {
     ownKeys: target => {
       providerStateInspections += 1
-      if (providerStateInspections > 1) throw delayedTrap
+      if (providerStateInspections > 2) throw delayedTrap
       return Reflect.ownKeys(target)
     }
   })
@@ -1692,17 +1765,38 @@ test('RunEngine detaches successful tool protocol state before persistence valid
     providerState,
     usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
   })
+  const journalEvents: RunContentJournalEvent[] = []
   const fixture = harness([turn, modelText('detached success')], {
     profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
-    contentJournal: { record: () => {} }
+    contentJournal: { record: event => { journalEvents.push(event) } }
   })
 
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(result.kind, 'completed')
   assert.equal(outputText(result), 'detached success')
-  assert.equal(argumentInspections >= 4, true)
-  assert.equal(providerStateInspections, 1)
+  assert.equal(argumentInspections, 2)
+  assert.equal(providerStateInspections, 2)
+  const responseTurns = journalEvents
+    .filter(event => event.type === 'provider.response')
+    .map(event => event.type === 'provider.response' ? event.turn : null)
+  assert.equal(responseTurns.length, 2)
+  const plannedTurn = responseTurns[0]
+  assert.notEqual(plannedTurn, null)
+  assert.notStrictEqual(plannedTurn, turn)
+  assert.deepEqual(plannedTurn?.toolCalls[0]?.arguments, { value: 'normalRead' })
+  const plannedAssistant = fixture.adapter.requests[1]?.messages
+    .find(message => message.role === 'assistant')
+  assert.deepEqual(
+    plannedAssistant?.role === 'assistant'
+      ? plannedAssistant.toolCalls?.[0]?.arguments
+      : null,
+    plannedTurn?.toolCalls[0]?.arguments
+  )
+  assert.deepEqual(
+    plannedAssistant?.role === 'assistant' ? plannedAssistant.providerState : null,
+    plannedTurn?.providerState
+  )
 })
 
 test('RunEngine propagates success persistence errors without a stale checkpoint fallback', async () => {
@@ -1740,6 +1834,34 @@ test('RunEngine propagates success persistence errors without a stale checkpoint
       turnsWithoutUsage: 0,
       cacheUsageComplete: true
     })
+  }
+})
+
+test('RunEngine never treats an abort-named Store failure as run cancellation', async () => {
+  for (const phase of ['compareAndSet', 'commitTerminal'] as const) {
+    const store = new SuccessCommitAbortNamedStore(phase)
+    const turn = phase === 'compareAndSet'
+      ? Object.freeze({
+          ...modelTools([toolCall(0, `abort-named-${phase}`, 'normalRead')]),
+          usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+        })
+      : Object.freeze({
+          ...modelText('abort-named terminal'),
+          usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+        })
+    const fixture = harness([turn], { store })
+
+    await assert.rejects(fixture.engine.start(fixture.input), error => (
+      error === store.sentinel &&
+      (error as Error).message === 'success store abort-named sentinel'
+    ))
+    const reserved = await store.load(fixture.input.runId)
+    assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+    assert.equal(
+      reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+      'reserved'
+    )
+    assert.equal(await store.loadTombstone(fixture.input.runId), null)
   }
 })
 
