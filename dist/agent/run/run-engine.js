@@ -4,6 +4,7 @@ import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
 import { parseProviderAttemptEventPayload } from '../contracts/event.js';
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js';
+import { parseJsonValue } from '../model/json-value.js';
 import { resolveModelCapabilitySnapshot } from '../model/model-capability.js';
 import { canonicalSessionKey } from '../session/conversation-scope.js';
 import { completedPreparedCall } from '../tools/prepared-capability.js';
@@ -15,6 +16,7 @@ import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheck
 import { snapshotModelRequestForJournal, snapshotModelTurnForJournal, snapshotRunCheckpointForJournal, snapshotTerminalReceiptForJournal } from './run-content-journal.js';
 import { upgradeRunCheckpointV1, upgradeRunCheckpointV2, upgradeRunCheckpointV3 } from './run-checkpoint-migration.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
+import { parseProviderTurnState } from './provider-state.js';
 import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
@@ -49,6 +51,14 @@ class RunAbortedError extends Error {
         this.name = 'RunAbortedError';
     }
 }
+class ModelSuccessPersistenceError extends Error {
+    failure;
+    constructor(failure) {
+        super('successful model turn persistence failed');
+        this.name = 'ModelSuccessPersistenceError';
+        this.failure = failure;
+    }
+}
 const EMPTY_PAYLOAD = Object.freeze({});
 function knownObservation(current, value) {
     return typeof current === 'number' ? Math.max(current, value) : current;
@@ -69,6 +79,51 @@ function mergedProviderUsage(previous, current) {
         return 'unavailable';
     const total = previous + current;
     return Number.isSafeInteger(total) ? total : 'unavailable';
+}
+function detachModelUsage(value) {
+    if (value === undefined)
+        return undefined;
+    const parsed = parseJsonValue(value, {
+        maxBytes: 1_024,
+        maxDepth: 2,
+        maxNodes: 8
+    });
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new TypeError('model usage is invalid');
+    }
+    const input = parsed;
+    const keys = Object.keys(input);
+    const requiredKeys = ['inputTokens', 'outputTokens', 'totalTokens'];
+    if (keys.some(key => ![...requiredKeys, 'inputCache'].includes(key)) ||
+        requiredKeys.some(key => !Object.hasOwn(input, key))) {
+        throw new TypeError('model usage is invalid');
+    }
+    const inputCache = input.inputCache;
+    if (inputCache === undefined) {
+        return Object.freeze({
+            inputTokens: input.inputTokens,
+            outputTokens: input.outputTokens,
+            totalTokens: input.totalTokens
+        });
+    }
+    if (inputCache === null || typeof inputCache !== 'object' || Array.isArray(inputCache)) {
+        throw new TypeError('model cache usage is invalid');
+    }
+    const cache = inputCache;
+    const cacheKeys = Object.keys(cache);
+    if (cacheKeys.length !== 2 ||
+        cacheKeys.some(key => key !== 'hitTokens' && key !== 'missTokens')) {
+        throw new TypeError('model cache usage is invalid');
+    }
+    return Object.freeze({
+        inputTokens: input.inputTokens,
+        outputTokens: input.outputTokens,
+        totalTokens: input.totalTokens,
+        inputCache: Object.freeze({
+            hitTokens: cache.hitTokens,
+            missTokens: cache.missTokens
+        })
+    });
 }
 function synchronizedObservationCounters(current, budget, ledgers, interruption, approvalHistory, completedModelTurns) {
     const approvalIds = new Set(approvalHistory.map(value => value.approvalId));
@@ -1154,6 +1209,8 @@ export class RunEngine {
                 if (error instanceof ConcurrentTerminalError) {
                     return observedTerminalResult(checkpoint.runId, error.tombstone);
                 }
+                if (error instanceof ModelSuccessPersistenceError)
+                    throw error.failure;
                 if (isAbortError(error) || controller.signal.aborted) {
                     return await this.cancel(checkpoint.runId, this.#signalCancellationReason(controller.signal));
                 }
@@ -1459,18 +1516,9 @@ export class RunEngine {
                     throw classified.error;
                 }
                 const activeRuntimeMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow());
-                const accounted = this.#recordProviderUsage(budget, counters, activeRuntimeMs, turn.usage?.totalTokens ?? 0);
+                const accounted = this.#recordProviderUsage(budget, counters, activeRuntimeMs);
                 counters = accounted.counters;
                 const completionOccurredAt = this.#timestamp();
-                this.#recordContentJournal(() => Object.freeze({
-                    type: 'provider.response',
-                    occurredAt: completionOccurredAt,
-                    runRef: current.runRef,
-                    requestRef: current.requestRef,
-                    ordinal: this.#providerAttemptOrdinal(current),
-                    attemptKind,
-                    turn: snapshotModelTurnForJournal(turn)
-                }));
                 return Object.freeze({
                     checkpoint: current,
                     turn,
@@ -1499,7 +1547,6 @@ export class RunEngine {
         }
     }
     async #evaluateModelTurn(checkpoint, attempted, correction) {
-        const { turn } = attempted;
         const attemptedEvent = {
             type: 'model.attempted',
             payload: Object.freeze({
@@ -1510,182 +1557,257 @@ export class RunEngine {
                 errorCode: null
             })
         };
-        let common;
+        let plan;
         try {
-            const usage = turn.usage;
+            const usage = detachModelUsage(attempted.turn.usage);
+            const recordedUsage = recordRunUsage(checkpoint.usage, usage);
+            const accounted = this.#recordProviderUsage(this.#runBudget(checkpoint), attempted.counters, 0, usage?.totalTokens ?? 0);
+            const counters = accounted.counters;
+            const budgetError = attempted.budgetError ?? accounted.budgetError;
             const observationCounters = Object.freeze({
                 ...checkpoint.observationCounters,
                 providerInputTokens: mergedProviderUsage(attempted.previousProviderUsage.providerInputTokens, usage?.inputTokens),
                 providerOutputTokens: mergedProviderUsage(attempted.previousProviderUsage.providerOutputTokens, usage?.outputTokens),
                 providerTotalTokens: mergedProviderUsage(attempted.previousProviderUsage.providerTotalTokens, usage?.totalTokens),
-                providerActiveDurationMs: knownObservation(checkpoint.observationCounters.providerActiveDurationMs, attempted.counters.usedActiveRuntimeMs)
+                providerActiveDurationMs: knownObservation(checkpoint.observationCounters.providerActiveDurationMs, counters.usedActiveRuntimeMs)
             });
-            common = Object.freeze({
-                budgetCounters: attempted.counters,
+            const common = Object.freeze({
+                budgetCounters: counters,
                 observationCounters,
-                usage: recordRunUsage(checkpoint.usage, usage),
+                usage: recordedUsage,
                 providerDispatch: Object.freeze({ state: 'idle' }),
                 messages: attempted.messages,
                 estimatedInputTokens: attempted.estimatedInputTokens,
                 recoveryUsed: attempted.recoveryUsed,
                 modelTurn: null
             });
+            if (budgetError !== null) {
+                plan = Object.freeze({
+                    kind: 'fail',
+                    error: budgetError,
+                    changes: common,
+                    drafts: Object.freeze([attemptedEvent])
+                });
+            }
+            else {
+                plan = this.#planSuccessfulModelTurn(checkpoint, attempted, counters, correction, common, attemptedEvent);
+            }
         }
         catch (error) {
-            return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], {
-                budgetCounters: attempted.counters,
-                providerDispatch: Object.freeze({ state: 'idle' }),
-                messages: attempted.messages,
-                estimatedInputTokens: attempted.estimatedInputTokens,
-                recoveryUsed: attempted.recoveryUsed,
-                modelTurn: null
-            }, undefined, attempted.occurredAt);
+            plan = Object.freeze({
+                kind: 'fail',
+                error: asAgentError(error),
+                changes: Object.freeze({
+                    budgetCounters: attempted.counters,
+                    providerDispatch: Object.freeze({ state: 'idle' }),
+                    messages: attempted.messages,
+                    estimatedInputTokens: attempted.estimatedInputTokens,
+                    recoveryUsed: attempted.recoveryUsed,
+                    modelTurn: null
+                }),
+                drafts: Object.freeze([attemptedEvent])
+            });
         }
-        if (attempted.budgetError !== null) {
-            return await this.#fail(checkpoint, attempted.budgetError, [attemptedEvent], common, undefined, attempted.occurredAt);
-        }
-        let reasoningSegments;
+        this.#recordContentJournal(() => Object.freeze({
+            type: 'provider.response',
+            occurredAt: attempted.occurredAt,
+            runRef: checkpoint.runRef,
+            requestRef: checkpoint.requestRef,
+            ordinal: this.#providerAttemptOrdinal(checkpoint),
+            attemptKind: attempted.attemptKind,
+            turn: snapshotModelTurnForJournal(attempted.turn)
+        }));
+        return await this.#persistSuccessfulModelTurn(checkpoint, plan, attempted.occurredAt);
+    }
+    #planSuccessfulModelTurn(checkpoint, attempted, counters, correction, initialCommon, attemptedEvent) {
+        let common = initialCommon;
         try {
-            reasoningSegments = appendRunReasoningSegment(checkpoint.reasoningSegments, {
+            const { turn } = attempted;
+            const reasoningSegments = appendRunReasoningSegment(checkpoint.reasoningSegments, {
                 step: checkpoint.step,
-                turn: attempted.counters.modelTurns,
+                turn: counters.modelTurns,
                 reasoning: turn.reasoning
             });
             common = Object.freeze({ ...common, reasoningSegments });
-        }
-        catch (error) {
-            return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], common, undefined, attempted.occurredAt);
-        }
-        let finishReason;
-        let toolCalls;
-        let refusal;
-        let text;
-        let providerState;
-        try {
-            finishReason = turn.finishReason;
-            toolCalls = turn.toolCalls;
-            refusal = turn.refusal;
-            text = turn.text;
-            providerState = turn.providerState;
-        }
-        catch (error) {
-            return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], common, undefined, attempted.occurredAt);
-        }
-        const completedEvent = {
-            type: 'model.completed',
-            payload: {
-                kind: correction ? 'correction' : 'normal',
-                finishReason,
-                toolCallCount: toolCalls.length
+            const finishReason = turn.finishReason;
+            const toolCalls = turn.toolCalls;
+            const refusal = turn.refusal;
+            const text = turn.text;
+            const rawProviderState = turn.providerState;
+            const completedEvent = {
+                type: 'model.completed',
+                payload: {
+                    kind: correction ? 'correction' : 'normal',
+                    finishReason,
+                    toolCallCount: toolCalls.length
+                }
+            };
+            if (refusal !== undefined && refusal.length > 0) {
+                return Object.freeze({
+                    kind: 'fail',
+                    error: modelProtocolError('provider_refusal'),
+                    changes: common,
+                    drafts: Object.freeze([attemptedEvent, completedEvent]),
+                    detailOverride: Object.freeze({ reason: 'provider_refusal' })
+                });
             }
-        };
-        if (refusal !== undefined && refusal.length > 0) {
-            return await this.#fail(checkpoint, modelProtocolError('provider_refusal'), [attemptedEvent, completedEvent], common, { reason: 'provider_refusal' }, attempted.occurredAt);
-        }
-        if (toolCalls.length > 0) {
-            if (correction || finishReason !== 'tool_calls') {
-                return await this.#fail(checkpoint, modelProtocolError(correction ? 'correction_contains_tool_calls' : 'tool_calls_finish_reason_missing'), [attemptedEvent, completedEvent], common, undefined, attempted.occurredAt);
-            }
-            let ledger;
-            try {
-                ledger = createToolExecutionLedger(checkpoint.step, toolCalls);
-            }
-            catch {
-                return await this.#fail(checkpoint, modelProtocolError('invalid_tool_call_identity'), [attemptedEvent, completedEvent], common, undefined, attempted.occurredAt);
-            }
-            let messages;
-            let estimatedInputTokens;
-            try {
-                const sortedCalls = [...toolCalls].sort((left, right) => left.index - right.index);
+            if (toolCalls.length > 0) {
+                if (correction || finishReason !== 'tool_calls') {
+                    return Object.freeze({
+                        kind: 'fail',
+                        error: modelProtocolError(correction ? 'correction_contains_tool_calls' : 'tool_calls_finish_reason_missing'),
+                        changes: common,
+                        drafts: Object.freeze([attemptedEvent, completedEvent])
+                    });
+                }
+                let ledger;
+                try {
+                    ledger = createToolExecutionLedger(checkpoint.step, toolCalls);
+                }
+                catch {
+                    return Object.freeze({
+                        kind: 'fail',
+                        error: modelProtocolError('invalid_tool_call_identity'),
+                        changes: common,
+                        drafts: Object.freeze([attemptedEvent, completedEvent])
+                    });
+                }
+                const providerState = rawProviderState === undefined
+                    ? undefined
+                    : parseProviderTurnState(rawProviderState);
+                if (providerState !== undefined &&
+                    (providerState.profileId !== checkpoint.profileId ||
+                        providerState.profileVersion !== checkpoint.profileVersion)) {
+                    throw new TypeError('assistant provider state profile is invalid');
+                }
                 const assistant = Object.freeze({
                     role: 'assistant',
                     content: text.length === 0 ? null : text,
-                    toolCalls: Object.freeze(sortedCalls.map(call => Object.freeze({
+                    toolCalls: Object.freeze(ledger.calls.map(call => Object.freeze({
                         callId: call.callId,
-                        name: call.name,
+                        name: call.toolName,
                         arguments: call.arguments
                     }))),
                     ...(providerState === undefined ? {} : { providerState })
                 });
-                messages = Object.freeze([...attempted.messages, assistant]);
-                estimatedInputTokens = attempted.estimatedInputTokens + estimatedTokensFor(assistant);
+                const messages = Object.freeze([...attempted.messages, assistant]);
+                const estimatedInputTokens = attempted.estimatedInputTokens +
+                    estimatedTokensFor(assistant);
+                return Object.freeze({
+                    kind: 'commit',
+                    status: 'evaluating_tools',
+                    changes: Object.freeze({
+                        ...common,
+                        messages,
+                        estimatedInputTokens,
+                        toolLedgers: Object.freeze([...checkpoint.toolLedgers, ledger]),
+                        preparedBatch: null,
+                        interruption: null
+                    }),
+                    drafts: Object.freeze([
+                        attemptedEvent,
+                        completedEvent,
+                        {
+                            type: 'tool.batch_planned',
+                            payload: { step: checkpoint.step, callCount: ledger.calls.length }
+                        }
+                    ])
+                });
             }
-            catch (error) {
-                return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], common, undefined, attempted.occurredAt);
-            }
-            return await this.#commit(checkpoint, 'evaluating_tools', {
-                ...common,
-                messages,
-                estimatedInputTokens,
-                toolLedgers: Object.freeze([...checkpoint.toolLedgers, ledger]),
-                preparedBatch: null,
-                interruption: null
-            }, [
-                attemptedEvent,
-                completedEvent,
-                {
-                    type: 'tool.batch_planned',
-                    payload: { step: checkpoint.step, callCount: ledger.calls.length }
-                }
-            ], true, attempted.occurredAt);
-        }
-        let normalizedText;
-        try {
-            normalizedText = text.normalize('NFC').trim();
-        }
-        catch (error) {
-            return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], common, undefined, attempted.occurredAt);
-        }
-        if (finishReason === 'stop' && normalizedText.length > 0) {
-            let output;
-            let completion;
-            try {
-                output = this.#assistantMessage(checkpoint, normalizedText);
-                completion = completionFromTerminalOutput({
+            const normalizedText = text.normalize('NFC').trim();
+            if (finishReason === 'stop' && normalizedText.length > 0) {
+                const output = this.#assistantMessage(checkpoint, normalizedText);
+                const completion = completionFromTerminalOutput({
                     requestKind: checkpoint.requestKind,
                     output,
                     visibleToolOutput: 'none'
                 });
+                return Object.freeze({
+                    kind: 'commit',
+                    status: 'completed',
+                    changes: Object.freeze({
+                        ...common,
+                        output,
+                        completion
+                    }),
+                    drafts: Object.freeze([
+                        attemptedEvent,
+                        completedEvent,
+                        {
+                            type: 'run.completed',
+                            payload: { completionKind: completion.kind }
+                        }
+                    ])
+                });
+            }
+            if (correction) {
+                return Object.freeze({
+                    kind: 'fail',
+                    error: modelProtocolError('invalid_correction_response'),
+                    changes: common,
+                    drafts: Object.freeze([attemptedEvent, completedEvent])
+                });
+            }
+            try {
+                const budget = this.#runBudget(checkpoint);
+                let correctionCounters = budget.recordCorrection(counters);
+                const maxOutputTokens = this.#availableOutputTokens(checkpoint, correctionCounters, attempted.estimatedInputTokens, 'correction');
+                correctionCounters = budget.reserveModelTurn(correctionCounters, {
+                    kind: 'correction',
+                    estimatedInputTokens: attempted.estimatedInputTokens,
+                    maxOutputTokens
+                });
+                return Object.freeze({
+                    kind: 'commit',
+                    status: 'correcting',
+                    changes: Object.freeze({
+                        ...common,
+                        budgetCounters: correctionCounters,
+                        modelTurn: Object.freeze({ kind: 'correction', maxOutputTokens })
+                    }),
+                    drafts: Object.freeze([
+                        attemptedEvent,
+                        completedEvent,
+                        {
+                            type: 'model.started',
+                            payload: {
+                                kind: 'correction',
+                                turn: correctionCounters.modelTurns
+                            }
+                        }
+                    ])
+                });
             }
             catch (error) {
-                return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent], common, undefined, attempted.occurredAt);
+                return Object.freeze({
+                    kind: 'fail',
+                    error: asAgentError(error),
+                    changes: common,
+                    drafts: Object.freeze([attemptedEvent, completedEvent])
+                });
             }
-            return await this.#commit(checkpoint, 'completed', {
-                ...common,
-                output,
-                completion
-            }, [attemptedEvent, completedEvent, {
-                    type: 'run.completed',
-                    payload: { completionKind: completion.kind }
-                }], true, attempted.occurredAt);
-        }
-        if (correction) {
-            return await this.#fail(checkpoint, modelProtocolError('invalid_correction_response'), [attemptedEvent, completedEvent], common, undefined, attempted.occurredAt);
-        }
-        let counters;
-        let maxOutputTokens;
-        try {
-            const budget = this.#runBudget(checkpoint);
-            counters = budget.recordCorrection(attempted.counters);
-            maxOutputTokens = this.#availableOutputTokens(checkpoint, counters, attempted.estimatedInputTokens, 'correction');
-            counters = budget.reserveModelTurn(counters, {
-                kind: 'correction',
-                estimatedInputTokens: attempted.estimatedInputTokens,
-                maxOutputTokens
-            });
         }
         catch (error) {
-            return await this.#fail(checkpoint, asAgentError(error), [attemptedEvent, completedEvent], common, undefined, attempted.occurredAt);
+            return Object.freeze({
+                kind: 'fail',
+                error: asAgentError(error),
+                changes: common,
+                drafts: Object.freeze([attemptedEvent])
+            });
         }
-        return await this.#commit(checkpoint, 'correcting', {
-            ...common,
-            budgetCounters: counters,
-            modelTurn: Object.freeze({ kind: 'correction', maxOutputTokens })
-        }, [
-            attemptedEvent,
-            completedEvent,
-            { type: 'model.started', payload: { kind: 'correction', turn: counters.modelTurns } }
-        ], true, attempted.occurredAt);
+    }
+    async #persistSuccessfulModelTurn(checkpoint, plan, occurredAt) {
+        try {
+            if (plan.kind === 'fail') {
+                return await this.#fail(checkpoint, plan.error, plan.drafts, plan.changes, plan.detailOverride, occurredAt);
+            }
+            return await this.#commit(checkpoint, plan.status, plan.changes, plan.drafts, true, occurredAt);
+        }
+        catch (error) {
+            if (error instanceof ConcurrentTerminalError || isAbortError(error))
+                throw error;
+            throw new ModelSuccessPersistenceError(error);
+        }
     }
     async #preflightTools(checkpoint, signal) {
         const ledger = checkpoint.toolLedgers.at(-1);

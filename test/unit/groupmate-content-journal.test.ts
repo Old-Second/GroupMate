@@ -661,9 +661,14 @@ test('provider response projector rejects malformed cache-aware usage with fixed
   })
   const invalidUsage = [
     { inputTokens: 12, outputTokens: 8, totalTokens: 21 },
+    { inputTokens: 12, outputTokens: 8, totalTokens: 20, extra: 0 },
     {
       inputTokens: 12, outputTokens: 8, totalTokens: 20,
       inputCache: { hitTokens: 7, missTokens: 4 }
+    },
+    {
+      inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      inputCache: { hitTokens: 12 }
     },
     {
       inputTokens: 12, outputTokens: 8, totalTokens: 20,

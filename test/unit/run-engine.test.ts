@@ -356,6 +356,7 @@ class RecoveryCommitCrashStore extends InMemoryRunStore {
 
 class PreSuccessCasCrashStore extends TerminalCaptureStore {
   crashed = false
+  readonly crash = new SimulatedProcessCrash()
 
   override async compareAndSet (
     expected: RunCheckpoint,
@@ -366,7 +367,7 @@ class PreSuccessCasCrashStore extends TerminalCaptureStore {
       next.events.slice(expected.events.length).some(event => event.type === 'model.completed')
     if (!this.crashed && commitsSuccessfulTurn) {
       this.crashed = true
-      throw new SimulatedProcessCrash()
+      throw this.crash
     }
     return await super.compareAndSet(expected, next)
   }
@@ -379,7 +380,7 @@ class PreSuccessCasCrashStore extends TerminalCaptureStore {
     if (!this.crashed && expected.providerDispatch.state === 'reserved' &&
       next.providerDispatch.state === 'idle') {
       this.crashed = true
-      throw new SimulatedProcessCrash()
+      throw this.crash
     }
     return await super.commitTerminal(expected, next, snapshot)
   }
@@ -387,6 +388,7 @@ class PreSuccessCasCrashStore extends TerminalCaptureStore {
 
 class PostSuccessCasCrashStore extends TerminalCaptureStore {
   crashed = false
+  readonly crash = new SimulatedProcessCrash()
 
   override async compareAndSet (
     expected: RunCheckpoint,
@@ -396,9 +398,72 @@ class PostSuccessCasCrashStore extends TerminalCaptureStore {
     if (!this.crashed && expected.providerDispatch.state === 'reserved' &&
       next.providerDispatch.state === 'idle' && next.status === 'evaluating_tools') {
       this.crashed = true
-      throw new SimulatedProcessCrash()
+      throw this.crash
     }
     return stored
+  }
+}
+
+class SentinelStoreError extends Error {}
+
+class SuccessCommitSentinelStore extends TerminalCaptureStore {
+  readonly sentinel = new SentinelStoreError('success store sentinel')
+
+  constructor (readonly phase: 'compareAndSet' | 'commitTerminal') {
+    super()
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.phase === 'compareAndSet' &&
+      expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' &&
+      next.events.slice(expected.events.length).some(event => event.type === 'model.completed')) {
+      throw this.sentinel
+    }
+    return await super.compareAndSet(expected, next)
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.phase === 'commitTerminal' &&
+      expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle') {
+      throw this.sentinel
+    }
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
+class OverflowUsageReservationStore extends TerminalCaptureStore {
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (expected.providerDispatch.state === 'idle' &&
+      next.providerDispatch.state === 'reserved') {
+      return await super.compareAndSet(expected, parseRunCheckpoint({
+        ...next,
+        usage: {
+          schemaVersion: 1,
+          availability: 'complete',
+          inputTokens: Number.MAX_SAFE_INTEGER,
+          outputTokens: 0,
+          totalTokens: Number.MAX_SAFE_INTEGER,
+          cacheHitTokens: 0,
+          cacheMissTokens: 0,
+          turnsWithUsage: 1,
+          turnsWithoutUsage: 0,
+          cacheUsageComplete: false
+        }
+      }))
+    }
+    return await super.compareAndSet(expected, next)
   }
 }
 
@@ -1515,6 +1580,233 @@ test('RunEngine fails a successful response planning exception against its reser
   })
 })
 
+test('RunEngine contains nested tool-call Proxy traps inside the reserved success boundary', async () => {
+  const store = new TerminalCaptureStore()
+  const nestedTrap = new Error('nested toolCalls length trap')
+  const toolCalls = new Proxy([], {
+    get: (target, property, receiver) => {
+      if (property === 'length') throw nestedTrap
+      return Reflect.get(target, property, receiver) as unknown
+    }
+  }) as unknown as ModelTurn['toolCalls']
+  const turn: ModelTurn = Object.freeze({
+    text: '',
+    toolCalls,
+    finishReason: 'tool_calls',
+    usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+  })
+  const fixture = harness([turn], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(await store.load(fixture.input.runId), null)
+  assert.equal((await store.loadTombstone(fixture.input.runId))?.status, 'failed')
+  assert.equal(store.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 3,
+    outputTokens: 1,
+    totalTokens: 4,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+  assert.deepEqual(store.terminalCheckpoint?.events
+    .filter(event => event.type === 'model.attempted')
+    .map(event => event.payload.outcome), ['succeeded'])
+})
+
+test('RunEngine rejects nested usage accessors without leaving the succeeded-attempt path', async () => {
+  const store = new TerminalCaptureStore()
+  let getterReads = 0
+  const usage = Object.defineProperty({
+    inputTokens: 3,
+    outputTokens: 1
+  }, 'totalTokens', {
+    enumerable: true,
+    get: () => {
+      getterReads += 1
+      throw new Error('nested usage getter')
+    }
+  }) as unknown as NonNullable<ModelTurn['usage']>
+  const turn: ModelTurn = Object.freeze({
+    ...modelText('usage accessor'),
+    usage
+  })
+  const fixture = harness([turn], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(getterReads, 0)
+  assert.equal(store.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 0,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: true
+  })
+  assert.deepEqual(store.terminalCheckpoint?.events
+    .filter(event => event.type === 'model.attempted')
+    .map(event => event.payload.outcome), ['succeeded'])
+})
+
+test('RunEngine detaches successful tool protocol state before persistence validation', async () => {
+  const delayedTrap = new Error('successful turn was traversed after planning')
+  let argumentInspections = 0
+  const argumentsValue = new Proxy({ value: 'normalRead' }, {
+    ownKeys: target => {
+      argumentInspections += 1
+      if (argumentInspections > 3) throw delayedTrap
+      return Reflect.ownKeys(target)
+    }
+  })
+  let providerStateInspections = 0
+  const providerState = new Proxy({
+    profileId: deepSeekCompatibilityProfile.id,
+    profileVersion: deepSeekCompatibilityProfile.version,
+    payload: Object.freeze({ reasoningContent: 'detached reasoning' })
+  }, {
+    ownKeys: target => {
+      providerStateInspections += 1
+      if (providerStateInspections > 1) throw delayedTrap
+      return Reflect.ownKeys(target)
+    }
+  })
+  const call = Object.freeze({
+    ...toolCall(0, 'stateful-protocol', 'normalRead'),
+    arguments: argumentsValue
+  })
+  const turn: ModelTurn = Object.freeze({
+    ...modelTools([call], '', 'detached reasoning'),
+    providerState,
+    usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+  })
+  const fixture = harness([turn, modelText('detached success')], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    contentJournal: { record: () => {} }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(outputText(result), 'detached success')
+  assert.equal(argumentInspections >= 4, true)
+  assert.equal(providerStateInspections, 1)
+})
+
+test('RunEngine propagates success persistence errors without a stale checkpoint fallback', async () => {
+  for (const phase of ['compareAndSet', 'commitTerminal'] as const) {
+    const store = new SuccessCommitSentinelStore(phase)
+    const turn = phase === 'compareAndSet'
+      ? Object.freeze({
+          ...modelTools([toolCall(0, `sentinel-${phase}`, 'normalRead')]),
+          usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+        })
+      : Object.freeze({
+          ...modelText('terminal sentinel'),
+          usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+        })
+    const fixture = harness([turn], { store })
+
+    await assert.rejects(fixture.engine.start(fixture.input), error => (
+      error === store.sentinel && (error as Error).message === 'success store sentinel'
+    ))
+    const reserved = await store.load(fixture.input.runId)
+    assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+    assert.equal(
+      reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+      'reserved'
+    )
+    assert.deepEqual(reserved?.schemaVersion === 4 ? reserved.usage : null, {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      turnsWithUsage: 0,
+      turnsWithoutUsage: 0,
+      cacheUsageComplete: true
+    })
+  }
+})
+
+test('RunEngine unwraps semantic-failure Store errors before aborted-controller handling', async () => {
+  const store = new SuccessCommitSentinelStore('commitTerminal')
+  const turn: ModelTurn = Object.freeze({
+    ...modelText('refused'),
+    refusal: 'provider refused',
+    usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+  })
+  const fixture = harness([turn], { store })
+
+  await assert.rejects(fixture.engine.start(fixture.input), error => (
+    error === store.sentinel && (error as Error).message === 'success store sentinel'
+  ))
+  const reserved = await store.load(fixture.input.runId)
+  assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+  assert.equal(
+    reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+    'reserved'
+  )
+})
+
+test('RunEngine fails closed when successful turn usage arithmetic is invalid or overflows', async () => {
+  const invalidStore = new TerminalCaptureStore()
+  const invalid = harness([Object.freeze({
+    ...modelText('invalid usage'),
+    usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 5 })
+  })], { store: invalidStore })
+  const invalidResult = await invalid.engine.start(invalid.input)
+  assert.equal(invalidResult.kind, 'failed')
+  assert.equal(invalidStore.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(invalidStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 0,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: true
+  })
+
+  const overflowStore = new OverflowUsageReservationStore()
+  const overflow = harness([Object.freeze({
+    ...modelText('overflow usage'),
+    usage: Object.freeze({ inputTokens: 1, outputTokens: 0, totalTokens: 1 })
+  })], { store: overflowStore })
+  const overflowResult = await overflow.engine.start(overflow.input)
+  assert.equal(overflowResult.kind, 'failed')
+  assert.equal(overflowStore.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(overflowStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: Number.MAX_SAFE_INTEGER,
+    outputTokens: 0,
+    totalTokens: Number.MAX_SAFE_INTEGER,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
 test('RunEngine records empty primary and correction success usage independently', async () => {
   const store = new TerminalCaptureStore()
   const fixture = harness([
@@ -1606,7 +1898,7 @@ test('RunEngine permits resend after pre-success-CAS crash without claiming exte
     usage: Object.freeze({ inputTokens: 7, outputTokens: 2, totalTokens: 9 })
   })], { store })
 
-  await assert.rejects(first.engine.start(first.input))
+  await assert.rejects(first.engine.start(first.input), error => error === store.crash)
   assert.equal(first.adapter.requests.length, 1)
   const crashed = await store.load(first.input.runId)
   assert.equal(store.crashed, true)
@@ -1654,7 +1946,7 @@ test('RunEngine persists a tool success transition before return crash and recov
     usage: Object.freeze({ inputTokens: 7, outputTokens: 2, totalTokens: 9 })
   })], { store })
 
-  await assert.rejects(first.engine.start(first.input))
+  await assert.rejects(first.engine.start(first.input), error => error === store.crash)
   const crashed = await store.load(first.input.runId)
   assert.equal(crashed?.schemaVersion === 4 ? crashed.status : null, 'evaluating_tools')
   assert.equal(crashed?.schemaVersion === 4 ? crashed.providerDispatch.state : null, 'idle')
