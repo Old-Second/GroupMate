@@ -1481,6 +1481,54 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   assert.equal(refusal.adapter.requests.length, 1)
 })
 
+test('RunEngine rejects an empty correction instead of treating it as allowed silence', async () => {
+  const fixture = harness([modelText(''), modelText('')])
+  const proactiveInput: StartRunInput = Object.freeze({
+    ...fixture.input,
+    requestKind: 'proactive_chat',
+    presentationRoute: Object.freeze({
+      schemaVersion: 1,
+      requestKind: 'proactive_chat',
+      profile: 'proactive',
+      presentationIntent: Object.freeze({
+        schemaVersion: 1,
+        kind: 'proactive',
+        recallAfterMs: null
+      }),
+      sessionAddress: fixture.input.sessionAddress,
+      actorId: 'actor-1',
+      requestMessageId: 'message-current'
+    })
+  })
+
+  const result = await fixture.engine.start(proactiveInput)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'provider_protocol_error')
+  assert.equal(
+    result.kind === 'failed' && result.error.details.reason,
+    'invalid_correction_response'
+  )
+  assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode), [
+    'auto',
+    'disabled'
+  ])
+  const snapshot = terminalSnapshot(result)
+  assert.deepEqual(snapshot === null ? null : {
+    status: snapshot.status,
+    completion: snapshot.completion,
+    providerAttempts: snapshot.counters.providerAttempts,
+    modelTurns: snapshot.counters.modelTurns,
+    correctionTurns: snapshot.counters.correctionTurns
+  }, {
+    status: 'failed',
+    completion: { kind: 'none' },
+    providerAttempts: 2,
+    modelTurns: 2,
+    correctionTurns: 1
+  })
+})
+
 test('RunEngine rejects duplicate or malformed call IDs before ledger preparation', async () => {
   for (const turn of [
     modelTools([
