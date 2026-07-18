@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parsePresentationTrace } from '../../src/agent/contracts/presentation-trace.js'
+import {
+  PRESENTATION_TRACE_MAX_BYTES,
+  parsePresentationTrace
+} from '../../src/agent/contracts/presentation-trace.js'
 import {
   executionTraceForwardPart,
   selectExecutionTrace
@@ -47,6 +50,28 @@ if (traceWithUsage.schemaVersion !== 2 || traceWithUsage.usage === undefined) {
   throw new TypeError('V2 usage fixture is missing')
 }
 const traceUsage = traceWithUsage.usage
+
+function largeToolSegments (count: number) {
+  return Array.from({ length: count }, (_, index) => Object.freeze({
+    kind: 'tool' as const,
+    step: index,
+    index: 0,
+    toolName: `tool_${index}`,
+    outcome: 'succeeded' as const,
+    argumentsSummary: 'a'.repeat(500),
+    resultSummary: '结'.repeat(1_000),
+    truncated: false
+  }))
+}
+
+function largeToolTrace (segments = largeToolSegments(3)) {
+  return parsePresentationTrace({
+    schemaVersion: 2,
+    truncated: false,
+    segments,
+    usage: traceUsage
+  })
+}
 
 test('execution trace selection keeps the four independent switch combinations', () => {
   const cases = [
@@ -156,4 +181,92 @@ test('selection preserves V2 usage and renderer appends one integer-formatted us
   assert.match(partialText, /已记录\/可确认部分/)
   assert.match(partialText, /参考费用不可用/)
   assert.match(partialText, /非供应商账单/)
+})
+
+test('selector fits UTF-8 fallback reasoning without losing V2 tools or usage', () => {
+  const original = largeToolTrace()
+  const originalBytes = Buffer.byteLength(JSON.stringify(original), 'utf8')
+  assert.ok(originalBytes > 11_000 && originalBytes < PRESENTATION_TRACE_MAX_BYTES)
+
+  const selected = selectExecutionTrace(
+    original,
+    { forwardReasoning: true, forwardToolDetails: true },
+    { text: '思'.repeat(2_000), truncated: false }
+  )
+
+  assert.equal(selected.schemaVersion, 2)
+  if (selected.schemaVersion !== 2) return
+  assert.deepEqual(selected.usage, traceUsage)
+  assert.deepEqual(selected.segments.slice(0, 3), original.segments)
+  assert.equal(selected.segments.length, 4)
+  const fallback = selected.segments.at(-1)
+  assert.equal(fallback?.kind, 'reasoning')
+  if (fallback?.kind !== 'reasoning') return
+  assert.equal(fallback.truncated, true)
+  assert.match(fallback.text, /…（内容已截断）$/u)
+  assert.ok([...fallback.text].length <= 2_000)
+  assert.equal(selected.truncated, true)
+  assert.ok(Buffer.byteLength(JSON.stringify(selected), 'utf8') <= PRESENTATION_TRACE_MAX_BYTES)
+})
+
+test('selector drops fallback when even its explicit truncation marker cannot fit', () => {
+  const prefix = largeToolSegments(4)
+  let low = 1
+  let high = 1_000
+  let fitted = 1
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    const candidate = [
+      ...prefix,
+      Object.freeze({
+        kind: 'tool' as const,
+        step: 4,
+        index: 0,
+        toolName: 'tool_4',
+        outcome: 'succeeded' as const,
+        argumentsSummary: 'a',
+        resultSummary: '结'.repeat(middle),
+        truncated: false
+      })
+    ]
+    const bytes = Buffer.byteLength(JSON.stringify({
+      schemaVersion: 2,
+      truncated: false,
+      segments: candidate,
+      usage: traceUsage
+    }), 'utf8')
+    if (bytes <= PRESENTATION_TRACE_MAX_BYTES) {
+      fitted = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+  const original = largeToolTrace([
+    ...prefix,
+    Object.freeze({
+      kind: 'tool' as const,
+      step: 4,
+      index: 0,
+      toolName: 'tool_4',
+      outcome: 'succeeded' as const,
+      argumentsSummary: 'a',
+      resultSummary: '结'.repeat(fitted),
+      truncated: false
+    })
+  ])
+  assert.ok(PRESENTATION_TRACE_MAX_BYTES -
+    Buffer.byteLength(JSON.stringify(original), 'utf8') < 3)
+
+  const selected = selectExecutionTrace(
+    original,
+    { forwardReasoning: true, forwardToolDetails: true },
+    { text: '思'.repeat(2_000), truncated: false }
+  )
+  assert.equal(selected.schemaVersion, 2)
+  if (selected.schemaVersion !== 2) return
+  assert.deepEqual(selected.segments, original.segments)
+  assert.deepEqual(selected.usage, traceUsage)
+  assert.equal(selected.truncated, true)
+  assert.ok(Buffer.byteLength(JSON.stringify(selected), 'utf8') <= PRESENTATION_TRACE_MAX_BYTES)
 })

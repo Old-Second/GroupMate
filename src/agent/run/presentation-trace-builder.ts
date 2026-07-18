@@ -485,7 +485,11 @@ function projectUsage (
         MODEL_PRICE_KEYS,
         'presentation model price'
       ))
-  const cost = usage.availability !== 'complete'
+  const allMissIsNotUpperBound = usage.availability === 'complete' &&
+    !usage.cacheUsageComplete && price !== null &&
+    price.inputCacheMissPicoYuanPerMillionTokens <
+      price.inputCacheHitPicoYuanPerMillionTokens
+  const cost = usage.availability !== 'complete' || allMissIsNotUpperBound
     ? Object.freeze({
         kind: 'unavailable' as const,
         catalogVersion: price?.catalogVersion ?? null,

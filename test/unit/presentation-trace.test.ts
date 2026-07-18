@@ -213,6 +213,12 @@ test('presentation usage codec rejects noncanonical costs, cross-state values an
     { ...usage, inputTokens: Number.MAX_SAFE_INTEGER + 1 },
     { ...usage, availability: 'partial' },
     { ...usage, cost: { ...usage.cost, kind: 'upper_bound' } },
+    {
+      ...usage,
+      cost: {
+        kind: 'unavailable', catalogVersion: 'catalog-v1', billingAuthority: false
+      }
+    },
     { ...usage, cost: { ...usage.cost, picoYuan: 1n } },
     Object.fromEntries(Object.entries(usage).filter(([key]) => key !== 'totalTokens')),
     { ...usage, extra: true }
@@ -312,6 +318,28 @@ test('presentation builder always emits V2 and projects exact, upper-bound and u
     assert.equal(projected.usage?.cost.kind, 'unavailable')
     assert.equal(projected.usage?.inputTokens, 100)
   }
+})
+
+test('presentation builder does not call all-miss cost an upper bound when miss is cheaper', () => {
+  const invertedPrice = Object.freeze({
+    ...frozenPrice,
+    catalogVersion: 'inverted-cache-price-v1',
+    inputCacheHitPicoYuanPerMillionTokens: 2_000_000_000_000,
+    inputCacheMissPicoYuanPerMillionTokens: 1_000_000_000_000
+  })
+  const projected = buildTrace({
+    reasoningSegments: [],
+    toolLedgers: [],
+    usage: Object.freeze({ ...completeUsage, cacheUsageComplete: false }),
+    modelPrice: invertedPrice
+  })
+  assert.equal(projected.schemaVersion, 2)
+  assert.deepEqual(projected.usage?.cost, {
+    kind: 'unavailable',
+    catalogVersion: 'inverted-cache-price-v1',
+    billingAuthority: false
+  })
+  assert.equal(projected.usage?.inputTokens, 100)
 })
 
 test('presentation trace parser enforces tool fields, closed outcomes and field limits', () => {

@@ -177,7 +177,7 @@ export function parsePresentationUsageSummary(value) {
         (cost.kind === 'upper_bound' &&
             (usage.availability !== 'complete' || usage.cacheUsageComplete)) ||
         (cost.kind === 'unavailable' && usage.availability === 'complete' &&
-            cost.catalogVersion !== null)) {
+            usage.cacheUsageComplete && cost.catalogVersion !== null)) {
         throw new TypeError('presentation usage cost state is inconsistent');
     }
     return Object.freeze({

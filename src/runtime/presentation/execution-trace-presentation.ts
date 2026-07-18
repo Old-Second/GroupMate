@@ -1,7 +1,10 @@
 import {
   EMPTY_PRESENTATION_TRACE,
+  PRESENTATION_TRACE_MAX_BYTES,
+  PRESENTATION_TRACE_MAX_REASONING_CODE_POINTS,
   parsePresentationTrace,
   type PresentationTrace,
+  type PresentationTraceSegmentV1,
   type PresentationTraceToolOutcomeV1,
   type PresentationUsageSummaryV1
 } from '../../agent/contracts/presentation-trace.js'
@@ -19,6 +22,85 @@ const OUTCOME_LABELS: Readonly<Record<PresentationTraceToolOutcomeV1, string>> =
   failed: '失败',
   indeterminate: '结果待确认'
 })
+const FALLBACK_TRUNCATION_MARKER = '…（内容已截断）'
+
+function selectedTraceValue (
+  trace: PresentationTrace,
+  segments: readonly PresentationTraceSegmentV1[],
+  truncated: boolean
+): unknown {
+  return {
+    schemaVersion: trace.schemaVersion,
+    truncated,
+    segments,
+    ...(trace.schemaVersion === 2 && trace.usage !== undefined
+      ? { usage: trace.usage }
+      : {})
+  }
+}
+
+function selectedTraceBytes (
+  trace: PresentationTrace,
+  segments: readonly PresentationTraceSegmentV1[],
+  truncated: boolean
+): number {
+  return Buffer.byteLength(JSON.stringify(
+    selectedTraceValue(trace, segments, truncated)
+  ), 'utf8')
+}
+
+function fitFallbackReasoning (
+  trace: PresentationTrace,
+  segments: readonly PresentationTraceSegmentV1[],
+  fallback: ReasoningView,
+  step: number
+): PresentationTraceSegmentV1 | null {
+  const complete = Object.freeze({
+    kind: 'reasoning' as const,
+    step,
+    turn: 1,
+    text: fallback.text,
+    truncated: fallback.truncated
+  })
+  const baseTruncated = trace.truncated || segments.some(segment => segment.truncated)
+  if (selectedTraceBytes(
+    trace,
+    [...segments, complete],
+    baseTruncated || complete.truncated
+  ) <= PRESENTATION_TRACE_MAX_BYTES) {
+    return complete
+  }
+
+  const markerPoints = [...FALLBACK_TRUNCATION_MARKER]
+  const sourcePoints = [...fallback.text]
+  let low = 0
+  let high = Math.min(
+    sourcePoints.length,
+    PRESENTATION_TRACE_MAX_REASONING_CODE_POINTS - markerPoints.length
+  )
+  let fitted: PresentationTraceSegmentV1 | null = null
+  while (low <= high) {
+    const retained = Math.floor((low + high) / 2)
+    const candidate = Object.freeze({
+      kind: 'reasoning' as const,
+      step,
+      turn: 1,
+      text: `${sourcePoints.slice(0, retained).join('')}${FALLBACK_TRUNCATION_MARKER}`,
+      truncated: true
+    })
+    if (selectedTraceBytes(
+      trace,
+      [...segments, candidate],
+      true
+    ) <= PRESENTATION_TRACE_MAX_BYTES) {
+      fitted = candidate
+      low = retained + 1
+    } else {
+      high = retained - 1
+    }
+  }
+  return fitted
+}
 
 export function selectExecutionTrace (
   trace: PresentationTrace,
@@ -35,30 +117,30 @@ export function selectExecutionTrace (
   const fallback = hasProviderReasoning || !settings.forwardReasoning
     ? undefined
     : normalizeReasoningView(fallbackReasoning)
+  let fallbackOmittedForBytes = false
   if (fallback !== undefined) {
     const maximumStep = parsed.segments.reduce(
       (maximum, segment) => Math.max(maximum, segment.step),
       -1
     )
     if (maximumStep < Number.MAX_SAFE_INTEGER) {
-      segments.push(Object.freeze({
-        kind: 'reasoning',
-        step: maximumStep + 1,
-        turn: 1,
-        text: fallback.text,
-        truncated: fallback.truncated
-      }))
+      const fitted = fitFallbackReasoning(
+        parsed,
+        segments,
+        fallback,
+        maximumStep + 1
+      )
+      if (fitted === null) fallbackOmittedForBytes = true
+      else segments.push(fitted)
     }
   }
   if (segments.length === 0 && parsed.schemaVersion === 1) return EMPTY_PRESENTATION_TRACE
-  return parsePresentationTrace({
-    schemaVersion: parsed.schemaVersion,
-    truncated: parsed.truncated || segments.some(segment => segment.truncated),
+  return parsePresentationTrace(selectedTraceValue(
+    parsed,
     segments,
-    ...(parsed.schemaVersion === 2 && parsed.usage !== undefined
-      ? { usage: parsed.usage }
-      : {})
-  })
+    parsed.truncated || fallbackOmittedForBytes ||
+      segments.some(segment => segment.truncated)
+  ))
 }
 
 function picoYuanAsYuan (picoYuan: string): string {

@@ -216,24 +216,45 @@ const toolOnlyTrace = parsePresentationTrace({
   }]
 })
 
+const presentationUsage = Object.freeze({
+  schemaVersion: 1 as const,
+  availability: 'complete' as const,
+  inputTokens: 100,
+  outputTokens: 20,
+  totalTokens: 120,
+  cacheHitTokens: 80,
+  cacheMissTokens: 20,
+  cacheUsageComplete: true,
+  cost: Object.freeze({
+    kind: 'exact' as const,
+    currency: 'CNY' as const,
+    picoYuan: '61600000',
+    catalogVersion: 'deepseek-cny-2026-07-19',
+    billingAuthority: false as const
+  })
+})
+
 const usageTrace = parsePresentationTrace({
   schemaVersion: 2,
   truncated: false,
   segments: providerTrace.segments,
-  usage: {
-    schemaVersion: 1,
-    availability: 'complete',
-    inputTokens: 100,
-    outputTokens: 20,
-    totalTokens: 120,
-    cacheHitTokens: 80,
-    cacheMissTokens: 20,
-    cacheUsageComplete: true,
-    cost: {
-      kind: 'exact', currency: 'CNY', picoYuan: '61600000',
-      catalogVersion: 'deepseek-cny-2026-07-19', billingAuthority: false
-    }
-  }
+  usage: presentationUsage
+})
+
+const largeFallbackTrace = parsePresentationTrace({
+  schemaVersion: 2,
+  truncated: false,
+  segments: Array.from({ length: 3 }, (_, index) => ({
+    kind: 'tool',
+    step: index,
+    index: 0,
+    toolName: `tool_${index}`,
+    outcome: 'succeeded',
+    argumentsSummary: 'a'.repeat(500),
+    resultSummary: '结'.repeat(1_000),
+    truncated: false
+  })),
+  usage: presentationUsage
 })
 
 const usageOnlyTrace = parsePresentationTrace({
@@ -1003,6 +1024,30 @@ test('usage-only, switches-off, blocked and ordinary no-trace replies send zero 
     }))
     assert.equal(f.calls.filter(call => call.part.media === 'forward').length, 0, item.name)
   }
+})
+
+test('oversized inline fallback never prevents the main reply or execution forward', async () => {
+  const f = fixture({
+    hooks: {
+      postprocess: async ({ text }) => ({
+        text,
+        reasoningView: { text: '思'.repeat(2_000), truncated: false }
+      })
+    }
+  })
+
+  const result = await f.presenter.present(input(completed({
+    kind: 'reply_text', text: '主回复必须发送'
+  }, largeFallbackTrace), { hooks: f.hooks }))
+
+  assert.equal(result.outcome, 'complete')
+  assert.deepEqual(f.calls.map(call => call.part.media), ['text', 'forward'])
+  assert.deepEqual(sentTexts(f.calls), ['主回复必须发送'])
+  const forward = f.calls[1]?.part
+  assert.equal(forward?.media, 'forward')
+  if (forward?.media !== 'forward') return
+  assert.equal(forward.nodes.filter(node => /Token 与费用/.test(node.text)).length, 1)
+  assert.match(forward.nodes.at(-2)?.text ?? '', /…（内容已截断）$/u)
 })
 
 test('already-visible success sends only its tool trace before a persistence notice', async () => {
