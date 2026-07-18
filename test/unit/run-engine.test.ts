@@ -2013,6 +2013,62 @@ test('RunEngine commits successful turn usage before a success-side budget failu
     .map(event => event.type), ['model.attempted'])
 })
 
+test('RunEngine keeps an active budget failure authoritative when the response snapshot is unsafe', async () => {
+  const store = new TerminalCaptureStore()
+  const journalEvents: RunContentJournalEvent[] = []
+  const toolCalls = new Proxy([], {
+    get: (target, property, receiver) => {
+      if (property === 'length') throw new Error('budget response toolCalls length trap')
+      return Reflect.get(target, property, receiver) as unknown
+    }
+  }) as unknown as ModelTurn['toolCalls']
+  const turn: ModelTurn = Object.freeze({
+    text: '',
+    toolCalls,
+    finishReason: 'tool_calls',
+    usage: Object.freeze({ inputTokens: 9, outputTokens: 1, totalTokens: 10 })
+  })
+  const fixture = harness([turn], {
+    store,
+    monotonicNow: sequenceClock(0, 10, 240_011, 240_020),
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' ? result.error.code : null, 'run_budget_exceeded')
+  const terminal = terminalSnapshot(result)
+  assert.deepEqual(terminal === null ? null : {
+    input: terminal.counters.providerInputTokens,
+    output: terminal.counters.providerOutputTokens,
+    total: terminal.counters.providerTotalTokens,
+    activeDurationMs: terminal.counters.providerActiveDurationMs
+  }, {
+    input: 9,
+    output: 1,
+    total: 10,
+    activeDurationMs: 240_000
+  })
+  assert.equal(store.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 9,
+    outputTokens: 1,
+    totalTokens: 10,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+  assert.deepEqual(store.terminalCheckpoint?.events
+    .filter(event => event.type === 'model.attempted' || event.type === 'model.completed')
+    .map(event => event.type), ['model.attempted'])
+  assert.equal(journalEvents.some(event => event.type === 'provider.response'), false)
+})
+
 test('RunEngine permits resend after pre-success-CAS crash without claiming external billing exactly once', async () => {
   const store = new PreSuccessCasCrashStore()
   const first = harness([Object.freeze({

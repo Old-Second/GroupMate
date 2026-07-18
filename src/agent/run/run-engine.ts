@@ -2161,7 +2161,7 @@ export class RunEngine {
         journalTurn = null
         plan = Object.freeze({
           kind: 'fail',
-          error: asAgentError(error),
+          error: budgetError ?? asAgentError(error),
           changes: common,
           drafts: Object.freeze([attemptedEvent])
         })
