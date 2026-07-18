@@ -687,12 +687,22 @@ function reasoningOptions (
 function requestSystemInstructions (
   config: RuntimeConfig,
   options: YunzaiAgentHandleOptions,
-  toolRun: YunzaiAgentToolRun
+  toolRun: YunzaiAgentToolRun,
+  messageEvidence: PreparedYunzaiMessageEvidenceV1
 ): readonly string[] {
   const configured = options.systemInstructions === undefined
     ? [configText(config, 'promptPrefixOverride') || DEFAULT_SYSTEM_INSTRUCTION]
     : [...options.systemInstructions]
   if (toolRun.systemAddition.trim() !== '') configured.push(toolRun.systemAddition)
+  if (!messageEvidence.hasReply) {
+    configured.push(
+      '当前 QQ 请求没有携带可解析的引用消息。不得从会话历史猜测或声称看到了被引用内容；如果用户要求读取、复述或解释引用消息，应明确说明当前无法读取，并请其重新引用或直接提供内容。'
+    )
+  } else if (!messageEvidence.replyResolved) {
+    configured.push(
+      '当前 QQ 请求包含引用标记，但被引用内容不可读取。不得从会话历史猜测或声称看到了被引用内容；如果用户要求读取、复述或解释引用消息，应明确说明当前无法读取，并请其重新引用或直接提供内容。'
+    )
+  }
   return Object.freeze(configured)
 }
 
@@ -1103,7 +1113,12 @@ export class YunzaiAgentServiceBridge {
         requestRef,
         createdAt,
         deadlineAt: new Date(new Date(createdAt).getTime() + RUN_DEADLINE_MS).toISOString(),
-        systemInstructions: requestSystemInstructions(this.#options.config, options, toolRun),
+        systemInstructions: requestSystemInstructions(
+          this.#options.config,
+          options,
+          toolRun,
+          messageEvidence
+        ),
         model: requestModel,
         contextBudget: contextBudget(requestModel.maxOutputTokens),
         ...(options.sessionTtlSeconds === undefined

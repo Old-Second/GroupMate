@@ -570,6 +570,129 @@ test('a stuck group history read does not remove context from another group', as
   assert.equal(JSON.stringify(historyDiagnostics).includes('群 B 唯一历史'), false)
 })
 
+test('adds trusted quote grounding after ordinary group history is loaded', async () => {
+  const modelRequests: ModelRequest[] = []
+  const baseOptions = options(() => undefined)
+  const graph = createProductionYunzaiAgent({
+    ...baseOptions,
+    bridge: {
+      ...baseOptions.bridge,
+      loadGroupHistory: async () => Object.freeze([{
+        message_id: 'old-message',
+        raw_message: '很像被引用目标的旧消息',
+        sender: Object.freeze({
+          user_id: 'old-member', card: '旧群友', nickname: '旧群友'
+        }),
+        time: 1_789_000_000
+      }])
+    },
+    modelFactory: () => Object.freeze({
+      async complete (request: ModelRequest): Promise<ModelTurn> {
+        modelRequests.push(request)
+        return Object.freeze({
+          text: 'fixture', toolCalls: Object.freeze([]), finishReason: 'stop'
+        })
+      },
+      async generate (): Promise<readonly string[]> { return Object.freeze([]) }
+    })
+  })
+  const event = {
+    isGroup: true,
+    group_id: 'group-1',
+    self_id: 'bot',
+    user_id: 'actor-1',
+    message_id: 'current-message',
+    sender: { user_id: 'actor-1', nickname: 'member', role: 'member' as const },
+    message: [{ type: 'text', text: '请复述我回复的那条消息' }],
+    group: {
+      name: 'group-1',
+      async getChatHistory () { return [] },
+      async getMemberMap () {
+        return new Map([
+          ['actor-1', { user_id: 'actor-1', role: 'member' }],
+          ['bot', { user_id: 'bot', role: 'member' }]
+        ])
+      }
+    }
+  }
+  const messageEvidence = await prepareYunzaiMessageEvidence({
+    event,
+    currentPrompt: '请复述我回复的那条消息',
+    ocrTexts: []
+  })
+  const prepared = prepareYunzaiPresentationRequest({
+    event,
+    evidence: messageEvidence,
+    requestKind: 'ordinary_chat',
+    presentationIntent: Object.freeze({
+      schemaVersion: 1 as const,
+      kind: 'ordinary' as const,
+      forcePicture: false
+    }),
+    getBotId: () => 'bot'
+  })
+
+  const result = await graph.bridge.handle(event, messageEvidence, {
+    enableGroupContext: true,
+    presentationRoute: prepared.route
+  })
+  const unresolvedEvent = {
+    ...event,
+    message_id: 'current-message-2',
+    source: { message_id: 'missing-quoted-message' },
+    group: {
+      ...event.group,
+      async getMsg () { throw new Error('quoted message is unavailable') }
+    }
+  }
+  const unresolvedEvidence = await prepareYunzaiMessageEvidence({
+    event: unresolvedEvent,
+    currentPrompt: '请复述我回复的那条消息',
+    ocrTexts: []
+  })
+  const unresolvedPrepared = prepareYunzaiPresentationRequest({
+    event: unresolvedEvent,
+    evidence: unresolvedEvidence,
+    requestKind: 'ordinary_chat',
+    presentationIntent: Object.freeze({
+      schemaVersion: 1 as const,
+      kind: 'ordinary' as const,
+      forcePicture: false
+    }),
+    getBotId: () => 'bot'
+  })
+  const unresolvedResult = await graph.bridge.handle(unresolvedEvent, unresolvedEvidence, {
+    enableGroupContext: true,
+    presentationRoute: unresolvedPrepared.route
+  })
+  await graph.shutdown('unit_test')
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(unresolvedResult.kind, 'completed')
+  assert.equal(messageEvidence.hasReply, false)
+  assert.equal(unresolvedEvidence.hasReply, true)
+  assert.equal(unresolvedEvidence.replyResolved, false)
+  assert.equal(modelRequests.length, 2)
+  assert.equal(modelRequests[0]?.messages.some(message =>
+    message.role === 'system' &&
+    typeof message.content === 'string' &&
+    message.content.includes('当前 QQ 请求没有携带可解析的引用消息') &&
+    message.content.includes('不得从会话历史猜测')
+  ), true)
+  assert.equal(modelRequests[0]?.messages.some(message =>
+    typeof message.content === 'string' && message.content.includes('很像被引用目标的旧消息')
+  ), true)
+  assert.equal(modelRequests[1]?.messages.some(message =>
+    message.role === 'system' &&
+    typeof message.content === 'string' &&
+    message.content.includes('当前 QQ 请求包含引用标记，但被引用内容不可读取') &&
+    message.content.includes('不得从会话历史猜测')
+  ), true)
+  assert.equal(modelRequests[1]?.messages.some(message =>
+    typeof message.content === 'string' && message.content.includes('很像被引用目标的旧消息')
+  ), true)
+})
+
 test('default disk journal construction uses plugin data path and fixed failure diagnostics', async () => {
   const failures: Array<Readonly<Record<string, unknown>>> = []
   const recorded: GroupMateDiskLogEvent[] = []

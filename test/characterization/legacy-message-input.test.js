@@ -42,6 +42,7 @@ test('typed request evidence resolves quoted images once and is reused by the ro
         historyCalls++
         return [{
           message_id: 'quoted-message',
+          real_seq: 42,
           sender: { user_id: 'actor-2', nickname: 'quoted member' },
           message: [
             { type: 'text', text: 'quoted content' },

@@ -9,6 +9,7 @@ const MAX_OCR_CODE_POINTS = 2_000
 type UnknownRecord = Record<string, unknown>
 
 interface HistoryReaderLike {
+  getMsg?: (messageId: unknown) => Promise<unknown>
   getChatHistory: (cursor: unknown, count: number) => Promise<unknown>
 }
 
@@ -90,6 +91,7 @@ function getBoundedScalar (value: unknown): string | undefined {
 function getBoundedMessageId (value: unknown): string | undefined {
   if (!['string', 'number', 'boolean'].includes(typeof value)) return undefined
   const source = String(value).normalize('NFC').trim()
+  if (source === '0') return undefined
   let byteLength = 0
   let result = ''
   for (const codePoint of source) {
@@ -125,14 +127,15 @@ function projectSender (value: unknown): Record<string, string> {
 }
 
 function getReplyCursor (event: MessageEventLike, source: UnknownRecord): unknown {
-  if (event.isGroup === true) {
-    return source.seq ?? source.message_id ?? source.id
-  }
-  return source.time ?? source.seq ?? source.message_id ?? source.id
+  const candidates = event.isGroup === true
+    ? [source.seq, source.message_id, source.id]
+    : [source.time, source.seq, source.message_id, source.id]
+  return candidates.find(candidate => getBoundedMessageId(candidate) !== undefined)
 }
 
 function getReplyMessageId (event: MessageEventLike, source: UnknownRecord): unknown {
-  return source.message_id ?? source.id ?? event.reply_id
+  return [source.message_id, source.id, event.reply_id]
+    .find(candidate => getBoundedMessageId(candidate) !== undefined)
 }
 
 function findReplySegment (message: unknown): UnknownRecord | undefined {
@@ -186,6 +189,26 @@ function isScopedMessage (
     .some(candidate => getBoundedMessageId(candidate) === actorId)
 }
 
+function isMatchingHistoryMessage (
+  event: MessageEventLike,
+  requestedMessageId: unknown,
+  cursor: unknown,
+  value: unknown
+): value is UnknownRecord {
+  if (!isRecord(value) || !hasReplyContent(value)) return false
+  const messageId = getBoundedMessageId(requestedMessageId)
+  if (messageId !== undefined) {
+    return getBoundedMessageId(value.message_id ?? value.id) === messageId
+  }
+
+  const expectedCursor = getBoundedMessageId(cursor)
+  if (expectedCursor === undefined) return false
+  const candidates = event.isGroup === true
+    ? [value.seq, value.real_seq, value.message_seq, value.message_id, value.id]
+    : [value.time, value.seq, value.real_seq, value.message_seq, value.message_id, value.id]
+  return candidates.some(candidate => getBoundedMessageId(candidate) === expectedCursor)
+}
+
 async function resolveReplyReference (
   event: MessageEventLike,
   source: UnknownRecord
@@ -197,12 +220,21 @@ async function resolveReplyReference (
   const cursor = getReplyCursor(event, source)
   const messageId = getReplyMessageId(event, source)
 
-  if (event.getReply) {
+  if ((messageId !== undefined || cursor !== undefined) && event.getReply) {
     try {
       const reply = await event.getReply()
       if (isRecord(reply) && hasReplyContent(reply)) return reply
     } catch {
       // Fall through to adapter-level message lookup.
+    }
+  }
+
+  if (messageId !== undefined && messageId !== null && reader?.getMsg) {
+    try {
+      const reply = await reader.getMsg(messageId)
+      if (isScopedMessage(event, messageId, reply)) return reply
+    } catch {
+      // Continue to raw adapter and scoped history fallbacks.
     }
   }
 
@@ -220,7 +252,7 @@ async function resolveReplyReference (
       const history = await reader.getChatHistory(cursor, 1)
       if (Array.isArray(history)) {
         const reply = history.at(-1)
-        if (isRecord(reply) && hasReplyContent(reply)) return reply
+        if (isMatchingHistoryMessage(event, messageId, cursor, reply)) return reply
       }
     } catch {
       // Keep the structural reply reference even when its content is unavailable.

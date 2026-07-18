@@ -53,6 +53,7 @@ test('resolves one group reply with sender identity and merged images', async ()
           groupCalls.push(args)
           return [{
             message_id: 'message-42',
+            real_seq: 42,
             sender: {
               card: 'member-card',
               nickname: 'member-name',
@@ -315,7 +316,7 @@ test('uses the private reader and source time for private replies', async () => 
       friend: {
         async getChatHistory (...args: unknown[]) {
           friendCalls.push(args)
-          return [{ raw_message: 'private quoted fallback', message: [] }]
+          return [{ time: 1234, raw_message: 'private quoted fallback', message: [] }]
         }
       },
       group: {
@@ -342,7 +343,7 @@ test('preserves long current and fallback reply text within the content budget',
       source: { time: 5678 },
       friend: {
         async getChatHistory () {
-          return [{ raw_message: longReply, message: [] }]
+          return [{ time: 5678, raw_message: longReply, message: [] }]
         }
       }
     }
@@ -386,7 +387,10 @@ test('resolves a flat reply segment when the adapter does not expose event.sourc
       group: {
         async getChatHistory (...args: unknown[]) {
           calls.push(args)
-          return [{ message: [{ type: 'text', text: 'quoted from segment' }] }]
+          return [{
+            message_id: 'quoted-message',
+            message: [{ type: 'text', text: 'quoted from segment' }]
+          }]
         }
       }
     }
@@ -663,6 +667,144 @@ test('reads the quoted target directly when history lookup cannot resolve a raw 
   )
 })
 
+for (const scope of ['group', 'private'] as const) {
+  test(`reads a raw TRSS ${scope} reply through the scoped getMsg facade`, async () => {
+    const directCalls: unknown[] = []
+    let historyCalls = 0
+    const reader = {
+      async getMsg (messageId: unknown) {
+        directCalls.push(messageId)
+        return {
+          message_id: 'quoted-message',
+          ...(scope === 'group' ? { group_id: 'group-1' } : {}),
+          ...(scope === 'private' ? { target_id: 'actor-1' } : {}),
+          sender: {
+            user_id: scope === 'private' ? 'bot' : 'actor-1',
+            nickname: 'quoted member'
+          },
+          message: [{ type: 'text', text: `quoted through ${scope}.getMsg` }]
+        }
+      },
+      async getChatHistory () {
+        historyCalls++
+        throw new Error('history must not replace a direct message lookup')
+      }
+    }
+    const result = await buildModelMessageInput({
+      currentPrompt: 'current',
+      event: {
+        isGroup: scope === 'group',
+        ...(scope === 'group' ? { group_id: 'group-1' } : {}),
+        user_id: 'actor-1',
+        message_id: 'current-message',
+        message: [{ type: 'text', text: 'current' }],
+        bot: {
+          async sendApi () {
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: {
+                message_id: 'current-message',
+                ...(scope === 'group' ? { group_id: 'group-1' } : {}),
+                user_id: 'actor-1',
+                message: [{ type: 'reply', data: { id: 'quoted-message' } }]
+              }
+            }
+          }
+        },
+        ...(scope === 'group' ? { group: reader } : { friend: reader })
+      }
+    })
+
+    assert.deepEqual(directCalls, ['quoted-message'])
+    assert.equal(historyCalls, 0)
+    assert.equal(result.replyResolved, true)
+    assert.equal(result.quotedMessageId, 'quoted-message')
+    assert.equal(
+      parseInputPayload(result.prompt).quotedMessage.content,
+      `quoted through ${scope}.getMsg`
+    )
+  })
+}
+
+test('treats reply id zero as unavailable instead of reading an unrelated message', async () => {
+  let resolverCalls = 0
+  const directCalls: unknown[] = []
+  const historyCalls: unknown[] = []
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current survives',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      message: [
+        { type: 'reply', data: { id: 0 } },
+        { type: 'text', text: 'current survives' }
+      ],
+      async getReply () {
+        resolverCalls++
+        return {
+          message_id: 'unrelated',
+          group_id: 'group-1',
+          message: [{ type: 'text', text: 'unrelated resolver message' }]
+        }
+      },
+      group: {
+        async getMsg (messageId: unknown) {
+          directCalls.push(messageId)
+          return {
+            message_id: 0,
+            group_id: 'group-1',
+            message: [{ type: 'text', text: 'unrelated latest message' }]
+          }
+        },
+        async getChatHistory (cursor: unknown) {
+          historyCalls.push(cursor)
+          return [{
+            message_id: 'unrelated',
+            group_id: 'group-1',
+            message: [{ type: 'text', text: 'unrelated history message' }]
+          }]
+        }
+      }
+    }
+  })
+
+  assert.equal(resolverCalls, 0)
+  assert.deepEqual(directCalls, [])
+  assert.deepEqual(historyCalls, [])
+  assert.equal(result.hasReply, true)
+  assert.equal(result.replyResolved, false)
+  assert.equal(result.quotedMessageId, null)
+  assert.deepEqual(parseInputPayload(result.prompt).quotedMessage, { status: 'unavailable' })
+})
+
+test('rejects an adjacent history message that does not match the reply reference', async () => {
+  const result = await buildModelMessageInput({
+    currentPrompt: 'current survives',
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      source: { message_id: 'quoted-message' },
+      message: [{ type: 'text', text: 'current survives' }],
+      group: {
+        async getMsg () { throw new Error('direct target unavailable') },
+        async getChatHistory () {
+          return [{
+            message_id: 'adjacent-message',
+            group_id: 'group-1',
+            message: [{ type: 'text', text: 'unrelated adjacent message' }]
+          }]
+        }
+      }
+    }
+  })
+
+  assert.equal(result.hasReply, true)
+  assert.equal(result.replyResolved, false)
+  assert.equal(result.quotedMessageId, 'quoted-message')
+  assert.deepEqual(parseInputPayload(result.prompt).quotedMessage, { status: 'unavailable' })
+})
+
 test('uses the canonical Yunzai reply reference and resolver when available', async () => {
   let replyCalls = 0
   const result = await buildModelMessageInput({
@@ -864,6 +1006,7 @@ test('does not recursively resolve reply segments inside the target', async () =
         async getChatHistory () {
           calls++
           return [{
+            real_seq: 1,
             message: [
               { type: 'reply', id: 'older-message' },
               { type: 'text', text: 'direct target' }
@@ -914,7 +1057,7 @@ test('keeps quoted prompt injection inside the quoted JSON field', async () => {
       source: { seq: 8 },
       group: {
         async getChatHistory () {
-          return [{ message: [{ type: 'text', text: hostileQuote }] }]
+          return [{ real_seq: 8, message: [{ type: 'text', text: hostileQuote }] }]
         }
       }
     }
@@ -941,6 +1084,7 @@ test('prepares one deeply frozen canonical evidence projection with bounded norm
         historyCalls++
         return [{
           message_id: 'quoted-message',
+          real_seq: 42,
           sender: { user_id: 'actor-2', nickname: 'quoted member' },
           message: [
             { type: 'text', text: 'quoted content' },
