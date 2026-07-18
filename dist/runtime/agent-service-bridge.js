@@ -26,6 +26,7 @@ import { PendingIndicatorPresenter } from './presentation/pending-indicator-pres
 import { createPresentationSettingsPort } from './presentation/presentation-settings.js';
 import { createYunzaiOutboundPortFactory, deliverWithDefiniteRetry } from './presentation/yunzai-outbound-port.js';
 import { materializeYunzaiForwardMessage } from './presentation/yunzai-forward-message.js';
+import { materializeYunzaiMagicSegment } from './presentation/yunzai-magic-segment.js';
 import { plainTextPart } from './presentation/text-presentation.js';
 import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
@@ -253,9 +254,9 @@ async function outboundValue(receiver, segment, part) {
             : { type: 'music', platform: part.provider, id: part.id };
     }
     if (part.media === 'dice')
-        return { type: 'dice' };
+        return materializeYunzaiMagicSegment(segment, 'dice');
     if (part.media === 'rps')
-        return { type: 'rps', value: part.value };
+        return materializeYunzaiMagicSegment(segment, 'rps', part.value);
     return await materializeYunzaiForwardMessage(receiver, part);
 }
 export function createApprovalOutboundPortFactory(input) {
@@ -967,6 +968,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         ...options,
         config: options.config,
         redis: options.redis,
+        outboundFactory,
         logger: options.logger
     });
     const runStore = dependencies.runStore ?? new RedisRunStore({ client: options.redis });

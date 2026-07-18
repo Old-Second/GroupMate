@@ -53,6 +53,9 @@ import {
   materializeYunzaiForwardMessage
 } from './dist/runtime/presentation/yunzai-forward-message.js'
 import {
+  materializeYunzaiMagicSegment
+} from './dist/runtime/presentation/yunzai-magic-segment.js'
+import {
   initializeProductionYunzaiAgent
 } from './dist/runtime/production-yunzai-agent.js'
 import {
@@ -283,8 +286,8 @@ async function outboundMessage (receiver, part) {
       ? segment.music(part.provider, part.id)
       : { type: 'music', platform: part.provider, id: part.id }
   }
-  if (part.media === 'dice') return { type: 'dice' }
-  if (part.media === 'rps') return { type: 'rps', value: part.value }
+  if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
+  if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
   return await materializeYunzaiForwardMessage(receiver, part)
 }
 

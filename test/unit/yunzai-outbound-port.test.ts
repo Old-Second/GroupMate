@@ -79,6 +79,113 @@ test('outbound normalizes a signed NapCat numeric message ID and recalls with it
   assert.deepEqual(fixture.recalls, [-12_345_678])
 })
 
+test('Yunzai host boundary projects a successful OneBot proxy without reading virtual receipt fields', async () => {
+  const virtualReads: PropertyKey[] = []
+  const envelope = new Proxy(
+    Object.freeze({
+      status: 'ok',
+      retcode: 0,
+      data: Object.freeze({ message_id: -12_345_678 })
+    }),
+    {
+      get (target, key, receiver) {
+        virtualReads.push(key)
+        const data = Reflect.get(target, 'data', receiver) as Readonly<Record<PropertyKey, unknown>>
+        return data[key] ?? Reflect.get(target, key, receiver)
+      }
+    }
+  )
+  const fixture = hostTarget([envelope], [true])
+  const port = await createYunzaiOutboundPortFactory({
+    forTarget: async () => fixture.target
+  }).forTarget(groupUserTarget)
+
+  const delivered = await port.deliver(textPart, 1)
+  assert.equal(delivered.kind, 'sent')
+  if (delivered.kind !== 'sent') return
+  assert.equal(delivered.receipt.messageId, '-12345678')
+  assert.equal(virtualReads.some(key => key !== 'then'), false)
+  assert.deepEqual(await port.recall(delivered.receipt), { kind: 'recalled' })
+  assert.deepEqual(fixture.recalls, [-12_345_678])
+})
+
+test('Yunzai host boundary leaves untrusted or ambiguous envelopes unconfirmed', async () => {
+  let nestedGetterReads = 0
+  const getterData = Object.defineProperty({}, 'message_id', {
+    enumerable: true,
+    get: () => {
+      nestedGetterReads += 1
+      return 'getter-id'
+    }
+  })
+  const ambiguousAccessorData = Object.defineProperty({ message_id: 'snake-id' }, 'messageId', {
+    enumerable: true,
+    get: () => {
+      nestedGetterReads += 1
+      return 'camel-id'
+    }
+  })
+  const revoked = Proxy.revocable(Object.freeze({ message_id: 'revoked-id' }), {})
+  revoked.revoke()
+  const values = [
+    Object.freeze({ status: 'failed', retcode: 100, data: Object.freeze({ message_id: 'failed-id' }) }),
+    Object.freeze({
+      status: 'failed', retcode: 100, data: null, message_id: 'flattened-failure-id'
+    }),
+    Object.freeze({ status: 'ok', retcode: 1, data: Object.freeze({ message_id: 'retcode-id' }) }),
+    Object.freeze({
+      status: 'ok', retcode: 0, data: Object.freeze({}), message_id: 'ambiguous-success-id'
+    }),
+    Object.freeze({
+      status: 'ok',
+      retcode: 0,
+      data: Object.freeze({ message_id: 'nested-success-id' }),
+      message_id: 'conflicting-root-id'
+    }),
+    Object.freeze({ retcode: 0, data: Object.freeze({ message_id: 'missing-status-id' }) }),
+    Object.freeze({ status: 'ok', retcode: 0, data: [] }),
+    Object.freeze({ status: 'ok', retcode: 0, data: getterData }),
+    Object.freeze({ status: 'ok', retcode: 0, data: ambiguousAccessorData }),
+    Object.freeze({ status: 'ok', retcode: 0, data: Object.create({ message_id: 'inherited-id' }) }),
+    Object.freeze({ status: 'ok', retcode: 0, data: Object.freeze({ message_id: 'one', messageId: 'two' }) }),
+    Object.freeze({ status: 'ok', retcode: 0, data: Object.freeze({ message_id: 0 }) }),
+    Object.freeze({ status: 'ok', retcode: 0, data: revoked.proxy })
+  ]
+  const valueCount = values.length
+  const fixture = hostTarget([...values])
+  const port = await createYunzaiOutboundPortFactory({
+    forTarget: async () => fixture.target
+  }).forTarget(groupUserTarget)
+
+  const results = []
+  for (let index = 0; index < valueCount; index += 1) {
+    results.push(await port.deliver(textPart, 1))
+  }
+  assert.deepEqual(results.map(result => result.kind), Array(valueCount).fill('outcome_unknown'))
+  assert.equal(nestedGetterReads, 0)
+})
+
+test('Yunzai host boundary fails closed when a nested proxy descriptor trap throws', async () => {
+  let descriptorChecks = 0
+  const hostileData = new Proxy(Object.freeze({ message_id: 'must-not-confirm' }), {
+    getOwnPropertyDescriptor () {
+      descriptorChecks += 1
+      throw new Error('descriptor unavailable')
+    }
+  })
+  const fixture = hostTarget([
+    Object.freeze({ status: 'ok', retcode: 0, data: hostileData })
+  ])
+  const port = await createYunzaiOutboundPortFactory({
+    forTarget: async () => fixture.target
+  }).forTarget(groupUserTarget)
+
+  assert.deepEqual(await port.deliver(textPart, 1), {
+    kind: 'outcome_unknown', media: 'text', attempt: 1, code: 'unknown_host_result'
+  })
+  assert.equal(descriptorChecks >= 1, true)
+})
+
 test('outbound rejects zero fractional and unsafe numeric message IDs', async () => {
   const fixture = hostTarget([
     { message_id: 0 },

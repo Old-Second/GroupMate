@@ -53,9 +53,11 @@ import {
   createYunzaiOutboundPortFactory,
   type OutboundPart,
   type SafeTextAtom,
-  type YunzaiOutboundHostPort
+  type YunzaiOutboundHostPort,
+  type YunzaiOutboundPortFactory
 } from '../presentation/yunzai-outbound-port.js'
 import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js'
+import { materializeYunzaiMagicSegment } from '../presentation/yunzai-magic-segment.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../message-input.js'
 
 type YunzaiValue = string | number
@@ -86,6 +88,7 @@ export interface YunzaiToolRuntimeBridgeOptions {
     signal: AbortSignal
   ) => Promise<ToolResource>
   readonly segment: () => YunzaiRecord
+  readonly outboundFactory?: YunzaiOutboundPortFactory
   readonly logger?: {
     info?(event: Readonly<Record<string, unknown>>): void
     warn?(message: string): void
@@ -463,14 +466,6 @@ function resourceValue (resource: ToolResource): Buffer | string {
   return resource.kind === 'remote_url' ? resource.url : resource.path
 }
 
-function magicSegment (segment: YunzaiRecord, type: 'dice' | 'rps', value?: number): unknown {
-  const factory = segment[type]
-  if (typeof factory === 'function') {
-    return Reflect.apply(factory, segment, value === undefined ? [] : [value])
-  }
-  return { type, data: {} }
-}
-
 function safeTextAtomValue (segment: YunzaiRecord, atom: SafeTextAtom): unknown {
   if (atom.kind === 'text') return atom.text
   if (atom.kind === 'at') {
@@ -501,17 +496,18 @@ async function outboundMessage (
   if (part.media === 'voice') return segment.record(resourceValue(part.resource))
   if (part.media === 'video') return segment.video(resourceValue(part.resource))
   if (part.media === 'music') return segment.music(part.provider, part.id)
-  if (part.media === 'dice') return magicSegment(segment, 'dice')
-  if (part.media === 'rps') return magicSegment(segment, 'rps', part.value)
+  if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
+  if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
   return await materializeYunzaiForwardMessage(receiver, part)
 }
 
 function qqCapabilities (
   event: YunzaiRecord,
   segment: YunzaiRecord,
-  botId: string
+  botId: string,
+  selectedFactory?: YunzaiOutboundPortFactory
 ): QqSendCapabilities {
-  const outboundHost: YunzaiOutboundHostPort = Object.freeze({
+  const factory = selectedFactory ?? createYunzaiOutboundPortFactory(Object.freeze({
     async forTarget (target: SessionAddress) {
       if (target.botId !== botId) return null
       const receiver = await messageTarget(event, target)
@@ -530,8 +526,7 @@ function qqCapabilities (
         }
       })
     }
-  })
-  const factory = createYunzaiOutboundPortFactory(outboundHost)
+  } satisfies YunzaiOutboundHostPort))
   const deliver = async <P extends OutboundPart> (
     target: SessionAddress,
     part: P,
@@ -927,7 +922,7 @@ function visibleServices (
   const crossChannelAccess = resolveCrossChannelAccess(options.config)
   return {
     policyFetch,
-    qq: qqCapabilities(event, options.segment(), botId),
+    qq: qqCapabilities(event, options.segment(), botId, options.outboundFactory),
     generateImage: async (prompt, signal) => {
       return options.generateImage === undefined
         ? generateWithApPlugin(event, prompt, signal)

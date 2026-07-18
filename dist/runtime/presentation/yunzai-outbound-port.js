@@ -1,4 +1,5 @@
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../../agent/session/conversation-scope.js';
+import { normalizeYunzaiHostDispatchResult } from '../yunzai-host-result.js';
 const runtimeDeliveryReceiptBrand = Symbol('groupmate.runtimeDeliveryReceipt');
 export const OUTBOUND_DELIVERY_TIMEOUT_MS = 30_000;
 export const OUTBOUND_RECALL_TIMEOUT_MS = 10_000;
@@ -257,7 +258,7 @@ function createPort(target, hostTarget) {
             if (race.value === false) {
                 return Object.freeze({ kind: 'failed_definite', media, attempt, code: 'host_rejected' });
             }
-            const confirmation = confirmedMessageId(race.value);
+            const confirmation = confirmedMessageId(normalizeYunzaiHostDispatchResult(race.value));
             if (!confirmation.confirmed)
                 return unknownDelivery(media, attempt, 'unknown');
             const receipt = Object.freeze({

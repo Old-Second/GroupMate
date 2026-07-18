@@ -121,9 +121,25 @@ interface Dispatch {
   readonly quoteMessageId?: string
 }
 
+function oneBotSuccessProxy (messageId: string): unknown {
+  const envelope = Object.freeze({
+    status: 'ok',
+    retcode: 0,
+    data: Object.freeze({ message_id: messageId })
+  })
+  return new Proxy(envelope, {
+    get (target, property, receiver) {
+      return Reflect.has(target, property)
+        ? Reflect.get(target, property, receiver)
+        : Reflect.get(target.data, property, target.data)
+    }
+  })
+}
+
 interface GraphFixtureOptions {
   readonly redis?: FakeRedis
   readonly model: ProductionModelPort
+  readonly dispatchResult?: (part: OutboundPart, messageId: string) => unknown
   readonly bot?: Readonly<Record<string, unknown>>
   readonly settingsForActor?: (actorId: string) => PresentationSettings
   readonly bymPolicy?: BymPolicySnapshot
@@ -244,7 +260,9 @@ function graphFixture (input: GraphFixtureOptions) {
               messageId,
               ...(quoteMessageId === undefined ? {} : { quoteMessageId })
             }))
-            return Object.freeze({ message_id: messageId })
+            return input.dispatchResult === undefined
+              ? Object.freeze({ message_id: messageId })
+              : input.dispatchResult(part, messageId)
           },
           async recall (messageId: string) {
             recalls.push(messageId)
@@ -740,6 +758,124 @@ test('enabled production journal receives one complete request, provider run and
   assert.equal(journal.drainCalls, 1)
 })
 
+test('visible tools reuse the selected production outbound factory and journal their delivery', async () => {
+  const host = hostFixture()
+  const journal = new RecordingContentJournal()
+  const scenario = new ControllerScenarioModel()
+  const fixture = graphFixture({
+    model: scenario,
+    bot: host.bot,
+    diskLogEnabled: true,
+    contentJournal: journal,
+    dispatchResult: (part, messageId) => part.media === 'dice'
+      ? oneBotSuccessProxy(messageId)
+      : Object.freeze({ message_id: messageId })
+  })
+  try {
+    assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '骰子请求', actorId: 'actor-dice', msg: '#chat1 骰子请求，请投掷 1 个骰子'
+    }, host)), true)
+
+    assert.deepEqual(fixture.dispatches.map(item => item.part.media), ['text', 'dice'])
+    assert.equal(host.visibleMessages.length, 0)
+    assert.deepEqual(
+      journal.outboundEvents.map(event => (
+        event.type === 'qq.outbound.deliver' ? event.part.media : event.type
+      )),
+      ['text', 'dice']
+    )
+    const diceEvents = journal.outboundEvents.filter(event => (
+      event.type === 'qq.outbound.deliver' && event.part.media === 'dice'
+    ))
+    assert.equal(diceEvents.length, 1)
+    const diceEvent = diceEvents[0]
+    assert.equal(diceEvent?.type, 'qq.outbound.deliver')
+    if (diceEvent?.type !== 'qq.outbound.deliver') assert.fail('expected dice delivery event')
+    assert.equal(diceEvent.result.kind, 'sent')
+    assert.deepEqual(diceEvent.target, {
+      botId: 'bot-1', scope: { kind: 'group', groupId: 'group-actor-dice' }
+    })
+    assert.equal(scenario.count('骰子请求'), 1)
+    assert.equal(scenario.requests.length, 1)
+    const terminal = journal.runEvents.at(-1)
+    assert.equal(terminal?.type, 'run.terminal_committed')
+    if (terminal?.type !== 'run.terminal_committed') assert.fail('expected terminal journal event')
+    assert.deepEqual(terminal.checkpoint.completion, {
+      kind: 'already_visible', source: 'tool_output'
+    })
+  } finally {
+    assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  }
+})
+
+test('visible tool unknown dispatch outcome terminates once without provider or tool retry', async () => {
+  const host = hostFixture()
+  const journal = new RecordingContentJournal()
+  const scenario = new ControllerScenarioModel()
+  const fixture = graphFixture({
+    model: scenario,
+    bot: host.bot,
+    diskLogEnabled: true,
+    contentJournal: journal,
+    dispatchResult: (part, messageId) => part.media === 'dice'
+      ? undefined
+      : Object.freeze({ message_id: messageId })
+  })
+  try {
+    assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '骰子请求',
+      actorId: 'actor-dice-unknown',
+      msg: '#chat1 骰子请求，请投掷 1 个骰子'
+    }, host)), true)
+
+    const diceDispatches = fixture.dispatches.filter(item => item.part.media === 'dice')
+    assert.equal(diceDispatches.length, 1)
+    assert.equal(scenario.requests.length, 1)
+    assert.equal(scenario.count('骰子请求'), 1)
+
+    const diceOutbound = journal.outboundEvents.filter(event => (
+      event.type === 'qq.outbound.deliver' && event.part.media === 'dice'
+    ))
+    assert.equal(diceOutbound.length, 1)
+    assert.equal(diceOutbound[0]?.type, 'qq.outbound.deliver')
+    if (diceOutbound[0]?.type !== 'qq.outbound.deliver') {
+      assert.fail('expected one dice delivery event')
+    }
+    assert.deepEqual(diceOutbound[0].result, {
+      kind: 'outcome_unknown',
+      media: 'dice',
+      attempt: 1,
+      code: 'unknown_host_result'
+    })
+
+    const warning = '操作结果暂时无法确认，请勿重复提交'
+    assert.equal(fixture.dispatches.filter(item => deliveredText(item.part) === warning).length, 1)
+
+    const terminal = journal.runEvents.at(-1)
+    assert.equal(terminal?.type, 'run.terminal_committed')
+    if (terminal?.type !== 'run.terminal_committed') {
+      assert.fail('expected terminal journal event')
+    }
+    assert.equal(terminal.checkpoint.status, 'failed')
+    assert.equal(terminal.checkpoint.error?.code, 'tool_outcome_unknown')
+    assert.equal(terminal.checkpoint.observationCounters.providerAttempts, 1)
+    assert.equal(terminal.checkpoint.observationCounters.modelTurns, 1)
+    assert.equal(terminal.checkpoint.observationCounters.toolCalls, 1)
+    assert.equal(terminal.checkpoint.observationCounters.toolAttempts, 1)
+    assert.equal(terminal.checkpoint.observationCounters.providerRetries, 0)
+    assert.equal(
+      journal.runEvents.filter(event => event.type === 'provider.request').length,
+      1
+    )
+    assert.equal(
+      journal.runEvents.filter(event => event.type === 'provider.response').length,
+      1
+    )
+  } finally {
+    assert.equal(await fixture.graph.shutdown('unit_test'), 0)
+  }
+})
+
 test('production wraps its selected outbound factory once for delivery and recall', async () => {
   const journal = new RecordingContentJournal()
   const fixture = graphFixture({
@@ -945,14 +1081,15 @@ test('production presentation covers ordinary proactive approval and all termina
       marker: '骰子请求', actorId: 'actor-dice', msg: '#chat1 骰子请求，请投掷 1 个骰子'
     }, host)), true)
     const visible = dispatches.slice(visibleStart)
-    assert.deepEqual(visible.map(item => item.part.media), ['text', 'forward'])
+    assert.deepEqual(visible.map(item => item.part.media), ['text', 'dice', 'forward'])
     assert.deepEqual(visible.map(item => deliveredText(item.part)), [
       '正在执行任务步骤（步骤 1）',
+      '',
       ''
     ])
-    assert.equal(visible[1]?.part.media === 'forward' ? visible[1].part.title : null, '工具执行详情')
-    assert.match(JSON.stringify(visible[1]?.part), /工具执行：sendDice|结果已通过工具发送/)
-    assert.equal(host.visibleMessages.length, 1)
+    assert.equal(visible[2]?.part.media === 'forward' ? visible[2].part.title : null, '工具执行详情')
+    assert.match(JSON.stringify(visible[2]?.part), /工具执行：sendDice|结果已通过工具发送/)
+    assert.equal(host.visibleMessages.length, 0)
 
     const silenceStart = dispatches.length
     assert.equal(await graph.bymController.bym(groupEvent({
@@ -1050,9 +1187,10 @@ test('production presentation preserves session-save failure across text visible
     }, host)), true)
     assert.deepEqual(dispatches.slice(visibleStart).map(item => deliveredText(item.part)), [
       '正在执行任务步骤（步骤 1）',
+      '',
       SESSION_PERSISTENCE_FAILED_MESSAGE
     ])
-    assert.equal(host.visibleMessages.length, 1)
+    assert.equal(host.visibleMessages.length, 0)
 
     const silenceStart = dispatches.length
     assert.equal(await graph.bymController.bym(groupEvent({

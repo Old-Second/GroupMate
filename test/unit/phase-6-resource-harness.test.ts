@@ -197,6 +197,15 @@ test('idle scenario constructs the production graph and emits every bounded reso
   assert.ok(current.peakRssBytes >= current.baselineRssBytes)
 })
 
+test('already-visible resource scenario follows the production outbound factory', async () => {
+  const current = await runPhase6ResourceScenario('alreadyVisible', { settleMs: 0 })
+
+  assert.equal(validatePhase6ResourceSample(current, 'alreadyVisible'), current)
+  assert.equal(current.outcome, 'visible_output')
+  assert.equal(current.activePages, 0)
+  assert.equal(current.borrowedBrowserHandles, 0)
+})
+
 test('resource harness source owns the complete production path and no completion facade shortcut', async () => {
   const scenario = await readFile(path.join(
     root,

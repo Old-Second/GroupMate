@@ -1390,7 +1390,10 @@ export async function runPhase6ResourceScenario (
     }
     if (scenario === 'alreadyVisible') {
       await runChat('visible', '骰子请求，请投掷 1 个骰子')
-      if (host.visibleMessages.length !== 1) throw new Error('visible tool output was not confirmed')
+      const visibleDeliveries = primary.dispatches.filter(item => item.part.media === 'dice')
+      if (visibleDeliveries.length !== 1 || host.visibleMessages.length !== 0) {
+        throw new Error('visible tool output did not use the production outbound factory exactly once')
+      }
     }
     if (scenario === 'checkpointResume') {
       const approvalEvent = groupEvent('7', '请禁言 QQ:8 60 秒', host, {

@@ -93,6 +93,7 @@ import {
   type YunzaiOutboundPortFactory
 } from './presentation/yunzai-outbound-port.js'
 import { materializeYunzaiForwardMessage } from './presentation/yunzai-forward-message.js'
+import { materializeYunzaiMagicSegment } from './presentation/yunzai-magic-segment.js'
 import { plainTextPart } from './presentation/text-presentation.js'
 import {
   PLAIN_TEXT_PRESENTATION_HOOKS,
@@ -142,7 +143,7 @@ export type { ActivePresentationContext } from './agent-service.js'
 
 export interface YunzaiAgentServiceBridgeOptions extends Omit<
   YunzaiToolRuntimeBridgeOptions,
-  'config' | 'redis' | 'logger'
+  'config' | 'redis' | 'logger' | 'outboundFactory'
 > {
   readonly config: RuntimeConfig
   readonly redis: ProductionRedisClient
@@ -508,8 +509,8 @@ async function outboundValue (
       ? Reflect.apply(segment.music, segment, [part.provider, part.id])
       : { type: 'music', platform: part.provider, id: part.id }
   }
-  if (part.media === 'dice') return { type: 'dice' }
-  if (part.media === 'rps') return { type: 'rps', value: part.value }
+  if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
+  if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
   return await materializeYunzaiForwardMessage(receiver, part)
 }
 
@@ -1411,6 +1412,7 @@ export function createYunzaiAgentServiceBridge (
     ...options,
     config: options.config,
     redis: options.redis,
+    outboundFactory,
     logger: options.logger
   })
   const runStore = dependencies.runStore ?? new RedisRunStore({ client: options.redis })

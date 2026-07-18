@@ -11,6 +11,10 @@ import {
   type YunzaiAgentToolRun,
   type YunzaiToolRuntimeBridge
 } from '../../src/runtime/tools/yunzai-tool-runtime.js'
+import {
+  createYunzaiOutboundPortFactory,
+  type OutboundPart
+} from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 
 const root = process.cwd()
@@ -281,6 +285,70 @@ test('Yunzai runtime freezes cross-channel policy per run', async () => {
   })
   assert.equal(secondResult.result?.status, 'denied')
   assert.deepEqual(sent, ['你好'])
+})
+
+test('Yunzai runtime sends an explicit cross-group target through the injected outbound factory', async () => {
+  const selectedTargets: unknown[] = []
+  const selectedParts: unknown[] = []
+  let eventReceiverSends = 0
+  const outboundFactory = createYunzaiOutboundPortFactory({
+    async forTarget (target) {
+      selectedTargets.push(target)
+      return Object.freeze({
+        async dispatch (part: OutboundPart) {
+          selectedParts.push(part)
+          return Object.freeze({ message_id: 'selected-factory-delivery' })
+        },
+        async recall () { return true }
+      })
+    }
+  })
+  const members = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner', nickname: 'owner' }],
+    [10000, { user_id: 10000, role: 'owner', nickname: 'bot' }]
+  ])
+  const event = {
+    isGroup: true,
+    group_id: 9,
+    user_id: 7,
+    self_id: 10000,
+    sender: { user_id: 7, role: 'owner', nickname: 'owner' },
+    group: { getMemberMap: async () => members },
+    bot: {
+      getGroupList: async () => [88],
+      pickGroup: () => ({
+        sendMsg: async () => {
+          eventReceiverSends += 1
+          return true
+        }
+      })
+    },
+    message: []
+  }
+  const bridge = createYunzaiToolRuntimeBridge({
+    config: config({ enableToolCrossGroupSend: true }),
+    redis: new FakeRedis(),
+    getMasterIds: async () => ['7'],
+    getBotId: () => '10000',
+    segment: () => ({}),
+    outboundFactory
+  })
+  const run = await bridge.prepareAgentRun({ event, prompt: '发送到群 88：你好' })
+  const outcome = await executeNativeTool(bridge, run, {
+    runId: 'run-selected-cross-group',
+    callId: 'call-selected-cross-group',
+    requestedName: 'sendMessage',
+    arguments: Object.freeze({ targetKind: 'group', targetId: '88', text: '你好' })
+  })
+
+  assert.equal(outcome.result?.status, 'success')
+  assert.deepEqual(selectedTargets, [{
+    botId: '10000', scope: { kind: 'group', groupId: '88' }
+  }])
+  assert.deepEqual(selectedParts, [{
+    media: 'text', atoms: [{ kind: 'text', text: '你好' }]
+  }])
+  assert.equal(eventReceiverSends, 0)
 })
 
 test('approved management capability rechecks fresh bot authority before dispatch', async () => {

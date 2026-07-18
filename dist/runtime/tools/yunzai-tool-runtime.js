@@ -10,6 +10,7 @@ import { createManagementToolDefinitions, createQueryToolRuntime, createToolRunt
 import { sessionAddressForTarget } from '../../tools/visible-tool-support.js';
 import { createYunzaiOutboundPortFactory } from '../presentation/yunzai-outbound-port.js';
 import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js';
+import { materializeYunzaiMagicSegment } from '../presentation/yunzai-magic-segment.js';
 export class ToolRuntimeConfigurationError extends Error {
     code = 'unknown_policy_profile';
     constructor() {
@@ -339,13 +340,6 @@ function resourceValue(resource) {
     }
     return resource.kind === 'remote_url' ? resource.url : resource.path;
 }
-function magicSegment(segment, type, value) {
-    const factory = segment[type];
-    if (typeof factory === 'function') {
-        return Reflect.apply(factory, segment, value === undefined ? [] : [value]);
-    }
-    return { type, data: {} };
-}
 function safeTextAtomValue(segment, atom) {
     if (atom.kind === 'text')
         return atom.text;
@@ -378,13 +372,13 @@ async function outboundMessage(receiver, segment, part) {
     if (part.media === 'music')
         return segment.music(part.provider, part.id);
     if (part.media === 'dice')
-        return magicSegment(segment, 'dice');
+        return materializeYunzaiMagicSegment(segment, 'dice');
     if (part.media === 'rps')
-        return magicSegment(segment, 'rps', part.value);
+        return materializeYunzaiMagicSegment(segment, 'rps', part.value);
     return await materializeYunzaiForwardMessage(receiver, part);
 }
-function qqCapabilities(event, segment, botId) {
-    const outboundHost = Object.freeze({
+function qqCapabilities(event, segment, botId, selectedFactory) {
+    const factory = selectedFactory ?? createYunzaiOutboundPortFactory(Object.freeze({
         async forTarget(target) {
             if (target.botId !== botId)
                 return null;
@@ -402,8 +396,7 @@ function qqCapabilities(event, segment, botId) {
                 }
             });
         }
-    });
-    const factory = createYunzaiOutboundPortFactory(outboundHost);
+    }));
     const deliver = async (target, part, signal) => await (await factory.forTarget(target)).deliver(part, 1, { signal });
     return {
         sendText: async (target, text, signal) => await deliver(target, {
@@ -773,7 +766,7 @@ function visibleServices(options, event, policyFetch, botId) {
     const crossChannelAccess = resolveCrossChannelAccess(options.config);
     return {
         policyFetch,
-        qq: qqCapabilities(event, options.segment(), botId),
+        qq: qqCapabilities(event, options.segment(), botId, options.outboundFactory),
         generateImage: async (prompt, signal) => {
             return options.generateImage === undefined
                 ? generateWithApPlugin(event, prompt, signal)

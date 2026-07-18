@@ -1,6 +1,7 @@
 import type { SessionAddress } from '../../agent/contracts/identity.js'
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../../agent/session/conversation-scope.js'
 import type { ToolResource } from '../../tools/visible-tool-support.js'
+import { normalizeYunzaiHostDispatchResult } from '../yunzai-host-result.js'
 import {
   type DeliveryResult,
   type OutboundMedia,
@@ -360,7 +361,7 @@ function createPort (target: SessionAddress, hostTarget: YunzaiHostTargetPort | 
       if (race.value === false) {
         return Object.freeze({ kind: 'failed_definite', media, attempt, code: 'host_rejected' })
       }
-      const confirmation = confirmedMessageId(race.value)
+      const confirmation = confirmedMessageId(normalizeYunzaiHostDispatchResult(race.value))
       if (!confirmation.confirmed) return unknownDelivery(media, attempt, 'unknown')
       const receipt = Object.freeze({
         [runtimeDeliveryReceiptBrand]: true as const,
