@@ -1,4 +1,5 @@
 import { parseJsonValue } from './json-value.js';
+import { DEEPSEEK_CNY_CATALOG_VERSION, resolveModelPriceSnapshot } from './model-price-catalog.js';
 import { normalizeModelReasoningTrace } from './model-adapter.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 const PROFILE_ID = 'deepseek';
@@ -6,6 +7,23 @@ const PROFILE_VERSION = 1;
 const LEGACY_CONTEXT_PROFILE_CODE = 'deepseek_invalid_legacy_context';
 const LEGACY_CONTEXT_MESSAGE = /^deepseek-[a-z0-9.-]+ does not support successive user or assistant messages \(messages\[\d+\] and messages\[\d+\] in your input\)\. You should interleave the user\/assistant messages in the message sequence\.$/i;
 const EMPTY_OBJECT = Object.freeze({});
+const DEEPSEEK_V4_CAPABILITY = Object.freeze({
+    schemaVersion: 1,
+    source: 'profile',
+    contextWindowTokens: 1_000_000,
+    maxOutputTokens: 384_000,
+    promptCaching: 'deepseek_disk',
+    usageExtensions: Object.freeze([
+        'prompt_cache_hit_tokens',
+        'prompt_cache_miss_tokens'
+    ]),
+    priceCatalogVersion: DEEPSEEK_CNY_CATALOG_VERSION
+});
+function resolveDeepSeekModelCapability(model, now) {
+    return resolveModelPriceSnapshot(model, now) === undefined
+        ? undefined
+        : DEEPSEEK_V4_CAPABILITY;
+}
 function hasToolCalls(message) {
     if (message.tool_calls === undefined)
         return false;
@@ -163,6 +181,7 @@ export const deepSeekCompatibilityProfile = Object.freeze({
         requiresAssistantContentForToolCalls: true,
         requiresReasoningStateForToolCalls: true
     }),
+    resolveModelCapability: resolveDeepSeekModelCapability,
     encodeToolControls: (input) => input.enabled
         ? Object.freeze({ tools: Object.freeze([...input.tools]) })
         : EMPTY_OBJECT,

@@ -1,5 +1,6 @@
 import type { AgentErrorCode } from '../contracts/error.js'
 import type { JsonObject } from './json-value.js'
+import type { ModelCapabilitySnapshotV1 } from './model-capability.js'
 import type {
   ModelInputCacheUsage,
   ModelProviderError,
@@ -33,6 +34,7 @@ export interface OpenAICompatibleProfile {
     requiresAssistantContentForToolCalls: boolean
     requiresReasoningStateForToolCalls: boolean
   }>
+  resolveModelCapability(model: string, now: Date): ModelCapabilitySnapshotV1 | undefined
   encodeToolControls(input: ToolControlInput): Readonly<JsonObject>
   encodeRequestExtensions(input: ModelReasoningOptions): Readonly<JsonObject>
   decodeUsageExtensions(
