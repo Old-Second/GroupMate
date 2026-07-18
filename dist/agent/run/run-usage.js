@@ -45,6 +45,11 @@ export function parseRunUsageSummary(value) {
     }
     if (safeSum(input.inputTokens, input.outputTokens) !== input.totalTokens ||
         safeSum(input.cacheHitTokens, input.cacheMissTokens) > input.inputTokens ||
+        (input.availability === 'unavailable' && input.cacheUsageComplete) ||
+        (input.availability === 'complete' && !input.cacheUsageComplete &&
+            input.inputTokens === 0 && input.outputTokens === 0 && input.totalTokens === 0 &&
+            input.cacheHitTokens === 0 && input.cacheMissTokens === 0 &&
+            input.turnsWithUsage === 0 && input.turnsWithoutUsage === 0) ||
         (input.cacheUsageComplete &&
             (input.cacheHitTokens + input.cacheMissTokens !== input.inputTokens ||
                 input.turnsWithoutUsage !== 0)) ||

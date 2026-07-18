@@ -45,6 +45,20 @@ test('usage codec rejects unknown, missing, unsafe and inconsistent values', () 
   }
 })
 
+test('usage codec rejects unavailable history marked cache-complete', () => {
+  assert.throws(() => parseRunUsageSummary({
+    ...initial,
+    availability: 'unavailable'
+  }), /usage/i)
+})
+
+test('usage codec rejects a fresh complete zero summary marked cache-incomplete', () => {
+  assert.throws(() => parseRunUsageSummary({
+    ...initial,
+    cacheUsageComplete: false
+  }), /usage/i)
+})
+
 test('records complete and partial usage without conflating missing cache extensions', () => {
   const complete = recordRunUsage(initial, {
     inputTokens: 10,
