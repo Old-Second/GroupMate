@@ -495,7 +495,7 @@ test('presentation observation records the actual reducer decision and fallback'
   const synthesisFallback = fixture({
     synthesis: Object.freeze({ kind: 'failed_definite', code: 'synthesis_rejected' })
   })
-  await synthesisFallback.presenter.present(input(completed({
+  const synthesisFallbackResult = await synthesisFallback.presenter.present(input(completed({
     kind: 'reply_text', text: '语音失败转文本'
   }), {
     settings: settings({
@@ -503,11 +503,46 @@ test('presentation observation records the actual reducer decision and fallback'
     }),
     hooks: synthesisFallback.hooks
   }))
+  assert.equal(synthesisFallbackResult.outcome, 'complete')
+  assert.deepEqual(synthesisFallbackResult.deliveries.map(delivery => delivery.media), ['text'])
   const synthesisFact = synthesisFallback.observations.at(-1)
   assert.equal(synthesisFact?.type, 'presentation')
   if (synthesisFact?.type === 'presentation') {
+    assert.equal(synthesisFact.value.outcome, 'complete')
     assert.equal(synthesisFact.value.reducerInput.selectedMode, 'text')
     assert.equal(synthesisFact.value.reducerInput.fallbackReason, 'synthesis_failed')
+  }
+
+  const textFirstSynthesisFailure = fixture({
+    synthesis: Object.freeze({ kind: 'failed_definite', code: 'synthesis_rejected' }),
+    deliveries: [sent('text')]
+  })
+  const textFirstSynthesisResult = await textFirstSynthesisFailure.presenter.present(input(completed({
+    kind: 'reply_text', text: '文字已发送但语音合成失败'
+  }), {
+    settings: settings({
+      tts: Object.freeze({
+        ...settings().tts,
+        enabled: true,
+        mode: 'azure',
+        alsoSendText: true
+      })
+    }),
+    hooks: textFirstSynthesisFailure.hooks
+  }))
+  assert.equal(textFirstSynthesisResult.outcome, 'partial')
+  const textFirstSynthesisFact = textFirstSynthesisFailure.observations.at(-1)
+  assert.equal(textFirstSynthesisFact?.type, 'presentation')
+  if (textFirstSynthesisFact?.type === 'presentation') {
+    assert.equal(textFirstSynthesisFact.value.outcome, 'partial')
+    assert.deepEqual(textFirstSynthesisFact.value.deliveries.map(delivery => delivery.media), [
+      'text'
+    ])
+    assert.equal(textFirstSynthesisFact.value.reducerInput.selectedMode, 'text')
+    assert.equal(
+      textFirstSynthesisFact.value.reducerInput.fallbackReason,
+      'synthesis_failed'
+    )
   }
 
   const textFirstVoice = fixture({ deliveries: [sent('text'), sent('voice')] })
@@ -1197,6 +1232,24 @@ test('ReplyPresenter selects TTS then picture then text with required renderer',
   assert.deepEqual(sentTexts(textFirstFailure.calls).at(-1), SESSION_PERSISTENCE_FAILED_MESSAGE)
   assert.deepEqual(textFirstFailure.ttsDiagnosticCalls, ['synthesis_rejected'])
   assert.equal(textFirstFailure.pictureCalls.length, 0)
+  const textFirstFailureObservation = textFirstFailure.observations.at(-1)
+  assert.equal(textFirstFailureObservation?.type, 'presentation')
+  if (textFirstFailureObservation?.type === 'presentation') {
+    assert.equal(textFirstFailureObservation.value.outcome, 'partial')
+    assert.deepEqual(textFirstFailureObservation.value.deliveries.map(delivery => ({
+      media: delivery.media,
+      outcome: delivery.outcome
+    })), [
+      { media: 'forward', outcome: 'sent' },
+      { media: 'text', outcome: 'sent' },
+      { media: 'text', outcome: 'sent' }
+    ])
+    assert.equal(textFirstFailureObservation.value.reducerInput.selectedMode, 'text')
+    assert.equal(
+      textFirstFailureObservation.value.reducerInput.fallbackReason,
+      'synthesis_failed'
+    )
+  }
 })
 
 test('ReplyPresenter bypasses picture for proactive and recovered legacy profiles', async () => {

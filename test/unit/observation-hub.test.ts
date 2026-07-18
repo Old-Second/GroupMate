@@ -374,6 +374,109 @@ test('safe deliveries keep exact attempt facts and enforce the twelve item bound
   })), TypeError)
 })
 
+test('presentation parser accepts only the exact pre-dispatch TTS synthesis partial shape', () => {
+  const sentText = presentationValue().deliveries[0]
+  const sentForward = {
+    schemaVersion: 1 as const,
+    media: 'forward' as const,
+    attempt: 1 as const,
+    outcome: 'sent' as const,
+    code: null
+  }
+  const synthesisFailureReducer: PresentationReducerInputV1 = {
+    ...ordinaryReducer(),
+    ttsEligibility: 'eligible',
+    selectedMode: 'text',
+    fallbackReason: 'synthesis_failed'
+  }
+  const traditionalPartial = presentationValue({
+    outcome: 'partial',
+    deliveries: [
+      sentText,
+      {
+        schemaVersion: 1,
+        media: 'text',
+        attempt: 2,
+        outcome: 'failed_definite',
+        code: 'host_rejected'
+      }
+    ]
+  })
+  assert.deepEqual(parsePresentationObservation(traditionalPartial), traditionalPartial)
+  const partial = presentationValue({
+    outcome: 'partial',
+    deliveries: [sentForward, sentText],
+    reducerInput: synthesisFailureReducer
+  })
+  assert.deepEqual(parsePresentationObservation(partial), partial)
+  const fullAuxiliaryShape = presentationValue({
+    outcome: 'partial',
+    deliveries: [sentForward, sentText, sentForward, sentText, sentText],
+    reducerInput: synthesisFailureReducer
+  })
+  assert.deepEqual(parsePresentationObservation(fullAuxiliaryShape), fullAuxiliaryShape)
+
+  for (const invalid of [
+    {
+      ...partial,
+      reducerInput: { ...synthesisFailureReducer, ttsEligibility: 'disabled' as const }
+    },
+    {
+      ...partial,
+      reducerInput: { ...synthesisFailureReducer, selectedMode: 'tts' as const }
+    },
+    {
+      ...partial,
+      reducerInput: { ...synthesisFailureReducer, fallbackReason: 'none' as const }
+    },
+    {
+      ...partial,
+      profile: 'proactive' as const,
+      reducerInput: {
+        ...synthesisFailureReducer,
+        requestKind: 'proactive_chat' as const,
+        profile: 'proactive' as const
+      }
+    },
+    {
+      ...partial,
+      deliveries: [sentForward]
+    },
+    {
+      ...partial,
+      deliveries: [sentForward, sentForward, sentText]
+    },
+    {
+      ...partial,
+      deliveries: [sentText, sentText, sentForward]
+    },
+    {
+      ...partial,
+      deliveries: [sentText, sentForward, sentForward]
+    },
+    {
+      ...partial,
+      deliveries: [sentText, sentText, sentText, sentText]
+    },
+    {
+      ...partial,
+      deliveries: [
+        sentText,
+        { ...sentText, media: 'voice' as const }
+      ]
+    },
+    {
+      ...partial,
+      deliveries: [
+        sentText,
+        { ...sentText, media: 'picture' as const }
+      ]
+    }
+  ]) {
+    assert.throws(() => parsePresentationObservation(invalid), TypeError)
+  }
+})
+
 test('presentation IDs require exactly 32 random bytes and stay independent from terminal IDs', () => {
   const first = createPresentationObservationId(size => {
     assert.equal(size, 32)

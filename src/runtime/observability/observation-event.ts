@@ -515,9 +515,38 @@ function validatePresentationCorrelation (
   }
 }
 
+function hasPreDispatchTtsDeliveryShape (
+  deliveries: readonly SafeDeliveryObservationV1[]
+): boolean {
+  let index = 0
+  if (deliveries[index]?.media === 'forward') index += 1
+  if (deliveries[index]?.media !== 'text') return false
+  index += 1
+  if (deliveries[index]?.media === 'forward') index += 1
+  let trailingTexts = 0
+  while (deliveries[index]?.media === 'text' && trailingTexts < 2) {
+    trailingTexts += 1
+    index += 1
+  }
+  return index === deliveries.length && deliveries.every(delivery => delivery.outcome === 'sent')
+}
+
+function isPreDispatchTtsSynthesisPartial (
+  deliveries: readonly SafeDeliveryObservationV1[],
+  reducerInput: PresentationReducerInputV1
+): boolean {
+  return reducerInput.requestKind === 'ordinary_chat' &&
+    reducerInput.profile === 'ordinary' &&
+    reducerInput.ttsEligibility === 'eligible' &&
+    reducerInput.selectedMode === 'text' &&
+    reducerInput.fallbackReason === 'synthesis_failed' &&
+    hasPreDispatchTtsDeliveryShape(deliveries)
+}
+
 function validatePresentationOutcome (
   outcome: PresentationResult['outcome'],
-  deliveries: readonly SafeDeliveryObservationV1[]
+  deliveries: readonly SafeDeliveryObservationV1[],
+  reducerInput: PresentationReducerInputV1
 ): void {
   const sent = deliveries.some(delivery => delivery.outcome === 'sent')
   const failed = deliveries.some(delivery => delivery.outcome === 'failed_definite')
@@ -525,7 +554,8 @@ function validatePresentationOutcome (
   const valid = outcome === 'complete'
     ? !failed && !unknown
     : outcome === 'partial'
-      ? sent && (failed || unknown)
+      ? sent && (failed || unknown ||
+        isPreDispatchTtsSynthesisPartial(deliveries, reducerInput))
       : outcome === 'failed'
         ? !sent && !unknown
         : outcome === 'unknown'
@@ -606,7 +636,7 @@ export function parsePresentationObservation (
   }
   const deliveries = Object.freeze(deliveryValues.map(parseDelivery))
   const outcome = input.outcome as PresentationResult['outcome']
-  validatePresentationOutcome(outcome, deliveries)
+  validatePresentationOutcome(outcome, deliveries, reducerInput)
   return Object.freeze({
     schemaVersion: 1,
     presentationObservationId: input.presentationObservationId,

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { TraceCandidateV1 } from '../../src/agent/run/run-trace.js'
-import type { PresentationObservationV1 } from '../../src/runtime/observability/observation-event.js'
+import {
+  parsePresentationObservation,
+  type PresentationObservationV1
+} from '../../src/runtime/observability/observation-event.js'
 import type {
   TraceLookupResult,
   TraceStore,
@@ -104,6 +107,58 @@ test('sampled-out success waits for presentation and anomaly ordering is equival
     assert.equal(recorder.snapshot().committedCandidateWait, 0)
     assert.equal(recorder.snapshot().presentationWait, 0)
   }
+})
+
+test('text-first pre-dispatch synthesis partial is retained with its real text delivery', async () => {
+  const store = new RecordingStore()
+  const recorder = new TraceRecorder({ store })
+  const candidate = traceCandidateFixture({ runRef: traceRunRef(false, 170_000) })
+  const presentation = parsePresentationObservation({
+    schemaVersion: 1,
+    presentationObservationId: 'b'.repeat(64),
+    runRef: candidate.runRef,
+    terminalObservationId: candidate.observationId,
+    profile: 'ordinary',
+    outcome: 'partial',
+    postprocessAnomaly: false,
+    deliveries: [{
+      schemaVersion: 1,
+      media: 'text',
+      attempt: 1,
+      outcome: 'sent',
+      code: null
+    }],
+    totalDurationMs: 12,
+    reducerInput: {
+      schemaVersion: 1,
+      reducerVersion: 1,
+      requestKind: 'ordinary_chat',
+      profile: 'ordinary',
+      textLengthBucket: '1_40',
+      hasReasoning: false,
+      hasCitation: false,
+      buttonsEligible: false,
+      ttsEligibility: 'eligible',
+      pictureEligibility: 'disabled',
+      quotePolicy: 'current_request',
+      selectedMode: 'text',
+      fallbackReason: 'synthesis_failed',
+      configEnumVersion: 1
+    }
+  })
+
+  recorder.stageCommittedTraceCandidate(candidate)
+  await recorder.observe(snapshotEvent(candidate), new AbortController().signal)
+  await recorder.observe(presentationEvent(presentation), new AbortController().signal)
+
+  assert.equal(store.engine.length, 1)
+  assert.deepEqual(store.presentations, [presentation])
+  assert.deepEqual(recorder.snapshot(), {
+    schemaVersion: 1,
+    currentLevel: 'basic',
+    committedCandidateWait: 0,
+    presentationWait: 0
+  })
 })
 
 test('recorder enforces independent cap two and off clears both waits synchronously', async () => {
