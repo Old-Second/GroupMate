@@ -6,7 +6,10 @@ import {
   type ModelRequest,
   type ModelTurn
 } from '../../src/agent/model/model-adapter.js'
-import { RedisRunStore } from '../../src/agent/run/redis-run-store.js'
+import {
+  RedisRunStore,
+  redisAdmissionKey
+} from '../../src/agent/run/redis-run-store.js'
 import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
 import { AGENT_SESSION_NAMESPACE } from '../../src/agent/session/redis-agent-session-store.js'
 import type { ToolResource } from '../../src/tools/visible-tool-support.js'
@@ -139,7 +142,10 @@ function oneBotSuccessProxy (messageId: string): unknown {
 interface GraphFixtureOptions {
   readonly redis?: FakeRedis
   readonly model: ProductionModelPort
-  readonly dispatchResult?: (part: OutboundPart, messageId: string) => unknown
+  readonly dispatchResult?: (
+    part: OutboundPart,
+    messageId: string
+  ) => unknown | Promise<unknown>
   readonly bot?: Readonly<Record<string, unknown>>
   readonly settingsForActor?: (actorId: string) => PresentationSettings
   readonly bymPolicy?: BymPolicySnapshot
@@ -152,6 +158,11 @@ interface GraphFixtureOptions {
   readonly generateId?: () => string
   readonly createRequestRef?: () => string
   readonly promptPrefixOverride?: string
+  readonly enableGroupContext?: boolean
+  readonly loadGroupHistory?: (
+    event: YunzaiMessageEvent,
+    limit: number
+  ) => Promise<readonly unknown[]>
   readonly logger?: ProductionYunzaiAgentOptions['bridge']['logger']
   readonly diskLogFactory?: (
     options: GroupMateDiskLogOptions
@@ -242,6 +253,9 @@ function graphFixture (input: GraphFixtureOptions) {
       getBotId: () => 'bot-1',
       segment: () => Object.freeze({}),
       botPicker,
+      ...(input.loadGroupHistory === undefined
+        ? {}
+        : { loadGroupHistory: input.loadGroupHistory }),
       ...(input.generateId === undefined ? {} : { generateId: input.generateId }),
       ...(input.createRequestRef === undefined
         ? {}
@@ -295,7 +309,7 @@ function graphFixture (input: GraphFixtureOptions) {
         blacklist: Object.freeze([]),
         imgOcr: false,
         groupMerge: false,
-        enableGroupContext: false,
+        enableGroupContext: input.enableGroupContext === true,
         thinkingMode: 'default' as const,
         reasoningEffort: 'default' as const,
         assistantLabel: 'GroupMate',
@@ -1127,7 +1141,7 @@ test('production presentation covers ordinary proactive approval and all termina
       marker: '取消请求', actorId: 'actor-cancel'
     }, host))
     await scenario.cancelStarted
-    assert.equal(await graph.shutdown('unit_test_cancel'), 0)
+    assert.equal(await graph.shutdown('unit_test_cancel'), 1)
     shutdown = true
     assert.equal(await cancellation, true)
     assert.equal(dispatches.at(-1)?.part.media, 'text')
@@ -1212,7 +1226,114 @@ test('production presentation preserves session-save failure across text visible
   }
 })
 
-test('production approval deferral retains reference and later retry finalizes once', async () => {
+test('production shutdown waits for an in-flight approval display before preserving it', async () => {
+  const redis = new FakeRedis()
+  const host = hostFixture()
+  let markDispatchStarted = (): void => undefined
+  let releaseDispatch = (): void => undefined
+  let markHistoryStarted = (): void => undefined
+  let releaseHistory = (): void => undefined
+  const dispatchStarted = new Promise<void>(resolve => { markDispatchStarted = resolve })
+  const dispatchRelease = new Promise<void>(resolve => { releaseDispatch = resolve })
+  const historyStarted = new Promise<void>(resolve => { markHistoryStarted = resolve })
+  const historyRelease = new Promise<void>(resolve => { releaseHistory = resolve })
+  const model = new ApprovalModel()
+  let approvalDispatchBlocked = false
+  const fixture = graphFixture({
+    redis,
+    model,
+    bot: host.bot,
+    toolPolicyProfile: 'safe',
+    enableGroupContext: true,
+    loadGroupHistory: async event => {
+      if (String(event.msg).includes('停机前进入准备的新请求')) {
+        markHistoryStarted()
+        await historyRelease
+      }
+      return Object.freeze([])
+    },
+    dispatchResult: async (_part, messageId) => {
+      if (!approvalDispatchBlocked) {
+        approvalDispatchBlocked = true
+        markDispatchStarted()
+        await dispatchRelease
+      }
+      return Object.freeze({ message_id: messageId })
+    }
+  })
+  let shutdown: Promise<number> | undefined
+  let preparing: Promise<boolean> | undefined
+  const handling = fixture.graph.chatController.chatgpt1(groupEvent({
+    marker: '审批禁言请求',
+    actorId: '7',
+    groupId: '9',
+    msg: '#chat1 审批禁言请求，请禁言 QQ:8 60 秒',
+    message: Object.freeze([
+      Object.freeze({ type: 'text', text: '#chat1 审批禁言请求，请禁言 ' }),
+      Object.freeze({ type: 'at', qq: 8, text: '@测试小号' }),
+      Object.freeze({ type: 'text', text: ' 60 秒' })
+    ]),
+    atme: true,
+    isMaster: true,
+    role: 'owner',
+    messageId: 'approval-display-shutdown-request'
+  }, host))
+  try {
+    await dispatchStarted
+    preparing = fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '停机前进入准备的新请求',
+      actorId: 'actor-text',
+      msg: '#chat1 停机前进入准备的新请求'
+    }, host))
+    await historyStarted
+    let shutdownSettled = false
+    shutdown = fixture.graph.shutdown('process_shutdown').then(value => {
+      shutdownSettled = true
+      return value
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(shutdownSettled, false)
+    assert.equal(await fixture.graph.chatController.chatgpt1(groupEvent({
+      marker: '停机关门后的新请求',
+      actorId: 'actor-text',
+      msg: '#chat1 停机关门后的新请求'
+    }, host)), true)
+    releaseHistory()
+    assert.equal(await preparing, true)
+    assert.equal(model.requests.length, 1)
+    const rejected = fixture.observations.slice(-2)
+    assert.equal(rejected.length, 2)
+    for (const observation of rejected) {
+      assert.equal(observation.outcome, 'rejected_admission')
+      assert.equal(observation.admissionRejectionReason, 'queue_aborted')
+    }
+
+    releaseDispatch()
+    assert.equal(await handling, true)
+    assert.equal(await shutdown, 1)
+    const delivery = fixture.dispatches[0]
+    if (delivery === undefined) assert.fail('approval delivery is missing')
+    const reference = await new RedisApprovalReferenceIndex(redis).load(
+      delivery.target,
+      delivery.messageId
+    )
+    assert.ok(reference !== null)
+    const checkpoint = await new RedisRunStore({ client: redis }).load(reference.runId)
+    assert.ok(checkpoint !== null)
+    assert.equal(checkpoint.status, 'waiting_approval')
+    assert.equal(await new RedisRunStore({ client: redis }).loadTombstone(reference.runId), null)
+  } finally {
+    releaseHistory()
+    releaseDispatch()
+    await Promise.allSettled([
+      handling,
+      ...(preparing === undefined ? [] : [preparing]),
+      shutdown ?? fixture.graph.shutdown('test_cleanup')
+    ])
+  }
+})
+
+test('production approval survives graceful shutdown, defers under pressure, and finalizes once', async () => {
   const redis = new FakeRedis()
   const host = hostFixture()
   const initialModel = new ApprovalModel()
@@ -1273,6 +1394,19 @@ test('production approval deferral retains reference and later retry finalizes o
       kind: 'ordinary',
       forcePicture: true
     }))
+
+    assert.equal(await initial.graph.shutdown('process_shutdown'), 1)
+    const preserved = await store.load(reference.runId)
+    assert.ok(preserved !== null)
+    if (preserved.schemaVersion !== 3) assert.fail('preserved checkpoint must use schema v3')
+    assert.equal(preserved.status, 'waiting_approval')
+    assert.equal(JSON.stringify(preserved.presentationRoute?.presentationIntent), intentBytes)
+    assert.equal(await store.loadTombstone(reference.runId), null)
+    assert.equal(await redis.get(redisAdmissionKey(preserved.sessionAddress)), null)
+    assert.deepEqual(
+      await index.load(approvalDelivery.target, approvalDelivery.messageId),
+      reference
+    )
 
     const activePressureModel = new RecoveryPressureModel()
     pressureModel = activePressureModel

@@ -559,7 +559,9 @@ export class AgentService {
     #onObserverFailure;
     #engine;
     #pending = new Map();
+    #runOperations = new Map();
     #lifecycleController = new AbortController();
+    #acceptingRunOperations = true;
     #shutdownReason = 'process_shutdown';
     #shutdownPromise;
     #observerFailureReported = false;
@@ -602,6 +604,9 @@ export class AgentService {
         return await this.#start(request, true, options);
     }
     async resume(runId, options = {}) {
+        const finishOperation = this.#beginRunOperation(runId);
+        if (finishOperation === null)
+            return null;
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(runId);
         let presentationLifecycle;
@@ -613,7 +618,7 @@ export class AgentService {
             if (pending === null || isApprovalRecoveryDeferred(pending))
                 return pending;
             if (linked.signal.aborted) {
-                return await this.cancel(runId, linked.signal.reason);
+                return await this.#cancelPending(runId, linked.signal.reason);
             }
             presentationLifecycle = await this.#beginResumedPresentation(pending);
             const result = await this.#engine.resume(runId, pending.binding, {
@@ -625,7 +630,7 @@ export class AgentService {
         }
         catch (error) {
             if (linked.signal.aborted) {
-                return await this.cancel(runId, linked.signal.reason);
+                return await this.#cancelPending(runId, linked.signal.reason);
             }
             if (pending === undefined)
                 throw error;
@@ -641,14 +646,27 @@ export class AgentService {
                 }).catch(() => undefined);
             }
             linked.dispose();
+            finishOperation();
         }
     }
     async cancel(runId, reason = 'user_cancelled') {
+        const finishOperation = this.#beginRunOperation(runId);
+        if (finishOperation === null)
+            return null;
+        try {
+            return await this.#cancelPending(runId, reason);
+        }
+        finally {
+            finishOperation();
+        }
+    }
+    async #cancelPending(runId, reason) {
+        const normalizedReason = cancellationReason(reason);
         const pending = this.#pending.get(runId);
         if (pending === undefined)
             return null;
         try {
-            const result = await this.#engine.cancel(runId, reason);
+            const result = await this.#engine.cancel(runId, normalizedReason);
             return await this.#finish(pending, result);
         }
         catch (error) {
@@ -661,16 +679,48 @@ export class AgentService {
         if (this.#shutdownPromise !== undefined)
             return this.#shutdownPromise;
         this.#shutdownReason = cancellationReason(reason, 'process_shutdown');
+        this.#acceptingRunOperations = false;
         this.#lifecycleController.abort(this.#shutdownReason);
-        const runIds = Object.freeze([...this.#pending.keys()]);
-        this.#shutdownPromise = Promise.all(runIds.map(async (runId) => await this.cancel(runId, this.#shutdownReason))).then(() => runIds.length);
+        const runIds = Object.freeze([...new Set([
+                ...this.#pending.keys(),
+                ...this.#runOperations.keys()
+            ])]);
+        this.#shutdownPromise = Promise.all(runIds.map(async (runId) => {
+            await this.#runOperations.get(runId)?.idle;
+            const pending = this.#pending.get(runId);
+            if (pending === undefined)
+                return;
+            let preserved = false;
+            try {
+                preserved = await this.#engine.detachResumableApprovalRuntime(runId, this.#shutdownReason);
+            }
+            catch { }
+            if (!preserved) {
+                await this.#cancelPending(runId, this.#shutdownReason);
+                return;
+            }
+            // The displayed approval and its reference are durable. Only the
+            // process-local runtime and admission lease are released here.
+            if (this.#pending.get(runId) !== pending)
+                return;
+            this.#pending.delete(runId);
+            await pending.lease.release().catch(() => undefined);
+        })).then(() => runIds.length);
         return this.#shutdownPromise;
     }
     async pendingApproval(runId, approvalId) {
         return await this.#engine.pendingApproval(runId, approvalId);
     }
     async displayApproval(input) {
-        return await this.#engine.displayApproval(input);
+        const finishOperation = this.#beginRunOperation(input.runId);
+        if (finishOperation === null)
+            return null;
+        try {
+            return await this.#engine.displayApproval(input);
+        }
+        finally {
+            finishOperation();
+        }
     }
     async presentationContext(runId) {
         const checkpoint = await this.#engine.loadCheckpoint(runId);
@@ -684,6 +734,9 @@ export class AgentService {
         });
     }
     async decideApproval(input, options = {}) {
+        const finishOperation = this.#beginRunOperation(input.runId);
+        if (finishOperation === null)
+            return null;
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
         let pending = this.#pending.get(input.runId);
         let presentationLifecycle;
@@ -695,7 +748,7 @@ export class AgentService {
             if (pending === null || isApprovalRecoveryDeferred(pending))
                 return pending;
             if (linked.signal.aborted) {
-                return await this.cancel(input.runId, linked.signal.reason);
+                return await this.#cancelPending(input.runId, linked.signal.reason);
             }
             presentationLifecycle = await this.#beginResumedPresentation(pending);
             const result = await this.#engine.decideApproval(input, pending.binding, { ...options, signal: linked.signal });
@@ -712,6 +765,7 @@ export class AgentService {
                 }).catch(() => undefined);
             }
             linked.dispose();
+            finishOperation();
         }
     }
     async #start(draft, ephemeral, options) {
@@ -742,6 +796,11 @@ export class AgentService {
         const queueStarted = readMonotonic(this.#monotonicNow);
         let queueDurationMs = 'unavailable';
         let sessionLoadDurationMs = 'not_attempted';
+        const finishOperation = this.#beginRunOperation(runId);
+        if (finishOperation === null) {
+            linked.dispose();
+            return preCreateEnvelope(cancelledRunResult(runId, this.#shutdownReason), requestObservationContext, 'rejected_admission', 'queue_aborted', 'unavailable', 'not_attempted');
+        }
         try {
             try {
                 lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
@@ -881,6 +940,7 @@ export class AgentService {
         }
         finally {
             linked.dispose();
+            finishOperation();
         }
     }
     async #lifecycleFor(route, progressDelivery) {
@@ -1115,5 +1175,31 @@ export class AgentService {
         catch {
             // Observability remains outside the run control plane.
         }
+    }
+    #beginRunOperation(runId) {
+        if (!this.#acceptingRunOperations)
+            return null;
+        let state = this.#runOperations.get(runId);
+        if (state === undefined) {
+            let resolve = () => undefined;
+            const idle = new Promise(complete => { resolve = complete; });
+            state = { count: 0, idle, resolve };
+            this.#runOperations.set(runId, state);
+        }
+        state.count += 1;
+        let active = true;
+        return () => {
+            if (!active)
+                return;
+            active = false;
+            const current = this.#runOperations.get(runId);
+            if (current !== state)
+                return;
+            current.count -= 1;
+            if (current.count > 0)
+                return;
+            this.#runOperations.delete(runId);
+            current.resolve();
+        };
     }
 }

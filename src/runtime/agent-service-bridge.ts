@@ -906,6 +906,30 @@ function failedEnvelope (
   })
 }
 
+function shutdownEnvelope (
+  runId: string,
+  context: RequestObservationContextV1
+): ChatReplyEnvelope {
+  return Object.freeze({
+    kind: 'cancelled',
+    runId,
+    runRef: 'unavailable',
+    reason: 'process_shutdown',
+    terminal: null,
+    requestObservationDraft: createRequestObservationDraft({
+      context,
+      runRef: 'unavailable',
+      outcome: 'rejected_admission',
+      admissionRejectionReason: 'queue_aborted',
+      queueDurationMs: 'unavailable',
+      sessionLoadDurationMs: 'not_attempted',
+      sessionSaveDurationMs: 'not_attempted',
+      terminalObservationId: 'not_attempted'
+    }),
+    sessionPersistence: 'not_attempted'
+  })
+}
+
 function safeMonotonicNow (
   clock: () => number | 'unavailable'
 ): number | 'unavailable' {
@@ -974,6 +998,11 @@ export class YunzaiAgentServiceBridge {
   readonly #monotonicNow: () => number | 'unavailable'
   readonly #requestJournal?: Pick<GroupMateContentJournal, 'recordRequest'>
   readonly #groupHistory: GroupHistoryReadCoordinator
+  #approvalDisplays = 0
+  #approvalDisplaysIdle: Promise<void> | undefined
+  #resolveApprovalDisplaysIdle: (() => void) | undefined
+  #shuttingDown = false
+  #shutdownPromise: Promise<number> | undefined
 
   constructor (input: Readonly<{
     options: YunzaiAgentServiceBridgeOptions
@@ -1040,11 +1069,16 @@ export class YunzaiAgentServiceBridge {
   }
 
   shutdown (reason = 'process_shutdown'): Promise<number> {
-    const shutdown = this.#bridge.shutdown(reason)
-    for (const timer of this.#approvalTimers.values()) clearTimeout(timer)
-    this.#approvalTimers.clear()
+    if (this.#shutdownPromise !== undefined) return this.#shutdownPromise
+    this.#shuttingDown = true
+    const approvalDisplaysIdle = this.#approvalDisplaysIdle
+    const shutdown = approvalDisplaysIdle === undefined
+      ? this.#bridge.shutdown(reason)
+      : approvalDisplaysIdle.then(async () => await this.#bridge.shutdown(reason))
+    this.#clearApprovalTimers()
     this.#prepared.clear()
-    return shutdown
+    this.#shutdownPromise = shutdown.finally(() => { this.#clearApprovalTimers() })
+    return this.#shutdownPromise
   }
 
   async handle (
@@ -1078,6 +1112,9 @@ export class YunzaiAgentServiceBridge {
       startedAtMonotonicMs: safeMonotonicNow(this.#monotonicNow)
     })
     const requestId = this.#generateId()
+    if (this.#shuttingDown) {
+      return shutdownEnvelope(requestId, requestObservationContext)
+    }
     let request: YunzaiAgentRequestDraft
     try {
       if (messageEvidence === null || typeof messageEvidence !== 'object' ||
@@ -1148,6 +1185,9 @@ export class YunzaiAgentServiceBridge {
       return failedEnvelope(requestId, error, requestObservationContext)
     }
     try {
+      if (this.#shuttingDown) {
+        return shutdownEnvelope(requestId, requestObservationContext)
+      }
       const result = requestKind === 'proactive_chat'
         ? await this.#bridge.handleEphemeral(request, {
             requestObservationContext,
@@ -1202,55 +1242,89 @@ export class YunzaiAgentServiceBridge {
   async #displayApproval (
     interruption: ApprovalInterruption
   ): Promise<void> {
-    const ttlSeconds = configInteger(
-      this.#options.config,
-      'toolApprovalTtlSeconds',
-      120,
-      30,
-      300
-    )
-    const outbound = await this.#outboundFactory.forTarget(interruption.approvalAddress)
-    const attempts = await deliverWithDefiniteRetry(
-      outbound,
-      plainTextPart(approvalText(interruption, ttlSeconds))
-    )
-    const delivery = attempts.at(-1)
-    const messageId = delivery?.kind === 'sent'
-      ? delivery.receipt.messageId ?? null
-      : null
-    if (messageId === null) throw new Error('approval message ID is unavailable')
-    const displayedAt = this.#now().toISOString()
-    const displayed = await this.#router.registerDisplayed({
-      runId: interruption.runId,
-      approvalId: interruption.approvalId,
-      messageId,
-      displayedAt,
-      ttlSeconds
-    })
-    if (displayed === null) throw new Error('approval registration failed')
-    this.#clearApprovalTimer(displayed.runId)
-    const timer = setTimeout(() => {
-      this.#approvalTimers.delete(displayed.runId)
-      void this.#router.expire(
-        displayed.approvalAddress,
+    const finishDisplay = this.#beginApprovalDisplay()
+    if (finishDisplay === null) throw new Error('approval display is shutting down')
+    try {
+      const ttlSeconds = configInteger(
+        this.#options.config,
+        'toolApprovalTtlSeconds',
+        120,
+        30,
+        300
+      )
+      const outbound = await this.#outboundFactory.forTarget(interruption.approvalAddress)
+      const attempts = await deliverWithDefiniteRetry(
+        outbound,
+        plainTextPart(approvalText(interruption, ttlSeconds))
+      )
+      const delivery = attempts.at(-1)
+      const messageId = delivery?.kind === 'sent'
+        ? delivery.receipt.messageId ?? null
+        : null
+      if (messageId === null) throw new Error('approval message ID is unavailable')
+      const displayedAt = this.#now().toISOString()
+      const displayed = await this.#router.registerDisplayed({
+        runId: interruption.runId,
+        approvalId: interruption.approvalId,
         messageId,
-        this.#now().toISOString(),
-        async (result, reference, context) => {
-          if (result.kind !== 'approval_deferred') {
-            this.#clearApprovalTimer(reference.runId)
+        displayedAt,
+        ttlSeconds
+      })
+      if (displayed === null) throw new Error('approval registration failed')
+      if (this.#shuttingDown) return
+      this.#clearApprovalTimer(displayed.runId)
+      const timer = setTimeout(() => {
+        this.#approvalTimers.delete(displayed.runId)
+        void this.#router.expire(
+          displayed.approvalAddress,
+          messageId,
+          this.#now().toISOString(),
+          async (result, reference, context) => {
+            if (result.kind !== 'approval_deferred') {
+              this.#clearApprovalTimer(reference.runId)
+            }
+            await this.#onApprovalOutcome(result, reference, context)
           }
-          await this.#onApprovalOutcome(result, reference, context)
-        }
-      ).catch(() => undefined)
-    }, ttlSeconds * 1_000)
-    timer.unref?.()
-    this.#approvalTimers.set(displayed.runId, timer)
+        ).catch(() => undefined)
+      }, ttlSeconds * 1_000)
+      timer.unref?.()
+      this.#approvalTimers.set(displayed.runId, timer)
+    } finally {
+      finishDisplay()
+    }
   }
 
   #clearApprovalTimer (runId: string): void {
     const timer = this.#approvalTimers.get(runId)
     if (timer !== undefined) clearTimeout(timer)
     this.#approvalTimers.delete(runId)
+  }
+
+  #clearApprovalTimers (): void {
+    for (const timer of this.#approvalTimers.values()) clearTimeout(timer)
+    this.#approvalTimers.clear()
+  }
+
+  #beginApprovalDisplay (): (() => void) | null {
+    if (this.#shuttingDown) return null
+    if (this.#approvalDisplays === 0) {
+      this.#approvalDisplaysIdle = new Promise(resolve => {
+        this.#resolveApprovalDisplaysIdle = resolve
+      })
+    }
+    this.#approvalDisplays += 1
+    let active = true
+    return (): void => {
+      if (!active) return
+      active = false
+      this.#approvalDisplays -= 1
+      if (this.#approvalDisplays > 0) return
+      this.#approvalDisplays = 0
+      const resolve = this.#resolveApprovalDisplaysIdle
+      this.#approvalDisplaysIdle = undefined
+      this.#resolveApprovalDisplaysIdle = undefined
+      resolve?.()
+    }
   }
 
 }

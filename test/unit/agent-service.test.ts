@@ -178,6 +178,7 @@ function result (text: string): ToolResult {
 
 class ServiceToolRuntime implements ToolRuntime {
   readonly #approvalRequired: boolean
+  readonly executions: string[] = []
 
   constructor (approvalRequired = false) {
     this.#approvalRequired = approvalRequired
@@ -202,6 +203,7 @@ class ServiceToolRuntime implements ToolRuntime {
   }
 
   async executePrepared (prepared: SerializablePreparedCapability): Promise<ToolResult> {
+    this.executions.push(prepared.callId)
     return result(prepared.toolName)
   }
 }
@@ -563,6 +565,37 @@ test('fresh admission maps only the three fixed rejection reasons before run cla
     assert.equal(outcome.requestObservationDraft.admissionRejectionReason, entry.reason)
     assert.equal(outcome.sessionPersistence, 'not_attempted')
   }
+})
+
+test('run reference initialization failure cannot strand AgentService shutdown', async () => {
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({}),
+    createRuntime: async () => contractRuntime(),
+    generateId: () => 'run-ref-initialization-failure',
+    createRunRef: () => { throw new Error('injected run reference failure') }
+  })
+
+  await assert.rejects(
+    service.handle(request('run-ref-initialization-failure', '验证同步初始化失败')),
+    /injected run reference failure/
+  )
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const shutdown = await Promise.race([
+    service.shutdown('process_shutdown'),
+    new Promise<'timeout'>(resolve => {
+      timeout = setTimeout(() => { resolve('timeout') }, 50)
+    })
+  ])
+  if (timeout !== undefined) clearTimeout(timeout)
+  assert.equal(shutdown, 0)
 })
 
 test('terminal session-save failure preserves every completed disposition and committed fact', async () => {
@@ -1623,7 +1656,7 @@ test('AgentService serializes active runs for the same canonical session', async
   assert.equal((await sessions.get(request('lookup', 'unused').sessionAddress))?.turnCount, 2)
 })
 
-test('AgentService cancellation releases a paused run before the next session turn', async () => {
+test('AgentService cancellation releases a paused run and shutdown waits for approval control', async () => {
   const redis = new FakeRedis(() => Date.parse(createdAt))
   const sessions = new RedisAgentSessionStore({
     redis, now: () => new Date(createdAt), generateId: () => 'session-cancel'
@@ -1652,7 +1685,13 @@ test('AgentService cancellation releases a paused run before the next session tu
   const snapshot = new ToolRegistry(definitions).createSnapshot({
     id: 'snapshot-service-cancel', facts, enabledTools: ['website']
   })
+  const toolRuntime = new ServiceToolRuntime(true)
   let generated = 0
+  let blockResumedPresentation = false
+  let markResumeStarted = (): void => undefined
+  let releaseResumedPresentation = (): void => undefined
+  const resumeStarted = new Promise<void>(resolve => { markResumeStarted = resolve })
+  const resumeRelease = new Promise<void>(resolve => { releaseResumedPresentation = resolve })
   const service = new AgentService({
     sessions,
     runStore,
@@ -1670,7 +1709,7 @@ test('AgentService cancellation releases a paused run before the next session tu
     createEngine: observer => new RunEngine({
       adapter,
       profile: standardOpenAIProfile,
-      scheduler: new ToolScheduler({ runtime: new ServiceToolRuntime(true) }),
+      scheduler: new ToolScheduler({ runtime: toolRuntime }),
       store: runStore,
       budget: createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 }),
       now: () => new Date(createdAt),
@@ -1692,6 +1731,14 @@ test('AgentService cancellation releases a paused run before the next session tu
           ])
         })
       })
+    }),
+    createPresentationLifecycle: () => Object.freeze({
+      onRunStarted: async () => {
+        if (!blockResumedPresentation) return
+        markResumeStarted()
+        await resumeRelease
+      },
+      onRunSettled: async () => undefined
     }),
     now: () => new Date(createdAt),
     generateId: () => `cancel-service-${++generated}`
@@ -1721,8 +1768,47 @@ test('AgentService cancellation releases a paused run before the next session tu
     request('cancel-3', '等待审批后关闭进程')
   )
   assert.equal(pendingShutdown.kind, 'paused')
+  if (pendingShutdown.kind !== 'paused') return
+  assert.ok(await service.displayApproval({
+    runId: pendingShutdown.runId,
+    approvalId: pendingShutdown.interruption.approvalId,
+    messageId: 'shutdown-approval-message',
+    displayedAt: '2026-07-17T00:00:01.000Z',
+    ttlSeconds: 120
+  }) !== null)
 
-  const cancelledCount = await service.shutdown('process_shutdown')
+  blockResumedPresentation = true
+  const decision = service.decideApproval({
+    runId: pendingShutdown.runId,
+    approvalId: pendingShutdown.interruption.approvalId,
+    kind: 'approved',
+    decidedAt: '2026-07-17T00:00:02.000Z',
+    sessionAddress: pendingShutdown.interruption.approvalAddress,
+    actor: Object.freeze({ userId: 'actor-1', role: 'bot_master' as const })
+  })
+  await resumeStarted
+
+  let shutdownSettled = false
+  const shutdown = service.shutdown('process_shutdown').then(value => {
+    shutdownSettled = true
+    return value
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(shutdownSettled, false)
+  const waitingDuringShutdown = await runStore.load(pendingShutdown.runId)
+  assert.ok(waitingDuringShutdown !== null)
+  if (waitingDuringShutdown.schemaVersion === 1) {
+    assert.fail('shutdown race fixture must persist a resumable v2+ checkpoint')
+  }
+  assert.equal(waitingDuringShutdown.status, 'waiting_approval')
+  assert.equal(waitingDuringShutdown.engineActivity.state, 'idle')
+  assert.equal(waitingDuringShutdown.providerDispatch.state, 'idle')
+  assert.deepEqual(toolRuntime.executions, [])
+  releaseResumedPresentation()
+
+  const [decisionResult, cancelledCount] = await Promise.all([decision, shutdown])
+  assert.equal(decisionResult?.kind, 'cancelled')
+  assert.deepEqual(toolRuntime.executions, [])
   assert.equal(cancelledCount, 1)
   assert.equal(await service.shutdown('ignored_second_reason'), 1)
   const shutdownCheckpoint = await runStore.loadTombstone(pendingShutdown.runId)

@@ -253,6 +253,12 @@ interface PendingRun {
   readonly progress?: ProgressDelivery
 }
 
+interface RunOperationState {
+  count: number
+  readonly idle: Promise<void>
+  readonly resolve: () => void
+}
+
 function isApprovalRecoveryDeferred (
   value: PendingRun | ApprovalRecoveryDeferred
 ): value is ApprovalRecoveryDeferred {
@@ -816,7 +822,9 @@ export class AgentService {
   readonly #onObserverFailure?: AgentServiceOptions['onObserverFailure']
   readonly #engine: RunEngine
   readonly #pending = new Map<string, PendingRun>()
+  readonly #runOperations = new Map<string, RunOperationState>()
   readonly #lifecycleController = new AbortController()
+  #acceptingRunOperations = true
   #shutdownReason = 'process_shutdown'
   #shutdownPromise: Promise<number> | undefined
   #observerFailureReported = false
@@ -884,6 +892,8 @@ export class AgentService {
     runId: string,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
+    const finishOperation = this.#beginRunOperation(runId)
+    if (finishOperation === null) return null
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(runId)
     let presentationLifecycle: RunPresentationLifecycle | undefined
@@ -894,7 +904,7 @@ export class AgentService {
       }
       if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
       if (linked.signal.aborted) {
-        return await this.cancel(runId, linked.signal.reason)
+        return await this.#cancelPending(runId, linked.signal.reason)
       }
       presentationLifecycle = await this.#beginResumedPresentation(pending)
       const result = await this.#engine.resume(runId, pending.binding, {
@@ -905,7 +915,7 @@ export class AgentService {
       return await this.#finish(pending, result)
     } catch (error) {
       if (linked.signal.aborted) {
-        return await this.cancel(runId, linked.signal.reason)
+        return await this.#cancelPending(runId, linked.signal.reason)
       }
       if (pending === undefined) throw error
       if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
@@ -918,6 +928,7 @@ export class AgentService {
         }).catch(() => undefined)
       }
       linked.dispose()
+      finishOperation()
     }
   }
 
@@ -925,10 +936,24 @@ export class AgentService {
     runId: string,
     reason = 'user_cancelled'
   ): Promise<ChatReplyEnvelope | null> {
+    const finishOperation = this.#beginRunOperation(runId)
+    if (finishOperation === null) return null
+    try {
+      return await this.#cancelPending(runId, reason)
+    } finally {
+      finishOperation()
+    }
+  }
+
+  async #cancelPending (
+    runId: string,
+    reason: unknown
+  ): Promise<ChatReplyEnvelope | null> {
+    const normalizedReason = cancellationReason(reason)
     const pending = this.#pending.get(runId)
     if (pending === undefined) return null
     try {
-      const result = await this.#engine.cancel(runId, reason)
+      const result = await this.#engine.cancel(runId, normalizedReason)
       return await this.#finish(pending, result)
     } catch (error) {
       this.#pending.delete(runId)
@@ -945,10 +970,34 @@ export class AgentService {
   shutdown (reason = 'process_shutdown'): Promise<number> {
     if (this.#shutdownPromise !== undefined) return this.#shutdownPromise
     this.#shutdownReason = cancellationReason(reason, 'process_shutdown')
+    this.#acceptingRunOperations = false
     this.#lifecycleController.abort(this.#shutdownReason)
-    const runIds = Object.freeze([...this.#pending.keys()])
+    const runIds = Object.freeze([...new Set([
+      ...this.#pending.keys(),
+      ...this.#runOperations.keys()
+    ])])
     this.#shutdownPromise = Promise.all(
-      runIds.map(async runId => await this.cancel(runId, this.#shutdownReason))
+      runIds.map(async runId => {
+        await this.#runOperations.get(runId)?.idle
+        const pending = this.#pending.get(runId)
+        if (pending === undefined) return
+        let preserved = false
+        try {
+          preserved = await this.#engine.detachResumableApprovalRuntime(
+            runId,
+            this.#shutdownReason
+          )
+        } catch {}
+        if (!preserved) {
+          await this.#cancelPending(runId, this.#shutdownReason)
+          return
+        }
+        // The displayed approval and its reference are durable. Only the
+        // process-local runtime and admission lease are released here.
+        if (this.#pending.get(runId) !== pending) return
+        this.#pending.delete(runId)
+        await pending.lease.release().catch(() => undefined)
+      })
     ).then(() => runIds.length)
     return this.#shutdownPromise
   }
@@ -963,7 +1012,13 @@ export class AgentService {
   async displayApproval (
     input: RunApprovalDisplayCommand
   ): Promise<ApprovalInterruption | null> {
-    return await this.#engine.displayApproval(input)
+    const finishOperation = this.#beginRunOperation(input.runId)
+    if (finishOperation === null) return null
+    try {
+      return await this.#engine.displayApproval(input)
+    } finally {
+      finishOperation()
+    }
   }
 
   async presentationContext (runId: string): Promise<ActivePresentationContext | null> {
@@ -981,6 +1036,8 @@ export class AgentService {
     input: RunApprovalDecisionCommand,
     options: RunControlOptions = {}
   ): Promise<ChatReplyEnvelope | ApprovalRecoveryDeferred | null> {
+    const finishOperation = this.#beginRunOperation(input.runId)
+    if (finishOperation === null) return null
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
     let pending: PendingRun | ApprovalRecoveryDeferred | null | undefined = this.#pending.get(input.runId)
     let presentationLifecycle: RunPresentationLifecycle | undefined
@@ -991,7 +1048,7 @@ export class AgentService {
       }
       if (pending === null || isApprovalRecoveryDeferred(pending)) return pending
       if (linked.signal.aborted) {
-        return await this.cancel(input.runId, linked.signal.reason)
+        return await this.#cancelPending(input.runId, linked.signal.reason)
       }
       presentationLifecycle = await this.#beginResumedPresentation(pending)
       const result = await this.#engine.decideApproval(
@@ -1010,6 +1067,7 @@ export class AgentService {
         }).catch(() => undefined)
       }
       linked.dispose()
+      finishOperation()
     }
   }
 
@@ -1052,6 +1110,18 @@ export class AgentService {
     const queueStarted = readMonotonic(this.#monotonicNow)
     let queueDurationMs: number | 'unavailable' = 'unavailable'
     let sessionLoadDurationMs: number | 'unavailable' | 'not_attempted' = 'not_attempted'
+    const finishOperation = this.#beginRunOperation(runId)
+    if (finishOperation === null) {
+      linked.dispose()
+      return preCreateEnvelope(
+        cancelledRunResult(runId, this.#shutdownReason),
+        requestObservationContext,
+        'rejected_admission',
+        'queue_aborted',
+        'unavailable',
+        'not_attempted'
+      )
+    }
     try {
       try {
         lease = await this.#admission.acquire(request.sessionAddress, linked.signal)
@@ -1227,6 +1297,7 @@ export class AgentService {
       )
     } finally {
       linked.dispose()
+      finishOperation()
     }
   }
 
@@ -1506,6 +1577,29 @@ export class AgentService {
       this.#onObserverFailure?.(Object.freeze({ event: 'agent.observer_failed' }))
     } catch {
       // Observability remains outside the run control plane.
+    }
+  }
+
+  #beginRunOperation (runId: string): (() => void) | null {
+    if (!this.#acceptingRunOperations) return null
+    let state = this.#runOperations.get(runId)
+    if (state === undefined) {
+      let resolve = (): void => undefined
+      const idle = new Promise<void>(complete => { resolve = complete })
+      state = { count: 0, idle, resolve }
+      this.#runOperations.set(runId, state)
+    }
+    state.count += 1
+    let active = true
+    return (): void => {
+      if (!active) return
+      active = false
+      const current = this.#runOperations.get(runId)
+      if (current !== state) return
+      current.count -= 1
+      if (current.count > 0) return
+      this.#runOperations.delete(runId)
+      current.resolve()
     }
   }
 }

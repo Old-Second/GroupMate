@@ -565,6 +565,28 @@ export class RunEngine {
             throw error;
         }
     }
+    async detachResumableApprovalRuntime(runId, reason = 'process_shutdown') {
+        const checkpoint = await this.loadCheckpoint(runId);
+        if (checkpoint === null || checkpoint.status !== 'waiting_approval' ||
+            checkpoint.interruption === null ||
+            checkpoint.engineActivity.state !== 'idle' ||
+            checkpoint.providerDispatch.state !== 'idle')
+            return false;
+        const interruption = checkpoint.interruption;
+        if (interruption.approvalMessageId === undefined ||
+            interruption.displayedAt === undefined || interruption.expiresAt === undefined ||
+            interruption.decision !== undefined)
+            return false;
+        const controller = this.#controllers.get(runId);
+        controller?.abort(boundedCancellationReason(reason));
+        this.#runtimeBindings.delete(runId);
+        this.#startedToolCalls.delete(runId);
+        this.#engineActivityStarts.delete(runId);
+        if (controller !== undefined && this.#controllers.get(runId) === controller) {
+            this.#controllers.delete(runId);
+        }
+        return true;
+    }
     async decideApproval(input, runtime, options = {}) {
         if (runtime !== undefined)
             this.#runtimeBindings.set(input.runId, runtime);
