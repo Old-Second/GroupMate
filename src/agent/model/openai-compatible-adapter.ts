@@ -313,7 +313,10 @@ export function buildImmutableChatRequest (
   }
 }
 
-function parseUsage (value: unknown): ModelUsage | undefined {
+function parseUsage (
+  value: unknown,
+  profile: OpenAICompatibleProfile
+): ModelUsage | undefined {
   if (value === undefined) return undefined
   const usage = asWireRecord(value, 'invalid_usage')
   const inputTokens = usage.prompt_tokens
@@ -324,11 +327,17 @@ function parseUsage (value: unknown): ModelUsage | undefined {
   ))) {
     throw modelProtocolError('invalid_usage')
   }
-  return Object.freeze({
+  const common = Object.freeze({
     inputTokens: inputTokens as number,
     outputTokens: outputTokens as number,
     totalTokens: totalTokens as number
   })
+  try {
+    const extensions = profile.decodeUsageExtensions(usage as JsonObject, common)
+    return Object.freeze({ ...common, ...extensions })
+  } catch {
+    throw modelProtocolError('invalid_usage')
+  }
 }
 
 function parseFinishReason (value: unknown): ModelFinishReason {
@@ -459,7 +468,7 @@ async function readBoundedJsonTurn (
     ...(typeof message.refusal === 'string' ? { refusal: message.refusal } : {}),
     toolCalls,
     finishReason,
-    ...(root.usage === undefined ? {} : { usage: parseUsage(root.usage) }),
+    ...(root.usage === undefined ? {} : { usage: parseUsage(root.usage, profile) }),
     ...(reasoning === undefined ? {} : { reasoning }),
     ...(providerState === undefined ? {} : { providerState }),
     ...(parseResponseId(root.id) === undefined ? {} : { responseId: parseResponseId(root.id) })
@@ -573,7 +582,7 @@ async function readBoundedEventStream (
       }
       responseId = nextResponseId
     }
-    if (root.usage !== undefined) usage = parseUsage(root.usage)
+    if (root.usage !== undefined) usage = parseUsage(root.usage, profile)
     const choice = parseSseChoice(root)
     if (choice === undefined) return
     if (choice.finish_reason !== undefined && choice.finish_reason !== null) {

@@ -252,7 +252,7 @@ export function buildImmutableChatRequest(request, profile) {
         throw modelRequestError('request_body_too_large_or_invalid');
     }
 }
-function parseUsage(value) {
+function parseUsage(value, profile) {
     if (value === undefined)
         return undefined;
     const usage = asWireRecord(value, 'invalid_usage');
@@ -262,11 +262,18 @@ function parseUsage(value) {
     if (![inputTokens, outputTokens, totalTokens].every(token => (Number.isSafeInteger(token) && Number(token) >= 0))) {
         throw modelProtocolError('invalid_usage');
     }
-    return Object.freeze({
+    const common = Object.freeze({
         inputTokens: inputTokens,
         outputTokens: outputTokens,
         totalTokens: totalTokens
     });
+    try {
+        const extensions = profile.decodeUsageExtensions(usage, common);
+        return Object.freeze({ ...common, ...extensions });
+    }
+    catch {
+        throw modelProtocolError('invalid_usage');
+    }
 }
 function parseFinishReason(value) {
     if (typeof value !== 'string' || value.length === 0) {
@@ -376,7 +383,7 @@ async function readBoundedJsonTurn(response, profile, signal) {
         ...(typeof message.refusal === 'string' ? { refusal: message.refusal } : {}),
         toolCalls,
         finishReason,
-        ...(root.usage === undefined ? {} : { usage: parseUsage(root.usage) }),
+        ...(root.usage === undefined ? {} : { usage: parseUsage(root.usage, profile) }),
         ...(reasoning === undefined ? {} : { reasoning }),
         ...(providerState === undefined ? {} : { providerState }),
         ...(parseResponseId(root.id) === undefined ? {} : { responseId: parseResponseId(root.id) })
@@ -487,7 +494,7 @@ async function readBoundedEventStream(response, profile, signal) {
             responseId = nextResponseId;
         }
         if (root.usage !== undefined)
-            usage = parseUsage(root.usage);
+            usage = parseUsage(root.usage, profile);
         const choice = parseSseChoice(root);
         if (choice === undefined)
             return;

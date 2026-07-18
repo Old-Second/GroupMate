@@ -1,6 +1,7 @@
 import type { AgentErrorCode } from '../contracts/error.js'
 import type { JsonObject } from './json-value.js'
 import type {
+  ModelInputCacheUsage,
   ModelProviderError,
   ModelReasoningTrace,
   ModelReasoningOptions,
@@ -34,6 +35,14 @@ export interface OpenAICompatibleProfile {
   }>
   encodeToolControls(input: ToolControlInput): Readonly<JsonObject>
   encodeRequestExtensions(input: ModelReasoningOptions): Readonly<JsonObject>
+  decodeUsageExtensions(
+    usage: Readonly<JsonObject>,
+    common: Readonly<{
+      inputTokens: number
+      outputTokens: number
+      totalTokens: number
+    }>
+  ): Readonly<{ inputCache?: ModelInputCacheUsage }>
   extractAssistantReasoning(message: Readonly<JsonObject>): ModelReasoningTrace | undefined
   captureAssistantState(message: Readonly<JsonObject>): ProviderTurnState | undefined
   restoreAssistantExtensions(state: ProviderTurnState): Readonly<JsonObject>

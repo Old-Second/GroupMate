@@ -161,6 +161,143 @@ test('DeepSeek non-streaming final turns expose display reasoning without provid
   assert.equal(turn.providerState, undefined)
 })
 
+test('DeepSeek non-streaming turns decode input cache usage', async () => {
+  const response = JSON.stringify({
+    id: 'fixture-deepseek-cache-usage',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: { role: 'assistant', content: 'fixture cached answer' }
+    }],
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      total_tokens: 120,
+      prompt_cache_hit_tokens: 80,
+      prompt_cache_miss_tokens: 20
+    }
+  })
+  const adapter = adapterWithFetch(
+    async () => fixtureResponse(response),
+    deepSeekCompatibilityProfile
+  )
+
+  const turn = await adapter.complete(frozenRequest(), new AbortController().signal)
+
+  assert.deepEqual(turn.usage, {
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    inputCache: { hitTokens: 80, missTokens: 20 }
+  })
+})
+
+test('standard profile ignores provider-specific input cache usage', async () => {
+  const response = JSON.stringify({
+    id: 'fixture-standard-cache-usage',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: { role: 'assistant', content: 'fixture standard answer' }
+    }],
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      total_tokens: 120,
+      prompt_cache_hit_tokens: 80,
+      prompt_cache_miss_tokens: 20
+    }
+  })
+  const adapter = adapterWithFetch(async () => fixtureResponse(response))
+
+  const turn = await adapter.complete(frozenRequest(), new AbortController().signal)
+
+  assert.deepEqual(turn.usage, {
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120
+  })
+})
+
+test('DeepSeek streaming usage-only final chunks decode input cache usage', async () => {
+  const stream = [
+    'data: {"id":"fixture-deepseek-cache-stream","choices":[{"index":0,"delta":{"content":"fixture cached answer"}}]}',
+    '',
+    'data: {"id":"fixture-deepseek-cache-stream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join('\n')
+  const adapter = adapterWithFetch(async () => fixtureResponse(stream, {
+    contentType: 'text/event-stream',
+    chunkBytes: 13
+  }), deepSeekCompatibilityProfile)
+
+  const turn = await adapter.complete(frozenRequest({ streaming: true }), new AbortController().signal)
+
+  assert.deepEqual(turn.usage, {
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    inputCache: { hitTokens: 80, missTokens: 20 }
+  })
+})
+
+test('DeepSeek leaves input cache usage absent when both cache counters are absent', async () => {
+  const response = JSON.stringify({
+    id: 'fixture-deepseek-no-cache-usage',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: { role: 'assistant', content: 'fixture answer' }
+    }],
+    usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
+  })
+  const adapter = adapterWithFetch(
+    async () => fixtureResponse(response),
+    deepSeekCompatibilityProfile
+  )
+
+  const turn = await adapter.complete(frozenRequest(), new AbortController().signal)
+
+  assert.equal(turn.usage?.inputCache, undefined)
+})
+
+test('DeepSeek rejects malformed input cache usage as a provider protocol error', async () => {
+  const malformedCaches = [
+    { prompt_cache_hit_tokens: -1, prompt_cache_miss_tokens: 101 },
+    { prompt_cache_hit_tokens: 80.5, prompt_cache_miss_tokens: 19.5 },
+    { prompt_cache_hit_tokens: '80', prompt_cache_miss_tokens: 20 },
+    { prompt_cache_hit_tokens: 80, prompt_cache_miss_tokens: 19 }
+  ]
+
+  for (const cacheUsage of malformedCaches) {
+    const response = JSON.stringify({
+      id: 'fixture-deepseek-invalid-cache-usage',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'fixture answer' }
+      }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        total_tokens: 120,
+        ...cacheUsage
+      }
+    })
+    const adapter = adapterWithFetch(
+      async () => fixtureResponse(response),
+      deepSeekCompatibilityProfile
+    )
+
+    await assert.rejects(
+      adapter.complete(frozenRequest(), new AbortController().signal),
+      isProviderError('provider_protocol_error', false)
+    )
+  }
+})
+
 test('DeepSeek streaming tool turns preserve full provider state beside display reasoning', async () => {
   const stream = [
     'data: {"id":"fixture-deepseek-stream","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"checking "}}]}',

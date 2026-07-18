@@ -97,6 +97,25 @@ test('DeepSeek owns bounded display reasoning independently of provider state', 
   }), /reasoning/i)
 })
 
+test('DeepSeek profile owns cache usage extensions and validates cache counters', () => {
+  const common = Object.freeze({ inputTokens: 100, outputTokens: 20, totalTokens: 120 })
+
+  assert.deepEqual(deepSeekCompatibilityProfile.decodeUsageExtensions({
+    prompt_cache_hit_tokens: 80,
+    prompt_cache_miss_tokens: 20
+  }, common), {
+    inputCache: { hitTokens: 80, missTokens: 20 }
+  })
+  assert.deepEqual(standardOpenAIProfile.decodeUsageExtensions({
+    prompt_cache_hit_tokens: 80,
+    prompt_cache_miss_tokens: 20
+  }, common), {})
+  assert.deepEqual(deepSeekCompatibilityProfile.decodeUsageExtensions({}, common), {})
+  assert.throws(() => deepSeekCompatibilityProfile.decodeUsageExtensions({
+    prompt_cache_hit_tokens: 80
+  }, common), /cache/i)
+})
+
 test('DeepSeek profile restores a complete assistant tool span and owns wire differences', async () => {
   const fixture = await readFixture('deepseek-thinking-tool.json')
   const choice = (fixture.choices as readonly JsonObject[])[0]

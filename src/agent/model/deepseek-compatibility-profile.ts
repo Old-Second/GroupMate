@@ -1,5 +1,6 @@
 import { parseJsonValue, type JsonObject } from './json-value.js'
 import type {
+  ModelInputCacheUsage,
   ModelProviderError,
   ModelReasoningTrace,
   ModelReasoningOptions
@@ -83,6 +84,27 @@ function encodeDeepSeekReasoningOptions (
   return Object.freeze({
     thinking: Object.freeze({ type: input.enabled ? 'enabled' : 'disabled' }),
     ...(input.effort === undefined ? {} : { reasoning_effort: input.effort })
+  })
+}
+
+function decodeDeepSeekUsageExtensions (
+  usage: Readonly<JsonObject>,
+  common: Readonly<{
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+  }>
+): Readonly<{ inputCache?: ModelInputCacheUsage }> {
+  const hitTokens = usage.prompt_cache_hit_tokens
+  const missTokens = usage.prompt_cache_miss_tokens
+  if (hitTokens === undefined && missTokens === undefined) return EMPTY_OBJECT
+  if (typeof hitTokens !== 'number' || typeof missTokens !== 'number' ||
+      !Number.isSafeInteger(hitTokens) || !Number.isSafeInteger(missTokens) ||
+      hitTokens < 0 || missTokens < 0 || hitTokens + missTokens !== common.inputTokens) {
+    throw new TypeError('DeepSeek input cache usage is invalid')
+  }
+  return Object.freeze({
+    inputCache: Object.freeze({ hitTokens, missTokens })
   })
 }
 
@@ -181,6 +203,7 @@ export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.free
     ? Object.freeze({ tools: Object.freeze([...input.tools]) })
     : EMPTY_OBJECT,
   encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+  decodeUsageExtensions: decodeDeepSeekUsageExtensions,
   extractAssistantReasoning: extractDeepSeekAssistantReasoning,
   captureAssistantState: captureDeepSeekAssistantState,
   restoreAssistantExtensions: restoreDeepSeekAssistantState,

@@ -23,6 +23,7 @@ export const standardOpenAIProfile: OpenAICompatibleProfile = Object.freeze({
       })
     : Object.freeze({ tool_choice: 'none' }),
   encodeRequestExtensions: () => EMPTY_OBJECT,
+  decodeUsageExtensions: () => EMPTY_OBJECT,
   extractAssistantReasoning: () => undefined,
   captureAssistantState: () => undefined,
   restoreAssistantExtensions: () => {

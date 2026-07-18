@@ -62,6 +62,20 @@ function encodeDeepSeekReasoningOptions(input) {
         ...(input.effort === undefined ? {} : { reasoning_effort: input.effort })
     });
 }
+function decodeDeepSeekUsageExtensions(usage, common) {
+    const hitTokens = usage.prompt_cache_hit_tokens;
+    const missTokens = usage.prompt_cache_miss_tokens;
+    if (hitTokens === undefined && missTokens === undefined)
+        return EMPTY_OBJECT;
+    if (typeof hitTokens !== 'number' || typeof missTokens !== 'number' ||
+        !Number.isSafeInteger(hitTokens) || !Number.isSafeInteger(missTokens) ||
+        hitTokens < 0 || missTokens < 0 || hitTokens + missTokens !== common.inputTokens) {
+        throw new TypeError('DeepSeek input cache usage is invalid');
+    }
+    return Object.freeze({
+        inputCache: Object.freeze({ hitTokens, missTokens })
+    });
+}
 function readDeepSeekError(error) {
     if (error.truncated)
         return undefined;
@@ -153,6 +167,7 @@ export const deepSeekCompatibilityProfile = Object.freeze({
         ? Object.freeze({ tools: Object.freeze([...input.tools]) })
         : EMPTY_OBJECT,
     encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+    decodeUsageExtensions: decodeDeepSeekUsageExtensions,
     extractAssistantReasoning: extractDeepSeekAssistantReasoning,
     captureAssistantState: captureDeepSeekAssistantState,
     restoreAssistantExtensions: restoreDeepSeekAssistantState,

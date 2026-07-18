@@ -62,10 +62,16 @@ export type ModelFinishReason =
   | 'content_filter'
   | 'unknown'
 
+export interface ModelInputCacheUsage {
+  readonly hitTokens: number
+  readonly missTokens: number
+}
+
 export interface ModelUsage {
   readonly inputTokens: number
   readonly outputTokens: number
   readonly totalTokens: number
+  readonly inputCache?: ModelInputCacheUsage
 }
 
 export const MAX_MODEL_REASONING_CODE_POINTS = 2_000
