@@ -203,10 +203,24 @@ function parseModelTurn(value) {
     }
     if (input.usage !== undefined) {
         const usage = jsonObject(input.usage, 'model usage');
-        exactKeys(usage, ['inputTokens', 'outputTokens', 'totalTokens'], ['inputTokens', 'outputTokens', 'totalTokens'], 'model usage');
-        safeInteger(usage.inputTokens, 'model input tokens');
-        safeInteger(usage.outputTokens, 'model output tokens');
-        safeInteger(usage.totalTokens, 'model total tokens');
+        exactKeys(usage, ['inputTokens', 'outputTokens', 'totalTokens', 'inputCache'], ['inputTokens', 'outputTokens', 'totalTokens'], 'model usage');
+        const inputTokens = safeInteger(usage.inputTokens, 'model input tokens');
+        const outputTokens = safeInteger(usage.outputTokens, 'model output tokens');
+        const totalTokens = safeInteger(usage.totalTokens, 'model total tokens');
+        if (inputTokens + outputTokens !== totalTokens ||
+            !Number.isSafeInteger(inputTokens + outputTokens)) {
+            throw new TypeError('model usage is inconsistent');
+        }
+        if (usage.inputCache !== undefined) {
+            const inputCache = jsonObject(usage.inputCache, 'model input cache usage');
+            exactKeys(inputCache, ['hitTokens', 'missTokens'], ['hitTokens', 'missTokens'], 'model input cache usage');
+            const hitTokens = safeInteger(inputCache.hitTokens, 'model cache hit tokens');
+            const missTokens = safeInteger(inputCache.missTokens, 'model cache miss tokens');
+            if (hitTokens + missTokens !== inputTokens ||
+                !Number.isSafeInteger(hitTokens + missTokens)) {
+                throw new TypeError('model input cache usage is inconsistent');
+            }
+        }
     }
     if (input.reasoning !== undefined)
         parseModelReasoningTrace(input.reasoning);

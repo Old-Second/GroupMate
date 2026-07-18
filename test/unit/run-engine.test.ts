@@ -354,6 +354,54 @@ class RecoveryCommitCrashStore extends InMemoryRunStore {
   }
 }
 
+class PreSuccessCasCrashStore extends TerminalCaptureStore {
+  crashed = false
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    const commitsSuccessfulTurn = expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' &&
+      next.events.slice(expected.events.length).some(event => event.type === 'model.completed')
+    if (!this.crashed && commitsSuccessfulTurn) {
+      this.crashed = true
+      throw new SimulatedProcessCrash()
+    }
+    return await super.compareAndSet(expected, next)
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (!this.crashed && expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle') {
+      this.crashed = true
+      throw new SimulatedProcessCrash()
+    }
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
+class PostSuccessCasCrashStore extends TerminalCaptureStore {
+  crashed = false
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    const stored = await super.compareAndSet(expected, next)
+    if (!this.crashed && expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' && next.status === 'evaluating_tools') {
+      this.crashed = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+}
+
 function definition (name: string, executionClass: ToolDefinition['executionClass'] = 'read_only'): ToolDefinition {
   return Object.freeze({
     name, version: 1, aliases: Object.freeze([]), description: `${name} fixture`,
@@ -557,9 +605,9 @@ function harness (
 class TerminalRaceRunStore implements RunStore {
   readonly base = new InMemoryRunStore()
   injected = false
-  readonly #phase: 'provider_reservation' | 'dispatch_completion' | 'terminal_commit'
+  readonly #phase: 'provider_reservation' | 'success_transition' | 'terminal_commit'
 
-  constructor (phase: 'provider_reservation' | 'dispatch_completion' | 'terminal_commit') {
+  constructor (phase: 'provider_reservation' | 'success_transition' | 'terminal_commit') {
     this.#phase = phase
   }
 
@@ -574,13 +622,12 @@ class TerminalRaceRunStore implements RunStore {
       expected.providerDispatch.state === 'idle' &&
       next.status === expected.status &&
       next.providerDispatch.state === 'reserved'
-    const completion = expected.status === 'calling_model' &&
+    const successTransition = expected.status === 'calling_model' &&
       expected.providerDispatch.state === 'reserved' &&
-      next.status === expected.status &&
-      next.providerDispatch.state === 'idle'
+      next.status === 'evaluating_tools' && next.providerDispatch.state === 'idle'
     const shouldInject = this.#phase === 'provider_reservation'
       ? reservation
-      : completion
+      : successTransition
     if (!this.injected && shouldInject) {
       this.injected = true
       const terminal = nextRunCheckpoint(expected, 'cancelled', {
@@ -1233,6 +1280,7 @@ test('RunEngine records a delayed failed Provider attempt before enforcing the a
 })
 
 test('RunEngine persists Provider dispatch reservation before wire and trusted usage after success', async () => {
+  const store = new TerminalCaptureStore()
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const reserved = await fixture.store.load('run-1')
@@ -1265,7 +1313,7 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
       ...modelText('带用量完成'),
       usage: Object.freeze({ inputTokens: 7, outputTokens: 3, totalTokens: 10 })
     })
-  }])
+  }], { store })
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -1281,6 +1329,366 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
     total: completed.counters.providerTotalTokens
   }, {
     attempts: 1, modelTurns: 1, input: 7, output: 3, total: 10
+  })
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 7,
+    outputTokens: 3,
+    totalTokens: 10,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine commits each trusted success usage once and marks missing usage partial', async () => {
+  const withUsageStore = new TerminalCaptureStore()
+  const withUsage = harness([Object.freeze({
+    ...modelText('cache usage complete'),
+    usage: Object.freeze({
+      inputTokens: 11,
+      outputTokens: 4,
+      totalTokens: 15,
+      inputCache: Object.freeze({ hitTokens: 7, missTokens: 4 })
+    })
+  })], { store: withUsageStore })
+
+  assert.equal((await withUsage.engine.start(withUsage.input)).kind, 'completed')
+  assert.deepEqual(withUsageStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 11,
+    outputTokens: 4,
+    totalTokens: 15,
+    cacheHitTokens: 7,
+    cacheMissTokens: 4,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: true
+  })
+
+  const withoutUsageStore = new TerminalCaptureStore()
+  const withoutUsage = harness([modelText('usage omitted')], { store: withoutUsageStore })
+  assert.equal((await withoutUsage.engine.start(withoutUsage.input)).kind, 'completed')
+  assert.deepEqual(withoutUsageStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'partial',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 0,
+    turnsWithoutUsage: 1,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine excludes wire failures from usage and records only retry or recovery success', async () => {
+  const retryable = new ModelProviderError({
+    code: 'provider_unavailable',
+    stage: 'model.response',
+    retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。',
+    statusCode: 503
+  })
+  const retryStore = new TerminalCaptureStore()
+  const retry = harness([retryable, Object.freeze({
+    ...modelText('retry success'),
+    usage: Object.freeze({ inputTokens: 8, outputTokens: 2, totalTokens: 10 })
+  })], { store: retryStore })
+  assert.equal((await retry.engine.start(retry.input)).kind, 'completed')
+  assert.deepEqual(retryStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 8,
+    outputTokens: 2,
+    totalTokens: 10,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。',
+    statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const recoveryStore = new TerminalCaptureStore()
+  const recovery = harness([legacyContext, Object.freeze({
+    ...modelText('recovery success'),
+    usage: Object.freeze({ inputTokens: 5, outputTokens: 3, totalTokens: 8 })
+  })], {
+    store: recoveryStore,
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简上下文' }]),
+      estimatedInputTokens: 4
+    })
+  })
+  assert.equal((await recovery.engine.start(recovery.input)).kind, 'completed')
+  assert.equal(recovery.adapter.requests.length, 2)
+  assert.deepEqual(recoveryStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 5,
+    outputTokens: 3,
+    totalTokens: 8,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine records trusted refusal and invalid tool protocol usage before failing closed', async () => {
+  const turns: readonly ModelTurn[] = [
+    Object.freeze({
+      text: '',
+      refusal: 'policy refusal',
+      toolCalls: Object.freeze([]),
+      finishReason: 'content_filter',
+      usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+    }),
+    Object.freeze({
+      ...modelTools([toolCall(0, 'call-invalid-finish', 'normalRead')]),
+      finishReason: 'stop',
+      usage: Object.freeze({ inputTokens: 6, outputTokens: 2, totalTokens: 8 })
+    })
+  ]
+  for (const turn of turns) {
+    const store = new TerminalCaptureStore()
+    const fixture = harness([turn], { store })
+    assert.equal((await fixture.engine.start(fixture.input)).kind, 'failed')
+    assert.deepEqual(store.terminalCheckpoint?.usage, {
+      schemaVersion: 1,
+      availability: 'complete',
+      inputTokens: turn.usage?.inputTokens,
+      outputTokens: turn.usage?.outputTokens,
+      totalTokens: turn.usage?.totalTokens,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      turnsWithUsage: 1,
+      turnsWithoutUsage: 0,
+      cacheUsageComplete: false
+    })
+  }
+})
+
+test('RunEngine fails a successful response planning exception against its reserved checkpoint', async () => {
+  const store = new TerminalCaptureStore()
+  const turn = Object.defineProperty({
+    toolCalls: Object.freeze([]),
+    finishReason: 'stop' as const,
+    usage: Object.freeze({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
+  }, 'text', {
+    enumerable: true,
+    get: () => { throw new Error('hostile successful turn text') }
+  }) as unknown as ModelTurn
+  const fixture = harness([turn], { store })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(store.terminalCheckpoint?.providerDispatch.state, 'idle')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 3,
+    outputTokens: 1,
+    totalTokens: 4,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine records empty primary and correction success usage independently', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([
+    Object.freeze({
+      ...modelText(''),
+      usage: Object.freeze({ inputTokens: 4, outputTokens: 1, totalTokens: 5 })
+    }),
+    Object.freeze({
+      ...modelText('corrected'),
+      usage: Object.freeze({ inputTokens: 6, outputTokens: 2, totalTokens: 8 })
+    })
+  ], { store })
+
+  assert.equal((await fixture.engine.start(fixture.input)).kind, 'completed')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 10,
+    outputTokens: 3,
+    totalTokens: 13,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 2,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+
+  const invalidStore = new TerminalCaptureStore()
+  const invalid = harness([
+    Object.freeze({
+      ...modelText(''),
+      usage: Object.freeze({ inputTokens: 2, outputTokens: 1, totalTokens: 3 })
+    }),
+    Object.freeze({
+      ...modelText(''),
+      usage: Object.freeze({ inputTokens: 4, outputTokens: 1, totalTokens: 5 })
+    })
+  ], { store: invalidStore })
+  assert.equal((await invalid.engine.start(invalid.input)).kind, 'failed')
+  assert.deepEqual(invalidStore.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 6,
+    outputTokens: 2,
+    totalTokens: 8,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 2,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine commits successful turn usage before a success-side budget failure', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([Object.freeze({
+    ...modelText('budget exhausted after return'),
+    usage: Object.freeze({ inputTokens: 9, outputTokens: 1, totalTokens: 10 })
+  })], {
+    store,
+    monotonicNow: sequenceClock(0, 10, 240_011, 240_020)
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' ? result.error.code : null, 'run_budget_exceeded')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 9,
+    outputTokens: 1,
+    totalTokens: 10,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+  assert.deepEqual(fixture.observedEvents
+    .filter(event => event.type === 'model.attempted' || event.type === 'model.completed')
+    .map(event => event.type), ['model.attempted'])
+})
+
+test('RunEngine permits resend after pre-success-CAS crash without claiming external billing exactly once', async () => {
+  const store = new PreSuccessCasCrashStore()
+  const first = harness([Object.freeze({
+    ...modelText('first external success'),
+    usage: Object.freeze({ inputTokens: 7, outputTokens: 2, totalTokens: 9 })
+  })], { store })
+
+  await assert.rejects(first.engine.start(first.input))
+  assert.equal(first.adapter.requests.length, 1)
+  const crashed = await store.load(first.input.runId)
+  assert.equal(store.crashed, true)
+  assert.equal(crashed?.schemaVersion === 4 ? crashed.providerDispatch.state : null, 'reserved')
+  assert.deepEqual(crashed?.schemaVersion === 4 ? crashed.usage : null, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 0,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: true
+  })
+
+  const second = harness([Object.freeze({
+    ...modelText('resent success'),
+    usage: Object.freeze({ inputTokens: 5, outputTokens: 1, totalTokens: 6 })
+  })], { store })
+  const resumed = await second.engine.resume(first.input.runId, second.input.runtime)
+  assert.equal(resumed.kind, 'completed')
+  assert.equal(second.adapter.requests.length, 1)
+  const tombstone = await store.loadTombstone(first.input.runId)
+  assert.equal(tombstone?.status, 'completed')
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 5,
+    outputTokens: 1,
+    totalTokens: 6,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+})
+
+test('RunEngine persists a tool success transition before return crash and recovery never resends it', async () => {
+  const store = new PostSuccessCasCrashStore()
+  const first = harness([Object.freeze({
+    ...modelTools([toolCall(0, 'call-post-success', 'normalRead')]),
+    usage: Object.freeze({ inputTokens: 7, outputTokens: 2, totalTokens: 9 })
+  })], { store })
+
+  await assert.rejects(first.engine.start(first.input))
+  const crashed = await store.load(first.input.runId)
+  assert.equal(crashed?.schemaVersion === 4 ? crashed.status : null, 'evaluating_tools')
+  assert.equal(crashed?.schemaVersion === 4 ? crashed.providerDispatch.state : null, 'idle')
+  assert.deepEqual(crashed?.schemaVersion === 4 ? crashed.usage : null, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 7,
+    outputTokens: 2,
+    totalTokens: 9,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
+
+  const second = harness([Object.freeze({
+    ...modelText('after recovered tool'),
+    usage: Object.freeze({ inputTokens: 5, outputTokens: 1, totalTokens: 6 })
+  })], { store })
+  const resumed = await second.engine.resume(first.input.runId, second.input.runtime)
+  assert.equal(resumed.kind, 'completed')
+  assert.equal(second.adapter.requests.length, 1)
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 12,
+    outputTokens: 3,
+    totalTokens: 15,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 2,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
   })
 })
 
@@ -1348,17 +1756,9 @@ test('RunEngine returns a concurrent terminal before Provider wire when dispatch
   ])
 })
 
-test('RunEngine stops model completion evaluation when dispatch-completion CAS loses to a terminal', async () => {
-  const store = new TerminalRaceRunStore('dispatch_completion')
-  let modelEvaluationReads = 0
-  const providerTurn: ModelTurn = Object.freeze({
-    text: 'wire 已完成但不应继续求值',
-    toolCalls: Object.freeze([]),
-    get finishReason (): ModelTurn['finishReason'] {
-      modelEvaluationReads += 1
-      return 'stop'
-    }
-  })
+test('RunEngine stops downstream tool work when the atomic success transition loses to a terminal', async () => {
+  const store = new TerminalRaceRunStore('success_transition')
+  const providerTurn = modelTools([toolCall(0, 'race-call', 'normalRead')])
   const fixture = harness([providerTurn], { store })
 
   const result = await fixture.engine.start(fixture.input)
@@ -1372,17 +1772,16 @@ test('RunEngine stops model completion evaluation when dispatch-completion CAS l
     terminal: null
   })
   assert.equal(fixture.adapter.requests.length, 1)
-  assert.equal(modelEvaluationReads, 0)
   assert.equal(fixture.tools.preparations, 0)
   assert.equal(fixture.tools.executions, 0)
   assert.equal(fixture.events.includes('model.completed'), false)
   assert.equal(fixture.events.some(event => event.startsWith('tool.')), false)
 })
 
-test('RunEngine journals a real Provider return before dispatch-completion CAS loss', async () => {
-  const store = new TerminalRaceRunStore('dispatch_completion')
+test('RunEngine journals a real Provider return before atomic success-transition CAS loss', async () => {
+  const store = new TerminalRaceRunStore('success_transition')
   const journalEvents: RunContentJournalEvent[] = []
-  const turn = modelText('wire return is journaled')
+  const turn = modelTools([toolCall(0, 'journal-race-call', 'normalRead')])
   const fixture = harness([turn], {
     store,
     contentJournal: { record: event => { journalEvents.push(event) } }

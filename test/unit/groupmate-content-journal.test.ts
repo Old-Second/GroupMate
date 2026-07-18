@@ -194,7 +194,12 @@ function modelTurnFixture (): ModelTurn {
       })
     })]),
     finishReason: 'tool_calls',
-    usage: Object.freeze({ inputTokens: 12, outputTokens: 8, totalTokens: 20 }),
+    usage: Object.freeze({
+      inputTokens: 12,
+      outputTokens: 8,
+      totalTokens: 20,
+      inputCache: Object.freeze({ hitTokens: 7, missTokens: 5 })
+    }),
     providerState: Object.freeze({
       profileId: 'standard',
       profileVersion: 1,
@@ -641,6 +646,55 @@ test('projects complete provider response failure and committed terminal content
       }
     }
   ])
+})
+
+test('provider response projector rejects malformed cache-aware usage with fixed evidence', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalJournalFixture()
+  const common = Object.freeze({
+    type: 'provider.response' as const,
+    occurredAt: '2026-07-17T08:03:00.000Z',
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary' as const
+  })
+  const invalidUsage = [
+    { inputTokens: 12, outputTokens: 8, totalTokens: 21 },
+    {
+      inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      inputCache: { hitTokens: 7, missTokens: 4 }
+    },
+    {
+      inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      inputCache: { hitTokens: -1, missTokens: 13 }
+    },
+    {
+      inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      inputCache: { hitTokens: 7.5, missTokens: 4.5 }
+    },
+    {
+      inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      inputCache: { hitTokens: 7, missTokens: 5, extra: 0 }
+    },
+    {
+      inputTokens: Number.MAX_SAFE_INTEGER + 1,
+      outputTokens: 0,
+      totalTokens: Number.MAX_SAFE_INTEGER + 1
+    }
+  ]
+
+  for (const usage of invalidUsage) {
+    journal.recordRunEvent(Object.freeze({
+      ...common,
+      turn: Object.freeze({ ...modelTurnFixture(), usage }) as ModelTurn
+    }))
+  }
+
+  assert.deepEqual(events, invalidUsage.map(() => ({
+    type: 'groupmate.content_journal.projection_failure',
+    payload: { operation: 'run_event', code: 'invalid_content' }
+  })))
 })
 
 test('projects provider reasoning into the complete content journal', () => {

@@ -100,7 +100,13 @@ class OneTurnAdapter implements ModelAdapter {
     return Object.freeze({
       text: '终态日志完成',
       toolCalls: Object.freeze([]),
-      finishReason: 'stop'
+      finishReason: 'stop',
+      usage: Object.freeze({
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        inputCache: Object.freeze({ hitTokens: 6, missTokens: 4 })
+      })
     })
   }
 }
@@ -264,6 +270,9 @@ test('RunEngine journals the complete checkpoint and exact receipt only after te
   const run = fixture(store, {
     record: event => {
       events.push(event)
+      if (event.type === 'provider.response') {
+        throw new Error('provider response journal unavailable')
+      }
       if (event.type === 'run.terminal_committed') {
         store.order.push('journal.terminal')
         throw new Error('terminal journal unavailable')
@@ -304,6 +313,18 @@ test('RunEngine journals the complete checkpoint and exact receipt only after te
   assert.equal(Object.isFrozen(
     terminal?.type === 'run.terminal_committed' ? terminal.receipt : undefined
   ), true)
+  assert.deepEqual(store.checkpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 10,
+    outputTokens: 2,
+    totalTokens: 12,
+    cacheHitTokens: 6,
+    cacheMissTokens: 4,
+    turnsWithUsage: 1,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: true
+  })
 })
 
 test('RunEngine canonicalizes mutable terminal receipts and isolates terminal journal from trace and result', async () => {

@@ -23,6 +23,7 @@ import {
   type StartRunInput
 } from '../../src/agent/run/run-engine.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
+import { recordRunUsage } from '../../src/agent/run/run-usage.js'
 import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
 import { RedisRunStore, redisRunKeys } from '../../src/agent/run/redis-run-store.js'
 import {
@@ -296,6 +297,19 @@ class ScriptedAdapter implements ModelAdapter {
   }
 }
 
+class TerminalCheckpointStore extends InMemoryRunStore {
+  terminalCheckpoint: RunCheckpoint | null = null
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    this.terminalCheckpoint = next
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
 class CountingRuntime implements ToolRuntime {
   preparations = 0
   executions = 0
@@ -438,6 +452,59 @@ test('RunEngine resumes a complete calling-model checkpoint exactly once', async
   assert.equal(adapter.calls, 1)
   assert.equal(await store.load(source.runId), null)
   assert.equal((await store.loadTombstone(source.runId))?.status, 'completed')
+})
+
+test('RunEngine resumes a committed evaluating-tools success without redispatching or duplicating usage', async () => {
+  const store = new TerminalCheckpointStore()
+  const source = initial('run-committed-success-recovery')
+  const path = executingPath(source, 'read_only')
+  const evaluating = path.at(-2)
+  if (evaluating === undefined || evaluating.status !== 'evaluating_tools') {
+    throw new TypeError('evaluating checkpoint is missing')
+  }
+  const committed = Object.freeze({
+    ...evaluating,
+    usage: recordRunUsage(evaluating.usage, Object.freeze({
+      inputTokens: 7,
+      outputTokens: 2,
+      totalTokens: 9
+    })),
+    providerDispatch: Object.freeze({ state: 'idle' })
+  }) as RunCheckpoint
+  await persistPath(store, [...path.slice(0, -2), committed])
+  const adapter = new ScriptedAdapter(Object.freeze({
+    ...textTurn('恢复工具后完成'),
+    usage: Object.freeze({ inputTokens: 5, outputTokens: 1, totalTokens: 6 })
+  }))
+  const toolRuntime = new CountingRuntime()
+  const engine = new RunEngine({
+    adapter,
+    profile: standardOpenAIProfile,
+    scheduler: new ToolScheduler({ runtime: toolRuntime }),
+    store,
+    budget,
+    now: () => new Date(timestamp),
+    generateId: () => 'generated-id'
+  })
+
+  const result = await engine.resume(source.runId, runtimeBinding(snapshot()))
+
+  assert.equal(result.kind, 'completed')
+  assert.equal(toolRuntime.preparations, 1)
+  assert.equal(toolRuntime.executions, 1)
+  assert.equal(adapter.calls, 1)
+  assert.deepEqual(store.terminalCheckpoint?.usage, {
+    schemaVersion: 1,
+    availability: 'complete',
+    inputTokens: 12,
+    outputTokens: 3,
+    totalTokens: 15,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    turnsWithUsage: 2,
+    turnsWithoutUsage: 0,
+    cacheUsageComplete: false
+  })
 })
 
 test('RunEngine upgrades v2 without allocating or changing its request references', async () => {
