@@ -12,8 +12,14 @@ import type { SessionAddress } from '../agent/contracts/identity.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
 import type { ContextItem } from '../agent/context/context-item.js'
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'
-import type { ModelAdapter } from '../agent/model/model-adapter.js'
-import { ModelProviderError } from '../agent/model/model-adapter.js'
+import type {
+  ModelAdapter,
+  ProviderRequestMetadata
+} from '../agent/model/model-adapter.js'
+import {
+  ModelProviderError,
+  parseProviderRequestMetadata
+} from '../agent/model/model-adapter.js'
 import type { ApprovalInterruption } from '../agent/run/interruption.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../agent/run/run-budget.js'
@@ -115,6 +121,10 @@ import {
 } from './yunzai-request-adapter.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from './message-input.js'
 import type { ObservationEventV1 } from './observability/observation-event.js'
+import type {
+  ProviderIsolationIdSource,
+  ProviderIsolationIdSourceFactory
+} from './provider-isolation-id.js'
 
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.'
 const RUN_DEADLINE_MS = 240_000
@@ -182,6 +192,7 @@ export interface YunzaiAgentServiceBridgeDependencies {
   readonly runStore?: RedisRunStore
   readonly admission?: RunAdmission
   readonly contentJournal?: GroupMateContentJournal
+  readonly providerIsolationIdSourceFactory?: ProviderIsolationIdSourceFactory
   readonly observations?: Readonly<{
     publish(event: ObservationEventV1): void
     acceptCommittedTraceCandidate(candidate: TraceCandidateV1): void
@@ -1454,6 +1465,32 @@ export function createYunzaiAgentServiceBridge (
   dependencies: YunzaiAgentServiceBridgeDependencies
 ): YunzaiAgentServiceBridge {
   const selected = compatibilityConfig(options.config)
+  let providerIsolationIdSource: ProviderIsolationIdSource | null = null
+  if (selected.profile.cacheIsolation === 'conversation_required') {
+    try {
+      providerIsolationIdSource = dependencies.providerIsolationIdSourceFactory?.() ?? null
+    } catch {
+      providerIsolationIdSource = null
+    }
+  }
+  const providerMetadataFor = async (
+    address: SessionAddress
+  ): Promise<ProviderRequestMetadata | undefined> => {
+    if (selected.profile.cacheIsolation !== 'conversation_required') return undefined
+    if (providerIsolationIdSource === null) {
+      throw providerConfigurationError('provider_isolation_unavailable')
+    }
+    try {
+      const state = await providerIsolationIdSource.resolve(address)
+      if (state.kind !== 'ready') {
+        throw providerConfigurationError('provider_isolation_unavailable')
+      }
+      return parseProviderRequestMetadata({ cacheIsolationId: state.cacheIsolationId })
+    } catch (error) {
+      if (error instanceof ModelProviderError) throw error
+      throw providerConfigurationError('provider_isolation_unavailable')
+    }
+  }
   const now = options.now ?? (() => new Date())
   const generateId = options.generateId ?? randomUUID
   const prepared = new Map<string, PreparedRuntime>()
@@ -1575,6 +1612,7 @@ export function createYunzaiAgentServiceBridge (
       }
     }),
     createRuntime: async request => {
+      const providerRequestMetadata = await providerMetadataFor(request.sessionAddress)
       const runtime = prepared.get(request.requestId)
       if (runtime === undefined) {
         throw new AgentError({
@@ -1583,7 +1621,10 @@ export function createYunzaiAgentServiceBridge (
         })
       }
       const value: AgentServiceRunRuntime = Object.freeze({
-        binding: runtime.run.binding,
+        binding: Object.freeze({
+          ...runtime.run.binding,
+          ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
+        }),
         runtimeFacts: runtime.runtimeFacts,
         groupContext: runtime.groupContext,
         ...(runtime.progress === undefined ? {} : { progress: runtime.progress })
@@ -1591,6 +1632,7 @@ export function createYunzaiAgentServiceBridge (
       return value
     },
     recoverRuntime: async checkpoint => {
+      const providerRequestMetadata = await providerMetadataFor(checkpoint.sessionAddress)
       const bot = await botAccess.picker.pick(checkpoint.sessionAddress.botId)
       if (bot === null) {
         throw new AgentError({
@@ -1601,7 +1643,12 @@ export function createYunzaiAgentServiceBridge (
         })
       }
       const recovered = await toolRuntime.recoverAgentRun({ checkpoint, bot })
-      return Object.freeze({ binding: recovered.binding })
+      return Object.freeze({
+        binding: Object.freeze({
+          ...recovered.binding,
+          ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
+        })
+      })
     },
     createPresentationLifecycle: async route => {
       const routeSettings = route.requestKind === 'legacy_unknown'

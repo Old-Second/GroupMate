@@ -1,3 +1,4 @@
+import { types as utilTypes } from 'node:util'
 import {
   AgentError,
   type AgentErrorCode,
@@ -25,6 +26,38 @@ export interface ModelAssistantToolCall {
   readonly arguments: JsonObject
 }
 
+export interface ProviderRequestMetadata {
+  readonly cacheIsolationId: string
+}
+
+const CACHE_ISOLATION_ID = /^gm_[gu]_[A-Za-z0-9_-]{43}$/
+
+export function parseProviderRequestMetadata (
+  value: unknown
+): ProviderRequestMetadata {
+  if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+    Array.isArray(value)) {
+    throw modelRequestError('invalid_provider_request_metadata')
+  }
+  let prototype: object | null
+  let keys: readonly PropertyKey[]
+  let descriptor: PropertyDescriptor | undefined
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null
+    keys = Reflect.ownKeys(value)
+    descriptor = Object.getOwnPropertyDescriptor(value, 'cacheIsolationId')
+  } catch {
+    throw modelRequestError('invalid_provider_request_metadata')
+  }
+  if (prototype !== Object.prototype || keys.length !== 1 ||
+    keys[0] !== 'cacheIsolationId' || descriptor === undefined ||
+    !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true ||
+    typeof descriptor.value !== 'string' || !CACHE_ISOLATION_ID.test(descriptor.value)) {
+    throw modelRequestError('invalid_provider_request_metadata')
+  }
+  return Object.freeze({ cacheIsolationId: descriptor.value })
+}
+
 export type ModelMessage =
   | Readonly<{ role: 'system' | 'developer' | 'user'; content: string }>
   | Readonly<{
@@ -43,6 +76,7 @@ export interface ModelRequest {
   readonly streaming: boolean
   readonly maxOutputTokens: number
   readonly reasoning: ModelReasoningOptions
+  readonly metadata?: ProviderRequestMetadata
   readonly temperature?: number
   readonly topP?: number
 }

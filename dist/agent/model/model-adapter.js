@@ -1,4 +1,30 @@
+import { types as utilTypes } from 'node:util';
 import { AgentError } from '../contracts/error.js';
+const CACHE_ISOLATION_ID = /^gm_[gu]_[A-Za-z0-9_-]{43}$/;
+export function parseProviderRequestMetadata(value) {
+    if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
+        Array.isArray(value)) {
+        throw modelRequestError('invalid_provider_request_metadata');
+    }
+    let prototype;
+    let keys;
+    let descriptor;
+    try {
+        prototype = Object.getPrototypeOf(value);
+        keys = Reflect.ownKeys(value);
+        descriptor = Object.getOwnPropertyDescriptor(value, 'cacheIsolationId');
+    }
+    catch {
+        throw modelRequestError('invalid_provider_request_metadata');
+    }
+    if (prototype !== Object.prototype || keys.length !== 1 ||
+        keys[0] !== 'cacheIsolationId' || descriptor === undefined ||
+        !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true ||
+        typeof descriptor.value !== 'string' || !CACHE_ISOLATION_ID.test(descriptor.value)) {
+        throw modelRequestError('invalid_provider_request_metadata');
+    }
+    return Object.freeze({ cacheIsolationId: descriptor.value });
+}
 export const MAX_MODEL_REASONING_CODE_POINTS = 2_000;
 export function normalizeModelReasoningTrace(value) {
     const normalized = value.trim().normalize('NFC');

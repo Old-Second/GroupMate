@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ContextEngine } from '../agent/context/context-engine.js';
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js';
-import { ModelProviderError } from '../agent/model/model-adapter.js';
+import { ModelProviderError, parseProviderRequestMetadata } from '../agent/model/model-adapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { RunEngine } from '../agent/run/run-engine.js';
@@ -1016,6 +1016,34 @@ function createBotAccess(options) {
 }
 export function createYunzaiAgentServiceBridge(options, dependencies) {
     const selected = compatibilityConfig(options.config);
+    let providerIsolationIdSource = null;
+    if (selected.profile.cacheIsolation === 'conversation_required') {
+        try {
+            providerIsolationIdSource = dependencies.providerIsolationIdSourceFactory?.() ?? null;
+        }
+        catch {
+            providerIsolationIdSource = null;
+        }
+    }
+    const providerMetadataFor = async (address) => {
+        if (selected.profile.cacheIsolation !== 'conversation_required')
+            return undefined;
+        if (providerIsolationIdSource === null) {
+            throw providerConfigurationError('provider_isolation_unavailable');
+        }
+        try {
+            const state = await providerIsolationIdSource.resolve(address);
+            if (state.kind !== 'ready') {
+                throw providerConfigurationError('provider_isolation_unavailable');
+            }
+            return parseProviderRequestMetadata({ cacheIsolationId: state.cacheIsolationId });
+        }
+        catch (error) {
+            if (error instanceof ModelProviderError)
+                throw error;
+            throw providerConfigurationError('provider_isolation_unavailable');
+        }
+    };
     const now = options.now ?? (() => new Date());
     const generateId = options.generateId ?? randomUUID;
     const prepared = new Map();
@@ -1123,6 +1151,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             }
         }),
         createRuntime: async (request) => {
+            const providerRequestMetadata = await providerMetadataFor(request.sessionAddress);
             const runtime = prepared.get(request.requestId);
             if (runtime === undefined) {
                 throw new AgentError({
@@ -1131,7 +1160,10 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 });
             }
             const value = Object.freeze({
-                binding: runtime.run.binding,
+                binding: Object.freeze({
+                    ...runtime.run.binding,
+                    ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
+                }),
                 runtimeFacts: runtime.runtimeFacts,
                 groupContext: runtime.groupContext,
                 ...(runtime.progress === undefined ? {} : { progress: runtime.progress })
@@ -1139,6 +1171,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             return value;
         },
         recoverRuntime: async (checkpoint) => {
+            const providerRequestMetadata = await providerMetadataFor(checkpoint.sessionAddress);
             const bot = await botAccess.picker.pick(checkpoint.sessionAddress.botId);
             if (bot === null) {
                 throw new AgentError({
@@ -1149,7 +1182,12 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 });
             }
             const recovered = await toolRuntime.recoverAgentRun({ checkpoint, bot });
-            return Object.freeze({ binding: recovered.binding });
+            return Object.freeze({
+                binding: Object.freeze({
+                    ...recovered.binding,
+                    ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
+                })
+            });
         },
         createPresentationLifecycle: async (route) => {
             const routeSettings = route.requestKind === 'legacy_unknown'

@@ -23,6 +23,7 @@ import { createYunzaiChatController } from './yunzai-chat-controller.js';
 import { prepareYunzaiPresentationRequest } from './yunzai-request-adapter.js';
 import { MetricsRegistry } from './observability/metrics-registry.js';
 import { ObservationHub } from './observability/observation-hub.js';
+import { createProviderIsolationIdSource } from './provider-isolation-id.js';
 import { RedisTraceStore } from './observability/redis-trace-store.js';
 import { RunObservationPolicyGate } from './observability/run-observation-policy-gate.js';
 import { SafeObservationFailureLogLimiter, createPresentationObservationLog, createRequestObservationLog } from './observability/safe-observation-logging.js';
@@ -458,6 +459,19 @@ function terminalPresentation(options, presenter) {
 }
 export function createProductionYunzaiAgent(options) {
     const model = options.modelFactory();
+    const providerIsolationIdSourceFactory = options.providerIsolationIdSourceFactory ?? (() => (createProviderIsolationIdSource({
+        directory: resolvePluginPath('data', 'identity'),
+        trustedRoot: resolvePluginPath(),
+        onDiagnostic: diagnostic => {
+            try {
+                options.bridge.logger?.error?.(Object.freeze({
+                    event: diagnostic.event,
+                    code: diagnostic.code
+                }));
+            }
+            catch { }
+        }
+    })));
     const random = options.random ?? Math.random;
     const now = options.now ?? (() => new Date());
     const journalNow = options.journalNow ?? (() => new Date());
@@ -525,6 +539,7 @@ export function createProductionYunzaiAgent(options) {
     }), {
         progressPresenter,
         modelAdapter: model,
+        providerIsolationIdSourceFactory,
         runStore,
         admission,
         ...(contentJournal === undefined ? {} : { contentJournal }),

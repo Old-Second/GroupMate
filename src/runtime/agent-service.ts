@@ -198,7 +198,8 @@ export interface AgentServiceRequestOptions extends RunControlOptions {
 export interface AgentServiceRunRuntime {
   readonly binding: Readonly<Pick<
     RunRuntimeBinding,
-    'snapshot' | 'prepareToolContext' | 'contextFor' | 'approvalControlContext'
+    'snapshot' | 'providerRequestMetadata' | 'prepareToolContext' | 'contextFor' |
+    'approvalControlContext'
   >>
   readonly progress?: ProgressDelivery
   readonly runtimeFacts?: readonly ContextItem[]
@@ -1387,6 +1388,9 @@ export class AgentService {
     }
     return Object.freeze({
       snapshot: runtime.binding.snapshot,
+      ...(runtime.binding.providerRequestMetadata === undefined
+        ? {}
+        : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
       prepareContext: async (signal: AbortSignal) => await prepare(false, signal),
       recoverContext: async (
         _checkpoint: RunCheckpoint,
@@ -1435,6 +1439,9 @@ export class AgentService {
       const runtime = await this.#recoverRuntime(checkpoint)
       const binding: RunRuntimeBinding = Object.freeze({
         snapshot: runtime.binding.snapshot,
+        ...(runtime.binding.providerRequestMetadata === undefined
+          ? {}
+          : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
         prepareContext: async () => Object.freeze({
           messages: checkpoint.messages,
           estimatedInputTokens: checkpoint.estimatedInputTokens

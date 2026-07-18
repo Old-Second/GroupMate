@@ -1011,6 +1011,9 @@ export class AgentService {
         };
         return Object.freeze({
             snapshot: runtime.binding.snapshot,
+            ...(runtime.binding.providerRequestMetadata === undefined
+                ? {}
+                : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
             prepareContext: async (signal) => await prepare(false, signal),
             recoverContext: async (_checkpoint, _error, signal) => await prepare(true, signal),
             prepareToolContext: runtime.binding.prepareToolContext,
@@ -1054,6 +1057,9 @@ export class AgentService {
             const runtime = await this.#recoverRuntime(checkpoint);
             const binding = Object.freeze({
                 snapshot: runtime.binding.snapshot,
+                ...(runtime.binding.providerRequestMetadata === undefined
+                    ? {}
+                    : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
                 prepareContext: async () => Object.freeze({
                     messages: checkpoint.messages,
                     estimatedInputTokens: checkpoint.estimatedInputTokens

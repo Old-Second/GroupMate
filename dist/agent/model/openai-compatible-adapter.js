@@ -1,6 +1,6 @@
 import { createParser } from 'eventsource-parser';
 import { jsonByteLength, parseJsonValue } from './json-value.js';
-import { ModelProviderError, modelProtocolError, modelRequestError } from './model-adapter.js';
+import { ModelProviderError, modelProtocolError, modelRequestError, parseProviderRequestMetadata } from './model-adapter.js';
 import { asWireRecord, iterateResponseBytes, readBoundedResponseText, readBoundedWireError } from './openai-wire.js';
 import { normalizeCompleteToolCalls, SseToolCallAccumulator } from './sse-tool-call-accumulator.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
@@ -12,9 +12,14 @@ const PROFILE_ID = /^[a-z][a-z0-9_.-]{0,63}$/;
 const RESERVED_MESSAGE_EXTENSION_KEYS = new Set(['role', 'content', 'tool_calls', 'function_call']);
 const RESERVED_REQUEST_EXTENSION_KEYS = new Set([
     'model', 'messages', 'stream', 'tools', 'functions', 'tool_choice',
-    'max_tokens', 'max_completion_tokens'
+    'max_tokens', 'max_completion_tokens', 'temperature', 'top_p', 'user_id'
+]);
+const RESERVED_METADATA_EXTENSION_KEYS = new Set([
+    'model', 'messages', 'stream', 'tools', 'functions', 'tool_choice',
+    'max_tokens', 'max_completion_tokens', 'temperature', 'top_p'
 ]);
 const ALLOWED_TOOL_CONTROL_KEYS = new Set(['tools', 'tool_choice']);
+const ALLOWED_REQUEST_METADATA_KEYS = new Set(['user_id']);
 const defaultFetch = async (url, init) => {
     const { default: nodeFetch } = await import('node-fetch');
     return await nodeFetch(url, init);
@@ -94,6 +99,11 @@ function cloneJsonObject(value, reason, maxBytes) {
 }
 function assertExtensionKeys(extensions, reserved, reason) {
     if (Object.keys(extensions).some(key => reserved.has(key)))
+        throw modelRequestError(reason);
+}
+function assertNoExtensionOverlap(first, second, reason) {
+    const firstKeys = new Set(Object.keys(first));
+    if (Object.keys(second).some(key => firstKeys.has(key)))
         throw modelRequestError(reason);
 }
 function wireToolCall(call) {
@@ -207,6 +217,9 @@ export function buildImmutableChatRequest(request, profile) {
         assertFiniteNumber(request.temperature, 'invalid_temperature');
     if (request.topP !== undefined)
         assertFiniteNumber(request.topP, 'invalid_top_p');
+    const metadata = request.metadata === undefined
+        ? undefined
+        : parseProviderRequestMetadata(request.metadata);
     const tools = Object.freeze(request.tools.map(wireToolDefinition));
     if (request.toolMode === 'required' && tools.length === 0) {
         throw modelRequestError('required_tools_missing');
@@ -226,6 +239,13 @@ export function buildImmutableChatRequest(request, profile) {
     }
     const requestExtensions = profile.encodeRequestExtensions(request.reasoning);
     assertExtensionKeys(requestExtensions, RESERVED_REQUEST_EXTENSION_KEYS, 'invalid_request_extensions');
+    const metadataExtensions = profile.encodeRequestMetadata(metadata);
+    assertExtensionKeys(metadataExtensions, RESERVED_METADATA_EXTENSION_KEYS, 'invalid_request_metadata_extensions');
+    if (Object.keys(metadataExtensions).some(key => !ALLOWED_REQUEST_METADATA_KEYS.has(key))) {
+        throw modelRequestError('invalid_request_metadata_extensions');
+    }
+    assertNoExtensionOverlap(requestExtensions, metadataExtensions, 'conflicting_request_extensions');
+    assertNoExtensionOverlap(toolControls, metadataExtensions, 'conflicting_request_extensions');
     const tokenField = profile.capabilities.outputTokenField;
     const candidate = {
         model,
@@ -235,6 +255,7 @@ export function buildImmutableChatRequest(request, profile) {
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
         ...(request.topP === undefined ? {} : { top_p: request.topP }),
         ...requestExtensions,
+        ...metadataExtensions,
         ...toolControls
     };
     if (Object.hasOwn(candidate, 'functions'))

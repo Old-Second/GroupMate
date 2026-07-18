@@ -2,6 +2,7 @@ const EMPTY_OBJECT = Object.freeze({});
 export const standardOpenAIProfile = Object.freeze({
     id: 'standard',
     version: 1,
+    cacheIsolation: 'none',
     capabilities: Object.freeze({
         supportsDeveloperRole: true,
         supportsToolChoice: true,
@@ -18,6 +19,7 @@ export const standardOpenAIProfile = Object.freeze({
         })
         : Object.freeze({ tool_choice: 'none' }),
     encodeRequestExtensions: () => EMPTY_OBJECT,
+    encodeRequestMetadata: () => EMPTY_OBJECT,
     decodeUsageExtensions: () => EMPTY_OBJECT,
     extractAssistantReasoning: () => undefined,
     captureAssistantState: () => undefined,

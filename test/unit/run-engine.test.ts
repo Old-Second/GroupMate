@@ -3,7 +3,12 @@ import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
 import type { AgentEvent } from '../../src/agent/contracts/event.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
-import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import type {
+  ModelAdapter,
+  ModelRequest,
+  ModelTurn,
+  ProviderRequestMetadata
+} from '../../src/agent/model/model-adapter.js'
 import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
@@ -617,6 +622,7 @@ function execution (): ToolExecutionContext {
 
 interface HarnessOptions {
   readonly profile?: typeof standardOpenAIProfile
+  readonly providerRequestMetadata?: ProviderRequestMetadata
   readonly maxOutputTokens?: number
   readonly prepareContext?: StartRunInput['runtime']['prepareContext']
   readonly recoverContext?: StartRunInput['runtime']['recoverContext']
@@ -699,6 +705,9 @@ function harness (
     }),
     runtime: Object.freeze({
       snapshot: snapshot(),
+      ...(options.providerRequestMetadata === undefined
+        ? {}
+        : { providerRequestMetadata: options.providerRequestMetadata }),
       prepareContext: options.prepareContext ?? (async () => Object.freeze({
         messages: Object.freeze([{ role: 'user' as const, content: '完成任务' }]),
         estimatedInputTokens: 16
@@ -2928,6 +2937,84 @@ test('RunEngine keeps provider retry, context recovery and correction counters s
     { type: 'provider.request', ordinal: 4, kind: 'retry' },
     { type: 'provider.response', ordinal: 4, kind: 'retry' }
   ])
+})
+
+test('RunEngine reuses one isolation metadata value across recovery, tool, retry and correction turns', async () => {
+  const metadata = Object.freeze({
+    cacheIsolationId: `gm_g_${'R'.repeat(43)}`
+  })
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const retryable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const recovered = harness([
+    legacyContext,
+    modelTools([toolCall(0, 'isolation-tool', 'normalRead')]),
+    retryable,
+    modelText('隔离任务完成')
+  ], {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    providerRequestMetadata: metadata,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简后的请求' }]),
+      estimatedInputTokens: 8
+    })
+  })
+  assert.equal(outputText(await recovered.engine.start(recovered.input)), '隔离任务完成')
+  assert.equal(recovered.adapter.requests.length, 4)
+  assert.equal(recovered.adapter.requests.every(request => request.metadata === metadata), true)
+
+  const corrected = harness([modelText(''), modelText('隔离纠错完成')], {
+    providerRequestMetadata: metadata
+  })
+  assert.equal(outputText(await corrected.engine.start(corrected.input)), '隔离纠错完成')
+  assert.equal(corrected.adapter.requests.length, 2)
+  assert.equal(corrected.adapter.requests.every(request => request.metadata === metadata), true)
+})
+
+test('RunEngine process resume takes isolation metadata from the recovered binding only', async () => {
+  const store = new RetryReservationCrashStore()
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const beforeRestart = Object.freeze({
+    cacheIsolationId: `gm_g_${'S'.repeat(43)}`
+  })
+  const crashed = harness([unavailable], {
+    store,
+    providerRequestMetadata: beforeRestart
+  })
+
+  await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
+  assert.strictEqual(crashed.adapter.requests[0]?.metadata, beforeRestart)
+  const checkpoint = await store.load(crashed.input.runId)
+  assert.notEqual(checkpoint, null)
+  assert.doesNotMatch(
+    JSON.stringify(checkpoint),
+    /metadata|cacheIsolationId|gm_g_/u
+  )
+  store.restoreProcess()
+
+  const afterRestart = Object.freeze({
+    cacheIsolationId: beforeRestart.cacheIsolationId
+  })
+  const resumed = harness([modelText('恢复后完成')], {
+    store,
+    providerRequestMetadata: afterRestart
+  })
+  assert.equal(
+    outputText(await resumed.engine.resume(crashed.input.runId, resumed.input.runtime)),
+    '恢复后完成'
+  )
+  assert.strictEqual(resumed.adapter.requests[0]?.metadata, afterRestart)
+  assert.notStrictEqual(afterRestart, beforeRestart)
 })
 
 test('RunEngine recalculates output capacity after legacy context recovery', async () => {

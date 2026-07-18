@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import type {
+  ModelAdapter,
+  ModelRequest,
+  ModelTurn,
+  ProviderRequestMetadata
+} from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import {
@@ -42,7 +47,11 @@ import {
   type YunzaiMessageEvent
 } from '../../src/runtime/agent-service-bridge.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../../src/runtime/message-input.js'
-import type { GroupMateContentJournal } from '../../src/runtime/logging/groupmate-content-journal.js'
+import {
+  createGroupMateContentJournal,
+  type GroupMateContentJournal
+} from '../../src/runtime/logging/groupmate-content-journal.js'
+import type { GroupMateDiskLogEvent } from '../../src/runtime/logging/groupmate-disk-log.js'
 import type {
   YunzaiAgentToolRun,
   YunzaiToolRuntimeBridge
@@ -177,6 +186,7 @@ function fixture (
   contentJournal: RunContentJournal,
   options: Readonly<{
     onCommittedTraceCandidate?: RunEngineOptions['onCommittedTraceCandidate']
+    providerRequestMetadata?: ProviderRequestMetadata
   }> = {}
 ): Readonly<{
     engine: RunEngine
@@ -241,6 +251,9 @@ function fixture (
     }),
     runtime: Object.freeze({
       snapshot,
+      ...(options.providerRequestMetadata === undefined
+        ? {}
+        : { providerRequestMetadata: options.providerRequestMetadata }),
       prepareContext: async () => Object.freeze({
         messages: Object.freeze([{ role: 'user' as const, content: '记录完整终态' }]),
         estimatedInputTokens: 8
@@ -263,6 +276,45 @@ function fixture (
   })
   return Object.freeze({ engine, input, adapter })
 }
+
+test('provider request journal strips isolation metadata at its typed snapshot boundary', async () => {
+  const store = new RecordingTerminalStore()
+  const diskEvents: GroupMateDiskLogEvent[] = []
+  const projected = createGroupMateContentJournal({
+    record: event => { diskEvents.push(event) },
+    drain: async () => undefined
+  })
+  const runEvents: RunContentJournalEvent[] = []
+  const metadata = Object.freeze({
+    cacheIsolationId: `gm_g_${'J'.repeat(43)}`
+  })
+  const run = fixture(store, {
+    record: event => {
+      runEvents.push(event)
+      projected.recordRunEvent(event)
+    }
+  }, { providerRequestMetadata: metadata })
+
+  const result = await run.engine.start(run.input)
+
+  assert.equal(result.kind, 'completed')
+  assert.strictEqual(run.adapter.requests[0]?.metadata, metadata)
+  const requestEvent = runEvents.find(event => event.type === 'provider.request')
+  assert.notEqual(requestEvent, undefined)
+  if (requestEvent?.type !== 'provider.request') return
+  assert.deepEqual(Reflect.ownKeys(requestEvent.request), [
+    'model', 'messages', 'tools', 'toolMode', 'streaming', 'maxOutputTokens', 'reasoning'
+  ])
+  const serialized = JSON.stringify(requestEvent)
+  assert.doesNotMatch(serialized, /metadata|cacheIsolationId|user_id|gm_g_|provider-isolation\.key/u)
+  assert.equal(
+    diskEvents.some(event => event.type === 'groupmate.content_journal.projection_failure'),
+    false
+  )
+  const projectedRequest = diskEvents.find(event => event.type === 'provider.request')
+  assert.notEqual(projectedRequest, undefined)
+  assert.doesNotMatch(JSON.stringify(projectedRequest), /metadata|cacheIsolationId|user_id|gm_g_/u)
+})
 
 test('RunEngine journals the complete checkpoint and exact receipt only after terminal commit succeeds', async () => {
   const store = new RecordingTerminalStore()

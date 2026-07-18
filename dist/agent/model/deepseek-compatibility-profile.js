@@ -80,6 +80,11 @@ function encodeDeepSeekReasoningOptions(input) {
         ...(input.effort === undefined ? {} : { reasoning_effort: input.effort })
     });
 }
+function encodeDeepSeekRequestMetadata(input) {
+    return input === undefined
+        ? EMPTY_OBJECT
+        : Object.freeze({ user_id: input.cacheIsolationId });
+}
 function decodeDeepSeekUsageExtensions(usage, common) {
     const hitTokens = usage.prompt_cache_hit_tokens;
     const missTokens = usage.prompt_cache_miss_tokens;
@@ -174,6 +179,7 @@ function deepSeekRecoveryHint(error) {
 export const deepSeekCompatibilityProfile = Object.freeze({
     id: PROFILE_ID,
     version: PROFILE_VERSION,
+    cacheIsolation: 'conversation_required',
     capabilities: Object.freeze({
         supportsDeveloperRole: false,
         supportsToolChoice: false,
@@ -187,6 +193,7 @@ export const deepSeekCompatibilityProfile = Object.freeze({
         ? Object.freeze({ tools: Object.freeze([...input.tools]) })
         : EMPTY_OBJECT,
     encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+    encodeRequestMetadata: encodeDeepSeekRequestMetadata,
     decodeUsageExtensions: decodeDeepSeekUsageExtensions,
     extractAssistantReasoning: extractDeepSeekAssistantReasoning,
     captureAssistantState: captureDeepSeekAssistantState,

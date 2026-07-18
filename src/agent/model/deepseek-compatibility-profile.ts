@@ -7,6 +7,7 @@ import {
 import type {
   ModelInputCacheUsage,
   ModelProviderError,
+  ProviderRequestMetadata,
   ModelReasoningTrace,
   ModelReasoningOptions
 } from './model-adapter.js'
@@ -111,6 +112,14 @@ function encodeDeepSeekReasoningOptions (
     thinking: Object.freeze({ type: input.enabled ? 'enabled' : 'disabled' }),
     ...(input.effort === undefined ? {} : { reasoning_effort: input.effort })
   })
+}
+
+function encodeDeepSeekRequestMetadata (
+  input: ProviderRequestMetadata | undefined
+): Readonly<JsonObject> {
+  return input === undefined
+    ? EMPTY_OBJECT
+    : Object.freeze({ user_id: input.cacheIsolationId })
 }
 
 function decodeDeepSeekUsageExtensions (
@@ -218,6 +227,7 @@ function deepSeekRecoveryHint (
 export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.freeze({
   id: PROFILE_ID,
   version: PROFILE_VERSION,
+  cacheIsolation: 'conversation_required',
   capabilities: Object.freeze({
     supportsDeveloperRole: false,
     supportsToolChoice: false,
@@ -231,6 +241,7 @@ export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.free
     ? Object.freeze({ tools: Object.freeze([...input.tools]) })
     : EMPTY_OBJECT,
   encodeRequestExtensions: encodeDeepSeekReasoningOptions,
+  encodeRequestMetadata: encodeDeepSeekRequestMetadata,
   decodeUsageExtensions: decodeDeepSeekUsageExtensions,
   extractAssistantReasoning: extractDeepSeekAssistantReasoning,
   captureAssistantState: captureDeepSeekAssistantState,

@@ -113,6 +113,10 @@ import {
   type SafeSinkFailureV1
 } from './observability/observation-hub.js'
 import type { ObservationEventV1 } from './observability/observation-event.js'
+import {
+  createProviderIsolationIdSource,
+  type ProviderIsolationIdSourceFactory
+} from './provider-isolation-id.js'
 import { RedisTraceStore } from './observability/redis-trace-store.js'
 import { RunObservationPolicyGate } from './observability/run-observation-policy-gate.js'
 import {
@@ -200,6 +204,7 @@ export interface ProductionYunzaiAgentOptions {
   readonly pictureRenderer: GroupMatePictureRenderer
   readonly tts: TtsReplyPort
   readonly modelFactory: () => ProductionModelPort
+  readonly providerIsolationIdSourceFactory?: ProviderIsolationIdSourceFactory
   readonly random?: () => number
   readonly now?: () => Date
   readonly monotonicNow?: () => number | 'unavailable'
@@ -676,6 +681,20 @@ export function createProductionYunzaiAgent (
   options: ProductionYunzaiAgentOptions
 ): ProductionYunzaiAgent {
   const model = options.modelFactory()
+  const providerIsolationIdSourceFactory = options.providerIsolationIdSourceFactory ?? (() => (
+    createProviderIsolationIdSource({
+      directory: resolvePluginPath('data', 'identity'),
+      trustedRoot: resolvePluginPath(),
+      onDiagnostic: diagnostic => {
+        try {
+          options.bridge.logger?.error?.(Object.freeze({
+            event: diagnostic.event,
+            code: diagnostic.code
+          }))
+        } catch {}
+      }
+    })
+  ))
   const random = options.random ?? Math.random
   const now = options.now ?? (() => new Date())
   const journalNow = options.journalNow ?? (() => new Date())
@@ -760,6 +779,7 @@ export function createProductionYunzaiAgent (
   }), {
     progressPresenter,
     modelAdapter: model,
+    providerIsolationIdSourceFactory,
     runStore,
     admission,
     ...(contentJournal === undefined ? {} : { contentJournal }),

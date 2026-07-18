@@ -3,15 +3,20 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import {
   ModelProviderError,
-  type ModelRequest
+  type ModelRequest,
+  type ProviderRequestMetadata
 } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
-import { OpenAICompatibleAdapter } from '../../src/agent/model/openai-compatible-adapter.js'
+import {
+  buildImmutableChatRequest,
+  OpenAICompatibleAdapter
+} from '../../src/agent/model/openai-compatible-adapter.js'
 import type { OpenAICompatibleProfile } from '../../src/agent/model/openai-compatible-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 
 const FIXTURES = new URL('../../../test/fixtures/openai/', import.meta.url)
+const CACHE_ISOLATION_ID = `gm_g_${'A'.repeat(43)}`
 
 interface FixtureResponseOptions {
   readonly status?: number
@@ -69,6 +74,13 @@ function frozenRequest (overrides: Partial<ModelRequest> = {}): ModelRequest {
     reasoning: { enabled: false },
     ...overrides
   } as ModelRequest)
+}
+
+function requestWithRawMetadata (metadata: unknown): ModelRequest {
+  return Object.freeze({
+    ...frozenRequest(),
+    metadata
+  }) as ModelRequest
 }
 
 function fixtureTool () {
@@ -132,6 +144,166 @@ test('standard profile disables tools without mutating input', async () => {
     outputTokens: 4,
     totalTokens: 15
   })
+})
+
+test('standard metadata is wire-neutral while DeepSeek emits one exact top-level user_id', async () => {
+  const metadata: ProviderRequestMetadata = Object.freeze({
+    cacheIsolationId: CACHE_ISOLATION_ID
+  })
+  const standardBodies: Array<Record<string, unknown>> = []
+  const deepSeekBodies: Array<Record<string, unknown>> = []
+  await adapterWithFetch(async (_url, init) => {
+    standardBodies.push(JSON.parse(init.body) as Record<string, unknown>)
+    return fixtureResponse(await loadText('standard-text.json'))
+  }).complete(frozenRequest({ metadata }), new AbortController().signal)
+  await adapterWithFetch(async (_url, init) => {
+    deepSeekBodies.push(JSON.parse(init.body) as Record<string, unknown>)
+    return fixtureResponse(await loadText('standard-text.json'))
+  }, deepSeekCompatibilityProfile).complete(
+    frozenRequest({ metadata }),
+    new AbortController().signal
+  )
+
+  assert.equal('user_id' in (standardBodies[0] ?? {}), false)
+  assert.equal(deepSeekBodies[0]?.user_id, CACHE_ISOLATION_ID)
+  assert.equal(
+    JSON.stringify(deepSeekBodies[0]?.messages).includes(CACHE_ISOLATION_ID),
+    false
+  )
+  assert.deepEqual(Reflect.ownKeys(metadata), ['cacheIsolationId'])
+  assert.equal(Object.isFrozen(metadata), true)
+})
+
+test('DeepSeek auxiliary requests remain compatible when conversation metadata is absent', async () => {
+  let body: Record<string, unknown> | undefined
+  await adapterWithFetch(async (_url, init) => {
+    body = JSON.parse(init.body) as Record<string, unknown>
+    return fixtureResponse(await loadText('standard-text.json'))
+  }, deepSeekCompatibilityProfile).complete(
+    frozenRequest(),
+    new AbortController().signal
+  )
+
+  assert.equal('user_id' in (body ?? {}), false)
+})
+
+test('request metadata codec rejects proxy, accessor, symbol, hidden and extra fields', async () => {
+  const accessor = Object.freeze(Object.defineProperty({}, 'cacheIsolationId', {
+    enumerable: true,
+    get: () => CACHE_ISOLATION_ID
+  }))
+  const symbol = Symbol('private-metadata')
+  const withSymbol = Object.freeze({
+    cacheIsolationId: CACHE_ISOLATION_ID,
+    [symbol]: 'secret'
+  })
+  const withHidden = Object.freeze(Object.defineProperty({
+    cacheIsolationId: CACHE_ISOLATION_ID
+  }, 'hidden', { value: 'secret', enumerable: false }))
+  const proxy = new Proxy({ cacheIsolationId: CACHE_ISOLATION_ID }, {
+    ownKeys: () => { throw new Error('proxy trap must not escape') }
+  })
+  const invalidValues: unknown[] = [
+    proxy,
+    accessor,
+    withSymbol,
+    withHidden,
+    Object.freeze({ cacheIsolationId: CACHE_ISOLATION_ID, extra: true }),
+    Object.freeze({ cacheIsolationId: 'raw-user-identity' }),
+    Object.freeze(Object.assign(Object.create(null), {
+      cacheIsolationId: CACHE_ISOLATION_ID
+    }))
+  ]
+
+  for (const metadata of invalidValues) {
+    let attempts = 0
+    await assert.rejects(
+      adapterWithFetch(async () => {
+        attempts += 1
+        return fixtureResponse(await loadText('standard-text.json'))
+      }, deepSeekCompatibilityProfile).complete(
+        requestWithRawMetadata(metadata),
+        new AbortController().signal
+      ),
+      isProviderError('provider_invalid_request', false)
+    )
+    assert.equal(attempts, 0)
+  }
+})
+
+test('DeepSeek reserves user_id from reasoning extensions and metadata cannot override core fields', async () => {
+  let attempts = 0
+  const metadata = Object.freeze({ cacheIsolationId: CACHE_ISOLATION_ID })
+  await assert.rejects(
+    new OpenAICompatibleAdapter({
+      endpoint: 'https://fixture.invalid/v1/chat/completions',
+      apiKey: 'fixture-key',
+      profile: Object.freeze({
+        ...deepSeekCompatibilityProfile,
+        id: 'deepseek-reserved-fixture',
+        encodeRequestExtensions: () => Object.freeze({ user_id: 'raw-private-id' })
+      }),
+      fetch: async () => {
+        attempts += 1
+        return fixtureResponse(await loadText('standard-text.json'))
+      }
+    }).complete(frozenRequest({ metadata }), new AbortController().signal),
+    isProviderError('provider_invalid_request', false)
+  )
+  await assert.rejects(
+    new OpenAICompatibleAdapter({
+      endpoint: 'https://fixture.invalid/v1/chat/completions',
+      apiKey: 'fixture-key',
+      profile: Object.freeze({
+        ...deepSeekCompatibilityProfile,
+        id: 'deepseek-metadata-fixture',
+        encodeRequestMetadata: () => Object.freeze({ model: 'overridden-model' })
+      }),
+      fetch: async () => {
+        attempts += 1
+        return fixtureResponse(await loadText('standard-text.json'))
+      }
+    }).complete(frozenRequest({ metadata }), new AbortController().signal),
+    isProviderError('provider_invalid_request', false)
+  )
+  for (const [id, encodeRequestMetadata] of [
+    ['deepseek-metadata-temperature', () => Object.freeze({ temperature: 2 })],
+    ['deepseek-metadata-top-p', () => Object.freeze({ top_p: 1 })]
+  ] as const) {
+    await assert.rejects(
+      new OpenAICompatibleAdapter({
+        endpoint: 'https://fixture.invalid/v1/chat/completions',
+        apiKey: 'fixture-key',
+        profile: Object.freeze({
+          ...deepSeekCompatibilityProfile,
+          id,
+          encodeRequestMetadata
+        }),
+        fetch: async () => {
+          attempts += 1
+          return fixtureResponse(await loadText('standard-text.json'))
+        }
+      }).complete(frozenRequest({ metadata }), new AbortController().signal),
+      isProviderError('provider_invalid_request', false)
+    )
+  }
+  await assert.rejects(
+    new OpenAICompatibleAdapter({
+      endpoint: 'https://fixture.invalid/v1/chat/completions',
+      apiKey: 'fixture-key',
+      profile: Object.freeze({
+        ...deepSeekCompatibilityProfile,
+        id: 'deepseek-reasoning-top-p',
+        encodeRequestExtensions: () => Object.freeze({ top_p: 1 })
+      }),
+      fetch: async () => {
+        attempts += 1
+        return fixtureResponse(await loadText('standard-text.json'))
+      }
+    }).complete(frozenRequest({ metadata }), new AbortController().signal),
+    isProviderError('provider_invalid_request', false)
+  )
+  assert.equal(attempts, 0)
 })
 
 test('DeepSeek non-streaming final turns expose display reasoning without provider state', async () => {
@@ -639,6 +811,46 @@ test('enforces request, SSE line and aggregate response byte limits', async () =
       .complete(frozenRequest(), new AbortController().signal),
     isProviderError('provider_protocol_error', false)
   )
+})
+
+test('final request byte limit includes the DeepSeek user_id metadata field', async () => {
+  let low = 1
+  let high = RUN_RESOURCE_LIMITS.requestBytes
+  let fitted = 1
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    const candidate = frozenRequest({
+      messages: [{ role: 'user', content: 'x'.repeat(middle) }]
+    })
+    try {
+      buildImmutableChatRequest(candidate, deepSeekCompatibilityProfile)
+      fitted = middle
+      low = middle + 1
+    } catch (error) {
+      assert.equal(isProviderError('provider_invalid_request', false)(error), true)
+      high = middle - 1
+    }
+  }
+  const nearLimit = frozenRequest({
+    messages: [{ role: 'user', content: 'x'.repeat(fitted) }]
+  })
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(
+      buildImmutableChatRequest(nearLimit, deepSeekCompatibilityProfile)
+    ), 'utf8') <= RUN_RESOURCE_LIMITS.requestBytes
+  )
+  let attempts = 0
+  await assert.rejects(
+    adapterWithFetch(async () => {
+      attempts += 1
+      return fixtureResponse(await loadText('standard-text.json'))
+    }, deepSeekCompatibilityProfile).complete(frozenRequest({
+      messages: nearLimit.messages,
+      metadata: Object.freeze({ cacheIsolationId: CACHE_ISOLATION_ID })
+    }), new AbortController().signal),
+    isProviderError('provider_invalid_request', false)
+  )
+  assert.equal(attempts, 0)
 })
 
 test('bounds error bodies and classifies stable HTTP failures without retrying', async () => {

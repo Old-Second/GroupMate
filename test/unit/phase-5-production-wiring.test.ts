@@ -219,6 +219,45 @@ test('production model transport is graph-stable and fails closed on configurati
   assert.match(index, /model:\s*\(\) => normalizedText\(Config\.model/)
 })
 
+test('Task 6 has one lazy Agent-only isolation source and re-derives recovery from checkpoint address', async () => {
+  const [production, bridge, service, engine, journal, checkpoint] = await Promise.all([
+    source('src/runtime/production-yunzai-agent.ts'),
+    source('src/runtime/agent-service-bridge.ts'),
+    source('src/runtime/agent-service.ts'),
+    source('src/agent/run/run-engine.ts'),
+    source('src/agent/run/run-content-journal.ts'),
+    source('src/agent/run/run-checkpoint.ts')
+  ])
+  assert.match(production, /createProviderIsolationIdSource/)
+  assert.match(
+    production,
+    /resolvePluginPath\('data',\s*'identity'\)/
+  )
+  assert.match(production, /providerIsolationIdSourceFactory/)
+  assert.match(
+    bridge,
+    /selected\.profile\.cacheIsolation\s*===\s*'conversation_required'/
+  )
+  assert.match(
+    bridge,
+    /createRuntime:\s*async request[\s\S]*?request\.sessionAddress[\s\S]*?providerRequestMetadata/
+  )
+  assert.match(
+    bridge,
+    /recoverRuntime:\s*async checkpoint[\s\S]*?checkpoint\.sessionAddress[\s\S]*?providerRequestMetadata/
+  )
+  assert.match(service, /providerRequestMetadata:\s*runtime\.binding\.providerRequestMetadata/)
+  assert.match(engine, /metadata:\s*runtime\.providerRequestMetadata/)
+  assert.match(journal, /snapshotModelRequestForJournal[\s\S]*?model:[\s\S]*?reasoning:/)
+  assert.doesNotMatch(checkpoint, /cacheIsolationId|ProviderRequestMetadata/)
+  const graph = await productionGraph()
+  assert.deepEqual(
+    [...graph.keys()].filter(file => file === 'dist/runtime/provider-isolation-id.js'),
+    ['dist/runtime/provider-isolation-id.js']
+  )
+  assert.equal([...graph.keys()].some(file => file === 'dist/runtime/completion-facade.js'), false)
+})
+
 test('production TTS materializes bounded audio before deleting temporary files', async () => {
   const index = await source('index.js')
   assert.match(index, /boundedResponseBytes\(response, MAX_AUDIO_BYTES\)/)

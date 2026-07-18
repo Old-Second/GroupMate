@@ -10,7 +10,18 @@ export function detachedRunContentSnapshot(value, maxBytes) {
     });
 }
 export function snapshotModelRequestForJournal(request) {
-    return detachedRunContentSnapshot(request, RUN_RESOURCE_LIMITS.requestBytes);
+    const projected = Object.freeze({
+        model: request.model,
+        messages: request.messages,
+        tools: request.tools,
+        toolMode: request.toolMode,
+        streaming: request.streaming,
+        maxOutputTokens: request.maxOutputTokens,
+        reasoning: request.reasoning,
+        ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+        ...(request.topP === undefined ? {} : { topP: request.topP })
+    });
+    return detachedRunContentSnapshot(projected, RUN_RESOURCE_LIMITS.requestBytes);
 }
 export function snapshotModelTurnForJournal(turn) {
     return detachedRunContentSnapshot(turn, RUN_RESOURCE_LIMITS.providerResponseBytes);

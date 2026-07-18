@@ -5,6 +5,7 @@ import type { ModelPriceSnapshotV1 } from './model-price-catalog.js'
 import type {
   ModelInputCacheUsage,
   ModelProviderError,
+  ProviderRequestMetadata,
   ModelReasoningTrace,
   ModelReasoningOptions,
   ModelToolMode
@@ -28,6 +29,7 @@ export interface ModelErrorOverride {
 export interface OpenAICompatibleProfile {
   readonly id: string
   readonly version: number
+  readonly cacheIsolation: 'none' | 'conversation_required'
   readonly capabilities: Readonly<{
     supportsDeveloperRole: boolean
     supportsToolChoice: boolean
@@ -39,6 +41,7 @@ export interface OpenAICompatibleProfile {
   resolveModelPrice(model: string, now: Date): ModelPriceSnapshotV1 | undefined
   encodeToolControls(input: ToolControlInput): Readonly<JsonObject>
   encodeRequestExtensions(input: ModelReasoningOptions): Readonly<JsonObject>
+  encodeRequestMetadata(input: ProviderRequestMetadata | undefined): Readonly<JsonObject>
   decodeUsageExtensions(
     usage: Readonly<JsonObject>,
     common: Readonly<{

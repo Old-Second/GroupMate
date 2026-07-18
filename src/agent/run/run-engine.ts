@@ -26,7 +26,8 @@ import type {
   ModelMessage,
   ModelRequest,
   ModelTurn,
-  ModelUsage
+  ModelUsage,
+  ProviderRequestMetadata
 } from '../model/model-adapter.js'
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js'
 import { parseJsonValue, type JsonObject, type JsonValue } from '../model/json-value.js'
@@ -136,6 +137,7 @@ export interface PreparedRunContext {
 
 export interface RunRuntimeBinding {
   readonly snapshot: ToolSnapshot
+  readonly providerRequestMetadata?: ProviderRequestMetadata
   prepareContext(signal: AbortSignal): Promise<PreparedRunContext>
   prepareToolContext(
     checkpoint: RunCheckpoint,
@@ -1906,6 +1908,9 @@ export class RunEngine {
           streaming: checkpoint.model.streaming,
           maxOutputTokens,
           reasoning: checkpoint.model.reasoning,
+          ...(runtime.providerRequestMetadata === undefined
+            ? {}
+            : { metadata: runtime.providerRequestMetadata }),
           ...(checkpoint.model.temperature === undefined
             ? {}
             : { temperature: checkpoint.model.temperature }),

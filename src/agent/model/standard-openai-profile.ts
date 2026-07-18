@@ -9,6 +9,7 @@ const EMPTY_OBJECT: Readonly<JsonObject> = Object.freeze({})
 export const standardOpenAIProfile: OpenAICompatibleProfile = Object.freeze({
   id: 'standard',
   version: 1,
+  cacheIsolation: 'none',
   capabilities: Object.freeze({
     supportsDeveloperRole: true,
     supportsToolChoice: true,
@@ -25,6 +26,7 @@ export const standardOpenAIProfile: OpenAICompatibleProfile = Object.freeze({
       })
     : Object.freeze({ tool_choice: 'none' }),
   encodeRequestExtensions: () => EMPTY_OBJECT,
+  encodeRequestMetadata: () => EMPTY_OBJECT,
   decodeUsageExtensions: () => EMPTY_OBJECT,
   extractAssistantReasoning: () => undefined,
   captureAssistantState: () => undefined,

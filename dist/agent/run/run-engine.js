@@ -1423,6 +1423,9 @@ export class RunEngine {
                     streaming: checkpoint.model.streaming,
                     maxOutputTokens,
                     reasoning: checkpoint.model.reasoning,
+                    ...(runtime.providerRequestMetadata === undefined
+                        ? {}
+                        : { metadata: runtime.providerRequestMetadata }),
                     ...(checkpoint.model.temperature === undefined
                         ? {}
                         : { temperature: checkpoint.model.temperature }),

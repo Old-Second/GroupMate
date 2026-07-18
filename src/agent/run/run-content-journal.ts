@@ -12,6 +12,8 @@ import {
 } from './run-store.js'
 import type { ProviderAttemptEventPayloadV1 } from './run-trace.js'
 
+export type JournalModelRequest = Omit<ModelRequest, 'metadata'>
+
 interface ProviderContentJournalEventBase {
   readonly occurredAt: string
   readonly runRef: string
@@ -23,7 +25,7 @@ interface ProviderContentJournalEventBase {
 export interface ProviderRequestContentJournalEvent
   extends ProviderContentJournalEventBase {
   readonly type: 'provider.request'
-  readonly request: ModelRequest
+  readonly request: JournalModelRequest
 }
 
 export interface ProviderResponseContentJournalEvent
@@ -71,8 +73,19 @@ export function detachedRunContentSnapshot<T> (
 
 export function snapshotModelRequestForJournal (
   request: ModelRequest
-): ModelRequest {
-  return detachedRunContentSnapshot(request, RUN_RESOURCE_LIMITS.requestBytes)
+): JournalModelRequest {
+  const projected: JournalModelRequest = Object.freeze({
+    model: request.model,
+    messages: request.messages,
+    tools: request.tools,
+    toolMode: request.toolMode,
+    streaming: request.streaming,
+    maxOutputTokens: request.maxOutputTokens,
+    reasoning: request.reasoning,
+    ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+    ...(request.topP === undefined ? {} : { topP: request.topP })
+  })
+  return detachedRunContentSnapshot(projected, RUN_RESOURCE_LIMITS.requestBytes)
 }
 
 export function snapshotModelTurnForJournal (turn: ModelTurn): ModelTurn {

@@ -10,7 +10,12 @@ import {
 } from '../../src/agent/contracts/presentation-trace.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
 import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
-import type { ModelAdapter, ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import type {
+  ModelAdapter,
+  ModelRequest,
+  ModelTurn,
+  ProviderRequestMetadata
+} from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import {
   RunAdmission,
@@ -485,11 +490,12 @@ function contractSnapshot () {
   })
 }
 
-function contractRuntime () {
+function contractRuntime (providerRequestMetadata?: ProviderRequestMetadata) {
   const snapshot = contractSnapshot()
   return Object.freeze({
     binding: Object.freeze({
       snapshot,
+      ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata }),
       prepareToolContext: async (): Promise<ToolPreparationContext> => Object.freeze({
         runId: 'contract-run', profile: 'compatible', facts, intent, now: createdAt
       }),
@@ -599,6 +605,43 @@ test('run reference initialization failure cannot strand AgentService shutdown',
   ])
   if (timeout !== undefined) clearTimeout(timeout)
   assert.equal(shutdown, 0)
+})
+
+test('runtime isolation failure stops a new run before engine start or checkpoint creation', async () => {
+  const runStore = new InMemoryRunStore()
+  let engineStarts = 0
+  let releases = 0
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore,
+    admission: {
+      acquire: async () => Object.freeze({
+        ...noOpLease(),
+        release: async () => { releases += 1 }
+      }),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({
+      start: async () => {
+        engineStarts += 1
+        throw new Error('engine must not start')
+      }
+    }),
+    createRuntime: async () => {
+      throw new Error('provider_isolation_unavailable')
+    },
+    generateId: () => 'isolation-unavailable-run',
+    createRunRef: () => 'f'.repeat(32)
+  })
+
+  const outcome = await service.handle(request('isolation-unavailable', '验证隔离失败关闭'))
+
+  assert.equal(outcome.kind, 'failed')
+  assert.equal(engineStarts, 0)
+  assert.equal(releases, 1)
+  assert.equal(await runStore.load('isolation-unavailable-run'), null)
 })
 
 test('terminal session-save failure preserves every completed disposition and committed fact', async () => {
@@ -970,6 +1013,11 @@ test('same-process resume reuses one active request context and creates one fina
     runRef,
     Object.freeze({ kind: 'reply_text', text: '恢复完成' })
   )
+  const providerRequestMetadata = Object.freeze({
+    cacheIsolationId: `gm_g_${'A'.repeat(43)}`
+  })
+  let startedMetadata: ProviderRequestMetadata | undefined
+  let resumedMetadata: ProviderRequestMetadata | undefined
   let monotonic = 200
   const service = new AgentService({
     sessions: contractSessions(),
@@ -981,15 +1029,21 @@ test('same-process resume reuses one active request context and creates one fina
     contextEngine: contractContextEngine(),
     progressPresenter: new RunProgressPresenter(),
     createEngine: () => contractEngine({
-      start: async () => Object.freeze({
-        kind: 'paused' as const,
-        runId,
-        runRef,
-        interruption
-      }),
-      resume: async () => terminal
+      start: async input => {
+        startedMetadata = input.runtime.providerRequestMetadata
+        return Object.freeze({
+          kind: 'paused' as const,
+          runId,
+          runRef,
+          interruption
+        })
+      },
+      resume: async (_runId, binding) => {
+        resumedMetadata = binding?.providerRequestMetadata
+        return terminal
+      }
     }),
-    createRuntime: async () => contractRuntime(),
+    createRuntime: async () => contractRuntime(providerRequestMetadata),
     generateId: () => runId,
     createRunRef: () => runRef,
     monotonicNow: () => monotonic++
@@ -1018,6 +1072,8 @@ test('same-process resume reuses one active request context and creates one fina
     resumed.requestObservationDraft.startedAtMonotonicMs,
     activeContext.startedAtMonotonicMs
   )
+  assert.strictEqual(startedMetadata, providerRequestMetadata)
+  assert.strictEqual(resumedMetadata, providerRequestMetadata)
   assert.equal(await service.resume(runId), null)
 })
 
@@ -1042,6 +1098,10 @@ test('approval recovery defers each admission failure and retries with restart d
   ]
   let recoverCalls = 0
   let releases = 0
+  const recoveredMetadata = Object.freeze({
+    cacheIsolationId: `gm_g_${'B'.repeat(43)}`
+  })
+  let decidedMetadata: ProviderRequestMetadata | undefined
   const service = new AgentService({
     sessions: contractSessions(),
     runStore: new InMemoryRunStore(),
@@ -1060,14 +1120,20 @@ test('approval recovery defers each admission failure and retries with restart d
     progressPresenter: new RunProgressPresenter(),
     createEngine: () => contractEngine({
       loadCheckpoint: async () => checkpoint,
-      decideApproval: async input => completedResult(
-        input.runId,
-        runRef,
-        Object.freeze({ kind: 'reply_text', text: '重启恢复完成' })
-      )
+      decideApproval: async (input, binding) => {
+        decidedMetadata = binding?.providerRequestMetadata
+        return completedResult(
+          input.runId,
+          runRef,
+          Object.freeze({ kind: 'reply_text', text: '重启恢复完成' })
+        )
+      }
     }),
     createRuntime: async () => contractRuntime(),
-    recoverRuntime: async () => contractRuntime()
+    recoverRuntime: async recoveredCheckpoint => {
+      assert.strictEqual(recoveredCheckpoint, checkpoint)
+      return contractRuntime(recoveredMetadata)
+    }
   })
   const decision = Object.freeze({
     runId,
@@ -1103,6 +1169,7 @@ test('approval recovery defers each admission failure and retries with restart d
   assert.equal(completed.requestObservationDraft.sessionLoadDurationMs, 'unavailable')
   assert.equal(completed.requestObservationDraft.sessionSaveDurationMs, 'not_attempted')
   assert.equal(completed.sessionPersistence, 'not_attempted')
+  assert.strictEqual(decidedMetadata, recoveredMetadata)
   assert.equal(recoverCalls, 4)
   assert.equal(releases, 1)
 })

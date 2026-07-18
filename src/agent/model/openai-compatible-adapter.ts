@@ -10,6 +10,7 @@ import {
   ModelProviderError,
   modelProtocolError,
   modelRequestError,
+  parseProviderRequestMetadata,
   type ModelAdapter,
   type ModelFinishReason,
   type ModelMessage,
@@ -55,9 +56,14 @@ const PROFILE_ID = /^[a-z][a-z0-9_.-]{0,63}$/
 const RESERVED_MESSAGE_EXTENSION_KEYS = new Set(['role', 'content', 'tool_calls', 'function_call'])
 const RESERVED_REQUEST_EXTENSION_KEYS = new Set([
   'model', 'messages', 'stream', 'tools', 'functions', 'tool_choice',
-  'max_tokens', 'max_completion_tokens'
+  'max_tokens', 'max_completion_tokens', 'temperature', 'top_p', 'user_id'
+])
+const RESERVED_METADATA_EXTENSION_KEYS = new Set([
+  'model', 'messages', 'stream', 'tools', 'functions', 'tool_choice',
+  'max_tokens', 'max_completion_tokens', 'temperature', 'top_p'
 ])
 const ALLOWED_TOOL_CONTROL_KEYS = new Set(['tools', 'tool_choice'])
+const ALLOWED_REQUEST_METADATA_KEYS = new Set(['user_id'])
 
 const defaultFetch: OpenAIFetch = async (url, init) => {
   const { default: nodeFetch } = await import('node-fetch')
@@ -140,6 +146,15 @@ function assertExtensionKeys (
   reason: string
 ): void {
   if (Object.keys(extensions).some(key => reserved.has(key))) throw modelRequestError(reason)
+}
+
+function assertNoExtensionOverlap (
+  first: Readonly<JsonObject>,
+  second: Readonly<JsonObject>,
+  reason: string
+): void {
+  const firstKeys = new Set(Object.keys(first))
+  if (Object.keys(second).some(key => firstKeys.has(key))) throw modelRequestError(reason)
 }
 
 function wireToolCall (call: Readonly<{
@@ -265,6 +280,9 @@ export function buildImmutableChatRequest (
   }
   if (request.temperature !== undefined) assertFiniteNumber(request.temperature, 'invalid_temperature')
   if (request.topP !== undefined) assertFiniteNumber(request.topP, 'invalid_top_p')
+  const metadata = request.metadata === undefined
+    ? undefined
+    : parseProviderRequestMetadata(request.metadata)
 
   const tools = Object.freeze(request.tools.map(wireToolDefinition))
   if (request.toolMode === 'required' && tools.length === 0) {
@@ -288,6 +306,25 @@ export function buildImmutableChatRequest (
     RESERVED_REQUEST_EXTENSION_KEYS,
     'invalid_request_extensions'
   )
+  const metadataExtensions = profile.encodeRequestMetadata(metadata)
+  assertExtensionKeys(
+    metadataExtensions,
+    RESERVED_METADATA_EXTENSION_KEYS,
+    'invalid_request_metadata_extensions'
+  )
+  if (Object.keys(metadataExtensions).some(key => !ALLOWED_REQUEST_METADATA_KEYS.has(key))) {
+    throw modelRequestError('invalid_request_metadata_extensions')
+  }
+  assertNoExtensionOverlap(
+    requestExtensions,
+    metadataExtensions,
+    'conflicting_request_extensions'
+  )
+  assertNoExtensionOverlap(
+    toolControls,
+    metadataExtensions,
+    'conflicting_request_extensions'
+  )
 
   const tokenField = profile.capabilities.outputTokenField
   const candidate = {
@@ -298,6 +335,7 @@ export function buildImmutableChatRequest (
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.topP === undefined ? {} : { top_p: request.topP }),
     ...requestExtensions,
+    ...metadataExtensions,
     ...toolControls
   }
   if (Object.hasOwn(candidate, 'functions')) throw modelRequestError('legacy_functions_forbidden')
