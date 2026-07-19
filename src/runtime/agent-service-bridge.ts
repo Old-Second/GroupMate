@@ -21,6 +21,7 @@ import type {
   ModelAdapter,
   ProviderRequestMetadata
 } from '../agent/model/model-adapter.js'
+import type { ModelCapabilityOverride } from '../agent/model/model-capability.js'
 import {
   ModelProviderError,
   parseProviderRequestMetadata
@@ -676,6 +677,18 @@ function compatibilityConfig (config: RuntimeConfig) {
       ? { openAiCompatibilityProfile: config.openAiCompatibilityProfile }
       : {}
   )
+}
+
+export function resolveConfiguredModelCapabilityOverride (
+  config: RuntimeConfig
+): ModelCapabilityOverride | undefined {
+  const value = config.apiContextWindowTokens
+  if (value === undefined || value === 0) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+    value < 1 || value > 1_000_000) {
+    throw new TypeError('model context window configuration is invalid')
+  }
+  return Object.freeze({ contextWindowTokens: value })
 }
 
 function providerConfigurationError (reason: string): ModelProviderError {
@@ -1498,6 +1511,7 @@ export function createYunzaiAgentServiceBridge (
   dependencies: YunzaiAgentServiceBridgeDependencies
 ): YunzaiAgentServiceBridge {
   const selected = compatibilityConfig(options.config)
+  const modelCapabilityOverride = resolveConfiguredModelCapabilityOverride(options.config)
   let providerIsolationIdSource: ProviderIsolationIdSource | null = null
   if (selected.profile.cacheIsolation === 'conversation_required') {
     try {
@@ -1612,6 +1626,7 @@ export function createYunzaiAgentServiceBridge (
       memoryStore: new NoopMemoryStore()
     }),
     contextArtifactStore,
+    ...(modelCapabilityOverride === undefined ? {} : { modelCapabilityOverride }),
     progressPresenter,
     createEngine: observer => new RunEngine({
       adapter: dependencies.modelAdapter,

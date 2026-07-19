@@ -547,6 +547,7 @@ export class AgentService {
     #admission;
     #contextEngine;
     #contextArtifactStore;
+    #modelCapabilityOverride;
     #progressPresenter;
     #createRuntime;
     #recoverRuntime;
@@ -572,6 +573,14 @@ export class AgentService {
         this.#admission = options.admission;
         this.#contextEngine = options.contextEngine;
         this.#contextArtifactStore = options.contextArtifactStore;
+        this.#modelCapabilityOverride = options.modelCapabilityOverride === undefined
+            ? undefined
+            : Object.freeze({
+                ...options.modelCapabilityOverride,
+                ...(options.modelCapabilityOverride.usageExtensions === undefined
+                    ? {}
+                    : { usageExtensions: Object.freeze([...options.modelCapabilityOverride.usageExtensions]) })
+            });
         this.#progressPresenter = options.progressPresenter;
         this.#createRuntime = options.createRuntime;
         this.#recoverRuntime = options.recoverRuntime;
@@ -870,6 +879,9 @@ export class AgentService {
                             sessionAddress: request.sessionAddress,
                             deadlineAt: request.deadlineAt,
                             model: request.model,
+                            ...(this.#modelCapabilityOverride === undefined
+                                ? {}
+                                : { modelCapabilityOverride: this.#modelCapabilityOverride }),
                             runtime: binding
                         }, {
                             signal: linked.signal,

@@ -110,6 +110,7 @@
   "bymReasoningEffort": "default",
   "apiStream": false,
   "apiMaxToken": 4096,
+  "apiContextWindowTokens": 0,
   "enableBYM": false,
   "bymRecognizeLeadingAlias": true,
   "bymRate": 5,

@@ -70,6 +70,11 @@
         "data": "apiMaxToken"
       },
       {
+        "type": "number",
+        "label": "上下文窗口 Token（0 为自动）",
+        "data": "apiContextWindowTokens"
+      },
+      {
         "type": "select",
         "label": "思考模式",
         "data": "apiThinkingMode",

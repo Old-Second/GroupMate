@@ -346,6 +346,16 @@ function compatibilityConfig(config) {
         ? { openAiCompatibilityProfile: config.openAiCompatibilityProfile }
         : {});
 }
+export function resolveConfiguredModelCapabilityOverride(config) {
+    const value = config.apiContextWindowTokens;
+    if (value === undefined || value === 0)
+        return undefined;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+        value < 1 || value > 1_000_000) {
+        throw new TypeError('model context window configuration is invalid');
+    }
+    return Object.freeze({ contextWindowTokens: value });
+}
 function providerConfigurationError(reason) {
     return new ModelProviderError({
         code: 'provider_invalid_request',
@@ -1043,6 +1053,7 @@ function createBotAccess(options) {
 }
 export function createYunzaiAgentServiceBridge(options, dependencies) {
     const selected = compatibilityConfig(options.config);
+    const modelCapabilityOverride = resolveConfiguredModelCapabilityOverride(options.config);
     let providerIsolationIdSource = null;
     if (selected.profile.cacheIsolation === 'conversation_required') {
         try {
@@ -1149,6 +1160,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             memoryStore: new NoopMemoryStore()
         }),
         contextArtifactStore,
+        ...(modelCapabilityOverride === undefined ? {} : { modelCapabilityOverride }),
         progressPresenter,
         createEngine: observer => new RunEngine({
             adapter: dependencies.modelAdapter,

@@ -44,6 +44,9 @@ test('provider manifest defines every baseline category with exact source entrie
   assert.ok(providerSurfaceManifest.configFields.openaiCompatible.includes(
     'openAiCompatibilityProfile'
   ))
+  assert.ok(providerSurfaceManifest.configFields.openaiCompatible.includes(
+    'apiContextWindowTokens'
+  ))
   assert.ok(providerSurfaceManifest.uiFields.openaiCompatible.includes(
     'openAiCompatibilityProfile'
   ))

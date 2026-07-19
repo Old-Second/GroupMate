@@ -16,7 +16,10 @@ import { resolvePluginPath } from '../../src/runtime/plugin-context.js'
 import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
 import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import { prepareYunzaiPresentationRequest } from '../../src/runtime/yunzai-request-adapter.js'
-import { resolveYunzaiGroupHistoryCursor } from '../../src/runtime/agent-service-bridge.js'
+import {
+  resolveConfiguredModelCapabilityOverride,
+  resolveYunzaiGroupHistoryCursor
+} from '../../src/runtime/agent-service-bridge.js'
 import {
   createProductionYunzaiAgent,
   getProductionYunzaiAgent,
@@ -332,6 +335,20 @@ test('group history cursor falls back to zero for signed NapCat message identifi
     'adapter-opaque-cursor'
   )
   assert.equal(resolveYunzaiGroupHistoryCursor({}), 0)
+})
+
+test('model context override is parsed once with zero preserving the selected profile', () => {
+  assert.equal(resolveConfiguredModelCapabilityOverride({}), undefined)
+  assert.equal(resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 0 }), undefined)
+  const override = resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 1_000_000 })
+  assert.deepEqual(override, { contextWindowTokens: 1_000_000 })
+  assert.equal(Object.isFrozen(override), true)
+  for (const value of [-1, 1.5, '65536', 1_000_001]) {
+    assert.throws(
+      () => resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: value }),
+      /context window configuration is invalid/
+    )
+  }
 })
 
 test('legacy entry applies the normalized cursor to group history reads', () => {

@@ -4,8 +4,10 @@ import { canonicalSessionKey, parseCanonicalSessionKey } from '../session/conver
 import { parseRunCheckpoint } from './run-checkpoint.js';
 import { acquireAdmissionClaim, redisAdmissionKey, recoverAdmissionClaim, releaseAdmissionClaim } from './redis-run-store.js';
 import { isTerminalRunStatus } from './run-state.js';
-const MAX_ACTIVE_RUNS = 2;
-const MAX_QUEUED_RUNS = 3;
+export const RUN_ADMISSION_LIMITS = Object.freeze({
+    activeRuns: 2,
+    queuedRuns: 3
+});
 const DEFAULT_LEASE_TTL_SECONDS = 600;
 const LEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export class RunAdmissionRejectionError extends AgentError {
@@ -106,7 +108,7 @@ export class RunAdmission {
         });
     }
     #canStart(sessionKey) {
-        return this.#active.size + this.#starting < MAX_ACTIVE_RUNS &&
+        return this.#active.size + this.#starting < RUN_ADMISSION_LIMITS.activeRuns &&
             !this.#activeSessions.has(sessionKey);
     }
     async #tryStart(address, sessionKey, recovery = false) {
@@ -159,7 +161,7 @@ export class RunAdmission {
         }
     }
     async #enqueue(address, sessionKey, recovery, signal) {
-        if (this.#queue.length >= MAX_QUEUED_RUNS)
+        if (this.#queue.length >= RUN_ADMISSION_LIMITS.queuedRuns)
             throw queueFull();
         return await new Promise((resolve, reject) => {
             const waiter = {
@@ -185,7 +187,7 @@ export class RunAdmission {
         this.#draining = true;
         try {
             while (this.#queue.length > 0 &&
-                this.#active.size + this.#starting < MAX_ACTIVE_RUNS) {
+                this.#active.size + this.#starting < RUN_ADMISSION_LIMITS.activeRuns) {
                 const waiter = this.#queue[0];
                 if (waiter === undefined)
                     return;

@@ -36,6 +36,18 @@ test('leaves scalar Guoba values unchanged', () => {
   assert.equal(normalizeGuobaConfigValue('model', 'deepseek-chat'), 'deepseek-chat')
 })
 
+test('normalizes the explicit context window override with zero as profile default', () => {
+  for (const value of [0, 1, 65_536, 1_000_000]) {
+    assert.equal(normalizeGuobaConfigValue('apiContextWindowTokens', value), value)
+  }
+  for (const value of [-1, 1.5, '65536', 1_000_001, Number.NaN]) {
+    assert.throws(
+      () => normalizeGuobaConfigValue('apiContextWindowTokens', value),
+      /模型上下文窗口配置无效/
+    )
+  }
+})
+
 test('normalizes the OpenAI compatibility profile explicitly and fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('openAiCompatibilityProfile', 'standard'), 'standard')
   assert.equal(normalizeGuobaConfigValue('openAiCompatibilityProfile', 'deepseek'), 'deepseek')
@@ -91,5 +103,9 @@ test('disk log saves require restart while ordinary live fields keep the normal 
   assert.equal(
     guobaConfigSaveMessage(['diskLogEnabled'], '观测屏障优先'),
     '观测屏障优先'
+  )
+  assert.equal(
+    guobaConfigSaveMessage(['apiContextWindowTokens']),
+    '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
   )
 })

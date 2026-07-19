@@ -88,6 +88,7 @@ const preservedFields = [
   'openAiBaseUrl',
   'model',
   'apiStream',
+  'apiContextWindowTokens',
   'apiThinkingMode',
   'apiReasoningEffort',
   'azureTTSKey',
@@ -123,6 +124,7 @@ const requiredGuobaFields = [
   'model',
   'apiStream',
   'apiMaxToken',
+  'apiContextWindowTokens',
   'apiThinkingMode',
   'apiReasoningEffort',
   'promptPrefixOverride',
@@ -234,7 +236,7 @@ const expectedGuobaGroups = [
       'toggleMode', 'assistantLabel', 'enablePrivateChat', 'enableRobotAt', 'turnConfirm',
       'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model',
       'promptPrefixOverride', 'temperature',
-      'apiStream', 'apiMaxToken', 'apiThinkingMode', 'apiReasoningEffort',
+      'apiStream', 'apiMaxToken', 'apiContextWindowTokens', 'apiThinkingMode', 'apiReasoningEffort',
       'forwardReasoning', 'forwardToolDetails', 'openAiForceUseReverse', 'enableGroupContext',
       'groupContextLength', 'groupContextTip', 'groupMerge',
       'conversationPreserveTime'
@@ -425,6 +427,25 @@ test('Guoba exposes only explicit standard and DeepSeek compatibility profiles',
   assert.match(field?.bottomHelpMessage ?? '', /重启/)
 })
 
+test('Guoba exposes one bounded restart-only context window override', async () => {
+  const field = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).find(schema => schema.field === 'apiContextWindowTokens')
+  const source = await readSource('utils/config.js')
+  const example = JSON.parse(
+    await readSource('config/config.example.json')
+  ) as Record<string, unknown>
+
+  assert.equal(field?.component, 'InputNumber')
+  assert.deepEqual(field?.componentProps, { min: 0, max: 1_000_000, step: 1 })
+  assert.match(field?.bottomHelpMessage ?? '', /0.*Profile|Profile.*0/)
+  assert.match(field?.bottomHelpMessage ?? '', /512 KiB/)
+  assert.match(field?.bottomHelpMessage ?? '', /256 KiB/)
+  assert.match(field?.bottomHelpMessage ?? '', /重启/)
+  assert.match(source, /^  apiContextWindowTokens: 0,/m)
+  assert.equal(example.apiContextWindowTokens, 0)
+})
+
 test('Guoba accurately marks restart-only and deferred rendering settings', async () => {
   const fields = new Map(buildGuobaSchemas({
     vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
@@ -432,7 +453,7 @@ test('Guoba accurately marks restart-only and deferred rendering settings', asyn
 
   for (const field of [
     'toggleMode', 'apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile',
-    'proxy', 'headless', 'chromePath', 'diskLogEnabled'
+    'apiContextWindowTokens', 'proxy', 'headless', 'chromePath', 'diskLogEnabled'
   ]) {
     assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
   }

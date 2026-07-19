@@ -37,8 +37,10 @@ interface AdmissionWaiter {
   onAbort?: () => void
 }
 
-const MAX_ACTIVE_RUNS = 2
-const MAX_QUEUED_RUNS = 3
+export const RUN_ADMISSION_LIMITS = Object.freeze({
+  activeRuns: 2,
+  queuedRuns: 3
+})
 const DEFAULT_LEASE_TTL_SECONDS = 600
 const LEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
@@ -152,7 +154,7 @@ export class RunAdmission {
   }
 
   #canStart (sessionKey: string): boolean {
-    return this.#active.size + this.#starting < MAX_ACTIVE_RUNS &&
+    return this.#active.size + this.#starting < RUN_ADMISSION_LIMITS.activeRuns &&
       !this.#activeSessions.has(sessionKey)
   }
 
@@ -218,7 +220,7 @@ export class RunAdmission {
     recovery: boolean,
     signal?: AbortSignal
   ): Promise<RunLease> {
-    if (this.#queue.length >= MAX_QUEUED_RUNS) throw queueFull()
+    if (this.#queue.length >= RUN_ADMISSION_LIMITS.queuedRuns) throw queueFull()
     return await new Promise<RunLease>((resolve, reject) => {
       const waiter: AdmissionWaiter = {
         address, sessionKey, recovery, signal, resolve, reject
@@ -241,7 +243,7 @@ export class RunAdmission {
     this.#draining = true
     try {
       while (this.#queue.length > 0 &&
-        this.#active.size + this.#starting < MAX_ACTIVE_RUNS) {
+        this.#active.size + this.#starting < RUN_ADMISSION_LIMITS.activeRuns) {
         const waiter = this.#queue[0]
         if (waiter === undefined) return
         if (waiter.signal?.aborted === true) {

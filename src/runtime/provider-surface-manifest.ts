@@ -75,6 +75,7 @@ export const providerSurfaceManifest = {
       'openAiCompatibilityProfile',
       'model',
       'apiStream',
+      'apiContextWindowTokens',
       'apiThinkingMode',
       'apiReasoningEffort'
     ],
@@ -150,7 +151,13 @@ export const providerSurfaceManifest = {
     azureOpenai: ['azureUrl', 'azureDeploymentName']
   },
   uiFields: {
-    openaiCompatible: ['apiKey', 'openAiBaseUrl', 'openAiCompatibilityProfile', 'model'],
+    openaiCompatible: [
+      'apiKey',
+      'openAiBaseUrl',
+      'openAiCompatibilityProfile',
+      'model',
+      'apiContextWindowTokens'
+    ],
     chatgptWeb: ['apiBaseUrl', 'OpenAiPlatformRefreshToken'],
     bing: ['sydney', 'sydneyReverseProxy', 'bingAiToken'],
     claude: ['claudeApiKey', 'claudeAISessionKey'],

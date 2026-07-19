@@ -103,6 +103,13 @@ export function buildGuobaSchemas ({
     field('temperature', '生成温度', '控制普通回复的随机性；服务端不支持时可能忽略该参数。', 'InputNumber', { min: 0, max: 2, step: 0.1 }),
     field('apiStream', '流式响应', '开启 Chat Completions 流式传输；最终 QQ 回复仍由统一展示层发送。', 'Switch'),
     field('apiMaxToken', '最大输出 Token', '单次模型回复允许使用的最大输出 Token 数。', 'InputNumber', { min: 1 }),
+    field(
+      'apiContextWindowTokens',
+      '模型上下文窗口 Token',
+      '0 表示使用模型 Profile；未知模型使用 32,768 Token 安全默认值。正整数只会缩小已知 Profile 能力，或为未知标准 OpenAI-compatible 模型显式声明窗口，并在新任务创建时冻结；暂停任务恢复时不会重读。大窗口仍受 512 KiB 请求、256 KiB checkpoint、Redis 与内存硬上限约束。修改后必须重启。',
+      'InputNumber',
+      { min: 0, max: 1_000_000, step: 1 }
+    ),
     field('apiThinkingMode', '思考模式', '向支持该扩展的 OpenAI-compatible 服务传递 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
     field('apiReasoningEffort', '思考强度', '向支持该扩展的模型传递 reasoning_effort；默认表示由服务端决定。', 'Select', { options: reasoningEffortOptions }),
     field('forwardReasoning', '转发思考过程', '将兼容服务返回的 reasoning_content 以转发消息展示；可能增加消息数量并暴露模型推理文本。', 'Switch'),

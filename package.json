@@ -22,6 +22,8 @@
     "test:resources:phase6": "pnpm run build && node scripts/measure-phase-6-resources.mjs",
     "test:redis:phase6": "pnpm run build && node scripts/smoke-phase-6-redis.mjs",
     "verify:phase6": "pnpm run build && node scripts/verify-phase-6.mjs",
+    "test:resources:phase7": "pnpm run build && node scripts/measure-phase-7-resources.mjs",
+    "verify:phase7": "pnpm run build && node scripts/verify-phase-7.mjs",
     "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
   "dependencies": {

@@ -28,6 +28,7 @@ export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
   'apiKey',
   'openAiBaseUrl',
   'openAiCompatibilityProfile',
+  'apiContextWindowTokens',
   'proxy',
   'headless',
   'chromePath',
@@ -63,6 +64,14 @@ function splitList (value: unknown, separator: RegExp): string[] {
 }
 
 export function normalizeGuobaConfigValue (key: string, value: unknown): unknown {
+  if (key === 'apiContextWindowTokens') {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+      value < 0 || value > 1_000_000) {
+      throw new TypeError('模型上下文窗口配置无效。')
+    }
+    return value
+  }
+
   if (key === 'observabilityLevel') {
     if (typeof value !== 'string' || !OBSERVABILITY_LEVELS.has(value)) {
       throw new TypeError('可观测性级别配置无效。')

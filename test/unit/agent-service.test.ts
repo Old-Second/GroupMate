@@ -644,6 +644,53 @@ test('runtime isolation failure stops a new run before engine start or checkpoin
   assert.equal(await runStore.load('isolation-unavailable-run'), null)
 })
 
+test('new runs receive the startup-frozen model capability override exactly once', async () => {
+  const runId = 'frozen-model-capability-run'
+  const runRef = 'd'.repeat(32)
+  const usageExtensions: Array<'prompt_cache_hit_tokens' | 'prompt_cache_miss_tokens'> = [
+    'prompt_cache_hit_tokens'
+  ]
+  const override = { contextWindowTokens: 65_536, usageExtensions }
+  let started: Parameters<RunEngine['start']>[0] | undefined
+  const service = new AgentService({
+    sessions: contractSessions(),
+    runStore: new InMemoryRunStore(),
+    admission: {
+      acquire: async () => noOpLease(),
+      recover: async () => noOpLease()
+    },
+    contextEngine: contractContextEngine(),
+    progressPresenter: new RunProgressPresenter(),
+    modelCapabilityOverride: override,
+    createEngine: () => contractEngine({
+      start: async input => {
+        started = input
+        return completedResult(
+          runId,
+          runRef,
+          Object.freeze({ kind: 'reply_text' as const, text: '完成' })
+        )
+      }
+    }),
+    createRuntime: async () => contractRuntime(),
+    generateId: () => runId,
+    createRunRef: () => runRef
+  })
+
+  override.contextWindowTokens = 32_768
+  usageExtensions.push('prompt_cache_miss_tokens')
+
+  const outcome = await service.handle(request('frozen-model-capability', '验证上下文窗口'))
+
+  assert.equal(outcome.kind, 'completed')
+  assert.deepEqual(started?.modelCapabilityOverride, {
+    contextWindowTokens: 65_536,
+    usageExtensions: ['prompt_cache_hit_tokens']
+  })
+  assert.equal(Object.isFrozen(started?.modelCapabilityOverride), true)
+  assert.equal(Object.isFrozen(started?.modelCapabilityOverride?.usageExtensions), true)
+})
+
 test('terminal session-save failure preserves every completed disposition and committed fact', async () => {
   const dispositions: readonly CompletionDisposition[] = Object.freeze([
     Object.freeze({ kind: 'reply_text', text: '保留正文' }),
