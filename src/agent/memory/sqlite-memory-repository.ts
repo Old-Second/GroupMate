@@ -2,25 +2,30 @@ import { createHash } from 'node:crypto'
 import { types as utilTypes } from 'node:util'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import {
+  createMemoryTombstoneV1,
   createMemoryOutboxEventV1,
   type MemoryOutboxEventV1,
   type MemoryProposalV1,
   type MemoryRecordV1,
-  type MemoryRevisionV1
+  type MemoryRevisionV1,
+  type MemoryTombstoneV1
 } from './memory-domain.js'
 import {
   decodeMemoryProposalV1,
   decodeMemoryRevisionV1,
+  decodeMemoryTombstoneV1,
   encodeMemoryOutboxEventV1,
   encodeMemoryProposalV1,
   encodeMemoryRecordV1,
-  encodeMemoryRevisionV1
+  encodeMemoryRevisionV1,
+  encodeMemoryTombstoneV1
 } from './memory-codec.js'
 import {
   inspectMemoryRecord,
   invalidMemoryValue,
   memoryNamespaceRefV1,
   memoryNamespaceWireV1,
+  parseMemoryNamespaceRefV1,
   parseMemoryNamespaceV1,
   type MemoryNamespaceRefV1,
   type MemoryNamespaceV1
@@ -47,6 +52,65 @@ export const MEMORY_OUTBOX_EVENT_ID_HASH_DOMAIN_V1 =
 interface CreateSqliteMemoryRepositoryOptionsV1 {
   readonly database: DatabaseSync
   readonly now: () => string
+}
+
+export interface PurgeExpiredSqliteMemoryRecordsOptionsV1 {
+  readonly database: DatabaseSync
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly now: () => string
+  readonly actorRef: string
+  readonly reasonCode: string
+}
+
+export type PurgeExpiredSqliteMemoryRecordsResultV1 =
+  | {
+      readonly status: 'purged'
+      readonly processedRecords: number
+      readonly hasMore: boolean
+    }
+  | Extract<MemoryRepositoryResultV1, {
+      readonly status: 'capacity' | 'corrupt' | 'unavailable'
+    }>
+
+export interface ScrubDeletedSqliteMemoryNamespaceOptionsV1 {
+  readonly database: DatabaseSync
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly namespaceGeneration: number
+  readonly now: () => string
+}
+
+export type ScrubDeletedSqliteMemoryNamespaceResultV1 =
+  | {
+      readonly status: 'scrubbed'
+      readonly processedAggregates: number
+      readonly hasMore: boolean
+    }
+  | Extract<MemoryRepositoryResultV1, {
+      readonly status: 'corrupt' | 'unavailable'
+    }>
+
+export interface PurgeExpiredSqliteMemoryTombstonesOptionsV1 {
+  readonly database: DatabaseSync
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly now: () => string
+}
+
+export type PurgeExpiredSqliteMemoryTombstonesResultV1 =
+  | {
+      readonly status: 'purged'
+      readonly processedTombstones: number
+      readonly hasMore: boolean
+    }
+  | Extract<MemoryRepositoryResultV1, {
+      readonly status: 'corrupt' | 'unavailable'
+    }>
+
+export interface SqliteMemoryDeletionCheckpointReceiptV1 {
+  readonly schemaVersion: 1
+  readonly logicalDeletion: 'committed'
+  readonly payloadDeletion: 'secure_delete_on' | 'unverified'
+  readonly walCheckpoint: 'truncated' | 'deferred'
+  readonly derivedCleanup: 'queued'
 }
 
 interface NamespaceRowV1 {
@@ -106,6 +170,14 @@ interface TransactionOutcomeV1 {
   readonly result: MemoryRepositoryResultV1
 }
 
+interface RecordForgetMutationV1 {
+  readonly operation: 'record.forget'
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly expectedRevision: number
+  readonly expectedNamespaceGeneration: number
+  readonly tombstone: MemoryTombstoneV1
+}
+
 type SqliteMemoryRepositoryAdapterResultV1 =
   | MemoryRepositoryResultV1
   | {
@@ -120,6 +192,7 @@ class CanonicalMemoryDataErrorV1 extends Error {}
 
 const CURSOR_PREFIX = 'memory-cursor:v1:'
 const RECEIPT_PREFIX = 'memory-receipt:v1:'
+const RETENTION_TOMBSTONE_HASH_DOMAIN_V1 = 'groupmate.memory.retention-tombstone.v1'
 
 function domainHash (domain: string, preimage: string): string {
   return createHash('sha256')
@@ -333,7 +406,7 @@ function storeGlobalUsage (
 }
 
 function mutationReceipt (
-  request: MemoryRepositoryRequestV1,
+  request: MemoryRepositoryRequestV1 | RecordForgetMutationV1,
   generation: number
 ): string {
   let payload: Readonly<Record<string, unknown>>
@@ -689,9 +762,9 @@ function ensureNamespace (
 }
 
 function unchangedResult (
-  request: MemoryRepositoryRequestV1,
+  request: MemoryRepositoryRequestV1 | RecordForgetMutationV1,
   generation: number,
-  value: MemoryProposalV1 | MemoryRecordV1
+  value: MemoryProposalV1 | MemoryRecordV1 | MemoryTombstoneV1
 ): TransactionOutcomeV1 {
   return Object.freeze({
     commit: false,
@@ -704,9 +777,9 @@ function unchangedResult (
 }
 
 function storedResult (
-  request: MemoryRepositoryRequestV1,
+  request: MemoryRepositoryRequestV1 | RecordForgetMutationV1,
   generation: number,
-  value: MemoryProposalV1 | MemoryRecordV1
+  value: MemoryProposalV1 | MemoryRecordV1 | MemoryTombstoneV1
 ): TransactionOutcomeV1 {
   return Object.freeze({
     commit: true,
@@ -1357,6 +1430,352 @@ function revisionCountForMemory (
   return rows.length
 }
 
+function loadTombstone (
+  database: DatabaseSync,
+  namespaceRef: MemoryNamespaceRefV1,
+  generation: number,
+  tombstoneId: string
+): { readonly tombstone: MemoryTombstoneV1; readonly wire: string; readonly wireBytes: number } | null {
+  const row = database.prepare(`
+    SELECT memory_id, deleted_revision, deletion_kind, deleted_at_ms, expires_at_ms,
+           receipt_hash, tombstone_wire, tombstone_wire_bytes
+    FROM tombstones
+    WHERE namespace_ref = ? AND namespace_generation = ? AND tombstone_id = ?
+  `).get(namespaceRef, generation, tombstoneId)
+  if (row === undefined) return null
+  const wire = exactString(rowValue(row, 'tombstone_wire'))
+  const wireBytes = positiveInteger(rowValue(row, 'tombstone_wire_bytes'))
+  if (Buffer.byteLength(wire, 'utf8') !== wireBytes) throw new CanonicalMemoryDataErrorV1()
+  let tombstone: MemoryTombstoneV1
+  try {
+    tombstone = decodeMemoryTombstoneV1(wire)
+  } catch {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+  const memoryId = rowValue(row, 'memory_id')
+  const deletedRevision = rowValue(row, 'deleted_revision')
+  if (tombstone.namespaceRef !== namespaceRef ||
+    tombstone.namespaceGeneration !== generation ||
+    tombstone.tombstoneId !== tombstoneId ||
+    tombstone.memoryId !== (memoryId === null ? null : canonicalMemoryId(memoryId)) ||
+    tombstone.deletedRevision !== (deletedRevision === null
+      ? null
+      : positiveInteger(deletedRevision)) ||
+    tombstone.deletionKind !== exactString(rowValue(row, 'deletion_kind')) ||
+    instantMilliseconds(tombstone.deletedAt) !== exactInteger(rowValue(row, 'deleted_at_ms')) ||
+    instantMilliseconds(tombstone.expiresAt) !== exactInteger(rowValue(row, 'expires_at_ms')) ||
+    tombstone.receiptHash !== exactString(rowValue(row, 'receipt_hash'))) {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+  return Object.freeze({ tombstone, wire, wireBytes })
+}
+
+function insertTombstone (
+  database: DatabaseSync,
+  tombstone: MemoryTombstoneV1,
+  wire: string,
+  wireBytes: number
+): void {
+  database.prepare(`
+    INSERT INTO tombstones(
+      namespace_ref, namespace_generation, tombstone_id, memory_id,
+      deleted_revision, deletion_kind, deleted_at_ms, expires_at_ms,
+      receipt_hash, tombstone_wire, tombstone_wire_bytes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    tombstone.namespaceRef,
+    tombstone.namespaceGeneration,
+    tombstone.tombstoneId,
+    tombstone.memoryId,
+    tombstone.deletedRevision,
+    tombstone.deletionKind,
+    instantMilliseconds(tombstone.deletedAt),
+    instantMilliseconds(tombstone.expiresAt),
+    tombstone.receiptHash,
+    wire,
+    wireBytes
+  )
+}
+
+function recordForgetMutation (
+  database: DatabaseSync,
+  request: RecordForgetMutationV1,
+  nowMs: number
+): TransactionOutcomeV1 {
+  const tombstoneWire = encodeMemoryTombstoneV1(request.tombstone)
+  const existingTombstone = loadTombstone(
+    database,
+    request.namespaceRef,
+    request.tombstone.namespaceGeneration,
+    request.tombstone.tombstoneId
+  )
+  if (existingTombstone !== null) {
+    return existingTombstone.wire === tombstoneWire
+      ? unchangedResult(
+          request,
+          request.tombstone.namespaceGeneration,
+          request.tombstone
+        )
+      : failureOutcome(Object.freeze({
+          status: 'conflict' as const,
+          category: 'idempotency' as const
+        }))
+  }
+  const priorRows = database.prepare(`
+    SELECT tombstone_id
+    FROM tombstones
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+      AND deletion_kind = 'memory_forgotten'
+    ORDER BY tombstone_id ASC
+    LIMIT 2
+  `).all(
+    request.namespaceRef,
+    request.expectedNamespaceGeneration,
+    request.tombstone.memoryId
+  )
+  for (const row of priorRows) {
+    const tombstoneId = exactString(rowValue(row, 'tombstone_id'))
+    if (loadTombstone(
+      database,
+      request.namespaceRef,
+      request.expectedNamespaceGeneration,
+      tombstoneId
+    ) === null) throw new CanonicalMemoryDataErrorV1()
+  }
+  if (priorRows.length > 0) {
+    return failureOutcome(Object.freeze({
+      status: 'conflict' as const,
+      category: 'idempotency' as const
+    }))
+  }
+  const namespace = loadNamespace(database, request.namespaceRef)
+  if (namespace === null || namespace.generation !== request.expectedNamespaceGeneration) {
+    return failureOutcome(Object.freeze({
+      status: 'conflict' as const,
+      category: 'generation' as const
+    }))
+  }
+  const memoryId = request.tombstone.memoryId
+  if (memoryId === null || request.tombstone.deletedRevision !== request.expectedRevision) {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+  const head = loadHead(database, request.namespaceRef, namespace.generation, memoryId)
+  if (head === null || head.revision.revision !== request.expectedRevision) {
+    return failureOutcome(Object.freeze({
+      status: 'conflict' as const,
+      category: 'revision' as const
+    }))
+  }
+  const proposalRows = database.prepare(`
+    SELECT proposal_wire_bytes
+    FROM proposals
+    WHERE namespace_ref = ? AND namespace_generation = ? AND resulting_memory_id = ?
+    ORDER BY proposal_id ASC
+  `).all(request.namespaceRef, namespace.generation, memoryId)
+  const proposalBytes = proposalRows.reduce(
+    (total, row) => total + positiveInteger(rowValue(row, 'proposal_wire_bytes')),
+    0
+  )
+  const revisionRows = database.prepare(`
+    SELECT revision, revision_wire_bytes
+    FROM revisions
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    ORDER BY revision ASC
+    LIMIT 33
+  `).all(request.namespaceRef, namespace.generation, memoryId)
+  if (revisionRows.length === 0 ||
+    revisionRows.length > MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions) {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+  let revisionBytes = 0
+  revisionRows.forEach((row, index) => {
+    if (positiveInteger(rowValue(row, 'revision')) !== index + 1) {
+      throw new CanonicalMemoryDataErrorV1()
+    }
+    revisionBytes += positiveInteger(rowValue(row, 'revision_wire_bytes'))
+  })
+  if (revisionRows.length !== request.expectedRevision) {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+
+  const usage = loadUsage(database, request.namespaceRef, namespace.generation)
+  const global = loadGlobalUsage(database)
+  const tombstoneBytes = Buffer.byteLength(tombstoneWire, 'utf8')
+  const baseUsage: UsageStateV1 = Object.freeze({
+    ...usage,
+    activeMemoryRecords: usage.activeMemoryRecords - 1,
+    retainedRevisionRecords: usage.retainedRevisionRecords - revisionRows.length,
+    tombstoneRecords: usage.tombstoneRecords + 1,
+    canonicalLogicalBytes: usage.canonicalLogicalBytes - proposalBytes - revisionBytes +
+      tombstoneBytes
+  })
+  const baseGlobal: GlobalUsageStateV1 = Object.freeze({
+    ...global,
+    activeMemoryRecords: global.activeMemoryRecords - 1,
+    canonicalLogicalBytes: global.canonicalLogicalBytes - proposalBytes - revisionBytes +
+      tombstoneBytes
+  })
+  if (baseUsage.activeMemoryRecords < 0 || baseUsage.retainedRevisionRecords < 0 ||
+    baseUsage.canonicalLogicalBytes < 0 || baseGlobal.activeMemoryRecords < 0 ||
+    baseGlobal.canonicalLogicalBytes < 0) throw new CanonicalMemoryDataErrorV1()
+  const event = prepareOutboxEvent(
+    nextOutboxSequence(database),
+    request.namespaceRef,
+    namespace.generation,
+    'record',
+    memoryId,
+    request.expectedRevision,
+    'record_forgotten',
+    request.tombstone.deletedAt
+  )
+  const projected = projectedOutboxUsage(baseUsage, baseGlobal, [event])
+  const failure = capacityResult(projected.usage, projected.global)
+  if (failure !== null) return failureOutcome(failure)
+
+  const proposalsDeleted = database.prepare(`
+    DELETE FROM proposals
+    WHERE namespace_ref = ? AND namespace_generation = ? AND resulting_memory_id = ?
+  `).run(request.namespaceRef, namespace.generation, memoryId)
+  if (proposalsDeleted.changes !== proposalRows.length) throw new CanonicalMemoryDataErrorV1()
+  const headDeleted = database.prepare(`
+    DELETE FROM heads
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+      AND current_revision = ?
+  `).run(request.namespaceRef, namespace.generation, memoryId, request.expectedRevision)
+  if (headDeleted.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+  const revisionsDeleted = database.prepare(`
+    DELETE FROM revisions
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+  `).run(request.namespaceRef, namespace.generation, memoryId)
+  if (revisionsDeleted.changes !== revisionRows.length) throw new CanonicalMemoryDataErrorV1()
+  insertTombstone(database, request.tombstone, tombstoneWire, tombstoneBytes)
+  insertOutboxEvent(database, event)
+  storeUsage(database, request.namespaceRef, namespace.generation, projected.usage, nowMs)
+  storeGlobalUsage(database, projected.global, nowMs)
+  return storedResult(request, namespace.generation, request.tombstone)
+}
+
+function namespaceDelete (
+  database: DatabaseSync,
+  request: Extract<MemoryRepositoryRequestV1, { readonly operation: 'namespace.delete' }>,
+  nowMs: number
+): TransactionOutcomeV1 {
+  const nextGeneration = request.expectedNamespaceGeneration + 1
+  const tombstoneWire = encodeMemoryTombstoneV1(request.tombstone)
+  const existingTombstone = loadTombstone(
+    database,
+    request.namespaceRef,
+    nextGeneration,
+    request.tombstone.tombstoneId
+  )
+  if (existingTombstone !== null) {
+    return existingTombstone.wire === tombstoneWire
+      ? unchangedResult(request, nextGeneration, request.tombstone)
+      : failureOutcome(Object.freeze({
+          status: 'conflict' as const,
+          category: 'idempotency' as const
+        }))
+  }
+  const priorRows = database.prepare(`
+    SELECT tombstone_id
+    FROM tombstones
+    WHERE namespace_ref = ? AND namespace_generation = ?
+      AND deletion_kind = 'namespace_deleted'
+    ORDER BY tombstone_id ASC
+    LIMIT 2
+  `).all(request.namespaceRef, nextGeneration)
+  for (const row of priorRows) {
+    const tombstoneId = exactString(rowValue(row, 'tombstone_id'))
+    if (loadTombstone(database, request.namespaceRef, nextGeneration, tombstoneId) === null) {
+      throw new CanonicalMemoryDataErrorV1()
+    }
+  }
+  if (priorRows.length > 0) {
+    return failureOutcome(Object.freeze({
+      status: 'conflict' as const,
+      category: 'idempotency' as const
+    }))
+  }
+  const namespace = loadNamespace(database, request.namespaceRef)
+  if (namespace === null || namespace.generation !== request.expectedNamespaceGeneration) {
+    return failureOutcome(Object.freeze({
+      status: 'conflict' as const,
+      category: 'generation' as const
+    }))
+  }
+  const oldUsage = loadUsage(database, request.namespaceRef, namespace.generation)
+  const global = loadGlobalUsage(database)
+  const tombstoneBytes = Buffer.byteLength(tombstoneWire, 'utf8')
+  const retainedOldUsage: UsageStateV1 = Object.freeze({
+    ...oldUsage,
+    canonicalLogicalBytes: oldUsage.canonicalLogicalBytes - namespace.namespaceWireBytes
+  })
+  const baseNewUsage: UsageStateV1 = Object.freeze({
+    pendingProposalRecords: 0,
+    activeMemoryRecords: 0,
+    retainedRevisionRecords: 0,
+    tombstoneRecords: 1,
+    canonicalLogicalBytes: namespace.namespaceWireBytes + tombstoneBytes,
+    pendingOutboxRecords: 0,
+    outboxLogicalBytes: 0
+  })
+  const baseGlobal: GlobalUsageStateV1 = Object.freeze({
+    ...global,
+    activeMemoryRecords: global.activeMemoryRecords - oldUsage.activeMemoryRecords,
+    canonicalLogicalBytes: global.canonicalLogicalBytes + tombstoneBytes
+  })
+  if (retainedOldUsage.canonicalLogicalBytes < 0 || baseGlobal.activeMemoryRecords < 0) {
+    throw new CanonicalMemoryDataErrorV1()
+  }
+  const event = prepareOutboxEvent(
+    nextOutboxSequence(database),
+    request.namespaceRef,
+    nextGeneration,
+    'namespace',
+    request.namespaceRef,
+    nextGeneration,
+    'namespace_deleted',
+    request.tombstone.deletedAt
+  )
+  const projected = projectedOutboxUsage(baseNewUsage, baseGlobal, [event])
+  const failure = capacityResult(projected.usage, projected.global)
+  if (failure !== null) return failureOutcome(failure)
+
+  const advanced = database.prepare(`
+    UPDATE namespaces
+    SET namespace_generation = ?, updated_at_ms = ?
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(nextGeneration, nowMs, request.namespaceRef, request.expectedNamespaceGeneration)
+  if (advanced.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+  storeUsage(
+    database,
+    request.namespaceRef,
+    request.expectedNamespaceGeneration,
+    retainedOldUsage,
+    nowMs
+  )
+  database.prepare(`
+    INSERT INTO usage(
+      namespace_ref, namespace_generation, pending_proposal_records,
+      active_memory_records, retained_revision_records, tombstone_records,
+      canonical_logical_bytes, pending_outbox_records, outbox_logical_bytes,
+      updated_at_ms
+    ) VALUES (?, ?, 0, 0, 0, ?, ?, ?, ?, ?)
+  `).run(
+    request.namespaceRef,
+    nextGeneration,
+    projected.usage.tombstoneRecords,
+    projected.usage.canonicalLogicalBytes,
+    projected.usage.pendingOutboxRecords,
+    projected.usage.outboxLogicalBytes,
+    nowMs
+  )
+  insertTombstone(database, request.tombstone, tombstoneWire, tombstoneBytes)
+  insertOutboxEvent(database, event)
+  storeGlobalUsage(database, projected.global, nowMs)
+  return storedResult(request, nextGeneration, request.tombstone)
+}
+
 function recordCorrect (
   database: DatabaseSync,
   request: Extract<MemoryRepositoryRequestV1, { readonly operation: 'record.correct' }>,
@@ -1571,6 +1990,52 @@ function runReadTransaction (
   }
 }
 
+type SqliteMemoryMaintenanceFailureV1 = Extract<MemoryRepositoryResultV1, {
+  readonly status: 'corrupt' | 'unavailable'
+}>
+
+interface SqliteMemoryMaintenanceOutcomeV1<T> {
+  readonly commit: boolean
+  readonly result: T
+}
+
+function maintenanceFailure (error: unknown): SqliteMemoryMaintenanceFailureV1 {
+  if (error instanceof CanonicalMemoryDataErrorV1) {
+    return Object.freeze({ status: 'corrupt' as const, category: 'canonical_data' as const })
+  }
+  const failure = unavailableForSqliteError(error)
+  if (failure.status === 'corrupt' || failure.status === 'unavailable') return failure
+  return Object.freeze({
+    status: 'unavailable' as const,
+    category: 'storage' as const,
+    retryable: false
+  })
+}
+
+function runMaintenanceTransaction<T> (
+  database: DatabaseSync,
+  operation: () => SqliteMemoryMaintenanceOutcomeV1<T>
+): T | SqliteMemoryMaintenanceFailureV1 {
+  let transactionStarted = false
+  try {
+    database.exec('BEGIN IMMEDIATE')
+    transactionStarted = true
+    const outcome = operation()
+    database.exec(outcome.commit ? 'COMMIT' : 'ROLLBACK')
+    transactionStarted = false
+    return outcome.result
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        database.exec('ROLLBACK')
+      } catch {
+        // The fixed canonical/storage result remains authoritative.
+      }
+    }
+    return maintenanceFailure(error)
+  }
+}
+
 function proposalLoad (
   database: DatabaseSync,
   request: Extract<MemoryRepositoryRequestV1, { readonly operation: 'proposal.load' }>
@@ -1746,6 +2211,14 @@ function executeAdapter (
       return runImmediateTransaction(database, () => recordCreate(database, request, nowMs))
     case 'record.correct':
       return runImmediateTransaction(database, () => recordCorrect(database, request, nowMs))
+    case 'record.forget':
+      return runImmediateTransaction(database, () => recordForgetMutation(
+        database,
+        request,
+        nowMs
+      ))
+    case 'namespace.delete':
+      return runImmediateTransaction(database, () => namespaceDelete(database, request, nowMs))
     case 'proposal.load':
       return runReadTransaction(database, () => proposalLoad(database, request))
     case 'record.get':
@@ -1754,13 +2227,6 @@ function executeAdapter (
       return runReadTransaction(database, () => recordList(database, request, nowMs))
     case 'usage.get':
       return runReadTransaction(database, () => usageGet(database, request))
-    case 'record.forget':
-    case 'namespace.delete':
-      return Object.freeze({
-        status: 'unavailable' as const,
-        category: 'storage' as const,
-        retryable: false
-      })
   }
 }
 
@@ -1776,5 +2242,419 @@ export function createSqliteMemoryRepositoryV1 (
       request,
       signal
     )
+  })
+}
+
+export function purgeExpiredSqliteMemoryRecordsV1 (
+  optionsValue: PurgeExpiredSqliteMemoryRecordsOptionsV1
+): PurgeExpiredSqliteMemoryRecordsResultV1 {
+  const input = inspectMemoryRecord(optionsValue, [
+    'database', 'namespaceRef', 'now', 'actorRef', 'reasonCode'
+  ])
+  const common = parseOptions({
+    database: input.database as DatabaseSync,
+    now: input.now as () => string
+  })
+  const namespaceRef = parseMemoryNamespaceRefV1(input.namespaceRef)
+  if (!memoryAsciiWithinLimit(input.actorRef, MEMORY_RESOURCE_LIMITS.opaqueIdAsciiBytes) ||
+    !input.actorRef.startsWith('actor:') || input.actorRef.length === 'actor:'.length ||
+    !memoryAsciiWithinLimit(input.reasonCode, MEMORY_RESOURCE_LIMITS.opaqueIdAsciiBytes) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(input.reasonCode)) return invalidMemoryValue()
+  const actorRef = input.actorRef
+  const reasonCode = input.reasonCode
+  const currentTime = nowInstant(common.now)
+  const nowMs = instantMilliseconds(currentTime)
+  return runMaintenanceTransaction<PurgeExpiredSqliteMemoryRecordsResultV1>(
+    common.database,
+    () => {
+      const namespace = loadNamespace(common.database, namespaceRef)
+      if (namespace === null) {
+        return Object.freeze({
+          commit: true,
+          result: Object.freeze({
+            status: 'purged' as const,
+            processedRecords: 0,
+            hasMore: false
+          })
+        })
+      }
+      const rows = common.database.prepare(`
+        SELECT memory_id, current_revision
+        FROM heads
+        WHERE namespace_ref = ? AND namespace_generation = ? AND purge_at_ms <= ?
+        ORDER BY purge_at_ms ASC, memory_id ASC
+        LIMIT 32
+      `).all(namespaceRef, namespace.generation, nowMs)
+      for (const row of rows) {
+        const memoryId = canonicalMemoryId(rowValue(row, 'memory_id'))
+        const revision = positiveInteger(rowValue(row, 'current_revision'))
+        const tombstone = createMemoryTombstoneV1({
+          tombstoneId: `tombstone:retention:${domainHash(
+            RETENTION_TOMBSTONE_HASH_DOMAIN_V1,
+            JSON.stringify({ namespaceRef, generation: namespace.generation, memoryId, revision })
+          )}`,
+          namespaceRef,
+          namespaceGeneration: namespace.generation,
+          memoryId,
+          deletedRevision: revision,
+          deletionKind: 'memory_forgotten',
+          deletedAt: currentTime,
+          deletedByActorRef: actorRef,
+          reasonCode,
+          expiresAt: new Date(nowMs + MEMORY_RESOURCE_LIMITS.tombstoneRetentionMs).toISOString()
+        })
+        const outcome = recordForgetMutation(
+          common.database,
+          Object.freeze({
+            operation: 'record.forget' as const,
+            namespaceRef,
+            expectedRevision: revision,
+            expectedNamespaceGeneration: namespace.generation,
+            tombstone
+          }),
+          nowMs
+        )
+        if (!outcome.commit) {
+          if (outcome.result.status === 'capacity' || outcome.result.status === 'corrupt' ||
+            outcome.result.status === 'unavailable') {
+            return Object.freeze({ commit: false, result: outcome.result })
+          }
+          return Object.freeze({
+            commit: false,
+            result: Object.freeze({
+              status: 'corrupt' as const,
+              category: 'canonical_data' as const
+            })
+          })
+        }
+      }
+      const currentNamespace = loadNamespace(common.database, namespaceRef)
+      const hasMore = currentNamespace !== null && common.database.prepare(`
+        SELECT memory_id
+        FROM heads
+        WHERE namespace_ref = ? AND namespace_generation = ? AND purge_at_ms <= ?
+        ORDER BY purge_at_ms ASC, memory_id ASC
+        LIMIT 1
+      `).get(namespaceRef, currentNamespace.generation, nowMs) !== undefined
+      return Object.freeze({
+        commit: true,
+        result: Object.freeze({
+          status: 'purged' as const,
+          processedRecords: rows.length,
+          hasMore
+        })
+      })
+    }
+  )
+}
+
+function usageIsPhysicallyEmpty (usage: UsageStateV1): boolean {
+  return usage.pendingProposalRecords === 0 && usage.activeMemoryRecords === 0 &&
+    usage.retainedRevisionRecords === 0 && usage.tombstoneRecords === 0 &&
+    usage.canonicalLogicalBytes === 0 && usage.pendingOutboxRecords === 0 &&
+    usage.outboxLogicalBytes === 0
+}
+
+function deleteUsageWhenEmpty (
+  database: DatabaseSync,
+  namespaceRef: MemoryNamespaceRefV1,
+  generation: number,
+  usage: UsageStateV1
+): void {
+  if (!usageIsPhysicallyEmpty(usage)) return
+  const deleted = database.prepare(`
+    DELETE FROM usage
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(namespaceRef, generation)
+  if (deleted.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+}
+
+export function scrubDeletedSqliteMemoryNamespaceV1 (
+  optionsValue: ScrubDeletedSqliteMemoryNamespaceOptionsV1
+): ScrubDeletedSqliteMemoryNamespaceResultV1 {
+  const input = inspectMemoryRecord(optionsValue, [
+    'database', 'namespaceRef', 'namespaceGeneration', 'now'
+  ])
+  const common = parseOptions({
+    database: input.database as DatabaseSync,
+    now: input.now as () => string
+  })
+  const namespaceRef = parseMemoryNamespaceRefV1(input.namespaceRef)
+  if (typeof input.namespaceGeneration !== 'number' ||
+    !Number.isSafeInteger(input.namespaceGeneration) || input.namespaceGeneration <= 0 ||
+    Object.is(input.namespaceGeneration, -0)) return invalidMemoryValue()
+  const generation = input.namespaceGeneration
+  const nowMs = instantMilliseconds(nowInstant(common.now))
+  return runMaintenanceTransaction<ScrubDeletedSqliteMemoryNamespaceResultV1>(
+    common.database,
+    () => {
+      const namespace = loadNamespace(common.database, namespaceRef)
+      if (namespace === null || namespace.generation <= generation) {
+        throw new CanonicalMemoryDataErrorV1()
+      }
+      const usageRow = common.database.prepare(`
+        SELECT namespace_ref FROM usage
+        WHERE namespace_ref = ? AND namespace_generation = ?
+      `).get(namespaceRef, generation)
+      if (usageRow === undefined) {
+        const residual = common.database.prepare(`
+          SELECT proposal_id AS aggregate_id FROM proposals
+          WHERE namespace_ref = ? AND namespace_generation = ?
+          UNION ALL
+          SELECT memory_id AS aggregate_id FROM revisions
+          WHERE namespace_ref = ? AND namespace_generation = ?
+          LIMIT 1
+        `).get(namespaceRef, generation, namespaceRef, generation)
+        if (residual !== undefined) throw new CanonicalMemoryDataErrorV1()
+        return Object.freeze({
+          commit: true,
+          result: Object.freeze({
+            status: 'scrubbed' as const,
+            processedAggregates: 0,
+            hasMore: false
+          })
+        })
+      }
+      const usage = loadUsage(common.database, namespaceRef, generation)
+      const global = loadGlobalUsage(common.database)
+      const proposalRows = common.database.prepare(`
+        SELECT proposal_id, state, proposal_wire_bytes
+        FROM proposals
+        WHERE namespace_ref = ? AND namespace_generation = ?
+        ORDER BY proposal_id ASC
+        LIMIT 32
+      `).all(namespaceRef, generation)
+      let processedAggregates = 0
+      let pendingDeleted = 0
+      let activeDeleted = 0
+      let revisionsDeleted = 0
+      let canonicalBytesDeleted = 0
+
+      if (proposalRows.length > 0) {
+        for (const row of proposalRows) {
+          const proposalId = exactString(rowValue(row, 'proposal_id'))
+          const state = exactString(rowValue(row, 'state'))
+          if (!['pending', 'approved', 'rejected', 'expired'].includes(state)) {
+            throw new CanonicalMemoryDataErrorV1()
+          }
+          if (state === 'pending') pendingDeleted += 1
+          canonicalBytesDeleted += positiveInteger(rowValue(row, 'proposal_wire_bytes'))
+          const deleted = common.database.prepare(`
+            DELETE FROM proposals
+            WHERE namespace_ref = ? AND namespace_generation = ? AND proposal_id = ?
+          `).run(namespaceRef, generation, proposalId)
+          if (deleted.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+        }
+        processedAggregates = proposalRows.length
+      } else {
+        const memoryRows = common.database.prepare(`
+          SELECT memory_id
+          FROM revisions
+          WHERE namespace_ref = ? AND namespace_generation = ?
+          GROUP BY memory_id
+          ORDER BY memory_id ASC
+          LIMIT 32
+        `).all(namespaceRef, generation)
+        for (const row of memoryRows) {
+          const memoryId = canonicalMemoryId(rowValue(row, 'memory_id'))
+          const head = loadHead(common.database, namespaceRef, generation, memoryId)
+          if (head === null) throw new CanonicalMemoryDataErrorV1()
+          const revisionRows = common.database.prepare(`
+            SELECT revision, revision_wire_bytes
+            FROM revisions
+            WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+            ORDER BY revision ASC
+            LIMIT 33
+          `).all(namespaceRef, generation, memoryId)
+          if (revisionRows.length === 0 ||
+            revisionRows.length > MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions ||
+            revisionRows.length !== head.revision.revision) {
+            throw new CanonicalMemoryDataErrorV1()
+          }
+          revisionRows.forEach((revisionRow, index) => {
+            if (positiveInteger(rowValue(revisionRow, 'revision')) !== index + 1) {
+              throw new CanonicalMemoryDataErrorV1()
+            }
+            canonicalBytesDeleted += positiveInteger(
+              rowValue(revisionRow, 'revision_wire_bytes')
+            )
+          })
+          const headDelete = common.database.prepare(`
+            DELETE FROM heads
+            WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+          `).run(namespaceRef, generation, memoryId)
+          if (headDelete.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+          const revisionDelete = common.database.prepare(`
+            DELETE FROM revisions
+            WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+          `).run(namespaceRef, generation, memoryId)
+          if (revisionDelete.changes !== revisionRows.length) {
+            throw new CanonicalMemoryDataErrorV1()
+          }
+          activeDeleted += 1
+          revisionsDeleted += revisionRows.length
+        }
+        processedAggregates = memoryRows.length
+      }
+
+      const nextUsage: UsageStateV1 = Object.freeze({
+        ...usage,
+        pendingProposalRecords: usage.pendingProposalRecords - pendingDeleted,
+        activeMemoryRecords: usage.activeMemoryRecords - activeDeleted,
+        retainedRevisionRecords: usage.retainedRevisionRecords - revisionsDeleted,
+        canonicalLogicalBytes: usage.canonicalLogicalBytes - canonicalBytesDeleted
+      })
+      const nextGlobal: GlobalUsageStateV1 = Object.freeze({
+        ...global,
+        canonicalLogicalBytes: global.canonicalLogicalBytes - canonicalBytesDeleted
+      })
+      if (nextUsage.pendingProposalRecords < 0 || nextUsage.activeMemoryRecords < 0 ||
+        nextUsage.retainedRevisionRecords < 0 || nextUsage.canonicalLogicalBytes < 0 ||
+        nextGlobal.canonicalLogicalBytes < 0) throw new CanonicalMemoryDataErrorV1()
+      storeUsage(common.database, namespaceRef, generation, nextUsage, nowMs)
+      storeGlobalUsage(common.database, nextGlobal, nowMs)
+      deleteUsageWhenEmpty(common.database, namespaceRef, generation, nextUsage)
+      const hasMore = common.database.prepare(`
+        SELECT proposal_id AS aggregate_id FROM proposals
+        WHERE namespace_ref = ? AND namespace_generation = ?
+        UNION ALL
+        SELECT memory_id AS aggregate_id FROM revisions
+        WHERE namespace_ref = ? AND namespace_generation = ?
+        LIMIT 1
+      `).get(namespaceRef, generation, namespaceRef, generation) !== undefined
+      return Object.freeze({
+        commit: true,
+        result: Object.freeze({
+          status: 'scrubbed' as const,
+          processedAggregates,
+          hasMore
+        })
+      })
+    }
+  )
+}
+
+export function purgeExpiredSqliteMemoryTombstonesV1 (
+  optionsValue: PurgeExpiredSqliteMemoryTombstonesOptionsV1
+): PurgeExpiredSqliteMemoryTombstonesResultV1 {
+  const input = inspectMemoryRecord(optionsValue, ['database', 'namespaceRef', 'now'])
+  const common = parseOptions({
+    database: input.database as DatabaseSync,
+    now: input.now as () => string
+  })
+  const namespaceRef = parseMemoryNamespaceRefV1(input.namespaceRef)
+  const nowMs = instantMilliseconds(nowInstant(common.now))
+  return runMaintenanceTransaction<PurgeExpiredSqliteMemoryTombstonesResultV1>(
+    common.database,
+    () => {
+      const namespace = loadNamespace(common.database, namespaceRef)
+      if (namespace === null) {
+        return Object.freeze({
+          commit: true,
+          result: Object.freeze({
+            status: 'purged' as const,
+            processedTombstones: 0,
+            hasMore: false
+          })
+        })
+      }
+      const rows = common.database.prepare(`
+        SELECT namespace_generation, tombstone_id, tombstone_wire_bytes
+        FROM tombstones
+        WHERE namespace_ref = ? AND expires_at_ms <= ?
+        ORDER BY namespace_generation ASC, expires_at_ms ASC, tombstone_id ASC
+        LIMIT 32
+      `).all(namespaceRef, nowMs)
+      const usageByGeneration = new Map<number, UsageStateV1>()
+      let canonicalBytesDeleted = 0
+      for (const row of rows) {
+        const generation = positiveInteger(rowValue(row, 'namespace_generation'))
+        const tombstoneId = exactString(rowValue(row, 'tombstone_id'))
+        const wireBytes = positiveInteger(rowValue(row, 'tombstone_wire_bytes'))
+        const tombstone = loadTombstone(
+          common.database,
+          namespaceRef,
+          generation,
+          tombstoneId
+        )
+        if (tombstone === null || tombstone.wireBytes !== wireBytes) {
+          throw new CanonicalMemoryDataErrorV1()
+        }
+        const usage = usageByGeneration.get(generation) ??
+          loadUsage(common.database, namespaceRef, generation)
+        if (usage.tombstoneRecords <= 0 || usage.canonicalLogicalBytes < wireBytes) {
+          throw new CanonicalMemoryDataErrorV1()
+        }
+        usageByGeneration.set(generation, Object.freeze({
+          ...usage,
+          tombstoneRecords: usage.tombstoneRecords - 1,
+          canonicalLogicalBytes: usage.canonicalLogicalBytes - wireBytes
+        }))
+        canonicalBytesDeleted += wireBytes
+        const deleted = common.database.prepare(`
+          DELETE FROM tombstones
+          WHERE namespace_ref = ? AND namespace_generation = ? AND tombstone_id = ?
+        `).run(namespaceRef, generation, tombstoneId)
+        if (deleted.changes !== 1) throw new CanonicalMemoryDataErrorV1()
+      }
+      const global = loadGlobalUsage(common.database)
+      const nextGlobal: GlobalUsageStateV1 = Object.freeze({
+        ...global,
+        canonicalLogicalBytes: global.canonicalLogicalBytes - canonicalBytesDeleted
+      })
+      if (nextGlobal.canonicalLogicalBytes < 0) throw new CanonicalMemoryDataErrorV1()
+      for (const [generation, usage] of usageByGeneration) {
+        storeUsage(common.database, namespaceRef, generation, usage, nowMs)
+        deleteUsageWhenEmpty(common.database, namespaceRef, generation, usage)
+      }
+      storeGlobalUsage(common.database, nextGlobal, nowMs)
+      const hasMore = common.database.prepare(`
+        SELECT tombstone_id
+        FROM tombstones
+        WHERE namespace_ref = ? AND expires_at_ms <= ?
+        ORDER BY namespace_generation ASC, expires_at_ms ASC, tombstone_id ASC
+        LIMIT 1
+      `).get(namespaceRef, nowMs) !== undefined
+      return Object.freeze({
+        commit: true,
+        result: Object.freeze({
+          status: 'purged' as const,
+          processedTombstones: rows.length,
+          hasMore
+        })
+      })
+    }
+  )
+}
+
+export function checkpointSqliteMemoryDeletionV1 (
+  optionsValue: { readonly database: DatabaseSync }
+): SqliteMemoryDeletionCheckpointReceiptV1 {
+  const input = inspectMemoryRecord(optionsValue, ['database'])
+  const database = input.database
+  if (database === null || typeof database !== 'object' || utilTypes.isProxy(database) ||
+    typeof (database as DatabaseSync).prepare !== 'function' ||
+    typeof (database as DatabaseSync).exec !== 'function') return invalidMemoryValue()
+  let payloadDeletion: SqliteMemoryDeletionCheckpointReceiptV1['payloadDeletion'] =
+    'unverified'
+  try {
+    const row = (database as DatabaseSync).prepare('PRAGMA secure_delete').get()
+    if (row !== undefined && Object.values(row)[0] === 1) payloadDeletion = 'secure_delete_on'
+  } catch {
+    // Logical deletion remains committed even if the invariant cannot be re-read here.
+  }
+  let walCheckpoint: SqliteMemoryDeletionCheckpointReceiptV1['walCheckpoint'] = 'deferred'
+  try {
+    const row = (database as DatabaseSync).prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()
+    if (row !== undefined && rowValue(row, 'busy') === 0) walCheckpoint = 'truncated'
+  } catch {
+    // Checkpoint is deliberately independent from the already committed logical delete.
+  }
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    logicalDeletion: 'committed' as const,
+    payloadDeletion,
+    walCheckpoint,
+    derivedCleanup: 'queued' as const
   })
 }
