@@ -19,6 +19,19 @@ import {
   TRACE_STORE_LIMITS,
   TRACE_SUCCESS_INDEX_KEY
 } from '../../src/runtime/observability/redis-trace-store.js'
+import {
+  MEMORY_HOT_CACHE_COUNTER_FIELDS,
+  MEMORY_HOT_CACHE_KEYS,
+  MEMORY_HOT_CACHE_LUA_MARKER,
+  MEMORY_HOT_CACHE_SCRIPT_VERSION,
+  MEMORY_HOT_CACHE_STATIC_BYTES,
+  memoryHotCacheHeadFieldV1,
+  memoryHotCacheHeadValueV1,
+  memoryHotCacheIndexEntryBytesV1,
+  memoryHotCacheMetadataEntryBytesV1,
+  memoryHotCacheRecordEntryBytesV1
+} from '../../src/agent/memory/redis-memory-hot-cache.js'
+import { MEMORY_RESOURCE_LIMITS } from '../../src/agent/memory/memory-resource-limits.js'
 
 interface FakeRedisEntry {
   readonly value: string
@@ -34,6 +47,14 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   private readonly entries = new Map<string, FakeRedisEntry>()
   private readonly sortedSets = new Map<string, Map<string, number>>()
   private readonly traceLengths = new Map<string, number>()
+  private readonly memoryHotRecords = new Map<string, string>()
+  private readonly memoryHotExpires = new Map<string, number>()
+  private readonly memoryHotLru = new Map<string, number>()
+  private readonly memoryHotMetadata = new Map<string, string>()
+  private memoryHotScriptVersion: string | null = null
+  private memoryHotEvalHook?: (operation: string) => boolean
+  private memoryHotEvalFailure = false
+  private genericExpirySweepVisits = 0
   private readonly pendingGetFailures = new Set<string>()
   private artifactEvalHook?: (operation: string) => boolean
   private artifactTtlComputationHook?: () => void
@@ -84,6 +105,149 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
 
   artifactExpiryForTest (key: string): number | null {
     return this.entries.get(key)?.expiresAtMs ?? null
+  }
+
+  memoryHotSnapshotForTest (): Readonly<{
+    topLevelKeys: readonly string[]
+    records: readonly (readonly [string, string])[]
+    expires: readonly (readonly [string, number])[]
+    lru: readonly (readonly [string, number])[]
+    metadata: readonly (readonly [string, string])[]
+    scriptVersion: string | null
+  }> {
+    const sorted = <T>(value: Map<string, T>): readonly (readonly [string, T])[] => (
+      Object.freeze([...value.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(entry => Object.freeze(entry)))
+    )
+    const hasState = this.memoryHotScriptVersion !== null || this.memoryHotRecords.size > 0 ||
+      this.memoryHotExpires.size > 0 || this.memoryHotLru.size > 0 ||
+      this.memoryHotMetadata.size > 0
+    return Object.freeze({
+      topLevelKeys: hasState ? MEMORY_HOT_CACHE_KEYS : Object.freeze([]),
+      records: sorted(this.memoryHotRecords),
+      expires: sorted(this.memoryHotExpires),
+      lru: sorted(this.memoryHotLru),
+      metadata: sorted(this.memoryHotMetadata),
+      scriptVersion: this.memoryHotScriptVersion
+    })
+  }
+
+  memoryHotExpiryForTest (field: string): number | null {
+    return this.memoryHotExpires.get(field) ?? null
+  }
+
+  memoryHotLruForTest (field: string): number | null {
+    return this.memoryHotLru.get(field) ?? null
+  }
+
+  corruptMemoryHotRecordForTest (field: string, wire: string): void {
+    const current = this.memoryHotRecords.get(field)
+    if (current === undefined) throw new TypeError('memory hot record is missing')
+    const state = this.parseMemoryHotState()
+    if (state === null) throw new TypeError('memory hot metadata is invalid')
+    state.recordEntryBytes += this.bytes(wire) - this.bytes(current)
+    this.memoryHotRecords.set(field, wire)
+    this.saveMemoryHotState(state)
+  }
+
+  replaceMemoryHotRecordForTest (field: string, wire: string, revision: number): void {
+    this.corruptMemoryHotRecordForTest(field, wire)
+    this.memoryHotMetadata.set(
+      memoryHotCacheHeadFieldV1(field),
+      memoryHotCacheHeadValueV1(revision, field)
+    )
+  }
+
+  afterNextMemoryHotEval (callback: (operation: string) => boolean): void {
+    this.memoryHotEvalHook = callback
+  }
+
+  failNextMemoryHotEval (): void {
+    this.memoryHotEvalFailure = true
+  }
+
+  corruptMemoryHotMetadataForTest (field: string, value: string | null): void {
+    if (value === null) this.memoryHotMetadata.delete(field)
+    else this.memoryHotMetadata.set(field, value)
+  }
+
+  setMemoryHotScriptVersionForTest (value: string | null): void {
+    this.memoryHotScriptVersion = value
+  }
+
+  seedMemoryHotEntriesForTest (input: {
+    readonly count: number
+    readonly wireBytes: number | readonly number[]
+    readonly expiresAtMs: number | readonly number[]
+    readonly lruMs: number | readonly number[]
+    readonly allowOverLimit?: boolean
+  }): void {
+    if (!Number.isSafeInteger(input.count) || input.count < 0 || input.count > 2_048) {
+      throw new TypeError('memory hot seed count is invalid')
+    }
+    this.memoryHotRecords.clear()
+    this.memoryHotExpires.clear()
+    this.memoryHotLru.clear()
+    this.memoryHotMetadata.clear()
+    this.memoryHotScriptVersion = null
+    if (!this.initializeMemoryHot()) throw new TypeError('memory hot seed initialization failed')
+    const generationField = `g:${'a'.repeat(64)}`
+    const generationValue = '0000000000000001'
+    this.memoryHotMetadata.set(generationField, generationValue)
+    const state = {
+      recordCount: 0,
+      generationCount: 1,
+      recordEntryBytes: 0,
+      expiryIndexBytes: 0,
+      lruIndexBytes: 0,
+      dynamicMetadataBytes: memoryHotCacheMetadataEntryBytesV1(
+        generationField,
+        generationValue
+      )
+    }
+    const selected = (
+      value: number | readonly number[],
+      index: number
+    ): number => typeof value === 'number' ? value : value[index] ?? Number.NaN
+    for (let index = 0; index < input.count; index += 1) {
+      const field = index.toString(16).padStart(64, '0')
+      const wireLength = selected(input.wireBytes, index)
+      const expiry = selected(input.expiresAtMs, index)
+      const lru = selected(input.lruMs, index)
+      if (!Number.isSafeInteger(wireLength) || wireLength < 0 ||
+        !Number.isSafeInteger(expiry) || !Number.isSafeInteger(lru)) {
+        throw new TypeError('memory hot seed entry is invalid')
+      }
+      const wire = 'x'.repeat(wireLength)
+      const headField = memoryHotCacheHeadFieldV1(field)
+      const headValue = memoryHotCacheHeadValueV1(1, field)
+      this.memoryHotRecords.set(field, wire)
+      this.memoryHotExpires.set(field, expiry)
+      this.memoryHotLru.set(field, lru)
+      this.memoryHotMetadata.set(headField, headValue)
+      state.recordCount += 1
+      state.recordEntryBytes += memoryHotCacheRecordEntryBytesV1(field, wire)
+      state.expiryIndexBytes += memoryHotCacheIndexEntryBytesV1(field)
+      state.lruIndexBytes += memoryHotCacheIndexEntryBytesV1(field)
+      state.dynamicMetadataBytes += memoryHotCacheMetadataEntryBytesV1(headField, headValue)
+    }
+    if (input.allowOverLimit !== true &&
+      this.memoryHotTotalBytes(state) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) {
+      throw new TypeError('memory hot seed exceeds logical bytes')
+    }
+    this.saveMemoryHotState(state)
+  }
+
+  seedUnrelatedKeysForTest (count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0) throw new TypeError('unrelated key count is invalid')
+    for (let index = 0; index < count; index += 1) {
+      this.entries.set(`UNRELATED:${index}`, { value: 'x' })
+    }
+  }
+
+  genericExpirySweepVisitsForTest (): number {
+    return this.genericExpirySweepVisits
   }
 
   seedTraceForTest (input: {
@@ -164,7 +328,6 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     keys: string[]
     arguments: string[]
   }): Promise<unknown> {
-    this.purgeAllExpired()
     const marker = script.split('\n', 1)[0] ?? ''
     const operation = options.arguments[0] ?? ''
     this.evalCalls.push({
@@ -172,6 +335,17 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       operation,
       argumentBytes: options.arguments.map(value => this.bytes(value))
     })
+    if (marker === MEMORY_HOT_CACHE_LUA_MARKER) {
+      if (this.memoryHotEvalFailure) {
+        this.memoryHotEvalFailure = false
+        throw new Error('fake memory hot eval failure')
+      }
+      const result = this.evalMemoryHot(operation, options.keys, options.arguments)
+      const hook = this.memoryHotEvalHook
+      if (hook?.(operation) === true) this.memoryHotEvalHook = undefined
+      return result
+    }
+    this.purgeAllExpired()
     if (marker === CONTEXT_ARTIFACT_STORE_LUA_MARKER) {
       const result = this.evalArtifact(operation, options.keys, options.arguments)
       const hook = this.artifactEvalHook
@@ -423,6 +597,531 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     }
 
     return 'invalid_operation'
+  }
+
+  private evalMemoryHot (
+    operation: string,
+    keys: readonly string[],
+    args: readonly string[]
+  ): unknown {
+    if (keys.length !== MEMORY_HOT_CACHE_KEYS.length ||
+      keys.some((key, index) => key !== MEMORY_HOT_CACHE_KEYS[index])) {
+      throw new TypeError('invalid memory hot keys')
+    }
+    if (operation === 'put') {
+      if (!this.initializeMemoryHot()) return 'version'
+      const state = this.parseMemoryHotState()
+      if (state === null) return 'metadata'
+      const field = args[1]
+      const generationField = args[2]
+      const headField = args[3]
+      const generationRaw = args[4]
+      const revisionRaw = args[5]
+      const wire = args[6]
+      const validUntilMs = Number(args[7])
+      if (field === undefined || generationField === undefined || headField === undefined ||
+        generationRaw === undefined || revisionRaw === undefined || wire === undefined ||
+        !/^\d{16}$/.test(generationRaw) || !/^\d{16}$/.test(revisionRaw) ||
+        !Number.isSafeInteger(validUntilMs)) return 'metadata'
+      const generation = Number(generationRaw)
+      const revision = Number(revisionRaw)
+      const currentTime = this.now()
+      if (validUntilMs <= currentTime) return 'expired'
+      let removed = this.cleanupExpiredMemoryHot(state, currentTime, 32)
+      if (removed < 0) return 'metadata'
+      const fenceRaw = this.memoryHotMetadata.get(generationField)
+      if (fenceRaw !== undefined) {
+        if (!this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+        const fence = Number(fenceRaw)
+        if (fence > generation) return 'stale'
+        if (fence < generation) this.memoryHotMetadata.set(generationField, generationRaw)
+      } else {
+        if (state.generationCount >= MEMORY_RESOURCE_LIMITS.deploymentNamespaces) return 'capacity'
+        const generationBytes = memoryHotCacheMetadataEntryBytesV1(
+          generationField,
+          generationRaw
+        )
+        while (this.memoryHotTotalBytes(state) + generationBytes >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes && removed < 32) {
+          const evicted = this.evictOldestMemoryHot(state, field)
+          if (evicted < 0) return 'metadata'
+          if (evicted === 0) break
+          removed += evicted
+        }
+        if (this.memoryHotTotalBytes(state) + generationBytes >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        this.memoryHotMetadata.set(generationField, generationRaw)
+        state.generationCount += 1
+        state.dynamicMetadataBytes += generationBytes
+        this.saveMemoryHotState(state)
+      }
+      const expectedHead = `${revisionRaw}|${field}`
+      const existing = this.memoryHotRecords.get(field)
+      const existingHead = this.memoryHotMetadata.get(headField)
+      if (existing !== undefined) {
+        if (!this.validMemoryHotHead(existingHead, field) ||
+          !this.memoryHotExpires.has(field) || !this.memoryHotLru.has(field)) return 'metadata'
+        const existingRevision = Number(existingHead.slice(0, 16))
+        if (existingRevision > revision) return 'stale'
+        if (existingRevision === revision) {
+          if (existing !== wire) return 'conflict'
+          this.memoryHotLru.set(field, currentTime)
+          this.saveMemoryHotState(state)
+          return 'unchanged'
+        }
+        const projectedRecordBytes = state.recordEntryBytes - this.bytes(existing) + this.bytes(wire)
+        const projectedMetadataBytes = state.dynamicMetadataBytes - this.bytes(existingHead) +
+          this.bytes(expectedHead)
+        let nextRecordBytes = projectedRecordBytes
+        let nextMetadataBytes = projectedMetadataBytes
+        while (this.memoryHotTotalBytes({
+          ...state,
+          recordEntryBytes: nextRecordBytes,
+          dynamicMetadataBytes: nextMetadataBytes
+        }) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes && removed < 32) {
+          const evicted = this.evictOldestMemoryHot(state, field)
+          if (evicted < 0) return 'metadata'
+          if (evicted === 0) break
+          removed += evicted
+          nextRecordBytes = state.recordEntryBytes - this.bytes(existing) + this.bytes(wire)
+          nextMetadataBytes = state.dynamicMetadataBytes - this.bytes(existingHead) +
+            this.bytes(expectedHead)
+        }
+        if (this.memoryHotTotalBytes({
+          ...state,
+          recordEntryBytes: nextRecordBytes,
+          dynamicMetadataBytes: nextMetadataBytes
+        }) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        this.memoryHotRecords.set(field, wire)
+        this.memoryHotMetadata.set(headField, expectedHead)
+        this.memoryHotExpires.set(field, currentTime + MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs)
+        this.memoryHotLru.set(field, currentTime)
+        state.recordEntryBytes = nextRecordBytes
+        state.dynamicMetadataBytes = nextMetadataBytes
+        this.saveMemoryHotState(state)
+        return 'stored'
+      }
+      if (existingHead !== undefined || this.memoryHotExpires.has(field) ||
+        this.memoryHotLru.has(field)) return 'metadata'
+      const projected = {
+        ...state,
+        recordCount: state.recordCount + 1,
+        recordEntryBytes: state.recordEntryBytes + memoryHotCacheRecordEntryBytesV1(field, wire),
+        expiryIndexBytes: state.expiryIndexBytes + memoryHotCacheIndexEntryBytesV1(field),
+        lruIndexBytes: state.lruIndexBytes + memoryHotCacheIndexEntryBytesV1(field),
+        dynamicMetadataBytes: state.dynamicMetadataBytes +
+          memoryHotCacheMetadataEntryBytesV1(headField, expectedHead)
+      }
+      while ((projected.recordCount > MEMORY_RESOURCE_LIMITS.redisHotRecords ||
+        this.memoryHotTotalBytes(projected) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) &&
+        removed < 32) {
+        const evicted = this.evictOldestMemoryHot(state, field)
+        if (evicted < 0) return 'metadata'
+        if (evicted === 0) break
+        removed += evicted
+        projected.recordCount = state.recordCount + 1
+        projected.recordEntryBytes = state.recordEntryBytes +
+          memoryHotCacheRecordEntryBytesV1(field, wire)
+        projected.expiryIndexBytes = state.expiryIndexBytes +
+          memoryHotCacheIndexEntryBytesV1(field)
+        projected.lruIndexBytes = state.lruIndexBytes + memoryHotCacheIndexEntryBytesV1(field)
+        projected.dynamicMetadataBytes = state.dynamicMetadataBytes +
+          memoryHotCacheMetadataEntryBytesV1(headField, expectedHead)
+      }
+      if (projected.recordCount > MEMORY_RESOURCE_LIMITS.redisHotRecords ||
+        this.memoryHotTotalBytes(projected) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) {
+        return 'capacity'
+      }
+      this.memoryHotRecords.set(field, wire)
+      this.memoryHotExpires.set(field, currentTime + MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs)
+      this.memoryHotLru.set(field, currentTime)
+      this.memoryHotMetadata.set(headField, expectedHead)
+      this.saveMemoryHotState(projected)
+      return 'stored'
+    }
+
+    if (operation === 'namespace_invalidate' && !this.initializeMemoryHot()) return 'version'
+    if (this.memoryHotScriptVersion === null && this.memoryHotEmpty()) return 'missing'
+    const state = this.parseMemoryHotState()
+    if (state === null) return 'metadata'
+
+    if (operation === 'usage') {
+      const fixed = (value: number): string => String(value).padStart(16, '0')
+      return [
+        'usage',
+        fixed(state.recordCount),
+        fixed(state.generationCount),
+        fixed(state.recordEntryBytes),
+        fixed(state.expiryIndexBytes),
+        fixed(state.lruIndexBytes),
+        fixed(state.dynamicMetadataBytes),
+        fixed(MEMORY_HOT_CACHE_STATIC_BYTES),
+        fixed(this.memoryHotTotalBytes(state))
+      ]
+    }
+
+    if (operation === 'record_invalidate') {
+      const field = args[1]
+      const generationField = args[2]
+      const headField = args[3]
+      const generationRaw = args[4]
+      const deletedRevisionRaw = args[5]
+      if (field === undefined || generationField === undefined || headField === undefined ||
+        generationRaw === undefined || deletedRevisionRaw === undefined) return 'metadata'
+      const fenceRaw = this.memoryHotMetadata.get(generationField)
+      if (fenceRaw !== undefined && !this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+      if (fenceRaw !== generationRaw) return 'unchanged'
+      const wire = this.memoryHotRecords.get(field)
+      if (wire === undefined) {
+        return this.memoryHotMetadata.has(headField) || this.memoryHotExpires.has(field) ||
+          this.memoryHotLru.has(field) ? 'metadata' : 'unchanged'
+      }
+      const headValue = this.memoryHotMetadata.get(headField)
+      if (!this.validMemoryHotHead(headValue, field)) {
+        return 'metadata'
+      }
+      if (headValue.slice(0, 16) > deletedRevisionRaw) return 'unchanged'
+      return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
+        ? 'invalidated'
+        : 'metadata'
+    }
+
+    if (operation === 'namespace_invalidate') {
+      const generationField = args[1]
+      const deletedRaw = args[2]
+      const nextRaw = args[3]
+      if (generationField === undefined || deletedRaw === undefined || nextRaw === undefined) {
+        return 'metadata'
+      }
+      const fenceRaw = this.memoryHotMetadata.get(generationField)
+      if (fenceRaw !== undefined && !this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+      if (fenceRaw !== undefined && fenceRaw >= nextRaw) return 'unchanged'
+      if (fenceRaw === undefined) {
+        if (state.generationCount >= MEMORY_RESOURCE_LIMITS.deploymentNamespaces) return 'capacity'
+        const generationBytes = memoryHotCacheMetadataEntryBytesV1(generationField, nextRaw)
+        let removed = this.cleanupExpiredMemoryHot(state, this.now(), 32)
+        if (removed < 0) return 'metadata'
+        while (this.memoryHotTotalBytes(state) + generationBytes >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes && removed < 32) {
+          const evicted = this.evictOldestMemoryHot(state, '')
+          if (evicted < 0) return 'metadata'
+          if (evicted === 0) break
+          removed += evicted
+        }
+        if (this.memoryHotTotalBytes(state) + generationBytes >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        state.generationCount += 1
+        state.dynamicMetadataBytes += generationBytes
+      } else if (fenceRaw > deletedRaw) {
+        return 'unchanged'
+      }
+      this.memoryHotMetadata.set(generationField, nextRaw)
+      this.saveMemoryHotState(state)
+      return 'invalidated'
+    }
+
+    if (operation === 'peek') {
+      const field = args[1]
+      const generationField = args[2]
+      const headField = args[3]
+      const generationRaw = args[4]
+      const expectedHead = args[5]
+      if (field === undefined || generationField === undefined || headField === undefined ||
+        generationRaw === undefined || expectedHead === undefined) return 'metadata'
+      const fenceRaw = this.memoryHotMetadata.get(generationField)
+      if (fenceRaw === undefined) return 'missing'
+      if (!this.validMemoryHotFixed(fenceRaw) ||
+        !this.validMemoryHotHead(expectedHead, field)) return 'metadata'
+      if (fenceRaw > generationRaw) return 'stale'
+      if (fenceRaw < generationRaw) return 'missing'
+      const wire = this.memoryHotRecords.get(field)
+      if (wire === undefined) {
+        if (this.memoryHotMetadata.has(headField) || this.memoryHotExpires.has(field) ||
+          this.memoryHotLru.has(field)) return 'metadata'
+        return 'missing'
+      }
+      const headValue = this.memoryHotMetadata.get(headField)
+      if (!this.validMemoryHotHead(headValue, field) ||
+        !this.memoryHotLru.has(field)) return 'metadata'
+      if (headValue !== expectedHead) {
+        return headValue.slice(0, 16) > expectedHead.slice(0, 16) ? 'stale' : 'mismatch'
+      }
+      const expiry = this.memoryHotExpires.get(field)
+      if (expiry === undefined) return 'metadata'
+      if (expiry <= this.now()) {
+        return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
+          ? 'expired'
+          : 'metadata'
+      }
+      if (this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes) {
+        return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
+          ? 'corrupt'
+          : 'metadata'
+      }
+      return ['candidate', wire]
+    }
+
+    if (operation === 'confirm_hit') {
+      const field = args[1]
+      const generationField = args[2]
+      const headField = args[3]
+      const generationRaw = args[4]
+      const expectedHead = args[5]
+      const wire = args[6]
+      const validUntilMs = Number(args[7])
+      if (field === undefined || generationField === undefined || headField === undefined ||
+        generationRaw === undefined || expectedHead === undefined || wire === undefined) {
+        return 'metadata'
+      }
+      const fenceRaw = this.memoryHotMetadata.get(generationField)
+      const headValue = this.memoryHotMetadata.get(headField)
+      if (!this.validMemoryHotFixed(fenceRaw) ||
+        !this.validMemoryHotHead(headValue, field) ||
+        !this.validMemoryHotHead(expectedHead, field)) return 'metadata'
+      if (fenceRaw !== generationRaw) return 'stale'
+      if (headValue !== expectedHead ||
+        this.memoryHotRecords.get(field) !== wire) return 'mismatch'
+      const expiry = this.memoryHotExpires.get(field)
+      if (expiry === undefined || !this.memoryHotLru.has(field)) return 'metadata'
+      const currentTime = this.now()
+      if (expiry <= currentTime || !Number.isSafeInteger(validUntilMs) ||
+        validUntilMs <= currentTime) {
+        return this.removeMemoryHotRecord(state, field, wire, headField, expectedHead)
+          ? 'expired'
+          : 'metadata'
+      }
+      this.memoryHotLru.set(field, currentTime)
+      return 'hit'
+    }
+
+    if (operation === 'delete_corrupt') {
+      const field = args[1]
+      const headField = args[2]
+      const wire = args[3]
+      if (field === undefined || headField === undefined || wire === undefined) return 'metadata'
+      if (this.memoryHotRecords.get(field) !== wire) return 'unchanged'
+      const headValue = this.memoryHotMetadata.get(headField)
+      if (!this.validMemoryHotHead(headValue, field)) return 'metadata'
+      return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
+        ? 'invalidated'
+        : 'metadata'
+    }
+    return 'invalid_operation'
+  }
+
+  private initializeMemoryHot (): boolean {
+    if (this.memoryHotScriptVersion !== null) {
+      return this.memoryHotScriptVersion === MEMORY_HOT_CACHE_SCRIPT_VERSION
+    }
+    if (!this.memoryHotEmpty()) return false
+    this.memoryHotScriptVersion = MEMORY_HOT_CACHE_SCRIPT_VERSION
+    for (const field of Object.values(MEMORY_HOT_CACHE_COUNTER_FIELDS)) {
+      this.memoryHotMetadata.set(field, '0000000000000000')
+    }
+    return true
+  }
+
+  private memoryHotEmpty (): boolean {
+    return this.memoryHotRecords.size === 0 && this.memoryHotExpires.size === 0 &&
+      this.memoryHotLru.size === 0 && this.memoryHotMetadata.size === 0
+  }
+
+  private parseMemoryHotState (): {
+    recordCount: number
+    generationCount: number
+    recordEntryBytes: number
+    expiryIndexBytes: number
+    lruIndexBytes: number
+    dynamicMetadataBytes: number
+  } | null {
+    if (this.memoryHotScriptVersion !== MEMORY_HOT_CACHE_SCRIPT_VERSION) return null
+    const value = (field: string): number | null => {
+      const raw = this.memoryHotMetadata.get(field)
+      if (raw === undefined || !/^\d{16}$/.test(raw)) return null
+      const parsed = Number(raw)
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+    }
+    const recordCount = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.recordCount)
+    const generationCount = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.generationCount)
+    const recordEntryBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.recordEntryBytes)
+    const expiryIndexBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.expiryIndexBytes)
+    const lruIndexBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.lruIndexBytes)
+    const dynamicMetadataBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.dynamicMetadataBytes)
+    if (recordCount === null || generationCount === null || recordEntryBytes === null ||
+      expiryIndexBytes === null || lruIndexBytes === null || dynamicMetadataBytes === null) {
+      return null
+    }
+    const state = {
+      recordCount,
+      generationCount,
+      recordEntryBytes,
+      expiryIndexBytes,
+      lruIndexBytes,
+      dynamicMetadataBytes
+    }
+    if (recordCount > MEMORY_RESOURCE_LIMITS.redisHotRecords ||
+      generationCount > MEMORY_RESOURCE_LIMITS.deploymentNamespaces ||
+      expiryIndexBytes !== recordCount * 80 ||
+      lruIndexBytes !== recordCount * 80 ||
+      dynamicMetadataBytes !== recordCount * 147 + generationCount * 82 ||
+      recordEntryBytes < recordCount * 64 ||
+      recordEntryBytes > recordCount * (64 + MEMORY_RESOURCE_LIMITS.recordWireBytes) ||
+      this.memoryHotRecords.size !== recordCount || this.memoryHotExpires.size !== recordCount ||
+      this.memoryHotLru.size !== recordCount ||
+      this.memoryHotMetadata.size !== 6 + recordCount + generationCount ||
+      this.memoryHotTotalBytes(state) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return null
+    return state
+  }
+
+  private saveMemoryHotState (state: {
+    recordCount: number
+    generationCount: number
+    recordEntryBytes: number
+    expiryIndexBytes: number
+    lruIndexBytes: number
+    dynamicMetadataBytes: number
+  }): void {
+    const fixed = (value: number): string => String(value).padStart(16, '0')
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.recordCount,
+      fixed(state.recordCount)
+    )
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.generationCount,
+      fixed(state.generationCount)
+    )
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.recordEntryBytes,
+      fixed(state.recordEntryBytes)
+    )
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.expiryIndexBytes,
+      fixed(state.expiryIndexBytes)
+    )
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.lruIndexBytes,
+      fixed(state.lruIndexBytes)
+    )
+    this.memoryHotMetadata.set(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.dynamicMetadataBytes,
+      fixed(state.dynamicMetadataBytes)
+    )
+  }
+
+  private memoryHotTotalBytes (state: {
+    recordEntryBytes: number
+    expiryIndexBytes: number
+    lruIndexBytes: number
+    dynamicMetadataBytes: number
+  }): number {
+    return MEMORY_HOT_CACHE_STATIC_BYTES + state.recordEntryBytes + state.expiryIndexBytes +
+      state.lruIndexBytes + state.dynamicMetadataBytes
+  }
+
+  private validMemoryHotFixed (value: string | undefined): value is string {
+    return value !== undefined && /^\d{16}$/.test(value)
+  }
+
+  private validMemoryHotHead (value: string | undefined, field: string): value is string {
+    return value !== undefined && /^[0-9]{16}\|[0-9a-f]{64}$/.test(value) &&
+      value.slice(17) === field
+  }
+
+  private removeMemoryHotRecord (
+    state: {
+      recordCount: number
+      generationCount: number
+      recordEntryBytes: number
+      expiryIndexBytes: number
+      lruIndexBytes: number
+      dynamicMetadataBytes: number
+    },
+    field: string,
+    wire: string,
+    headField: string,
+    headValue: string
+  ): boolean {
+    if (this.memoryHotRecords.get(field) !== wire ||
+      this.memoryHotMetadata.get(headField) !== headValue ||
+      !this.memoryHotExpires.has(field) || !this.memoryHotLru.has(field)) return false
+    const projected = {
+      ...state,
+      recordCount: state.recordCount - 1,
+      recordEntryBytes: state.recordEntryBytes - memoryHotCacheRecordEntryBytesV1(field, wire),
+      expiryIndexBytes: state.expiryIndexBytes - memoryHotCacheIndexEntryBytesV1(field),
+      lruIndexBytes: state.lruIndexBytes - memoryHotCacheIndexEntryBytesV1(field),
+      dynamicMetadataBytes: state.dynamicMetadataBytes -
+        memoryHotCacheMetadataEntryBytesV1(headField, headValue)
+    }
+    if (Object.values(projected).some(value => !Number.isSafeInteger(value) || value < 0)) {
+      return false
+    }
+    this.memoryHotRecords.delete(field)
+    this.memoryHotExpires.delete(field)
+    this.memoryHotLru.delete(field)
+    this.memoryHotMetadata.delete(headField)
+    this.saveMemoryHotState(projected)
+    Object.assign(state, projected)
+    return true
+  }
+
+  private cleanupExpiredMemoryHot (
+    state: {
+      recordCount: number
+      generationCount: number
+      recordEntryBytes: number
+      expiryIndexBytes: number
+      lruIndexBytes: number
+      dynamicMetadataBytes: number
+    },
+    currentTime: number,
+    limit: number
+  ): number {
+    const victims = [...this.memoryHotExpires.entries()]
+      .filter(([, score]) => score <= currentTime)
+      .sort((left, right) => left[1] - right[1] || (left[0] < right[0] ? -1 : 1))
+      .slice(0, limit)
+    for (const [field] of victims) {
+      if (!this.removeMemoryHotVictim(state, field)) return -1
+    }
+    return victims.length
+  }
+
+  private evictOldestMemoryHot (
+    state: {
+      recordCount: number
+      generationCount: number
+      recordEntryBytes: number
+      expiryIndexBytes: number
+      lruIndexBytes: number
+      dynamicMetadataBytes: number
+    },
+    skipField: string
+  ): number {
+    const field = [...this.memoryHotLru.entries()]
+      .filter(([candidate]) => candidate !== skipField)
+      .sort((left, right) => left[1] - right[1] || (left[0] < right[0] ? -1 : 1))[0]?.[0]
+    if (field === undefined) return 0
+    return this.removeMemoryHotVictim(state, field) ? 1 : -1
+  }
+
+  private removeMemoryHotVictim (
+    state: {
+      recordCount: number
+      generationCount: number
+      recordEntryBytes: number
+      expiryIndexBytes: number
+      lruIndexBytes: number
+      dynamicMetadataBytes: number
+    },
+    field: string
+  ): boolean {
+    if (!/^[0-9a-f]{64}$/.test(field)) return false
+    const wire = this.memoryHotRecords.get(field)
+    const headField = memoryHotCacheHeadFieldV1(field)
+    const headValue = this.memoryHotMetadata.get(headField)
+    if (wire === undefined || !this.validMemoryHotHead(headValue, field)) return false
+    return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
   }
 
   private evalRunMigration (keys: string[], args: string[]): string {
@@ -953,6 +1652,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   private purgeAllExpired (): void {
-    for (const key of this.entries.keys()) this.purgeExpired(key)
+    for (const key of this.entries.keys()) {
+      this.genericExpirySweepVisits += 1
+      this.purgeExpired(key)
+    }
   }
 }
