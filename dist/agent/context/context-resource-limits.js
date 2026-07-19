@@ -8,7 +8,7 @@ export const CONTEXT_ARTIFACT_RESOURCE_LIMITS = Object.freeze({
     minimumRemainingLifetimeMs: 1,
     maximumExpiryHorizonMs: 86_400_000,
     reconcileScanCount: 128,
-    maxReconcileScanCalls: 256,
+    maxReconcileScanCalls: 2_048,
     maxReconcileDataKeys: 129,
     maxMetadataCasAttempts: 4,
     metadataBytes: 64

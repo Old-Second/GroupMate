@@ -47,11 +47,35 @@ class ReconcileConflictRedis extends FakeRedis {
 }
 
 class ReconcileIncompleteRedis extends FakeRedis {
+  scanAttempts = 0
+
   override async scan (_cursor: number, _options: { MATCH: string; COUNT: number }): Promise<{
     cursor: number
     keys: string[]
   }> {
+    this.scanAttempts += 1
     return { cursor: 1, keys: [] }
+  }
+}
+
+class LargeSharedKeyspaceRedis extends FakeRedis {
+  readonly #keyspaceSize: number
+
+  constructor (keyspaceSize: number) {
+    super(() => NOW)
+    this.#keyspaceSize = keyspaceSize
+  }
+
+  override async scan (cursor: number, options: { MATCH: string; COUNT: number }): Promise<{
+    cursor: number
+    keys: string[]
+  }> {
+    this.scanCalls.push({ cursor, ...options })
+    const nextCursor = cursor + options.COUNT
+    return {
+      cursor: nextCursor >= this.#keyspaceSize ? 0 : nextCursor,
+      keys: []
+    }
   }
 }
 
@@ -277,6 +301,10 @@ test('metadata and bounded reconcile failures keep distinct body-free store code
   assert.deepEqual(await store(incompleteRedis).putIfAbsent(source, NOW + 600_000), {
     status: 'unavailable', code: 'reconcile_incomplete'
   })
+  assert.equal(
+    incompleteRedis.scanAttempts,
+    CONTEXT_ARTIFACT_RESOURCE_LIMITS.maxReconcileScanCalls
+  )
 
   const invalidLuaRedis = new InvalidArtifactLuaRedis(() => NOW)
   const invalid = await store(invalidLuaRedis).putIfAbsent(source, NOW + 600_000)
@@ -307,6 +335,26 @@ test('bounded reconcile repairs missing, stale and corrupt body-free metadata', 
   const third = artifact('after-expiry')
   assert.deepEqual(readyArtifact(await repository.putIfAbsent(third, now + 600_000)), third)
   assert.match(await redis.get(CONTEXT_ARTIFACT_METADATA_KEY) ?? '', /^1\|1\|\d+$/)
+})
+
+test('bounded reconcile completes inside a large shared Redis keyspace', async () => {
+  const redis = new LargeSharedKeyspaceRedis(96_000)
+  const source = artifact('large-shared-keyspace')
+
+  assert.deepEqual(
+    readyArtifact(await store(redis).putIfAbsent(source, NOW + 600_000)),
+    source
+  )
+  assert.equal(redis.scanCalls.length, 750)
+  assert.equal(redis.scanCalls.length > 256, true)
+  assert.equal(
+    redis.scanCalls.length <= CONTEXT_ARTIFACT_RESOURCE_LIMITS.maxReconcileScanCalls,
+    true
+  )
+  assert.equal(redis.scanCalls.every(call => (
+    call.MATCH === `${CONTEXT_ARTIFACT_STORE_NAMESPACE}*` &&
+    call.COUNT === CONTEXT_ARTIFACT_RESOURCE_LIMITS.reconcileScanCount
+  )), true)
 })
 
 test('all missing reads share one bounded reconcile wave per store', async () => {
@@ -471,7 +519,7 @@ test('resource limits preserve exact boundaries and reject the 129th namespace k
     minimumRemainingLifetimeMs: 1,
     maximumExpiryHorizonMs: 86_400_000,
     reconcileScanCount: 128,
-    maxReconcileScanCalls: 256,
+    maxReconcileScanCalls: 2_048,
     maxReconcileDataKeys: 129,
     maxMetadataCasAttempts: 4,
     metadataBytes: 64
