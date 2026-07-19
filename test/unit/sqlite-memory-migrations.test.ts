@@ -376,8 +376,35 @@ test('sqlite memory v1 schema is strict, generation-bound and has no FTS objects
     assert.deepEqual(tablePrimaryKey(memory.database, 'proposals'), [
       'namespace_ref', 'namespace_generation', 'proposal_id'
     ])
+    const proposalColumns = memory.database.prepare("PRAGMA table_info('proposals')").all()
+      .map(row => String(row.name))
+    assert.ok(proposalColumns.includes('resulting_memory_id'))
+    assert.ok(proposalColumns.includes('resulting_revision'))
+    assert.ok(proposalColumns.includes('resulting_revision_hash'))
+    const proposalSql = String(
+      applicationRows.find(row => row.name === 'proposals')?.sql
+    )
+    assert.match(proposalSql, /resulting_revision\s+IS\s+NULL\s+OR\s+resulting_revision\s*=\s*1/i)
+    assert.match(proposalSql, /ON\s+DELETE\s+NO\s+ACTION\s+DEFERRABLE\s+INITIALLY\s+DEFERRED/i)
+    const proposalIndexes = memory.database.prepare("PRAGMA index_list('proposals')").all()
+    assert.ok(proposalIndexes.some(row => (
+      JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
+      JSON.stringify([
+        { name: 'namespace_ref', descending: 0 },
+        { name: 'namespace_generation', descending: 0 },
+        { name: 'resulting_memory_id', descending: 0 },
+        { name: 'resulting_revision', descending: 0 },
+        { name: 'proposal_id', descending: 0 }
+      ])
+    )), 'proposals must index the approved memory binding')
     assert.deepEqual(tablePrimaryKey(memory.database, 'revisions'), [
       'namespace_ref', 'namespace_generation', 'memory_id', 'revision'
+    ])
+    assert.deepEqual(foreignKeyColumns(memory.database, 'proposals', 'revisions'), [
+      { from: 'namespace_ref', to: 'namespace_ref' },
+      { from: 'namespace_generation', to: 'namespace_generation' },
+      { from: 'resulting_memory_id', to: 'memory_id' },
+      { from: 'resulting_revision', to: 'revision' }
     ])
     assert.deepEqual(tablePrimaryKey(memory.database, 'revision_payloads'), [
       'namespace_ref', 'namespace_generation', 'memory_id', 'revision'

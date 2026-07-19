@@ -319,7 +319,9 @@ function repositoryReply (request: MemoryRepositoryRequestV1): unknown {
     case 'record.list': return deepFreezeFixture({
       status: 'page',
       records: [memoryRecordFixture()],
-      nextCursor: request.cursor === CURSOR ? NEXT_CURSOR : CURSOR
+      nextCursor: request.cursor === CURSOR ? NEXT_CURSOR : CURSOR,
+      corruptRecords: 0,
+      corruptRefs: []
     })
     case 'record.correct': return mutationResult(request.nextRevision.record)
     case 'record.forget': return mutationResult(request.tombstone)
@@ -602,6 +604,30 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
             createdAt: FIXTURE_TIMES.observedAt
           }))
         },
+        {
+          ...approved,
+          initialRevision: initialRevisionFixture(memoryRecordFixture({
+            validity: deepFreezeFixture({ state: 'uncertain', validFrom: null })
+          }))
+        },
+        {
+          ...approved,
+          initialRevision: initialRevisionFixture(memoryRecordFixture({
+            supersedes: deepFreezeFixture([FIXTURE_IDS.relatedMemoryId])
+          }))
+        },
+        {
+          ...approved,
+          initialRevision: initialRevisionFixture(memoryRecordFixture({
+            consent: deepFreezeFixture({
+              state: 'owner_policy',
+              approvedByActorRef: FIXTURE_IDS.actorRef,
+              evidenceSourceId: null,
+              policyRef: FIXTURE_IDS.policyRef,
+              approvedAt: FIXTURE_TIMES.confirmedAt
+            })
+          }))
+        },
         { ...create, initialRevision: correctedRevisionFixture() },
         { ...correct, nextRevision: initialRevisionFixture() },
         {
@@ -630,6 +656,7 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
         { status: 'unchanged', value: record, receipt: RECEIPT },
         { status: 'conflict', category: 'revision' },
         { status: 'capacity', category: 'active_records' },
+        { status: 'capacity', category: 'namespaces' },
         { status: 'corrupt', category: 'canonical_data' },
         { status: 'unavailable', category: 'busy', retryable: true }
       ] as const
@@ -675,6 +702,23 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
       assert.deepEqual(await replaced.execute(request), {
         status: 'corrupt',
         category: 'adapter_contract'
+      })
+
+      const usageRequest = repositoryRequests(access.capability, access.namespaceRef)[9]
+      const listRequest = repositoryRequests(access.capability, access.namespaceRef)[5]
+      assert.ok(usageRequest)
+      assert.ok(listRequest)
+      const absentUsage = factory.repository({
+        now: () => NOW,
+        execute: async () => ({ status: 'not_found' })
+      })
+      assert.deepEqual(await absentUsage.execute(usageRequest), { status: 'not_found' })
+      const invalidCursor = factory.repository({
+        now: () => NOW,
+        execute: async () => ({ status: 'invalid_cursor' })
+      })
+      assert.deepEqual(await invalidCursor.execute({ ...listRequest, cursor: CURSOR }), {
+        status: 'invalid_cursor'
       })
     })
 
@@ -807,6 +851,7 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
         { ...base, cursor: 64 },
         { ...base, offset: 64 },
         { ...base, limit: MEMORY_RESOURCE_LIMITS.listPageRecords + 1 },
+        { ...base, maxWireBytes: MEMORY_RESOURCE_LIMITS.recordWireBytes + 1 },
         { ...base, maxWireBytes: MEMORY_RESOURCE_LIMITS.listPageWireBytes + 1 }
       ]) await assert.rejects(validPort.execute(invalid), TypeError)
       assert.equal(calls, 1)
@@ -819,7 +864,9 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
             { length: MEMORY_RESOURCE_LIMITS.listPageRecords + 1 },
             () => memoryRecordFixture()
           ),
-          nextCursor: null
+          nextCursor: null,
+          corruptRecords: 0,
+          corruptRefs: []
         })
       })
       assert.deepEqual(await tooMany.execute(base), {
@@ -827,18 +874,26 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
         category: 'adapter_contract'
       })
 
-      const oneRecordBytes = Buffer.byteLength(JSON.stringify([memoryRecordFixture()]), 'utf8')
+      const byteHeavyRecords = Array.from({ length: 16 }, (_, index) => (
+        memoryRecordFixture({ memoryId: `memory:page-byte-${index + 1}` })
+      ))
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(byteHeavyRecords), 'utf8') >
+        MEMORY_RESOURCE_LIMITS.recordWireBytes + 2
+      )
       const tooManyBytes = factory.repository({
         now: () => NOW,
         execute: async () => ({
           status: 'page',
-          records: [memoryRecordFixture()],
-          nextCursor: null
+          records: byteHeavyRecords,
+          nextCursor: null,
+          corruptRecords: 0,
+          corruptRefs: []
         })
       })
       assert.deepEqual(await tooManyBytes.execute({
         ...base,
-        maxWireBytes: oneRecordBytes - 1
+        maxWireBytes: MEMORY_RESOURCE_LIMITS.recordWireBytes + 2
       }), {
         status: 'corrupt',
         category: 'adapter_contract'
@@ -846,7 +901,13 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
 
       const emptyContinuation = factory.repository({
         now: () => NOW,
-        execute: async () => ({ status: 'page', records: [], nextCursor: CURSOR })
+        execute: async () => ({
+          status: 'page',
+          records: [],
+          nextCursor: CURSOR,
+          corruptRecords: 0,
+          corruptRefs: []
+        })
       })
       assert.deepEqual(await emptyContinuation.execute(base), {
         status: 'corrupt',
@@ -858,13 +919,63 @@ export function registerMemoryPortContract (factory: MemoryPortContractFactory):
         execute: async () => ({
           status: 'page',
           records: [memoryRecordFixture()],
-          nextCursor: CURSOR
+          nextCursor: CURSOR,
+          corruptRecords: 0,
+          corruptRefs: []
         })
       })
       assert.deepEqual(await cursorLoop.execute({ ...base, cursor: CURSOR }), {
         status: 'corrupt',
         category: 'adapter_contract'
       })
+
+      const corruptOnly = factory.repository({
+        now: () => NOW,
+        execute: async () => ({
+          status: 'page',
+          records: [],
+          nextCursor: NEXT_CURSOR,
+          corruptRecords: 1,
+          corruptRefs: [NEXT_CURSOR]
+        })
+      })
+      assert.deepEqual(await corruptOnly.execute(base), {
+        status: 'page',
+        records: [],
+        nextCursor: NEXT_CURSOR,
+        corruptRecords: 1,
+        corruptRefs: [NEXT_CURSOR],
+        wireBytes: 2
+      })
+
+      for (const malformedPage of [
+        { status: 'page', records: [], nextCursor: null },
+        {
+          status: 'page', records: [], nextCursor: null,
+          corruptRecords: -1, corruptRefs: []
+        },
+        {
+          status: 'page', records: [], nextCursor: null,
+          corruptRecords: 1, corruptRefs: []
+        },
+        {
+          status: 'page', records: [], nextCursor: null,
+          corruptRecords: 2, corruptRefs: [NEXT_CURSOR, NEXT_CURSOR]
+        },
+        {
+          status: 'page', records: [], nextCursor: null,
+          corruptRecords: 1, corruptRefs: [`memory-cursor:v2:${'a'.repeat(64)}`]
+        }
+      ]) {
+        const malformed = factory.repository({
+          now: () => NOW,
+          execute: async () => malformedPage
+        })
+        assert.deepEqual(await malformed.execute(base), {
+          status: 'corrupt',
+          category: 'adapter_contract'
+        })
+      }
     })
   })
 

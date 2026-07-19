@@ -79,10 +79,28 @@ const SCHEMA_OBJECTS_V1: readonly SqliteSchemaObjectV1[] = Object.freeze([
   state TEXT NOT NULL CHECK(state IN ('pending', 'approved', 'rejected', 'expired')),
   proposed_at_ms INTEGER NOT NULL CHECK(proposed_at_ms >= 0),
   decided_at_ms INTEGER CHECK(decided_at_ms IS NULL OR decided_at_ms >= proposed_at_ms),
+  resulting_memory_id TEXT CHECK(
+    resulting_memory_id IS NULL OR length(resulting_memory_id) BETWEEN 1 AND 128
+  ),
+  resulting_revision INTEGER CHECK(
+    resulting_revision IS NULL OR resulting_revision = 1
+  ),
+  resulting_revision_hash TEXT CHECK(
+    resulting_revision_hash IS NULL OR (${HASH_CHECK('resulting_revision_hash')})
+  ),
   proposal_wire TEXT NOT NULL CHECK(length(proposal_wire) > 0),
   proposal_wire_bytes INTEGER NOT NULL CHECK(proposal_wire_bytes > 0),
+  CHECK(
+    (state = 'approved' AND resulting_memory_id IS NOT NULL AND
+      resulting_revision IS NOT NULL AND resulting_revision_hash IS NOT NULL) OR
+    (state != 'approved' AND resulting_memory_id IS NULL AND
+      resulting_revision IS NULL AND resulting_revision_hash IS NULL)
+  ),
   PRIMARY KEY(namespace_ref, namespace_generation, proposal_id),
-  FOREIGN KEY(namespace_ref) REFERENCES namespaces(namespace_ref) ON DELETE CASCADE
+  FOREIGN KEY(namespace_ref) REFERENCES namespaces(namespace_ref) ON DELETE CASCADE,
+  FOREIGN KEY(namespace_ref, namespace_generation, resulting_memory_id, resulting_revision)
+    REFERENCES revisions(namespace_ref, namespace_generation, memory_id, revision)
+    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
 ) STRICT, WITHOUT ROWID`
   }),
   Object.freeze({
@@ -239,6 +257,14 @@ ON proposals(namespace_ref ASC, namespace_generation ASC, state ASC, proposed_at
     tableName: 'revisions',
     sql: `CREATE UNIQUE INDEX memory_revisions_hash_v1
 ON revisions(namespace_ref ASC, namespace_generation ASC, revision_hash ASC)`
+  }),
+  Object.freeze({
+    type: 'index' as const,
+    name: 'memory_proposals_resulting_memory_v1',
+    tableName: 'proposals',
+    sql: `CREATE INDEX memory_proposals_resulting_memory_v1
+ON proposals(namespace_ref ASC, namespace_generation ASC, resulting_memory_id ASC,
+  resulting_revision ASC, proposal_id ASC)`
   }),
   Object.freeze({
     type: 'index' as const,

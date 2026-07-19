@@ -128,11 +128,14 @@ export type MemoryRepositoryResultV1 =
     }
   | { readonly status: 'found'; readonly value: MemoryProposalV1 | MemoryRecordV1 }
   | { readonly status: 'not_found' }
+  | { readonly status: 'invalid_cursor' }
   | {
       readonly status: 'page'
       readonly records: readonly MemoryRecordV1[]
       readonly nextCursor: string | null
       readonly wireBytes: number
+      readonly corruptRecords: number
+      readonly corruptRefs: readonly string[]
     }
   | { readonly status: 'usage'; readonly value: MemoryRepositoryUsageV1 }
   | {
@@ -146,6 +149,7 @@ export type MemoryRepositoryResultV1 =
         | 'active_records'
         | 'retained_revisions'
         | 'tombstones'
+        | 'namespaces'
         | 'canonical_bytes'
         | 'outbox_records'
         | 'outbox_bytes'
@@ -258,7 +262,7 @@ function canonicalValuesEqual (left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-function approvalBindsInitialRevision (
+export function memoryApprovalBindsInitialRevisionV1 (
   proposal: MemoryProposalV1,
   revision: MemoryRevisionV1,
   namespaceRef: MemoryNamespaceRefV1,
@@ -266,6 +270,10 @@ function approvalBindsInitialRevision (
 ): boolean {
   const decision = proposal.decision
   const record = revision.record
+  const consentEvidenceIsBound = record.consent.state === 'explicit'
+    ? record.consent.evidenceSourceId !== null && record.consent.policyRef === null &&
+      proposal.sources.some(source => source.sourceId === record.consent.evidenceSourceId)
+    : record.consent.evidenceSourceId === null && record.consent.policyRef !== null
   return proposal.state === 'approved' && decision !== null &&
     revision.operation === 'created' && revision.revision === 1 &&
     record.namespaceRef === namespaceRef &&
@@ -284,6 +292,12 @@ function approvalBindsInitialRevision (
     record.consent.approvedAt === decision.decidedAt &&
     record.createdAt === decision.decidedAt &&
     record.confirmedAt === decision.decidedAt &&
+    record.updatedAt === decision.decidedAt &&
+    record.validity.state === 'current' &&
+    record.validity.validFrom === proposal.observedAt &&
+    record.supersedes.length === 0 &&
+    record.deletionState === 'active' &&
+    consentEvidenceIsBound &&
     revision.changedByActorRef === decision.decidedByActorRef &&
     revision.changedAt === decision.decidedAt &&
     revision.reason === decision.reason
@@ -363,7 +377,7 @@ function parseMemoryRepositoryRequestV1 (value: unknown): MemoryRepositoryReques
         ? null
         : parseWireCheckedRevision(input.initialRevision)
       if ((nextProposal.state === 'approved' && (initialRevision === null ||
-        !approvalBindsInitialRevision(
+        !memoryApprovalBindsInitialRevisionV1(
           nextProposal,
           initialRevision,
           namespaceRef,
@@ -429,6 +443,12 @@ function parseMemoryRepositoryRequestV1 (value: unknown): MemoryRepositoryReques
       const { input, capability, namespaceRef } = parseRequestBase(value, [
         ...shared, 'cursor', 'limit', 'maxWireBytes'
       ])
+      const maxWireBytes = positiveInteger(
+        input.maxWireBytes,
+        MEMORY_RESOURCE_LIMITS.listPageWireBytes
+      )
+      if (maxWireBytes < MEMORY_RESOURCE_LIMITS.recordWireBytes +
+        Buffer.byteLength('[]', 'utf8')) return invalidMemoryValue()
       return Object.freeze({
         schemaVersion: 1 as const,
         operation,
@@ -436,10 +456,7 @@ function parseMemoryRepositoryRequestV1 (value: unknown): MemoryRepositoryReques
         namespaceRef,
         cursor: opaqueCursor(input.cursor),
         limit: positiveInteger(input.limit, MEMORY_RESOURCE_LIMITS.listPageRecords),
-        maxWireBytes: positiveInteger(
-          input.maxWireBytes,
-          MEMORY_RESOURCE_LIMITS.listPageWireBytes
-        )
+        maxWireBytes
       })
     }
     case 'record.correct': {
@@ -587,11 +604,25 @@ function parsePageResult (
   value: unknown,
   request: Extract<MemoryRepositoryRequestV1, { readonly operation: 'record.list' }>
 ): MemoryRepositoryResultV1 {
-  const input = inspectMemoryRecord(value, ['status', 'records', 'nextCursor'])
+  const input = inspectMemoryRecord(value, [
+    'status', 'records', 'nextCursor', 'corruptRecords', 'corruptRefs'
+  ])
   if (input.status !== 'page') return invalidMemoryValue()
   const records = inspectMemoryArray(input.records, MEMORY_RESOURCE_LIMITS.listPageRecords)
     .map(parseMemoryRecordV1)
-  if (records.length > request.limit || records.some(record => (
+  const corruptRecords = nonnegativeInteger(input.corruptRecords)
+  const corruptRefs = inspectMemoryArray(
+    input.corruptRefs,
+    MEMORY_RESOURCE_LIMITS.listPageRecords
+  ).map(value => {
+    const cursor = opaqueCursor(value)
+    if (cursor === null) return invalidMemoryValue()
+    return cursor
+  })
+  if (records.length + corruptRecords > request.limit ||
+    corruptRecords !== corruptRefs.length ||
+    new Set(corruptRefs).size !== corruptRefs.length ||
+    corruptRefs.includes(request.cursor ?? '') || records.some(record => (
     record.namespaceRef !== request.namespaceRef
   )) || new Set(records.map(record => record.memoryId)).size !== records.length) {
     return invalidMemoryValue()
@@ -601,13 +632,15 @@ function parsePageResult (
   if (wireBytes > request.maxWireBytes ||
     wireBytes > MEMORY_RESOURCE_LIMITS.listPageWireBytes) return invalidMemoryValue()
   const nextCursor = opaqueCursor(input.nextCursor)
-  if ((records.length === 0 && nextCursor !== null) ||
+  if ((records.length === 0 && corruptRecords === 0 && nextCursor !== null) ||
     (nextCursor !== null && nextCursor === request.cursor)) return invalidMemoryValue()
   return Object.freeze({
     status: 'page' as const,
     records: Object.freeze(records),
     nextCursor,
-    wireBytes
+    wireBytes,
+    corruptRecords,
+    corruptRefs: Object.freeze(corruptRefs)
   })
 }
 
@@ -650,7 +683,8 @@ function parseRepositoryResult (
   signalAborted: boolean
 ): MemoryRepositoryResultV1 {
   const discriminator = inspectMemoryRecord(value, ['status'], [
-    'value', 'receipt', 'records', 'nextCursor', 'wireBytes', 'category', 'retryable'
+    'value', 'receipt', 'records', 'nextCursor', 'wireBytes', 'corruptRecords',
+    'corruptRefs', 'category', 'retryable'
   ])
   const status = discriminator.status
 
@@ -668,7 +702,15 @@ function parseRepositoryResult (
   }
   if (status === 'not_found') {
     inspectMemoryRecord(value, ['status'])
-    if (request.operation !== 'proposal.load' && request.operation !== 'record.get') {
+    if (request.operation !== 'proposal.load' && request.operation !== 'record.get' &&
+      request.operation !== 'usage.get') {
+      return invalidMemoryValue()
+    }
+    return Object.freeze({ status })
+  }
+  if (status === 'invalid_cursor') {
+    inspectMemoryRecord(value, ['status'])
+    if (request.operation !== 'record.list' || request.cursor === null) {
       return invalidMemoryValue()
     }
     return Object.freeze({ status })
@@ -701,6 +743,7 @@ function parseRepositoryResult (
         'active_records',
         'retained_revisions',
         'tombstones',
+        'namespaces',
         'canonical_bytes',
         'outbox_records',
         'outbox_bytes'
