@@ -298,10 +298,7 @@ readonly Phase7bMemoryProcessSample[]
 interface VerifyPhase7bMemoryOptions {
   readonly samples?: unknown
   readonly wiringAudit?: (projectRoot: string) => Promise<Phase7bMemoryWiringAudit>
-  readonly securityAudit?: (
-    projectRoot: string,
-    options: { readonly skipSourceDistCheck: true }
-  ) => Promise<Phase7SecurityAuditResult>
+  readonly securityAudit?: (projectRoot: string) => Promise<Phase7SecurityAuditResult>
 }
 
 function exactRecord (value: unknown, label: string): Record<string, unknown> {
@@ -1546,7 +1543,7 @@ export async function verifyPhase7bMemory (
   const securityAudit = options.securityAudit ?? auditPhase7SecurityBoundaries
   let security: Phase7SecurityAuditResult | null = null
   try {
-    security = await securityAudit(root, { skipSourceDistCheck: true })
+    security = await securityAudit(root)
   } catch {
     security = null
   }

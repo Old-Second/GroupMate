@@ -326,14 +326,19 @@ test('Guoba and example config expose no long-term memory enable surface', async
   assert.deepEqual(Object.keys(config).filter(field => forbidden.has(field)), [])
 })
 
-test('Phase 7B verification entry stays on test-dist until Task 11', async () => {
+test('Phase 7B verification entry runs the built Task 11 artifact', async () => {
   const script = await readFile(path.join(PROJECT_ROOT, 'scripts/verify-phase-7b.mjs'), 'utf8')
-  assert.match(script, /^import \{ main \} from '\.\.\/\.test-dist\/src\/verification\/phase-7b-memory-report\.js'\nawait main\(\)\n?$/)
+  assert.match(script, /^import \{ main \} from '\.\.\/dist\/verification\/phase-7b-memory-report\.js'\nawait main\(\)\n?$/)
+  const report = await readFile(path.join(
+    PROJECT_ROOT,
+    'src/verification/phase-7b-memory-report.ts'
+  ), 'utf8')
+  assert.doesNotMatch(report, /skipSourceDistCheck/)
+  assert.match(report, /security = await securityAudit\(root\)/)
   const pkg = JSON.parse(await readFile(path.join(PROJECT_ROOT, 'package.json'), 'utf8')) as {
     readonly scripts?: Readonly<Record<string, string>>
   }
   assert.equal(pkg.scripts?.['verify:phase7b'],
-    'pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7b.mjs')
-  assert.equal(pkg.scripts?.['verify:phase7b']?.includes('build'), false)
-  assert.equal(pkg.scripts?.['verify:phase7b']?.includes('dist/verification'), false)
+    'pnpm run build && pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7b.mjs')
+  assert.equal(pkg.scripts?.['verify:phase7b']?.includes('build'), true)
 })
