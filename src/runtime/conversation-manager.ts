@@ -58,6 +58,13 @@ function identifier (value: unknown, label: string): string {
   return text
 }
 
+function senderDisplayName (event: ConversationCommandEvent): string | undefined {
+  for (const value of [event.sender?.card, event.sender?.nickname]) {
+    if (typeof value === 'string' && value.trim().length > 0) return value
+  }
+  return undefined
+}
+
 export function resolveConversationCommandAddress (
   event: ConversationCommandEvent,
   groupMerge: boolean,
@@ -183,12 +190,11 @@ export async function joinConversation (
     input.event.sender?.user_id ?? input.event.user_id,
     'userId'
   )
+  const displayName = senderDisplayName(input.event)
   try {
     await input.bridge.fork(source, destination, {
       userId,
-      ...(input.event.sender?.card === undefined && input.event.sender?.nickname === undefined
-        ? {}
-        : { displayName: input.event.sender.card ?? input.event.sender.nickname })
+      ...(displayName === undefined ? {} : { displayName })
     }, input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds })
     return { message: `加入${name}的对话成功`, quote: false, success: true }
   } catch (error) {

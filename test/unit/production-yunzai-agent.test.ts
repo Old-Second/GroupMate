@@ -492,7 +492,7 @@ test('a stuck group history read does not remove context from another group', as
           message_id: 'history-b',
           raw_message: '群 B 唯一历史',
           sender: Object.freeze({
-            user_id: 'member-b', card: '群友 B', nickname: '群友 B'
+            user_id: 'member-b', card: '', nickname: '群友 B'
           }),
           time: 1_789_000_000
         }])
@@ -516,7 +516,11 @@ test('a stuck group history read does not remove context from another group', as
       user_id: `actor-${groupId}`,
       message_id: `current-${groupId}`,
       sender: {
-        user_id: `actor-${groupId}`, nickname: `member-${groupId}`, role: 'member' as const
+        user_id: `actor-${groupId}`,
+        nickname: `QQ昵称-${groupId}`,
+        card: `群名片-${groupId}`,
+        title: `群头衔-${groupId}`,
+        role: 'admin' as const
       },
       message: [{ type: 'text', text: `current request ${groupId}` }],
       group: {
@@ -562,6 +566,18 @@ test('a stuck group history read does not remove context from another group', as
   assert.equal(modelRequests[1]?.messages.some(message =>
     typeof message.content === 'string' && message.content.includes('群 B 唯一历史')
   ), true)
+  assert.equal(modelRequests[1]?.messages.some(message =>
+    typeof message.content === 'string' && message.content.includes('【群友 B】(member-b)')
+  ), true)
+  const groupRuntimeMetadata = modelRequests[1]?.messages.find(message =>
+    typeof message.content === 'string' && message.content.includes('当前会话元数据')
+  )?.content ?? ''
+  assert.equal(groupRuntimeMetadata.includes('"actorUserId":"actor-group-b"'), true)
+  assert.equal(groupRuntimeMetadata.includes('"actorNickname":"QQ昵称-group-b"'), true)
+  assert.equal(groupRuntimeMetadata.includes('"actorGroupCard":"群名片-group-b"'), true)
+  assert.equal(groupRuntimeMetadata.includes('"actorGroupTitle":"群头衔-group-b"'), true)
+  assert.equal(groupRuntimeMetadata.includes('"actorRole":"admin"'), true)
+  assert.equal(groupRuntimeMetadata.includes('"groupName":"group-b"'), true)
   assert.deepEqual(historyDiagnostics, [Object.freeze({
     event: 'groupmate.group_history.fail_open',
     code: 'timeout_without_cache'

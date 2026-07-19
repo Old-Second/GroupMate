@@ -1,6 +1,7 @@
 import type { JsonObject } from '../model/json-value.js'
 import { parseJsonValue } from '../model/json-value.js'
 import type { NormalizedToolCall } from '../model/model-adapter.js'
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 import type { SerializablePreparedCapability } from '../tools/prepared-capability.js'
 import type { ToolResult } from '../tools/tool-result.js'
 import { parseToolResult, toolResultForModel } from '../tools/tool-result.js'
@@ -34,6 +35,7 @@ export interface ToolLedgerCall {
   readonly index: number
   readonly callId: string
   readonly toolName: string
+  readonly argumentsText?: string
   readonly arguments: JsonObject
   readonly status: ToolLedgerStatus
   readonly capability: SerializablePreparedCapability | null
@@ -119,6 +121,7 @@ export function createToolExecutionLedger (
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new TypeError('tool ledger arguments are invalid')
     }
+    const argumentsText = parseExactToolArgumentsText(call.argumentsText, parsed as JsonObject)
     indexes.add(call.index)
     callIds.add(call.callId)
     return {
@@ -127,6 +130,7 @@ export function createToolExecutionLedger (
       index: call.index,
       callId: call.callId,
       toolName: call.name,
+      argumentsText,
       arguments: parsed as JsonObject,
       status: 'planned',
       capability: null,

@@ -541,6 +541,7 @@ test('DeepSeek display truncation never truncates tool continuation state', asyn
 
 test('DeepSeek tool continuation keeps the prior wire message prefix and reasoning state', async () => {
   const captured: Array<Record<string, unknown>> = []
+  const exactArgumentsText = '{ "note": "e\\u0301", "city": "Wu\\u0068an" }'
   const responses = [
     JSON.stringify({
       id: 'fixture-deepseek-cache-tool',
@@ -554,7 +555,7 @@ test('DeepSeek tool continuation keeps the prior wire message prefix and reasoni
           tool_calls: [{
             id: 'call-weather',
             type: 'function',
-            function: { name: 'weather', arguments: '{"city":"Wuhan"}' }
+            function: { name: 'weather', arguments: exactArgumentsText }
           }]
         }
       }]
@@ -590,6 +591,7 @@ test('DeepSeek tool continuation keeps the prior wire message prefix and reasoni
         toolCalls: toolTurn.toolCalls.map(call => ({
           callId: call.callId,
           name: call.name,
+          argumentsText: call.argumentsText,
           arguments: call.arguments
         })),
         providerState: toolTurn.providerState
@@ -606,6 +608,12 @@ test('DeepSeek tool continuation keeps the prior wire message prefix and reasoni
   assert.equal(
     secondMessages[firstMessages.length]?.reasoning_content,
     'cacheable reasoning prefix'
+  )
+  assert.equal(
+    ((secondMessages[firstMessages.length]?.tool_calls as Array<{
+      function: { arguments: string }
+    }>)[0]?.function.arguments),
+    exactArgumentsText
   )
   assert.deepEqual(captured[1]?.tools, captured[0]?.tools)
 })

@@ -5,6 +5,8 @@ import { asWireRecord, iterateResponseBytes, readBoundedResponseText, readBounde
 import { normalizeCompleteToolCalls, SseToolCallAccumulator } from './sse-tool-call-accumulator.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js';
+import { providerRequestWireIdentity } from '../run/provider-generation.js';
+import { parseExactToolArgumentsText } from './tool-arguments-text.js';
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,128}$/;
 const CALL_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const RESPONSE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -112,12 +114,21 @@ function wireToolCall(call) {
     if (!TOOL_NAME.test(call.name))
         throw modelRequestError('invalid_tool_name');
     const argumentsValue = cloneJsonObject(call.arguments, 'invalid_tool_arguments', RUN_RESOURCE_LIMITS.toolArgumentsBytes);
+    let argumentsText;
+    try {
+        argumentsText = call.argumentsText === undefined
+            ? JSON.stringify(argumentsValue)
+            : parseExactToolArgumentsText(call.argumentsText, argumentsValue);
+    }
+    catch {
+        throw modelRequestError('invalid_tool_arguments_text');
+    }
     return Object.freeze({
         id: call.callId,
         type: 'function',
         function: Object.freeze({
             name: call.name,
-            arguments: JSON.stringify(argumentsValue)
+            arguments: argumentsText
         })
     });
 }
@@ -693,6 +704,9 @@ export class OpenAICompatibleAdapter {
                 ? {}
                 : { 'OpenAI-Organization': assertString(options.organization, 'invalid_organization', 256) })
         });
+    }
+    requestIdentity(request) {
+        return providerRequestWireIdentity(buildImmutableChatRequest(request, this.#profile));
     }
     async complete(request, signal) {
         if (signal.aborted)

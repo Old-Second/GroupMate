@@ -8,9 +8,14 @@ import {
   type RunCheckpointV2,
   type RunCheckpointV3,
   type RunCheckpointV4,
-  type RunCheckpointV5
+  type RunCheckpointV5,
+  type RunCheckpointV6
 } from './run-checkpoint.js'
 import { parseModelCapabilitySnapshot } from '../model/model-capability.js'
+import {
+  parseContextPlanV1,
+  upgradeLegacyContextPlanV1
+} from '../context/context-plan.js'
 import { createUnavailableRunUsageSummary } from './run-usage.js'
 import type { RunObservationCountersV1 } from './run-observation.js'
 import { isDeepStrictEqual } from 'node:util'
@@ -36,6 +41,12 @@ function migratedBudget (checkpoint: RunCheckpointV1 | RunCheckpointV2 | RunChec
     toolWireSnapshot: null
   })
 }
+
+const LEGACY_CONTEXT_RUNTIME = Object.freeze({
+  contextRuntimeMode: 'legacy_compatible' as const,
+  pendingContextMessages: Object.freeze([]),
+  providerGeneration: null
+})
 
 function assertMigratable (checkpoint: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4): void {
   if (isTerminalRunStatus(checkpoint.status)) {
@@ -109,7 +120,7 @@ function legacyObservationCounters (
 export function upgradeRunCheckpointV1 (
   checkpoint: RunCheckpointV1,
   input: { readonly runRef: string; readonly requestRef: string }
-): RunCheckpointV5 {
+): RunCheckpointV6 {
   assertMigratable(checkpoint)
   const {
     schemaVersion: _schemaVersion,
@@ -120,7 +131,8 @@ export function upgradeRunCheckpointV1 (
   return parseRunCheckpoint({
     ...state,
     ...migratedBudget(checkpoint),
-    schemaVersion: 5,
+    ...LEGACY_CONTEXT_RUNTIME,
+    schemaVersion: 6,
     revision: checkpoint.revision + 1,
     runRef: input.runRef,
     requestRef: input.requestRef,
@@ -144,13 +156,14 @@ export function upgradeRunCheckpointV1 (
 
 export function upgradeRunCheckpointV2 (
   checkpoint: RunCheckpointV2
-): RunCheckpointV5 {
+): RunCheckpointV6 {
   assertMigratable(checkpoint)
   const { schemaVersion: _schemaVersion, budgetLimits: _budgetLimits, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
     ...migratedBudget(checkpoint),
-    schemaVersion: 5,
+    ...LEGACY_CONTEXT_RUNTIME,
+    schemaVersion: 6,
     revision: checkpoint.revision + 1,
     reasoningSegments: Object.freeze([]),
     modelCapability: legacyModelCapability(),
@@ -173,13 +186,14 @@ function legacyModelCapability () {
 
 export function upgradeRunCheckpointV3 (
   checkpoint: RunCheckpointV3
-): RunCheckpointV5 {
+): RunCheckpointV6 {
   assertMigratable(checkpoint)
   const { schemaVersion: _schemaVersion, budgetLimits: _budgetLimits, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
     ...migratedBudget(checkpoint),
-    schemaVersion: 5,
+    ...LEGACY_CONTEXT_RUNTIME,
+    schemaVersion: 6,
     revision: checkpoint.revision + 1,
     modelCapability: legacyModelCapability(),
     modelPrice: null,
@@ -189,21 +203,46 @@ export function upgradeRunCheckpointV3 (
 
 export function upgradeRunCheckpointV4 (
   checkpoint: RunCheckpointV4
-): RunCheckpointV5 {
+): RunCheckpointV6 {
   assertMigratable(checkpoint)
   const { schemaVersion: _schemaVersion, budgetLimits: _budgetLimits, ...state } = checkpoint
   return parseRunCheckpoint({
     ...state,
     ...migratedBudget(checkpoint),
-    schemaVersion: 5,
+    ...LEGACY_CONTEXT_RUNTIME,
+    schemaVersion: 6,
+    revision: checkpoint.revision + 1
+  })
+}
+
+export function upgradeRunCheckpointV5 (
+  checkpoint: RunCheckpointV5
+): RunCheckpointV6 {
+  if (isTerminalRunStatus(checkpoint.status)) {
+    throw new TypeError('terminal active checkpoint cannot be migrated')
+  }
+  const { schemaVersion: _schemaVersion, ...state } = checkpoint
+  let contextPlan = checkpoint.contextPlan
+  if (contextPlan !== null) {
+    try {
+      contextPlan = parseContextPlanV1(contextPlan)
+    } catch {
+      contextPlan = upgradeLegacyContextPlanV1(contextPlan, checkpoint.messages)
+    }
+  }
+  return parseRunCheckpoint({
+    ...state,
+    contextPlan,
+    ...LEGACY_CONTEXT_RUNTIME,
+    schemaVersion: 6,
     revision: checkpoint.revision + 1
   })
 }
 
 export function validateExactRunCheckpointMigration (
-  expected: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4,
-  next: RunCheckpointV5
-): RunCheckpointV5 {
+  expected: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5,
+  next: RunCheckpointV6
+): RunCheckpointV6 {
   const canonical = expected.schemaVersion === 1
     ? upgradeRunCheckpointV1(expected, {
         runRef: next.runRef,
@@ -213,7 +252,9 @@ export function validateExactRunCheckpointMigration (
       ? upgradeRunCheckpointV2(expected)
       : expected.schemaVersion === 3
         ? upgradeRunCheckpointV3(expected)
-        : upgradeRunCheckpointV4(expected)
+        : expected.schemaVersion === 4
+          ? upgradeRunCheckpointV4(expected)
+          : upgradeRunCheckpointV5(expected)
   const parsedNext = parseRunCheckpoint(next)
   if (!isDeepStrictEqual(canonical, parsedNext)) {
     throw new TypeError('run checkpoint migration is not canonical')

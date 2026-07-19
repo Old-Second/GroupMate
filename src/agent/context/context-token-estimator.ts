@@ -5,6 +5,7 @@ import type {
   ModelMessage
 } from '../model/model-adapter.js'
 import type { ProviderTurnState } from '../run/provider-state.js'
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 
 export const CONTEXT_TOKEN_ESTIMATOR_VERSION = 'context-byte-quarter-v1'
 export const MAX_CONTEXT_CANONICAL_MESSAGE_BYTES = 512 * 1_024
@@ -44,6 +45,12 @@ export function normalizeContextString (value: unknown): string {
   if (typeof value !== 'string' || value.length > MAX_CONTEXT_STRING_CODE_UNITS ||
     hasLoneSurrogate(value)) return invalidContextValue()
   return value.normalize('NFC')
+}
+
+function exactContextString (value: unknown): string {
+  if (typeof value !== 'string' || value.length > MAX_CONTEXT_STRING_CODE_UNITS ||
+    hasLoneSurrogate(value)) return invalidContextValue()
+  return value
 }
 
 export function requireContextAscii (value: unknown): string {
@@ -240,13 +247,58 @@ export function canonicalizeContextJsonValue (value: unknown): JsonValue {
   })
 }
 
+function cloneExactJsonValue (
+  value: unknown,
+  depth: number,
+  state: WalkState
+): JsonValue {
+  state.nodes += 1
+  if (state.nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) return invalidContextValue()
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'string') return exactContextString(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Object.is(value, -0) ||
+      (Number.isInteger(value) && !Number.isSafeInteger(value))) return invalidContextValue()
+    return value
+  }
+  if (typeof value !== 'object' || value === null || utilTypes.isProxy(value)) {
+    return invalidContextValue()
+  }
+  if (state.ancestors.has(value)) return invalidContextValue()
+  state.ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      const input = inspectContextArray(value)
+      return Object.freeze(input.map(item => cloneExactJsonValue(item, depth + 1, state)))
+    }
+    const input = inspectArbitraryRecord(value)
+    const output: Record<string, JsonValue> = {}
+    for (const key of Object.keys(input)) {
+      exactContextString(key)
+      Object.defineProperty(output, key, {
+        value: cloneExactJsonValue(input[key], depth + 1, state),
+        enumerable: true,
+        configurable: true,
+        writable: true
+      })
+    }
+    return Object.freeze(output) as JsonObject
+  } finally {
+    state.ancestors.delete(value)
+  }
+}
+
 function parseToolCall (value: unknown, state: WalkState): ModelAssistantToolCall {
-  const input = inspectContextRecord(value, ['callId', 'name', 'arguments'])
-  const args = canonicalizeContextJsonValueWithState(input.arguments, state)
+  const input = inspectContextRecord(value, ['callId', 'name', 'arguments'], ['argumentsText'])
+  const args = cloneExactJsonValue(input.arguments, 0, state)
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return invalidContextValue()
+  const argumentsText = input.argumentsText === undefined
+    ? undefined
+    : parseExactToolArgumentsText(input.argumentsText, args as JsonObject)
   return Object.freeze({
     callId: requireContextAscii(input.callId),
     name: requireContextAscii(input.name),
+    ...(argumentsText === undefined ? {} : { argumentsText }),
     arguments: args as JsonObject
   })
 }
@@ -258,7 +310,7 @@ function parseProviderState (value: unknown, state: WalkState): ProviderTurnStat
   return Object.freeze({
     profileId: input.profileId,
     profileVersion,
-    payload: canonicalizeContextJsonValueWithState(input.payload, state)
+    payload: cloneExactJsonValue(input.payload, 0, state)
   })
 }
 
@@ -340,7 +392,7 @@ function modelMessageJson (message: ModelMessage): string {
       ]
       if (message.toolCalls !== undefined) {
         fields.push(`"toolCalls":[${message.toolCalls.map(call => {
-          return `{"callId":${JSON.stringify(call.callId)},"name":${JSON.stringify(call.name)},"arguments":${stringifyJsonValue(call.arguments)}}`
+          return `{"callId":${JSON.stringify(call.callId)},"name":${JSON.stringify(call.name)}${call.argumentsText === undefined ? '' : `,"argumentsText":${JSON.stringify(call.argumentsText)}`},"arguments":${stringifyJsonValue(call.arguments)}}`
         }).join(',')}]`)
       }
       if (message.providerState !== undefined) {

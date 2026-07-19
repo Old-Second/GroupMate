@@ -665,3 +665,30 @@ test('NoopMemoryStore returns one frozen empty result and exposes no writer', as
     return error instanceof AgentError && error.code === 'cancelled'
   })
 })
+
+test('source projection creates deterministic immutable spans before planner selection', () => {
+  const engine = new ContextEngine({ estimator, memoryStore: new NoopMemoryStore() })
+  const sourceInput = input({
+    runtimeFacts: [item('runtime', 'runtime_fact', 'R')],
+    sessionHistory: [item('history', 'session_history', 'H')],
+    groupContext: [item('group', 'group_context', 'G')]
+  })
+
+  const first = engine.projectSourceSpans(sourceInput, 'run:source-projection')
+  const second = engine.projectSourceSpans(sourceInput, 'run:source-projection')
+
+  assert.deepEqual(second, first)
+  assert.equal(Object.isFrozen(first), true)
+  assert.deepEqual(first.map(span => span.source), [
+    'system_instruction',
+    'runtime_fact',
+    'session_history',
+    'group_context',
+    'current_request'
+  ])
+  assert.deepEqual(first.map(span => span.requirement), [
+    'mandatory', 'optional', 'optional', 'optional', 'mandatory'
+  ])
+  assert.equal(first.every(span => span.namespaceRef === 'run:source-projection'), true)
+  assert.equal(first.every(span => span.originGeneration === 0), true)
+})

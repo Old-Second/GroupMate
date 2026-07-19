@@ -10,8 +10,13 @@ import type {
 } from '../agent/contracts/interaction.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
+import type { ContextArtifactStore } from '../agent/context/context-artifact-store.js'
 import type { ContextItem } from '../agent/context/context-item.js'
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'
+import {
+  RedisContextArtifactStore,
+  type RedisContextArtifactClient
+} from '../agent/context/redis-context-artifact-store.js'
 import type {
   ModelAdapter,
   ProviderRequestMetadata
@@ -132,7 +137,8 @@ const MAX_GROUP_CONTEXT_ITEMS = 64
 const MAX_GROUP_CONTEXT_TEXT = 4_096
 
 type RuntimeConfig = Readonly<Record<string, unknown>>
-type ProductionRedisClient = RedisToolClient & RedisRunClient & RedisSessionClient
+type ProductionRedisClient = RedisToolClient & RedisRunClient & RedisSessionClient &
+RedisContextArtifactClient
 type YunzaiRecord = Record<string, any>
 
 export type YunzaiMessageEvent = YunzaiRequestEvent & YunzaiApprovalReplyEvent & {
@@ -191,6 +197,7 @@ export interface YunzaiAgentServiceBridgeDependencies {
   readonly modelAdapter: ModelAdapter
   readonly runStore?: RedisRunStore
   readonly admission?: RunAdmission
+  readonly contextArtifactStore?: ContextArtifactStore
   readonly contentJournal?: GroupMateContentJournal
   readonly providerIsolationIdSourceFactory?: ProviderIsolationIdSourceFactory
   readonly observations?: Readonly<{
@@ -747,6 +754,19 @@ function boundedText (value: string): string {
   return [...value.normalize('NFC')].slice(0, MAX_GROUP_CONTEXT_TEXT).join('')
 }
 
+function optionalNonBlankIdentity (...values: readonly unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string' && typeof value !== 'number') continue
+    const normalized = String(value).normalize('NFC').trim()
+    if (normalized !== '') return normalized
+  }
+  return undefined
+}
+
+function firstNonBlankIdentity (...values: readonly unknown[]): string {
+  return optionalNonBlankIdentity(...values) ?? 'unknown'
+}
+
 function groupContextItem (
   requestId: string,
   raw: unknown,
@@ -772,8 +792,8 @@ function groupContextItem (
   const sender = record.sender !== null && typeof record.sender === 'object'
     ? record.sender as YunzaiRecord
     : {}
-  const senderId = String(sender.user_id ?? 'unknown').slice(0, 128)
-  const displayName = String(sender.card ?? sender.nickname ?? senderId).slice(0, 256)
+  const senderId = firstNonBlankIdentity(sender.user_id).slice(0, 128)
+  const displayName = firstNonBlankIdentity(sender.card, sender.nickname, senderId).slice(0, 256)
   const rawTime = typeof record.time === 'number' && Number.isFinite(record.time)
     ? new Date(Math.trunc(record.time) * 1_000)
     : new Date(fallbackTime)
@@ -803,8 +823,18 @@ function runtimeIdentityItem (
   event: YunzaiMessageEvent
 ): ContextItem {
   const eventValue = event as YunzaiRecord
+  const sender = eventValue.sender !== null && typeof eventValue.sender === 'object'
+    ? eventValue.sender as YunzaiRecord
+    : {}
   const groupName = request.channel.kind === 'group'
     ? String(eventValue.group?.name ?? eventValue.group_name ?? '').slice(0, 256)
+    : undefined
+  const actorNickname = optionalNonBlankIdentity(sender.nickname)?.slice(0, 256)
+  const actorGroupCard = request.channel.kind === 'group'
+    ? optionalNonBlankIdentity(sender.card)?.slice(0, 256)
+    : undefined
+  const actorGroupTitle = request.channel.kind === 'group'
+    ? optionalNonBlankIdentity(sender.title, sender.special_title, sender.group_title)?.slice(0, 256)
     : undefined
   const metadata = Object.freeze({
     channel: request.channel.kind === 'group' ? 'qq_group' : 'qq_private',
@@ -812,6 +842,9 @@ function runtimeIdentityItem (
       ? { groupId: request.channel.groupId, ...(groupName === '' ? {} : { groupName }) }
       : {}),
     actorUserId: request.actor.userId,
+    ...(actorNickname === undefined ? {} : { actorNickname }),
+    ...(actorGroupCard === undefined ? {} : { actorGroupCard }),
+    ...(actorGroupTitle === undefined ? {} : { actorGroupTitle }),
     ...(request.actor.displayName === undefined
       ? {}
       : { actorDisplayName: request.actor.displayName }),
@@ -1531,6 +1564,8 @@ export function createYunzaiAgentServiceBridge (
     client: options.redis,
     generateId
   })
+  const contextArtifactStore = dependencies.contextArtifactStore ??
+    new RedisContextArtifactStore({ client: options.redis })
   const sessions = new RedisAgentSessionStore({
     redis: options.redis,
     now,
@@ -1576,6 +1611,7 @@ export function createYunzaiAgentServiceBridge (
       },
       memoryStore: new NoopMemoryStore()
     }),
+    contextArtifactStore,
     progressPresenter,
     createEngine: observer => new RunEngine({
       adapter: dependencies.modelAdapter,

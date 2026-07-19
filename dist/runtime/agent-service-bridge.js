@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ContextEngine } from '../agent/context/context-engine.js';
 import { NoopMemoryStore } from '../agent/context/noop-memory-store.js';
+import { RedisContextArtifactStore } from '../agent/context/redis-context-artifact-store.js';
 import { ModelProviderError, parseProviderRequestMetadata } from '../agent/model/model-adapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
@@ -411,6 +412,19 @@ function messageText(value) {
 function boundedText(value) {
     return [...value.normalize('NFC')].slice(0, MAX_GROUP_CONTEXT_TEXT).join('');
 }
+function optionalNonBlankIdentity(...values) {
+    for (const value of values) {
+        if (typeof value !== 'string' && typeof value !== 'number')
+            continue;
+        const normalized = String(value).normalize('NFC').trim();
+        if (normalized !== '')
+            return normalized;
+    }
+    return undefined;
+}
+function firstNonBlankIdentity(...values) {
+    return optionalNonBlankIdentity(...values) ?? 'unknown';
+}
 function groupContextItem(requestId, raw, position, fallbackTime, currentMessageId) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
         return null;
@@ -429,8 +443,8 @@ function groupContextItem(requestId, raw, position, fallbackTime, currentMessage
     const sender = record.sender !== null && typeof record.sender === 'object'
         ? record.sender
         : {};
-    const senderId = String(sender.user_id ?? 'unknown').slice(0, 128);
-    const displayName = String(sender.card ?? sender.nickname ?? senderId).slice(0, 256);
+    const senderId = firstNonBlankIdentity(sender.user_id).slice(0, 128);
+    const displayName = firstNonBlankIdentity(sender.card, sender.nickname, senderId).slice(0, 256);
     const rawTime = typeof record.time === 'number' && Number.isFinite(record.time)
         ? new Date(Math.trunc(record.time) * 1_000)
         : new Date(fallbackTime);
@@ -456,8 +470,18 @@ function groupContextItem(requestId, raw, position, fallbackTime, currentMessage
 }
 function runtimeIdentityItem(request, event) {
     const eventValue = event;
+    const sender = eventValue.sender !== null && typeof eventValue.sender === 'object'
+        ? eventValue.sender
+        : {};
     const groupName = request.channel.kind === 'group'
         ? String(eventValue.group?.name ?? eventValue.group_name ?? '').slice(0, 256)
+        : undefined;
+    const actorNickname = optionalNonBlankIdentity(sender.nickname)?.slice(0, 256);
+    const actorGroupCard = request.channel.kind === 'group'
+        ? optionalNonBlankIdentity(sender.card)?.slice(0, 256)
+        : undefined;
+    const actorGroupTitle = request.channel.kind === 'group'
+        ? optionalNonBlankIdentity(sender.title, sender.special_title, sender.group_title)?.slice(0, 256)
         : undefined;
     const metadata = Object.freeze({
         channel: request.channel.kind === 'group' ? 'qq_group' : 'qq_private',
@@ -465,6 +489,9 @@ function runtimeIdentityItem(request, event) {
             ? { groupId: request.channel.groupId, ...(groupName === '' ? {} : { groupName }) }
             : {}),
         actorUserId: request.actor.userId,
+        ...(actorNickname === undefined ? {} : { actorNickname }),
+        ...(actorGroupCard === undefined ? {} : { actorGroupCard }),
+        ...(actorGroupTitle === undefined ? {} : { actorGroupTitle }),
         ...(request.actor.displayName === undefined
             ? {}
             : { actorDisplayName: request.actor.displayName }),
@@ -1079,6 +1106,8 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         client: options.redis,
         generateId
     });
+    const contextArtifactStore = dependencies.contextArtifactStore ??
+        new RedisContextArtifactStore({ client: options.redis });
     const sessions = new RedisAgentSessionStore({
         redis: options.redis,
         now,
@@ -1119,6 +1148,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             },
             memoryStore: new NoopMemoryStore()
         }),
+        contextArtifactStore,
         progressPresenter,
         createEngine: observer => new RunEngine({
             adapter: dependencies.modelAdapter,

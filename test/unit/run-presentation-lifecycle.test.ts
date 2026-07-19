@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { SessionAddress } from '../../src/agent/contracts/identity.js'
+import { ContextEngine } from '../../src/agent/context/context-engine.js'
+import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import type { RunEngine } from '../../src/agent/run/run-engine.js'
 import type { FrozenObservationPolicyV1 } from '../../src/agent/run/run-observation.js'
 import { AgentService } from '../../src/runtime/agent-service.js'
@@ -231,7 +233,13 @@ test('AgentService callback lifecycle detaches once when progress drain rejects'
       }),
       recover: async () => { throw new Error('not used') }
     } as never,
-    contextEngine: {} as never,
+    contextEngine: new ContextEngine({
+      estimator: {
+        estimate: () => 1,
+        estimateModelMessage: () => 1
+      },
+      memoryStore: new NoopMemoryStore()
+    }),
     progressPresenter: progress,
     createEngine: () => engine,
     createRuntime: async () => Object.freeze({

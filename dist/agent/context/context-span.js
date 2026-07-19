@@ -8,7 +8,7 @@ export const MAX_CONTEXT_ARTIFACT_REFS = 32;
 export const MAX_CONTEXT_SPANS = 128;
 const KINDS = ['message', 'tool_protocol', 'artifact'];
 const SOURCES = [
-    'system_instruction', 'current_request', 'runtime_fact', 'session_history',
+    'system_instruction', 'current_request', 'recovery_baseline', 'runtime_fact', 'session_history',
     'group_context', 'memory', 'approval', 'tool_chain', 'artifact'
 ];
 const PROVENANCE_KINDS = [
@@ -53,9 +53,29 @@ function parseToolProtocol(value) {
         return invalidContextValue();
     return Object.freeze({
         phase: enumValue(input.phase, PHASES),
-        step: requireSafeInteger(input.step, { positive: true }),
+        step: requireSafeInteger(input.step),
         callIds
     });
+}
+export function contextWireProtocolIsValid(messages) {
+    const seenCallIds = new Set();
+    for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message?.role === 'tool')
+            return false;
+        if (message?.role !== 'assistant' || message.toolCalls === undefined)
+            continue;
+        for (const [offset, call] of message.toolCalls.entries()) {
+            if (seenCallIds.has(call.callId))
+                return false;
+            seenCallIds.add(call.callId);
+            const result = messages[index + offset + 1];
+            if (result?.role !== 'tool' || result.toolCallId !== call.callId)
+                return false;
+        }
+        index += message.toolCalls.length;
+    }
+    return true;
 }
 function hasProtocolFields(message) {
     return message.role === 'tool' || (message.role === 'assistant' &&
@@ -89,6 +109,7 @@ function validateSourceMatrix(span) {
     const expectedProvenance = {
         system_instruction: 'run',
         current_request: 'run',
+        recovery_baseline: 'run',
         runtime_fact: 'run',
         session_history: 'session_item',
         group_context: 'group_snapshot',
@@ -109,6 +130,17 @@ function validateSourceMatrix(span) {
     else if (span.source === 'current_request') {
         if (span.kind !== 'message' || span.requirement !== 'mandatory' || span.toolProtocol !== null ||
             span.messages.length !== 1 || span.messages[0]?.role !== 'user')
+            return invalidContextValue();
+    }
+    else if (span.source === 'recovery_baseline') {
+        const baselineRef = span.sourceRefs[0];
+        if (span.kind !== 'message' || span.trust !== 'trusted' ||
+            span.requirement !== 'mandatory' || span.priority !== 'critical' ||
+            span.originGeneration === 0 || span.supersedes !== null || span.toolProtocol !== null ||
+            span.messages.length === 0 || !contextWireProtocolIsValid(span.messages) ||
+            span.provenance.revision !== span.originGeneration || span.sourceRefs.length !== 1 ||
+            baselineRef?.ref !== span.provenance.ref ||
+            baselineRef.contentHash !== span.provenance.contentHash)
             return invalidContextValue();
     }
     else if (span.source === 'session_history') {

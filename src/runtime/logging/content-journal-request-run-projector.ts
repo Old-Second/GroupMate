@@ -1,7 +1,8 @@
 import { isAgentErrorCode, type SerializedAgentError } from '../../agent/contracts/error.js'
 import { parsePresentationRoute } from '../../agent/contracts/interaction.js'
-import type { JsonValue } from '../../agent/model/json-value.js'
+import type { JsonObject, JsonValue } from '../../agent/model/json-value.js'
 import type { ModelRequest, ModelTurn } from '../../agent/model/model-adapter.js'
+import { parseExactToolArgumentsText } from '../../agent/model/tool-arguments-text.js'
 import { parseRunCheckpoint, type RunCheckpoint } from '../../agent/run/run-checkpoint.js'
 import type { RunContentJournalEvent } from '../../agent/run/run-content-journal.js'
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js'
@@ -183,13 +184,17 @@ function parseModelMessage (value: JsonValue): void {
       const toolCall = jsonObject(call, 'model tool call') as UnknownRecord
       exactKeys(
         toolCall,
-        ['callId', 'name', 'arguments'],
+        ['callId', 'name', 'argumentsText', 'arguments'],
         ['callId', 'name', 'arguments'],
         'model tool call'
       )
       text(toolCall.callId, 'model tool call ID')
       text(toolCall.name, 'model tool name')
-      jsonObject(toolCall.arguments, 'model tool arguments')
+      const argumentsValue = jsonObject(toolCall.arguments, 'model tool arguments') as JsonObject
+      if (toolCall.argumentsText !== undefined) {
+        text(toolCall.argumentsText, 'model tool arguments text', true)
+        parseExactToolArgumentsText(toolCall.argumentsText, argumentsValue)
+      }
     }
   }
   if (input.providerState !== undefined) parseProviderTurnState(input.providerState)

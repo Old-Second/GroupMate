@@ -16,6 +16,13 @@ function identifier(value, label) {
     }
     return text;
 }
+function senderDisplayName(event) {
+    for (const value of [event.sender?.card, event.sender?.nickname]) {
+        if (typeof value === 'string' && value.trim().length > 0)
+            return value;
+    }
+    return undefined;
+}
 export function resolveConversationCommandAddress(event, groupMerge, targetUserId) {
     const botId = identifier(event.self_id ?? event.bot?.uin, 'botId');
     const userId = identifier(targetUserId ?? event.sender?.user_id ?? event.user_id, 'userId');
@@ -108,12 +115,11 @@ export async function joinConversation(input) {
     const source = resolveConversationCommandAddress(input.event, input.groupMerge, target.qq);
     const destination = resolveConversationCommandAddress(input.event, input.groupMerge);
     const userId = identifier(input.event.sender?.user_id ?? input.event.user_id, 'userId');
+    const displayName = senderDisplayName(input.event);
     try {
         await input.bridge.fork(source, destination, {
             userId,
-            ...(input.event.sender?.card === undefined && input.event.sender?.nickname === undefined
-                ? {}
-                : { displayName: input.event.sender.card ?? input.event.sender.nickname })
+            ...(displayName === undefined ? {} : { displayName })
         }, input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds });
         return { message: `加入${name}的对话成功`, quote: false, success: true };
     }

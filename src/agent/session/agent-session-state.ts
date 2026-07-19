@@ -8,6 +8,7 @@ import {
 } from '../model/json-value.js'
 import { parseProviderTurnState } from '../run/provider-state.js'
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js'
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 
 export interface SemanticConversationMessage {
   readonly kind: 'message'
@@ -79,7 +80,7 @@ function protocolAssistant (
   const callIds = new Set<string>()
   const toolCalls = message.toolCalls.map(rawCall => {
     const call = record(rawCall, 'provider protocol tool call')
-    exact(call, ['callId', 'name', 'arguments'], 'provider protocol tool call')
+    exact(call, ['callId', 'name', 'argumentsText', 'arguments'], 'provider protocol tool call')
     if (typeof call.callId !== 'string' || !IDENTIFIER.test(call.callId) ||
       typeof call.name !== 'string' || !IDENTIFIER.test(call.name) || callIds.has(call.callId)) {
       throw new TypeError('provider protocol span tool call is invalid')
@@ -93,10 +94,14 @@ function protocolAssistant (
       Array.isArray(parsedArguments)) {
       throw new TypeError('provider protocol span tool arguments are invalid')
     }
+    const argumentsText = call.argumentsText === undefined
+      ? undefined
+      : parseExactToolArgumentsText(call.argumentsText, parsedArguments as JsonObject)
     callIds.add(call.callId)
     return Object.freeze({
       callId: call.callId,
       name: call.name,
+      ...(argumentsText === undefined ? {} : { argumentsText }),
       arguments: parsedArguments as JsonObject
     })
   })

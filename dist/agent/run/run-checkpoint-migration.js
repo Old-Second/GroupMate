@@ -1,6 +1,7 @@
 import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { parseRunCheckpoint } from './run-checkpoint.js';
 import { parseModelCapabilitySnapshot } from '../model/model-capability.js';
+import { parseContextPlanV1, upgradeLegacyContextPlanV1 } from '../context/context-plan.js';
 import { createUnavailableRunUsageSummary } from './run-usage.js';
 import { isDeepStrictEqual } from 'node:util';
 import { legacyFixedLoopPolicy } from './run-loop-policy.js';
@@ -24,6 +25,11 @@ function migratedBudget(checkpoint) {
         toolWireSnapshot: null
     });
 }
+const LEGACY_CONTEXT_RUNTIME = Object.freeze({
+    contextRuntimeMode: 'legacy_compatible',
+    pendingContextMessages: Object.freeze([]),
+    providerGeneration: null
+});
 function assertMigratable(checkpoint) {
     if (isTerminalRunStatus(checkpoint.status)) {
         throw new TypeError('terminal active checkpoint cannot be migrated');
@@ -87,7 +93,8 @@ export function upgradeRunCheckpointV1(checkpoint, input) {
     return parseRunCheckpoint({
         ...state,
         ...migratedBudget(checkpoint),
-        schemaVersion: 5,
+        ...LEGACY_CONTEXT_RUNTIME,
+        schemaVersion: 6,
         revision: checkpoint.revision + 1,
         runRef: input.runRef,
         requestRef: input.requestRef,
@@ -114,7 +121,8 @@ export function upgradeRunCheckpointV2(checkpoint) {
     return parseRunCheckpoint({
         ...state,
         ...migratedBudget(checkpoint),
-        schemaVersion: 5,
+        ...LEGACY_CONTEXT_RUNTIME,
+        schemaVersion: 6,
         revision: checkpoint.revision + 1,
         reasoningSegments: Object.freeze([]),
         modelCapability: legacyModelCapability(),
@@ -139,7 +147,8 @@ export function upgradeRunCheckpointV3(checkpoint) {
     return parseRunCheckpoint({
         ...state,
         ...migratedBudget(checkpoint),
-        schemaVersion: 5,
+        ...LEGACY_CONTEXT_RUNTIME,
+        schemaVersion: 6,
         revision: checkpoint.revision + 1,
         modelCapability: legacyModelCapability(),
         modelPrice: null,
@@ -152,7 +161,30 @@ export function upgradeRunCheckpointV4(checkpoint) {
     return parseRunCheckpoint({
         ...state,
         ...migratedBudget(checkpoint),
-        schemaVersion: 5,
+        ...LEGACY_CONTEXT_RUNTIME,
+        schemaVersion: 6,
+        revision: checkpoint.revision + 1
+    });
+}
+export function upgradeRunCheckpointV5(checkpoint) {
+    if (isTerminalRunStatus(checkpoint.status)) {
+        throw new TypeError('terminal active checkpoint cannot be migrated');
+    }
+    const { schemaVersion: _schemaVersion, ...state } = checkpoint;
+    let contextPlan = checkpoint.contextPlan;
+    if (contextPlan !== null) {
+        try {
+            contextPlan = parseContextPlanV1(contextPlan);
+        }
+        catch {
+            contextPlan = upgradeLegacyContextPlanV1(contextPlan, checkpoint.messages);
+        }
+    }
+    return parseRunCheckpoint({
+        ...state,
+        contextPlan,
+        ...LEGACY_CONTEXT_RUNTIME,
+        schemaVersion: 6,
         revision: checkpoint.revision + 1
     });
 }
@@ -166,7 +198,9 @@ export function validateExactRunCheckpointMigration(expected, next) {
             ? upgradeRunCheckpointV2(expected)
             : expected.schemaVersion === 3
                 ? upgradeRunCheckpointV3(expected)
-                : upgradeRunCheckpointV4(expected);
+                : expected.schemaVersion === 4
+                    ? upgradeRunCheckpointV4(expected)
+                    : upgradeRunCheckpointV5(expected);
     const parsedNext = parseRunCheckpoint(next);
     if (!isDeepStrictEqual(canonical, parsedNext)) {
         throw new TypeError('run checkpoint migration is not canonical');

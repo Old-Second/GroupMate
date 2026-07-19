@@ -1,5 +1,6 @@
 import { isAgentErrorCode } from '../../agent/contracts/error.js';
 import { parsePresentationRoute } from '../../agent/contracts/interaction.js';
+import { parseExactToolArgumentsText } from '../../agent/model/tool-arguments-text.js';
 import { parseRunCheckpoint } from '../../agent/run/run-checkpoint.js';
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js';
 import { parseProviderTurnState } from '../../agent/run/provider-state.js';
@@ -140,10 +141,14 @@ function parseModelMessage(value) {
     if (input.toolCalls !== undefined) {
         for (const call of jsonArray(input.toolCalls, 256, 'model tool calls')) {
             const toolCall = jsonObject(call, 'model tool call');
-            exactKeys(toolCall, ['callId', 'name', 'arguments'], ['callId', 'name', 'arguments'], 'model tool call');
+            exactKeys(toolCall, ['callId', 'name', 'argumentsText', 'arguments'], ['callId', 'name', 'arguments'], 'model tool call');
             text(toolCall.callId, 'model tool call ID');
             text(toolCall.name, 'model tool name');
-            jsonObject(toolCall.arguments, 'model tool arguments');
+            const argumentsValue = jsonObject(toolCall.arguments, 'model tool arguments');
+            if (toolCall.argumentsText !== undefined) {
+                text(toolCall.argumentsText, 'model tool arguments text', true);
+                parseExactToolArgumentsText(toolCall.argumentsText, argumentsValue);
+            }
         }
     }
     if (input.providerState !== undefined)

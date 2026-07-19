@@ -13,8 +13,9 @@ import {
 } from '../agent/contracts/result.js'
 import type { AbortOptions, ListOptions, SaveOptions } from '../agent/contracts/storage.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
+import type { ContextArtifactStore } from '../agent/context/context-artifact-store.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
-import type { ContextItem } from '../agent/context/context-item.js'
+import type { ContextInput, ContextItem } from '../agent/context/context-item.js'
 import type {
   ModelMessage,
   ModelProviderError
@@ -84,6 +85,7 @@ import type {
   YunzaiAgentRequest,
   YunzaiAgentRequestDraft
 } from './yunzai-request-adapter.js'
+import { createRunContextPlanner } from './run-context-planner.js'
 
 export type PausedChatReplyEnvelope =
   Extract<RunAdvanceResult, { readonly kind: 'paused' }> & {
@@ -224,6 +226,7 @@ export interface AgentServiceOptions {
   readonly runStore: RunStore
   readonly admission: Pick<RunAdmission, 'acquire' | 'recover'>
   readonly contextEngine: ContextEngine
+  readonly contextArtifactStore?: ContextArtifactStore
   readonly progressPresenter: RunProgressPresenter
   readonly createEngine: (observer: (event: AgentEvent) => void) => RunEngine
   readonly createRuntime: (request: YunzaiAgentRequest) => Promise<AgentServiceRunRuntime>
@@ -809,6 +812,7 @@ export class AgentService {
   readonly #sessions: SessionStore<AgentSessionState>
   readonly #admission: Pick<RunAdmission, 'acquire' | 'recover'>
   readonly #contextEngine: ContextEngine
+  readonly #contextArtifactStore?: ContextArtifactStore
   readonly #progressPresenter: RunProgressPresenter
   readonly #createRuntime: AgentServiceOptions['createRuntime']
   readonly #recoverRuntime?: AgentServiceOptions['recoverRuntime']
@@ -834,6 +838,7 @@ export class AgentService {
     this.#sessions = options.sessions
     this.#admission = options.admission
     this.#contextEngine = options.contextEngine
+    this.#contextArtifactStore = options.contextArtifactStore
     this.#progressPresenter = options.progressPresenter
     this.#createRuntime = options.createRuntime
     this.#recoverRuntime = options.recoverRuntime
@@ -1348,7 +1353,7 @@ export class AgentService {
     session: SessionRecord<AgentSessionState> | null,
     runtime: AgentServiceRunRuntime
   ): RunRuntimeBinding {
-    const prepare = async (dropOptional: boolean, signal: AbortSignal) => {
+    const sourceInput = (dropOptional: boolean): ContextInput => {
       const systemInstructions = Object.freeze(request.systemInstructions.map((value, index) => (
         systemItem(runId, value, index, request.createdAt)
       )))
@@ -1371,14 +1376,29 @@ export class AgentService {
         groupContext,
         request.contextBudget
       )
-      const snapshot = await this.#contextEngine.prepare({
+      return Object.freeze({
         systemInstructions,
         runtimeFacts: bounded.runtimeFacts,
         sessionHistory: bounded.sessionHistory,
         groupContext: bounded.groupContext,
         currentRequest,
         toolMessages: EMPTY_ITEMS
-      }, request.contextBudget, signal)
+      })
+    }
+    const initialInput = sourceInput(false)
+    const planner = createRunContextPlanner({
+      namespaceRef: request.runRef,
+      initialSpans: this.#contextEngine.projectSourceSpans(initialInput, request.runRef),
+      ...(this.#contextArtifactStore === undefined
+        ? {}
+        : { artifactStore: this.#contextArtifactStore })
+    })
+    const prepare = async (dropOptional: boolean, signal: AbortSignal) => {
+      const snapshot = await this.#contextEngine.prepare(
+        dropOptional ? sourceInput(true) : initialInput,
+        request.contextBudget,
+        signal
+      )
       return Object.freeze({
         messages: coalesceModelMessages(
           currentRunItemOrder(snapshot.items).map(modelMessageFor)
@@ -1392,6 +1412,7 @@ export class AgentService {
         ? {}
         : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
       prepareContext: async (signal: AbortSignal) => await prepare(false, signal),
+      planModelTurn: planner.planModelTurn,
       recoverContext: async (
         _checkpoint: RunCheckpoint,
         _error: ModelProviderError,
@@ -1437,6 +1458,13 @@ export class AgentService {
     }
     try {
       const runtime = await this.#recoverRuntime(checkpoint)
+      const planner = createRunContextPlanner({
+        namespaceRef: checkpoint.runRef,
+        initialSpans: null,
+        ...(this.#contextArtifactStore === undefined
+          ? {}
+          : { artifactStore: this.#contextArtifactStore })
+      })
       const binding: RunRuntimeBinding = Object.freeze({
         snapshot: runtime.binding.snapshot,
         ...(runtime.binding.providerRequestMetadata === undefined
@@ -1446,6 +1474,7 @@ export class AgentService {
           messages: checkpoint.messages,
           estimatedInputTokens: checkpoint.estimatedInputTokens
         }),
+        planModelTurn: planner.planModelTurn,
         recoverContext: async () => undefined,
         prepareToolContext: runtime.binding.prepareToolContext,
         contextFor: runtime.binding.contextFor,

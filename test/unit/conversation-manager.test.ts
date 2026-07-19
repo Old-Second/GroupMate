@@ -17,7 +17,7 @@ const event = {
   group_id: 8,
   user_id: 7,
   self_id: 10000,
-  sender: { user_id: 7, nickname: 'member' },
+  sender: { user_id: 7, card: '', nickname: 'member' },
   message: [] as Array<Record<string, unknown>>
 }
 
@@ -141,19 +141,23 @@ test('join validates mentions and forks to an independent session', async () => 
     ...event,
     message: [{ type: 'at', qq: 9, text: '@target' }]
   }
+  let joinedStartedBy: Readonly<{ userId: string; displayName?: string }> | null = null
   assert.deepEqual(await joinConversation({
     bridge: fakeBridge({
-      fork: async (_source, target, startedBy) => ({
-        schemaVersion: 1,
-        sessionId: 'joined',
-        botId: target.botId,
-        scope: target.scope,
-        startedBy,
-        createdAt: '2026-07-13T00:00:00.000Z',
-        updatedAt: '2026-07-13T00:00:00.000Z',
-        turnCount: 0,
-        state: { schemaVersion: 1, messages: [] }
-      } satisfies SessionRecord<AgentSessionState>)
+      fork: async (_source, target, startedBy) => {
+        joinedStartedBy = startedBy
+        return {
+          schemaVersion: 1,
+          sessionId: 'joined',
+          botId: target.botId,
+          scope: target.scope,
+          startedBy,
+          createdAt: '2026-07-13T00:00:00.000Z',
+          updatedAt: '2026-07-13T00:00:00.000Z',
+          turnCount: 0,
+          state: { schemaVersion: 1, messages: [] }
+        } satisfies SessionRecord<AgentSessionState>
+      }
     }),
     event: joinedEvent,
     groupMerge: false,
@@ -163,6 +167,7 @@ test('join validates mentions and forks to an independent session', async () => 
     quote: false,
     success: true
   })
+  assert.deepEqual(joinedStartedBy, { userId: '7', displayName: 'member' })
 
   assert.deepEqual(await joinConversation({
     bridge: fakeBridge({

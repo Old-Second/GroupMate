@@ -40,6 +40,8 @@ import {
 } from './sse-tool-call-accumulator.js'
 import { parseProviderTurnState, type ProviderTurnState } from '../run/provider-state.js'
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js'
+import { providerRequestWireIdentity } from '../run/provider-generation.js'
+import { parseExactToolArgumentsText } from './tool-arguments-text.js'
 
 export interface OpenAICompatibleAdapterOptions {
   readonly endpoint: string
@@ -160,6 +162,7 @@ function assertNoExtensionOverlap (
 function wireToolCall (call: Readonly<{
   callId: string
   name: string
+  argumentsText?: string
   arguments: JsonObject
 }>): JsonObject {
   if (!CALL_ID.test(call.callId)) throw modelRequestError('invalid_tool_call_id')
@@ -169,12 +172,20 @@ function wireToolCall (call: Readonly<{
     'invalid_tool_arguments',
     RUN_RESOURCE_LIMITS.toolArgumentsBytes
   )
+  let argumentsText: string
+  try {
+    argumentsText = call.argumentsText === undefined
+      ? JSON.stringify(argumentsValue)
+      : parseExactToolArgumentsText(call.argumentsText, argumentsValue)
+  } catch {
+    throw modelRequestError('invalid_tool_arguments_text')
+  }
   return Object.freeze({
     id: call.callId,
     type: 'function',
     function: Object.freeze({
       name: call.name,
-      arguments: JSON.stringify(argumentsValue)
+      arguments: argumentsText
     })
   })
 }
@@ -806,6 +817,10 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         ? {}
         : { 'OpenAI-Organization': assertString(options.organization, 'invalid_organization', 256) })
     })
+  }
+
+  requestIdentity (request: ModelRequest) {
+    return providerRequestWireIdentity(buildImmutableChatRequest(request, this.#profile))
   }
 
   async complete (request: ModelRequest, signal: AbortSignal): Promise<ModelTurn> {

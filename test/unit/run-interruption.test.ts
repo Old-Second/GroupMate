@@ -440,6 +440,9 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     contextPlan: _contextPlan,
     contextArtifactRefs: _contextArtifactRefs,
     toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
     ...state
   } = source
   return Object.freeze({
@@ -475,8 +478,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const undisplayed = await source.store.load(paused.runId)
-  assert.equal(undisplayed?.schemaVersion, 5)
-  if (undisplayed?.schemaVersion !== 5) throw new TypeError('approval checkpoint is missing')
+  assert.equal(undisplayed?.schemaVersion, 6)
+  if (undisplayed?.schemaVersion !== 6) throw new TypeError('approval checkpoint is missing')
   await displayCurrent(
     source,
     paused.interruption,
@@ -484,8 +487,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
     '2026-07-14T00:00:01.000Z'
   )
   const displayed = await source.store.load(paused.runId)
-  assert.equal(displayed?.schemaVersion, 5)
-  if (displayed?.schemaVersion !== 5) throw new TypeError('displayed checkpoint is missing')
+  assert.equal(displayed?.schemaVersion, 6)
+  if (displayed?.schemaVersion !== 6) throw new TypeError('displayed checkpoint is missing')
 
   const recovered = (
     legacy: RunCheckpointV1,
@@ -615,8 +618,8 @@ test('RunEngine restores approval reasoning from a V4 checkpoint without duplica
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const stored = await store.load(paused.runId)
-  assert.equal(stored?.schemaVersion, 5)
-  if (stored?.schemaVersion !== 5) throw new TypeError('V5 approval checkpoint is missing')
+  assert.equal(stored?.schemaVersion, 6)
+  if (stored?.schemaVersion !== 6) throw new TypeError('V6 approval checkpoint is missing')
   assert.deepEqual(stored.reasoningSegments.map(item => item.text), [
     '审批前思考'
   ])

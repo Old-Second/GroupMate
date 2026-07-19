@@ -115,7 +115,7 @@ test('Yunzai request adapter freezes group addressing and quoted message referen
     self_id: 'bot-1',
     user_id: 'actor-1',
     message_id: 'current-message-1',
-    sender: { user_id: 'actor-1', nickname: 'member', role: 'admin' },
+    sender: { user_id: 'actor-1', card: '', nickname: 'member', role: 'admin' },
     message: [
       { type: 'text', text: 'current request' },
       { type: 'image', url: 'https://fixture.invalid/current.png' }

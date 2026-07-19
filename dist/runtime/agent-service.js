@@ -10,6 +10,7 @@ import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
 import { progressResumeStateFromEvents } from './run-progress-presenter.js';
 import { activateRequestObservation, beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
+import { createRunContextPlanner } from './run-context-planner.js';
 export function projectRunAdvanceResult(envelope) {
     if (envelope.kind === 'completed') {
         return parseRunAdvanceResult(Object.freeze({
@@ -545,6 +546,7 @@ export class AgentService {
     #sessions;
     #admission;
     #contextEngine;
+    #contextArtifactStore;
     #progressPresenter;
     #createRuntime;
     #recoverRuntime;
@@ -569,6 +571,7 @@ export class AgentService {
         this.#sessions = options.sessions;
         this.#admission = options.admission;
         this.#contextEngine = options.contextEngine;
+        this.#contextArtifactStore = options.contextArtifactStore;
         this.#progressPresenter = options.progressPresenter;
         this.#createRuntime = options.createRuntime;
         this.#recoverRuntime = options.recoverRuntime;
@@ -981,7 +984,7 @@ export class AgentService {
         return lifecycle;
     }
     #bindingFor(runId, request, session, runtime) {
-        const prepare = async (dropOptional, signal) => {
+        const sourceInput = (dropOptional) => {
             const systemInstructions = Object.freeze(request.systemInstructions.map((value, index) => (systemItem(runId, value, index, request.createdAt))));
             const currentRequest = Object.freeze({
                 id: `current:${request.message.id}`,
@@ -996,14 +999,25 @@ export class AgentService {
                 ? EMPTY_ITEMS
                 : Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]);
             const bounded = boundedOptionalContext(Object.freeze([...systemInstructions, currentRequest]), runtimeFacts, history, groupContext, request.contextBudget);
-            const snapshot = await this.#contextEngine.prepare({
+            return Object.freeze({
                 systemInstructions,
                 runtimeFacts: bounded.runtimeFacts,
                 sessionHistory: bounded.sessionHistory,
                 groupContext: bounded.groupContext,
                 currentRequest,
                 toolMessages: EMPTY_ITEMS
-            }, request.contextBudget, signal);
+            });
+        };
+        const initialInput = sourceInput(false);
+        const planner = createRunContextPlanner({
+            namespaceRef: request.runRef,
+            initialSpans: this.#contextEngine.projectSourceSpans(initialInput, request.runRef),
+            ...(this.#contextArtifactStore === undefined
+                ? {}
+                : { artifactStore: this.#contextArtifactStore })
+        });
+        const prepare = async (dropOptional, signal) => {
+            const snapshot = await this.#contextEngine.prepare(dropOptional ? sourceInput(true) : initialInput, request.contextBudget, signal);
             return Object.freeze({
                 messages: coalesceModelMessages(currentRunItemOrder(snapshot.items).map(modelMessageFor)),
                 estimatedInputTokens: snapshot.estimatedInputTokens
@@ -1015,6 +1029,7 @@ export class AgentService {
                 ? {}
                 : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
             prepareContext: async (signal) => await prepare(false, signal),
+            planModelTurn: planner.planModelTurn,
             recoverContext: async (_checkpoint, _error, signal) => await prepare(true, signal),
             prepareToolContext: runtime.binding.prepareToolContext,
             contextFor: runtime.binding.contextFor,
@@ -1055,6 +1070,13 @@ export class AgentService {
         }
         try {
             const runtime = await this.#recoverRuntime(checkpoint);
+            const planner = createRunContextPlanner({
+                namespaceRef: checkpoint.runRef,
+                initialSpans: null,
+                ...(this.#contextArtifactStore === undefined
+                    ? {}
+                    : { artifactStore: this.#contextArtifactStore })
+            });
             const binding = Object.freeze({
                 snapshot: runtime.binding.snapshot,
                 ...(runtime.binding.providerRequestMetadata === undefined
@@ -1064,6 +1086,7 @@ export class AgentService {
                     messages: checkpoint.messages,
                     estimatedInputTokens: checkpoint.estimatedInputTokens
                 }),
+                planModelTurn: planner.planModelTurn,
                 recoverContext: async () => undefined,
                 prepareToolContext: runtime.binding.prepareToolContext,
                 contextFor: runtime.binding.contextFor,

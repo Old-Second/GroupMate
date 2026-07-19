@@ -8,12 +8,14 @@ import {
 } from './context-artifact.js'
 import {
   createContextPlanV1,
+  contextWireHash,
   parseContextPlanV1,
   type ContextPlanOmittedV1,
   type ContextPlanV1
 } from './context-plan.js'
 import {
   contextSpanHash,
+  contextWireProtocolIsValid,
   MAX_CONTEXT_SPANS,
   parseContextSourceRefs,
   parseContextSpanV1,
@@ -43,10 +45,13 @@ export const CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN = 'groupmate.context.compact
 export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 512 * 1_024
 export const MAX_CONTEXT_COMPACTION_TOOL_CALLS = 8
 
+export type ContextPlannerTransitionV1 = 'normal' | 'recovery_prefix_reset'
+
 export interface ContextPlannerInputV1 {
   readonly schemaVersion: 1
   readonly namespaceRef: string
   readonly generation: number
+  readonly transition: ContextPlannerTransitionV1
   readonly previousPlan: ContextPlanV1 | null
   readonly estimatorVersion: string
   readonly capabilityHash: string
@@ -88,6 +93,7 @@ const PRIORITY_RANK: Readonly<Record<ContextSpanPriority, number>> = {
 }
 
 const SOURCE_RANK: Readonly<Record<ContextSpanSource, number>> = {
+  recovery_baseline: 10,
   system_instruction: 9,
   current_request: 8,
   approval: 7,
@@ -159,16 +165,15 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
     return invalidContextValue()
   }
   const input = inspectContextRecord(value, [
-    'schemaVersion', 'namespaceRef', 'generation', 'previousPlan', 'estimatorVersion',
+    'schemaVersion', 'namespaceRef', 'generation', 'transition', 'previousPlan', 'estimatorVersion',
     'capabilityHash', 'artifactPolicy', 'budget', 'spans', 'artifacts'
   ])
-  if (input.schemaVersion !== 1 || (input.artifactPolicy !== 'disabled' && input.artifactPolicy !== 'enabled')) {
+  if (input.schemaVersion !== 1 ||
+    (input.transition !== 'normal' && input.transition !== 'recovery_prefix_reset') ||
+    (input.artifactPolicy !== 'disabled' && input.artifactPolicy !== 'enabled')) {
     return invalidContextValue()
   }
   const spans = Object.freeze(inspectContextArray(input.spans, MAX_CONTEXT_SPANS).map(parseContextSpanV1))
-  if (spans.some(span => span.kind === 'artifact' || span.source === 'artifact')) {
-    return invalidContextValue()
-  }
   const artifacts = Object.freeze(inspectContextArray(input.artifacts, MAX_CONTEXT_SPANS)
     .map(parseContextArtifactV1))
   if (spans.length + artifacts.length > MAX_CONTEXT_SPANS) return invalidContextValue()
@@ -176,6 +181,7 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
     schemaVersion: 1 as const,
     namespaceRef: requireContextAscii(input.namespaceRef),
     generation: requireSafeInteger(input.generation, { positive: true }),
+    transition: input.transition,
     previousPlan: input.previousPlan === null ? null : parseContextPlanV1(input.previousPlan),
     estimatorVersion: requireContextAscii(input.estimatorVersion),
     capabilityHash: requireContextHash(input.capabilityHash),
@@ -185,7 +191,7 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
     artifacts
   })
   if (parsed.previousPlan === null) {
-    if (parsed.generation < 1) return invalidContextValue()
+    if (parsed.generation < 1 || parsed.transition !== 'normal') return invalidContextValue()
   } else if (parsed.generation !== parsed.previousPlan.generation + 1 ||
     parsed.previousPlan.namespaceRef !== parsed.namespaceRef ||
     parsed.previousPlan.estimatorVersion !== parsed.estimatorVersion ||
@@ -194,6 +200,31 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
   }
   if (parsed.estimatorVersion !== CONTEXT_TOKEN_ESTIMATOR_VERSION) return invalidContextValue()
   validateSpanSet(parsed.spans, parsed.namespaceRef)
+  const recoveryBaselines = parsed.spans.filter(span => span.source === 'recovery_baseline')
+  if (recoveryBaselines.length > 1) return invalidContextValue()
+  const recoveryBaseline = recoveryBaselines[0]
+  if (recoveryBaseline !== undefined) {
+    const previousPlan = parsed.previousPlan
+    const previousEntry = previousPlan?.included.find(entry => (
+      entry.spanId === recoveryBaseline.spanId
+    ))
+    const anchoredToImmediatePlan = previousPlan !== null &&
+      recoveryBaseline.originGeneration === previousPlan.generation &&
+      recoveryBaseline.provenance.ref === `plan:${previousPlan.planHash}` &&
+      recoveryBaseline.provenance.contentHash === previousPlan.planHash
+    const retainedFromEarlierPlan = previousPlan !== null &&
+      recoveryBaseline.originGeneration < previousPlan.generation &&
+      recoveryBaseline.provenance.ref ===
+        `plan:${recoveryBaseline.provenance.contentHash}` &&
+      previousEntry?.representation === 'raw' &&
+      previousEntry.wireHash === contextWireHash(recoveryBaseline.messages) &&
+      previousEntry.contentHash === contextSpanHash(recoveryBaseline)
+    if (previousPlan === null || parsed.transition !== 'normal' ||
+      (!anchoredToImmediatePlan && !retainedFromEarlierPlan) ||
+      parsed.spans.some(span => span !== recoveryBaseline &&
+        (span.semanticOrder <= recoveryBaseline.semanticOrder ||
+          span.originGeneration < recoveryBaseline.originGeneration))) return invalidContextValue()
+  }
   if (plannerInputBytes(parsed) > MAX_CONTEXT_PLANNER_INPUT_BYTES) return invalidContextValue()
   return parsed
 }
@@ -263,25 +294,13 @@ function fitsHardBudget (usage: Usage, budget: ContextPlannerBudgetV1): boolean 
 function protocolIsGloballyValid (spans: readonly ContextSpanV1[]): boolean {
   const seen = new Set<string>()
   for (const span of spans) {
-    if (span.toolProtocol === null) continue
-    for (const callId of span.toolProtocol.callIds) {
-      if (seen.has(callId)) return false
-      seen.add(callId)
+    for (const message of span.messages) {
+      if (message.role !== 'assistant' || message.toolCalls === undefined) continue
+      for (const call of message.toolCalls) {
+        if (seen.has(call.callId)) return false
+        seen.add(call.callId)
+      }
     }
-  }
-  return true
-}
-
-function finalWireProtocolIsValid (messages: readonly ModelMessage[]): boolean {
-  for (let index = 0; index < messages.length; index += 1) {
-    const message = messages[index]
-    if (message?.role === 'tool') return false
-    if (message?.role !== 'assistant' || message.toolCalls === undefined) continue
-    for (const [offset, call] of message.toolCalls.entries()) {
-      const result = messages[index + offset + 1]
-      if (result?.role !== 'tool' || result.toolCallId !== call.callId) return false
-    }
-    index += message.toolCalls.length
   }
   return true
 }
@@ -339,16 +358,39 @@ function materializeArtifacts (
   coverage: ReadonlyMap<string, readonly string[]>
   inactiveArtifactIds: ReadonlySet<string>
 }> {
-  const rawById = new Map(input.spans.map(span => [span.spanId, span]))
+  const rawSpans = input.spans.filter(span => span.source !== 'artifact')
+  const rawById = new Map(rawSpans.map(span => [span.spanId, span]))
+  const retainedById = new Map(input.spans
+    .filter(span => span.source === 'artifact')
+    .map(span => [span.spanId, span]))
   const seenCovered = new Set<string>()
   const artifactSpans: ContextSpanV1[] = []
   const coverage = new Map<string, readonly string[]>()
   const inactiveArtifactIds = new Set<string>()
   const previousArtifactIds = new Set(input.previousPlan?.artifactRefs ?? [])
   for (const artifact of input.artifacts) {
+    const retained = retainedById.get(artifact.artifactId)
     if (artifact.namespaceRef !== input.namespaceRef ||
-      artifact.estimatorVersion !== input.estimatorVersion || rawById.has(artifact.artifactId)) {
+      artifact.estimatorVersion !== input.estimatorVersion || rawById.has(artifact.artifactId) ||
+      (retained !== undefined && contextSpanHash(retained) !== contextSpanHash(
+        contextArtifactToSpan(artifact, retained.semanticOrder, retained.priority)
+      )) || (retained !== undefined && !previousArtifactIds.has(artifact.artifactId))) {
       return invalidContextValue()
+    }
+    if (retained !== undefined && previousArtifactIds.has(artifact.artifactId)) {
+      const previousEntry = input.previousPlan?.included.find(entry => (
+        entry.spanId === artifact.artifactId
+      ))
+      if (previousEntry === undefined || previousEntry.representation !== 'artifact' ||
+        previousEntry.wireHash !== contextWireHash(retained.messages) ||
+        previousEntry.contentHash !== contextSpanHash(retained) ||
+        artifact.sourceSpanIds.some(spanId => seenCovered.has(spanId))) {
+        return invalidContextValue()
+      }
+      artifact.sourceSpanIds.forEach(spanId => seenCovered.add(spanId))
+      artifactSpans.push(retained)
+      coverage.set(retained.spanId, artifact.sourceSpanIds)
+      continue
     }
     const sources = artifact.sourceSpanIds.map(spanId => {
       const span = rawById.get(spanId)
@@ -398,7 +440,7 @@ function materializeArtifacts (
       return invalidContextValue()
     }
     const artifactSemanticOrder = Math.min(...sources.map(span => span.semanticOrder))
-    const artifactSpan = contextArtifactToSpan(artifact, artifactSemanticOrder)
+    const artifactSpan = retained ?? contextArtifactToSpan(artifact, artifactSemanticOrder)
     artifactSpans.push(artifactSpan)
     if (allowNewArtifacts || previousArtifactIds.has(artifactSpan.spanId)) {
       coverage.set(artifactSpan.spanId, Object.freeze(sources.map(span => span.spanId)))
@@ -406,8 +448,11 @@ function materializeArtifacts (
       inactiveArtifactIds.add(artifactSpan.spanId)
     }
   }
+  if (retainedById.size !== artifactSpans.filter(span => retainedById.has(span.spanId)).length) {
+    return invalidContextValue()
+  }
   return Object.freeze({
-    spans: Object.freeze([...input.spans, ...artifactSpans]),
+    spans: Object.freeze([...rawSpans, ...artifactSpans]),
     coverage,
     inactiveArtifactIds
   })
@@ -415,17 +460,36 @@ function materializeArtifacts (
 
 function previousWire (
   previous: ContextPlanV1,
-  byId: ReadonlyMap<string, ContextSpanV1>
+  byId: ReadonlyMap<string, ContextSpanV1>,
+  recoveryBaseline: ContextSpanV1 | undefined
 ): readonly ModelMessage[] | null {
   const wire: ModelMessage[] = []
+  let direct = true
   for (const entry of previous.included) {
     const span = byId.get(entry.spanId)
-    if (span === undefined || entry.contentHash !== contextSpanHash(span) ||
+    if (span === undefined || entry.wireHash !== contextWireHash(span.messages) ||
       entry.wireCount !== span.messages.length ||
-      entry.representation !== (span.source === 'artifact' ? 'artifact' : 'raw')) return null
+      entry.representation !== (span.source === 'artifact' ? 'artifact' : 'raw')) {
+      direct = false
+      break
+    }
     wire.push(...span.messages)
   }
-  const frozenWire = Object.freeze(wire)
+  let frozenWire: readonly ModelMessage[]
+  if (direct) {
+    frozenWire = Object.freeze(wire)
+  } else {
+    if (recoveryBaseline === undefined ||
+      recoveryBaseline.messages.length !== previous.messageCount) return null
+    let cursor = 0
+    for (const entry of previous.included) {
+      const nextCursor = cursor + entry.wireCount
+      const slice = Object.freeze(recoveryBaseline.messages.slice(cursor, nextCursor))
+      if (slice.length !== entry.wireCount || contextWireHash(slice) !== entry.wireHash) return null
+      cursor = nextCursor
+    }
+    frozenWire = recoveryBaseline.messages
+  }
   try {
     if (previous.estimatedInputTokens !== estimateModelMessagesTokens(frozenWire) ||
       previous.serializedMessageBytes !== serializedModelMessagesBytes(frozenWire)) return null
@@ -464,10 +528,15 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
   const materialized = materializeArtifacts(input, crossesCompactionBoundary)
   const allSpans = materialized.spans
   const byId = new Map(allSpans.map(span => [span.spanId, span]))
-  const priorWire = input.previousPlan === null ? Object.freeze([]) : previousWire(input.previousPlan, byId)
-  if (priorWire === null) return BLOCKED_BUDGET
+  const recoveryBaseline = input.spans.find(span => span.source === 'recovery_baseline')
+  const reconstructedPriorWire = input.previousPlan === null
+    ? Object.freeze([])
+    : previousWire(input.previousPlan, byId, recoveryBaseline)
+  if (reconstructedPriorWire === null && input.transition === 'normal') return BLOCKED_BUDGET
+  const priorWire = reconstructedPriorWire ?? Object.freeze([])
 
-  const applySupersedes = input.previousPlan === null || crossesCompactionBoundary
+  const applySupersedes = input.previousPlan === null || crossesCompactionBoundary ||
+    input.transition === 'recovery_prefix_reset'
   const superseded = new Set(applySupersedes
     ? input.spans
       .filter(span => span.supersedes !== null)
@@ -528,9 +597,10 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
 
   const ordered = [...selectedSpans].sort(semanticOrder)
   const wire = Object.freeze(ordered.flatMap(span => span.messages))
-  if (!finalWireProtocolIsValid(wire)) return BLOCKED_PROTOCOL
+  if (!contextWireProtocolIsValid(wire)) return BLOCKED_PROTOCOL
   let prefixMessageCount = commonPrefixMessageCount(priorWire, wire)
-  const requiresFullPrefix = input.previousPlan?.mode === 'normal' &&
+  const requiresFullPrefix = input.transition === 'normal' &&
+    input.previousPlan?.mode === 'normal' &&
     !entersCompacting(rawUsage, input.budget)
   if (requiresFullPrefix) {
     if (wire.length < priorWire.length || prefixMessageCount !== priorWire.length) {
@@ -544,6 +614,7 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
       representation: span.source === 'artifact' ? 'artifact' as const : 'raw' as const,
       wireStart,
       wireCount: span.messages.length,
+      wireHash: contextWireHash(span.messages),
       contentHash: contextSpanHash(span)
     })
     wireStart += span.messages.length

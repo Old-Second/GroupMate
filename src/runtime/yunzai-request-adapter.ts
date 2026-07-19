@@ -31,6 +31,9 @@ export interface YunzaiRequestEvent extends MessageEventLike {
     readonly user_id?: unknown
     readonly nickname?: unknown
     readonly card?: unknown
+    readonly title?: unknown
+    readonly special_title?: unknown
+    readonly group_title?: unknown
     readonly role?: unknown
   }
 }
@@ -99,6 +102,13 @@ function timestamp (value: string, label: string): string {
 
 function actorRole (value: unknown): ActorIdentity['role'] {
   return value === 'owner' || value === 'admin' ? value : 'member'
+}
+
+function firstNonBlankDisplayName (...values: readonly unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim().length > 0) return value.slice(0, 256)
+  }
+  return undefined
 }
 
 function publicImageReference (value: string): boolean {
@@ -349,12 +359,13 @@ export async function adaptYunzaiRequest (
   const channel: ChannelIdentity = isGroup
     ? Object.freeze({ kind: 'group', botId, groupId: groupId as string })
     : Object.freeze({ kind: 'private', botId, userId: actorId })
-  const displayName = input.event.sender?.card ?? input.event.sender?.nickname
+  const displayName = firstNonBlankDisplayName(
+    input.event.sender?.card,
+    input.event.sender?.nickname
+  )
   const actor: ActorIdentity = Object.freeze({
     userId: actorId,
-    ...(typeof displayName === 'string' && displayName.length > 0
-      ? { displayName: displayName.slice(0, 256) }
-      : {}),
+    ...(displayName === undefined ? {} : { displayName }),
     role: actorRole(input.event.sender?.role)
   })
   const messageId = messageInput.currentMessageId ?? requestId

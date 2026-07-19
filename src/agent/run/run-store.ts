@@ -13,6 +13,7 @@ import {
   type RunCheckpointV3,
   type RunCheckpointV4,
   type RunCheckpointV5,
+  type RunCheckpointV6,
   type RunCheckpoint
 } from './run-checkpoint.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
@@ -96,9 +97,9 @@ export interface RunStore {
   create(checkpoint: RunCheckpoint): Promise<RunCheckpoint>
   load(runId: string): Promise<LoadedRunCheckpoint | null>
   upgrade(
-    expected: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4,
-    next: RunCheckpointV5
-  ): Promise<RunCheckpointV5>
+    expected: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5,
+    next: RunCheckpointV6
+  ): Promise<RunCheckpointV6>
   compareAndSet(
     expected: RunCheckpoint,
     next: RunCheckpoint

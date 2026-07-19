@@ -34,7 +34,7 @@ const allowedTransitions = Object.freeze({
         'failed',
         'cancelled'
     ]),
-    executing_tools: new Set(['calling_model', 'failed', 'cancelled']),
+    executing_tools: new Set(['preparing', 'calling_model', 'failed', 'cancelled']),
     correcting: new Set(['completed', 'failed', 'cancelled']),
     completed: new Set(),
     failed: new Set(),

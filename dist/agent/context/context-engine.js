@@ -588,6 +588,7 @@ function strictPlannerGate(items, currentRequestId, query, maxMessages) {
             schemaVersion: 1,
             namespaceRef,
             generation: 1,
+            transition: 'normal',
             previousPlan: null,
             estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
             capabilityHash,
@@ -652,6 +653,48 @@ export class ContextEngine {
     constructor(options) {
         this.estimator = options.estimator;
         this.memoryStore = options.memoryStore;
+    }
+    projectSourceSpans(input, namespaceRef, signal) {
+        assertNotAborted(signal);
+        validateInputContainers(input);
+        if (input.memoryQuery !== undefined) {
+            return invalidContextInput('memory_query_requires_prepare');
+        }
+        const semanticItems = Object.freeze([
+            ...input.systemInstructions,
+            ...input.runtimeFacts,
+            ...input.sessionHistory,
+            ...input.groupContext,
+            input.currentRequest,
+            ...input.toolMessages
+        ]);
+        if (semanticItems.length > MAX_CONTEXT_SPANS) {
+            throw contextError('context.input', {
+                itemCount: semanticItems.length,
+                maxItems: MAX_CONTEXT_SPANS
+            });
+        }
+        const inputBytes = byteLength(semanticItems);
+        if (inputBytes > MAX_CONTEXT_PLANNER_INPUT_BYTES) {
+            throw contextError('context.input', {
+                inputBytes,
+                maxBytes: MAX_CONTEXT_PLANNER_INPUT_BYTES
+            });
+        }
+        const seen = new Map();
+        const unique = [];
+        for (const item of semanticItems) {
+            const first = seen.get(item.id);
+            if (first === undefined) {
+                seen.set(item.id, item);
+                unique.push(item);
+            }
+            else if (itemIsMandatory(first) || itemIsMandatory(item)) {
+                return invalidContextInput('mandatory_duplicate_id');
+            }
+        }
+        assertNotAborted(signal);
+        return Object.freeze(strictProjections(Object.freeze(unique), namespaceRef, undefined).map(projection => projection.span));
     }
     async prepare(input, budget, signal) {
         assertNotAborted(signal);

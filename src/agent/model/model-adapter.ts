@@ -6,6 +6,7 @@ import {
 } from '../contracts/error.js'
 import type { JsonObject } from './json-value.js'
 import type { ProviderTurnState } from '../run/provider-state.js'
+import type { ProviderRequestWireIdentityV1 } from '../run/provider-generation.js'
 
 export type ModelToolMode = 'auto' | 'required' | 'disabled'
 
@@ -23,6 +24,7 @@ export interface ModelToolDefinition {
 export interface ModelAssistantToolCall {
   readonly callId: string
   readonly name: string
+  readonly argumentsText?: string
   readonly arguments: JsonObject
 }
 
@@ -142,6 +144,7 @@ export interface ModelTurn {
 }
 
 export interface ModelAdapter {
+  requestIdentity?(request: ModelRequest): ProviderRequestWireIdentityV1
   complete(request: ModelRequest, signal: AbortSignal): Promise<ModelTurn>
 }
 

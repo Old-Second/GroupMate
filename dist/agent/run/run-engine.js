@@ -3,6 +3,8 @@ import { performance } from 'node:perf_hooks';
 import { completionFromTerminalOutput } from '../contracts/completion.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
 import { parseProviderAttemptEventPayload } from '../contracts/event.js';
+import { contextArtifactRefsRetainedOrCleared } from '../context/context-artifact-ref-transition.js';
+import { contextWireHash } from '../context/context-plan.js';
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js';
 import { parseJsonValue } from '../model/json-value.js';
 import { resolveModelCapabilitySnapshot } from '../model/model-capability.js';
@@ -14,9 +16,10 @@ import { boundedMonotonicDurationMs } from './run-budget.js';
 import { availableModelOutputTokens, createToolWireSnapshotV1 } from './model-turn-capacity.js';
 import { createInitialRunCheckpoint, nextRunCheckpoint, recoverExecutingRunCheckpoint } from './run-checkpoint.js';
 import { snapshotModelRequestForJournal, snapshotModelTurnForJournal, snapshotRunCheckpointForJournal, snapshotTerminalReceiptForJournal } from './run-content-journal.js';
-import { upgradeRunCheckpointV1, upgradeRunCheckpointV2, upgradeRunCheckpointV3, upgradeRunCheckpointV4 } from './run-checkpoint-migration.js';
+import { upgradeRunCheckpointV1, upgradeRunCheckpointV2, upgradeRunCheckpointV3, upgradeRunCheckpointV4, upgradeRunCheckpointV5 } from './run-checkpoint-migration.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { parseProviderTurnState } from './provider-state.js';
+import { createFrozenProviderGenerationV1, providerRequestScopeFingerprint, providerRequestWireIdentity } from './provider-generation.js';
 import { createRunTerminalSnapshot, parseFrozenObservationPolicy } from './run-observation.js';
 import { createRequestRef, createRunRef } from './run-reference.js';
 import { createRunEvent } from './run-events.js';
@@ -34,7 +37,8 @@ class ModelAttemptFailure extends Error {
     messages;
     estimatedInputTokens;
     recoveryUsed;
-    constructor(agentError, state) {
+    knownProviderFailure;
+    constructor(agentError, state, knownProviderFailure = null) {
         super('model attempt failed', { cause: agentError });
         this.name = 'ModelAttemptFailure';
         this.agentError = agentError;
@@ -43,6 +47,7 @@ class ModelAttemptFailure extends Error {
         this.messages = state.messages;
         this.estimatedInputTokens = state.estimatedInputTokens;
         this.recoveryUsed = state.recoveryUsed;
+        this.knownProviderFailure = knownProviderFailure;
     }
 }
 class RunAbortedError extends Error {
@@ -359,6 +364,15 @@ function toolOutcomeUnknown() {
         userMessage: '操作结果暂时无法确认，请先核实后再试。'
     });
 }
+function providerOutcomeUnknown() {
+    return new AgentError({
+        code: 'provider_unavailable',
+        stage: 'model.recovery',
+        retryable: false,
+        userMessage: '模型请求结果暂时无法确认，请重新发起任务。',
+        details: { reason: 'ambiguous_dispatch_recovery_exhausted' }
+    });
+}
 function boundedCancellationReason(reason) {
     const normalized = typeof reason === 'string' ? reason.trim() : '';
     return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalized)
@@ -605,7 +619,7 @@ export class RunEngine {
     }
     async loadCheckpoint(runId) {
         const loaded = await this.#store.load(runId);
-        if (loaded === null || loaded.schemaVersion === 5)
+        if (loaded === null || loaded.schemaVersion === 6)
             return loaded;
         if (isTerminalRunStatus(loaded.status)) {
             throw new TypeError('terminal active checkpoint cannot be migrated');
@@ -619,7 +633,9 @@ export class RunEngine {
                 ? upgradeRunCheckpointV2(loaded)
                 : loaded.schemaVersion === 3
                     ? upgradeRunCheckpointV3(loaded)
-                    : upgradeRunCheckpointV4(loaded);
+                    : loaded.schemaVersion === 4
+                        ? upgradeRunCheckpointV4(loaded)
+                        : upgradeRunCheckpointV5(loaded);
         return await this.#store.upgrade(loaded, upgraded);
     }
     async pendingApproval(runId, approvalId) {
@@ -925,6 +941,9 @@ export class RunEngine {
                 manifest: input.runtime.snapshot.manifest
             }),
             toolWireSnapshot: createToolWireSnapshotV1(input.runtime.snapshot.modelTools),
+            contextRuntimeMode: input.runtime.planModelTurn === undefined
+                ? 'legacy_compatible'
+                : 'generation_planner',
             budgetLimits: this.#budget.limits,
             budgetCounters: this.#budget.initialCounters,
             deadlineAt: input.deadlineAt,
@@ -1141,11 +1160,42 @@ export class RunEngine {
             checkpoint.engineActivity.state === 'idle')
             return checkpoint;
         let observationCounters = checkpoint.observationCounters;
-        if (checkpoint.providerDispatch.state === 'reserved') {
-            observationCounters = unavailableProviderObservations(observationCounters);
-        }
         if (checkpoint.engineActivity.state === 'reserved') {
             observationCounters = unavailableEngineObservations(observationCounters);
+        }
+        if (checkpoint.providerDispatch.state === 'reserved') {
+            observationCounters = unavailableProviderObservations(observationCounters);
+            if (checkpoint.contextRuntimeMode === 'generation_planner') {
+                const providerGeneration = checkpoint.providerGeneration;
+                if (providerGeneration === null || checkpoint.modelTurn === null) {
+                    return await this.#fail(checkpoint, new AgentError({
+                        code: 'checkpoint_invalid',
+                        stage: 'model.recovery',
+                        retryable: false,
+                        userMessage: '模型请求恢复状态不完整，请重新发起任务。'
+                    }));
+                }
+                if (providerGeneration.ambiguityRecoveryUsed) {
+                    return await this.#fail(checkpoint, providerOutcomeUnknown(), [], {
+                        observationCounters
+                    });
+                }
+                return await this.#commit(checkpoint, checkpoint.status, {
+                    observationCounters,
+                    providerDispatch: Object.freeze({ state: 'idle' }),
+                    engineActivity: Object.freeze({ state: 'idle' }),
+                    providerGeneration: createFrozenProviderGenerationV1(Object.freeze({
+                        generation: providerGeneration.generation,
+                        kind: providerGeneration.kind,
+                        planHash: providerGeneration.planHash,
+                        requestHash: providerGeneration.requestHash,
+                        requestBytes: providerGeneration.requestBytes,
+                        requestProtocolVersion: providerGeneration.requestProtocolVersion,
+                        scopeFingerprint: providerGeneration.scopeFingerprint,
+                        ambiguityRecoveryUsed: true
+                    }))
+                }, [], false);
+            }
         }
         return await this.#commit(checkpoint, checkpoint.status, {
             observationCounters,
@@ -1267,13 +1317,19 @@ export class RunEngine {
         this.#assertNotAborted(signal);
         switch (checkpoint.status) {
             case 'created': return await this.#prepare(checkpoint, signal);
-            case 'preparing': return await this.#reserveNormalTurn(checkpoint);
+            case 'preparing': return checkpoint.contextRuntimeMode === 'generation_planner' &&
+                (checkpoint.contextPlan === null || checkpoint.pendingContextMessages.length > 0)
+                ? await this.#planGeneration(checkpoint, {
+                    kind: 'normal',
+                    transition: 'normal'
+                }, signal)
+                : await this.#reserveNormalTurn(checkpoint);
             case 'calling_model': return checkpoint.modelTurn === null &&
                 checkpoint.toolLedgers.at(-1) !== undefined &&
                 toolLedgerHasVisibleOutput(checkpoint.toolLedgers.at(-1))
                 ? await this.#completeVisibleOutput(checkpoint)
                 : checkpoint.modelTurn === null
-                    ? await this.#beginCorrection(checkpoint)
+                    ? await this.#beginCorrection(checkpoint, signal)
                     : await this.#callModel(checkpoint, signal, false);
             case 'evaluating_tools': return await this.#preflightTools(checkpoint, signal);
             case 'executing_tools': return await this.#executeTools(checkpoint, signal);
@@ -1282,6 +1338,12 @@ export class RunEngine {
         }
     }
     async #prepare(checkpoint, signal) {
+        if (checkpoint.contextRuntimeMode === 'generation_planner') {
+            return await this.#planGeneration(checkpoint, {
+                kind: 'normal',
+                transition: 'normal'
+            }, signal, [{ type: 'run.started' }]);
+        }
         const runtime = this.#runtime(checkpoint.runId);
         const context = await this.#raceAbort(runtime.prepareContext(signal), signal);
         if (!Number.isSafeInteger(context.estimatedInputTokens) ||
@@ -1302,17 +1364,110 @@ export class RunEngine {
             }
         ]);
     }
+    async #planGeneration(checkpoint, request, signal, leadingDrafts = []) {
+        const runtime = this.#runtime(checkpoint.runId);
+        if (runtime.planModelTurn === undefined) {
+            throw new TypeError('generation planner runtime is unavailable');
+        }
+        const planned = await this.#raceAbort(runtime.planModelTurn(checkpoint, request, signal), signal);
+        this.#validatePlannedContext(checkpoint, planned);
+        return await this.#commit(checkpoint, 'preparing', {
+            messages: Object.freeze([...planned.messages]),
+            estimatedInputTokens: planned.estimatedInputTokens,
+            contextPlan: planned.plan,
+            contextArtifactRefs: Object.freeze([...planned.artifactRefs]),
+            pendingContextMessages: Object.freeze([]),
+            providerGeneration: null
+        }, [
+            ...leadingDrafts,
+            {
+                type: 'context.prepared',
+                payload: {
+                    messageCount: planned.messages.length,
+                    estimatedInputTokens: planned.estimatedInputTokens
+                }
+            }
+        ]);
+    }
     async #reserveNormalTurn(checkpoint) {
         const reservation = this.#reserveModelTurn(checkpoint, 'normal');
+        const providerGeneration = checkpoint.contextRuntimeMode === 'generation_planner'
+            ? this.#createProviderGeneration(checkpoint, this.#buildModelRequest(checkpoint, reservation.turn, false), 'normal')
+            : null;
         return await this.#commit(checkpoint, 'calling_model', {
             budgetCounters: reservation.counters,
-            modelTurn: reservation.turn
+            modelTurn: reservation.turn,
+            providerGeneration
         }, [{
                 type: 'model.started',
                 payload: { kind: 'normal', turn: reservation.counters.modelTurns }
             }]);
     }
-    async #beginCorrection(checkpoint) {
+    async #beginCorrection(checkpoint, signal) {
+        if (checkpoint.contextRuntimeMode === 'generation_planner') {
+            if (checkpoint.providerGeneration === null) {
+                if (!checkpoint.forceCorrection || checkpoint.contextPlan === null) {
+                    throw new TypeError('committed correction plan state is invalid');
+                }
+                return await this.#reserveCorrectionTurn(checkpoint);
+            }
+            return await this.#planGenerationForCorrection(checkpoint, signal);
+        }
+        return await this.#reserveCorrectionTurn(checkpoint);
+    }
+    async #planGenerationForCorrection(checkpoint, signal) {
+        const runtime = this.#runtime(checkpoint.runId);
+        if (runtime.planModelTurn === undefined) {
+            throw new TypeError('generation planner runtime is unavailable');
+        }
+        const planned = await this.#raceAbort(runtime.planModelTurn(checkpoint, Object.freeze({
+            kind: 'correction',
+            transition: 'normal'
+        }), signal), signal);
+        this.#validatePlannedContext(checkpoint, planned);
+        const expectedCorrectionPrefix = Object.freeze([
+            ...checkpoint.messages,
+            ...checkpoint.pendingContextMessages
+        ]);
+        const correctionPrefix = Object.freeze(planned.messages.slice(0, expectedCorrectionPrefix.length));
+        if (planned.messages.length !== expectedCorrectionPrefix.length + 1 ||
+            contextWireHash(correctionPrefix) !== contextWireHash(expectedCorrectionPrefix) ||
+            planned.messages.at(-1)?.role !== 'user' ||
+            planned.plan.prefixMessageCount !== checkpoint.messages.length ||
+            !contextArtifactRefsRetainedOrCleared(checkpoint.contextArtifactRefs, planned.artifactRefs)) {
+            throw new TypeError('planned correction context is not append-only');
+        }
+        return await this.#commit(checkpoint, checkpoint.status, {
+            messages: Object.freeze([...planned.messages]),
+            estimatedInputTokens: planned.estimatedInputTokens,
+            contextPlan: planned.plan,
+            contextArtifactRefs: Object.freeze([...planned.artifactRefs]),
+            pendingContextMessages: Object.freeze([]),
+            providerGeneration: null
+        }, [{
+                type: 'context.prepared',
+                payload: {
+                    messageCount: planned.messages.length,
+                    estimatedInputTokens: planned.estimatedInputTokens
+                }
+            }]);
+    }
+    #validatePlannedContext(checkpoint, planned) {
+        const previousPlan = checkpoint.contextPlan;
+        if (!Number.isSafeInteger(planned.estimatedInputTokens) ||
+            planned.estimatedInputTokens < 0 || !Array.isArray(planned.messages) ||
+            !Array.isArray(planned.artifactRefs) || planned.plan.namespaceRef !== checkpoint.runRef ||
+            planned.plan.generation !== (previousPlan?.generation ?? 0) + 1 ||
+            planned.plan.previousPlanHash !== (previousPlan?.planHash ?? null) ||
+            planned.plan.estimatedInputTokens !== planned.estimatedInputTokens ||
+            planned.plan.messageCount !== planned.messages.length ||
+            planned.plan.artifactRefs.length !== planned.artifactRefs.length ||
+            planned.plan.artifactRefs.some((ref, index) => ref !== planned.artifactRefs[index]) ||
+            planned.plan.included.some(entry => contextWireHash(Object.freeze(planned.messages.slice(entry.wireStart, entry.wireStart + entry.wireCount))) !== entry.wireHash)) {
+            throw new TypeError('planned run context is invalid');
+        }
+    }
+    async #reserveCorrectionTurn(checkpoint) {
         const budget = this.#runBudget(checkpoint);
         let counters = budget.recordCorrection(checkpoint.budgetCounters);
         const maxOutputTokens = this.#availableOutputTokens(checkpoint, counters, checkpoint.estimatedInputTokens, 'correction');
@@ -1321,9 +1476,14 @@ export class RunEngine {
             estimatedInputTokens: checkpoint.estimatedInputTokens,
             maxOutputTokens
         });
+        const turn = Object.freeze({ kind: 'correction', maxOutputTokens });
+        const providerGeneration = checkpoint.contextRuntimeMode === 'generation_planner'
+            ? this.#createProviderGeneration(checkpoint, this.#buildModelRequest(checkpoint, turn, true), 'correction')
+            : null;
         return await this.#commit(checkpoint, 'correcting', {
             budgetCounters: counters,
-            modelTurn: Object.freeze({ kind: 'correction', maxOutputTokens })
+            modelTurn: turn,
+            providerGeneration
         }, [{
                 type: 'model.started',
                 payload: { kind: 'correction', turn: counters.modelTurns }
@@ -1340,6 +1500,55 @@ export class RunEngine {
             counters,
             turn: Object.freeze({ kind, maxOutputTokens })
         });
+    }
+    #buildModelRequest(checkpoint, reserved, correction, messages = checkpoint.messages) {
+        const runtime = this.#runtime(checkpoint.runId);
+        return Object.freeze({
+            model: checkpoint.model.model,
+            messages,
+            tools: correction ? Object.freeze([]) : modelTools(runtime.snapshot),
+            toolMode: correction ? 'disabled' : 'auto',
+            streaming: checkpoint.model.streaming,
+            maxOutputTokens: reserved.maxOutputTokens,
+            reasoning: checkpoint.model.reasoning,
+            ...(runtime.providerRequestMetadata === undefined
+                ? {}
+                : { metadata: runtime.providerRequestMetadata }),
+            ...(checkpoint.model.temperature === undefined
+                ? {}
+                : { temperature: checkpoint.model.temperature }),
+            ...(checkpoint.model.topP === undefined ? {} : { topP: checkpoint.model.topP })
+        });
+    }
+    #createProviderGeneration(checkpoint, request, kind, ambiguityRecoveryUsed = false) {
+        const plan = checkpoint.contextPlan;
+        if (plan === null)
+            throw new TypeError('provider generation lacks context plan');
+        let identity;
+        if (this.#adapter.requestIdentity !== undefined) {
+            identity = this.#adapter.requestIdentity(request);
+        }
+        else {
+            const value = parseJsonValue(request, {
+                maxBytes: RUN_RESOURCE_LIMITS.requestBytes,
+                maxDepth: 32,
+                maxNodes: 32_768
+            });
+            if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+                throw new TypeError('model request identity is invalid');
+            }
+            identity = providerRequestWireIdentity(value);
+        }
+        return createFrozenProviderGenerationV1(Object.freeze({
+            generation: plan.generation,
+            kind,
+            planHash: plan.planHash,
+            requestHash: identity.requestHash,
+            requestBytes: identity.requestBytes,
+            requestProtocolVersion: identity.requestProtocolVersion,
+            scopeFingerprint: providerRequestScopeFingerprint(request.metadata),
+            ambiguityRecoveryUsed
+        }));
     }
     #availableOutputTokens(checkpoint, counters, estimatedInputTokens, kind) {
         this.#assertSnapshot(checkpoint, this.#runtime(checkpoint.runId).snapshot);
@@ -1371,13 +1580,17 @@ export class RunEngine {
         catch (error) {
             if (!(error instanceof ModelAttemptFailure))
                 throw error;
-            return await this.#fail(error.checkpoint, error.agentError, [], {
+            const knownFailureChanges = error.knownProviderFailure === null
+                ? Object.freeze({})
+                : this.#failedProviderDispatchChanges(error.checkpoint, error.counters);
+            return await this.#fail(error.checkpoint, error.agentError, error.knownProviderFailure?.drafts ?? [], {
+                ...knownFailureChanges,
                 budgetCounters: error.counters,
                 messages: error.messages,
                 estimatedInputTokens: error.estimatedInputTokens,
                 recoveryUsed: error.recoveryUsed,
                 modelTurn: null
-            });
+            }, undefined, error.knownProviderFailure?.occurredAt);
         }
         if ('terminal' in attempted)
             return attempted.checkpoint;
@@ -1405,16 +1618,22 @@ export class RunEngine {
         }, []);
         return Object.freeze({ checkpoint: stored, previousUsage });
     }
-    async #completeFailedProviderDispatch(checkpoint, counters, occurredAt, drafts = []) {
+    async #completeFailedProviderDispatch(checkpoint, counters, occurredAt, drafts = [], changes = Object.freeze({})) {
+        return await this.#commit(checkpoint, checkpoint.status, {
+            ...this.#failedProviderDispatchChanges(checkpoint, counters),
+            ...changes
+        }, drafts, true, occurredAt);
+    }
+    #failedProviderDispatchChanges(checkpoint, counters) {
         const observationCounters = Object.freeze({
             ...checkpoint.observationCounters,
             providerActiveDurationMs: knownObservation(checkpoint.observationCounters.providerActiveDurationMs, counters.usedActiveRuntimeMs)
         });
-        return await this.#commit(checkpoint, checkpoint.status, {
+        return Object.freeze({
             budgetCounters: counters,
             observationCounters,
             providerDispatch: Object.freeze({ state: 'idle' })
-        }, drafts, true, occurredAt);
+        });
     }
     async #attemptModel(checkpoint, reserved, signal, correction) {
         const runtime = this.#runtime(checkpoint.runId);
@@ -1427,24 +1646,16 @@ export class RunEngine {
         let nextAttemptKind = pendingProviderAttemptKind(checkpoint, correction);
         let current = checkpoint;
         let maxOutputTokens = reserved.maxOutputTokens;
+        let knownProviderFailure = null;
         try {
             while (true) {
-                const request = Object.freeze({
-                    model: checkpoint.model.model,
-                    messages,
-                    tools: correction ? Object.freeze([]) : modelTools(runtime.snapshot),
-                    toolMode: correction ? 'disabled' : 'auto',
-                    streaming: checkpoint.model.streaming,
-                    maxOutputTokens,
-                    reasoning: checkpoint.model.reasoning,
-                    ...(runtime.providerRequestMetadata === undefined
-                        ? {}
-                        : { metadata: runtime.providerRequestMetadata }),
-                    ...(checkpoint.model.temperature === undefined
-                        ? {}
-                        : { temperature: checkpoint.model.temperature }),
-                    ...(checkpoint.model.topP === undefined ? {} : { topP: checkpoint.model.topP })
-                });
+                const request = this.#buildModelRequest(current, Object.freeze({ kind: reserved.kind, maxOutputTokens }), correction, messages);
+                if (current.contextRuntimeMode === 'generation_planner') {
+                    const frozen = current.providerGeneration;
+                    if (frozen === null || !sameJson(frozen, this.#createProviderGeneration(current, request, frozen.kind, frozen.ambiguityRecoveryUsed))) {
+                        throw new TypeError('provider request identity changed after reservation');
+                    }
+                }
                 const timeoutMs = this.#providerTimeout(current, counters);
                 const reservedDispatch = await this.#reserveProviderDispatch(current);
                 current = reservedDispatch.checkpoint;
@@ -1493,21 +1704,28 @@ export class RunEngine {
                         }
                         return providerFailureJournalEvent(journalFields, classified.serialized);
                     });
-                    current = await this.#completeFailedProviderDispatch(current, counters, completionOccurredAt, [{
-                            type: 'model.attempted',
-                            payload: Object.freeze({
-                                observationSchemaVersion: 1,
-                                attemptKind,
-                                outcome: aborted ? 'cancelled' : 'failed',
-                                durationMs: activeRuntimeMs,
-                                errorCode
-                            })
-                        }]);
-                    if (isTerminalRunStatus(current.status)) {
-                        return Object.freeze({ terminal: true, checkpoint: current });
-                    }
-                    if (aborted)
+                    const failedAttemptDraft = Object.freeze({
+                        type: 'model.attempted',
+                        payload: Object.freeze({
+                            observationSchemaVersion: 1,
+                            attemptKind,
+                            outcome: aborted ? 'cancelled' : 'failed',
+                            durationMs: activeRuntimeMs,
+                            errorCode
+                        })
+                    });
+                    knownProviderFailure = Object.freeze({
+                        drafts: Object.freeze([failedAttemptDraft]),
+                        occurredAt: completionOccurredAt
+                    });
+                    if (aborted) {
+                        current = await this.#completeFailedProviderDispatch(current, counters, completionOccurredAt, knownProviderFailure.drafts);
+                        knownProviderFailure = null;
+                        if (isTerminalRunStatus(current.status)) {
+                            return Object.freeze({ terminal: true, checkpoint: current });
+                        }
                         throw new RunAbortedError();
+                    }
                     if (accounted.budgetError !== null)
                         throw accounted.budgetError;
                     if (error instanceof ModelProviderError) {
@@ -1518,8 +1736,18 @@ export class RunEngine {
                             checkpoint.toolLedgers.length === 0 &&
                             counters.recoveryAttempts < checkpoint.budgetLimits.maxRecoveryAttempts;
                         if (recoveryHint === 'drop_optional_context_once' && recoveryAllowed &&
-                            !recoveryUsed && runtime.recoverContext !== undefined) {
-                            const recovered = await this.#raceAbort(runtime.recoverContext(checkpoint, error, signal), signal);
+                            !recoveryUsed && (runtime.recoverContext !== undefined ||
+                            runtime.planModelTurn !== undefined)) {
+                            const recovered = current.contextRuntimeMode === 'generation_planner'
+                                ? runtime.planModelTurn === undefined
+                                    ? undefined
+                                    : await this.#raceAbort(runtime.planModelTurn(current, Object.freeze({
+                                        kind: 'context_recovery',
+                                        transition: 'recovery_prefix_reset'
+                                    }), signal), signal)
+                                : runtime.recoverContext === undefined
+                                    ? undefined
+                                    : await this.#raceAbort(runtime.recoverContext(checkpoint, error, signal), signal);
                             if (recovered !== undefined) {
                                 if (!Number.isSafeInteger(recovered.estimatedInputTokens) ||
                                     recovered.estimatedInputTokens < 0 || !Array.isArray(recovered.messages)) {
@@ -1528,33 +1756,67 @@ export class RunEngine {
                                 if (recovered.estimatedInputTokens > estimatedInputTokens) {
                                     throw new TypeError('recovered run context must not grow');
                                 }
-                                counters = budget.recordRecovery(counters);
-                                recoveryUsed = true;
-                                nextAttemptKind = 'recovery';
-                                messages = Object.freeze([...recovered.messages]);
-                                estimatedInputTokens = recovered.estimatedInputTokens;
+                                const recoveredCounters = budget.recordRecovery(counters);
+                                const recoveredMessages = Object.freeze([...recovered.messages]);
+                                const recoveredEstimatedInputTokens = recovered.estimatedInputTokens;
                                 const recoveredCapacity = availableModelOutputTokens({
                                     capability: checkpoint.modelCapability,
-                                    estimatedInputTokens,
+                                    estimatedInputTokens: recoveredEstimatedInputTokens,
                                     requestedOutputTokens: checkpoint.model.maxOutputTokens,
                                     toolSchemaTokens: reserved.kind === 'normal'
                                         ? checkpoint.toolWireSnapshot?.estimatedTokens ?? 4_096
                                         : 0
                                 });
-                                maxOutputTokens = checkpoint.modelLoopPolicy.kind === 'legacy_fixed' &&
+                                const recoveredMaxOutputTokens = checkpoint.modelLoopPolicy.kind === 'legacy_fixed' &&
                                     checkpoint.modelLoopPolicy.maxEstimatedTokens === 49_152
                                     ? Math.min(reserved.maxOutputTokens, recoveredCapacity)
                                     : recoveredCapacity;
-                                current = await this.#commit(current, current.status, {
-                                    budgetCounters: counters,
+                                let providerGeneration = current.providerGeneration;
+                                let contextChanges = Object.freeze({});
+                                if (current.contextRuntimeMode === 'generation_planner') {
+                                    if (!('plan' in recovered) || !('artifactRefs' in recovered)) {
+                                        throw new TypeError('recovered context plan is invalid');
+                                    }
+                                    const planned = recovered;
+                                    this.#validatePlannedContext(current, planned);
+                                    const candidate = Object.freeze({
+                                        ...current,
+                                        messages: recoveredMessages,
+                                        estimatedInputTokens: recoveredEstimatedInputTokens,
+                                        contextPlan: planned.plan,
+                                        contextArtifactRefs: planned.artifactRefs,
+                                        pendingContextMessages: Object.freeze([]),
+                                        recoveryUsed: true
+                                    });
+                                    const recoveryTurn = Object.freeze({
+                                        kind: reserved.kind,
+                                        maxOutputTokens: recoveredMaxOutputTokens
+                                    });
+                                    providerGeneration = this.#createProviderGeneration(candidate, this.#buildModelRequest(candidate, recoveryTurn, false, recoveredMessages), 'context_recovery');
+                                    contextChanges = Object.freeze({
+                                        contextPlan: planned.plan,
+                                        contextArtifactRefs: Object.freeze([...planned.artifactRefs]),
+                                        pendingContextMessages: Object.freeze([])
+                                    });
+                                }
+                                counters = recoveredCounters;
+                                recoveryUsed = true;
+                                nextAttemptKind = 'recovery';
+                                messages = recoveredMessages;
+                                estimatedInputTokens = recoveredEstimatedInputTokens;
+                                maxOutputTokens = recoveredMaxOutputTokens;
+                                current = await this.#completeFailedProviderDispatch(current, counters, completionOccurredAt, knownProviderFailure.drafts, {
+                                    ...contextChanges,
                                     messages,
                                     estimatedInputTokens,
                                     recoveryUsed,
+                                    providerGeneration,
                                     modelTurn: Object.freeze({
                                         kind: reserved.kind,
                                         maxOutputTokens
                                     })
-                                }, []);
+                                });
+                                knownProviderFailure = null;
                                 continue;
                             }
                         }
@@ -1562,9 +1824,8 @@ export class RunEngine {
                             counters.providerRetries < checkpoint.budgetLimits.maxProviderRetries) {
                             counters = budget.recordProviderRetry(counters);
                             nextAttemptKind = correction ? 'correction' : 'retry';
-                            current = await this.#commit(current, current.status, {
-                                budgetCounters: counters
-                            }, []);
+                            current = await this.#completeFailedProviderDispatch(current, counters, completionOccurredAt, knownProviderFailure.drafts);
+                            knownProviderFailure = null;
                             continue;
                         }
                         throw classified.error;
@@ -1599,7 +1860,7 @@ export class RunEngine {
                 messages,
                 estimatedInputTokens,
                 recoveryUsed
-            });
+            }, knownProviderFailure);
         }
     }
     async #evaluateModelTurn(checkpoint, attempted, correction) {
@@ -1736,6 +1997,15 @@ export class RunEngine {
                         drafts: Object.freeze([attemptedEvent, completedEvent])
                     });
                 }
+                const priorCallIds = new Set(checkpoint.toolLedgers.flatMap(ledger => (ledger.calls.map(call => call.callId))));
+                if (toolCalls.some(call => priorCallIds.has(call.callId))) {
+                    return Object.freeze({
+                        kind: 'fail',
+                        error: modelProtocolError('invalid_tool_call_identity'),
+                        changes: common,
+                        drafts: Object.freeze([attemptedEvent, completedEvent])
+                    });
+                }
                 let ledger;
                 try {
                     ledger = createToolExecutionLedger(checkpoint.step, toolCalls);
@@ -1762,13 +2032,18 @@ export class RunEngine {
                     toolCalls: Object.freeze(ledger.calls.map(call => Object.freeze({
                         callId: call.callId,
                         name: call.toolName,
+                        argumentsText: call.argumentsText,
                         arguments: call.arguments
                     }))),
                     ...(providerState === undefined ? {} : { providerState })
                 });
-                const messages = Object.freeze([...attempted.messages, assistant]);
-                const estimatedInputTokens = attempted.estimatedInputTokens +
-                    estimatedTokensFor(assistant);
+                const generationPlanner = checkpoint.contextRuntimeMode === 'generation_planner';
+                const messages = generationPlanner
+                    ? attempted.messages
+                    : Object.freeze([...attempted.messages, assistant]);
+                const estimatedInputTokens = generationPlanner
+                    ? attempted.estimatedInputTokens
+                    : attempted.estimatedInputTokens + estimatedTokensFor(assistant);
                 return Object.freeze({
                     kind: 'commit',
                     status: 'evaluating_tools',
@@ -1776,6 +2051,9 @@ export class RunEngine {
                         ...common,
                         messages,
                         estimatedInputTokens,
+                        ...(generationPlanner
+                            ? { pendingContextMessages: Object.freeze([assistant]) }
+                            : {}),
                         toolLedgers: Object.freeze([...checkpoint.toolLedgers, ledger]),
                         preparedBatch: null,
                         interruption: null
@@ -1821,6 +2099,17 @@ export class RunEngine {
                     kind: 'fail',
                     error: modelProtocolError('invalid_correction_response'),
                     changes: common,
+                    drafts: Object.freeze([attemptedEvent, completedEvent])
+                });
+            }
+            if (checkpoint.contextRuntimeMode === 'generation_planner') {
+                return Object.freeze({
+                    kind: 'commit',
+                    status: 'calling_model',
+                    changes: Object.freeze({
+                        ...common,
+                        forceCorrection: true
+                    }),
                     drafts: Object.freeze([attemptedEvent, completedEvent])
                 });
             }
@@ -1993,9 +2282,17 @@ export class RunEngine {
         const forceCorrection = checkpoint.forceCorrection ||
             toolLedgerRequiresToolDisabledFinalResponse(completedLedger);
         const toolMessages = toolLedgerModelMessages(completedLedger);
-        const messages = Object.freeze([...checkpoint.messages, ...toolMessages]);
-        const estimatedInputTokens = checkpoint.estimatedInputTokens +
-            toolMessages.reduce((total, message) => total + estimatedTokensFor(message), 0);
+        const generationPlanner = checkpoint.contextRuntimeMode === 'generation_planner';
+        const messages = generationPlanner
+            ? checkpoint.messages
+            : Object.freeze([...checkpoint.messages, ...toolMessages]);
+        const estimatedInputTokens = generationPlanner
+            ? checkpoint.estimatedInputTokens
+            : checkpoint.estimatedInputTokens +
+                toolMessages.reduce((total, message) => total + estimatedTokensFor(message), 0);
+        const pendingContextMessages = generationPlanner
+            ? Object.freeze([...checkpoint.pendingContextMessages, ...toolMessages])
+            : checkpoint.pendingContextMessages;
         const attemptEvents = execution.results.flatMap(result => (result.attemptObservations.map(observation => ({
             type: 'tool.attempted',
             payload: Object.freeze({
@@ -2022,6 +2319,7 @@ export class RunEngine {
         const common = {
             messages,
             estimatedInputTokens,
+            pendingContextMessages,
             observationCounters: Object.freeze({
                 ...checkpoint.observationCounters,
                 toolAttempts: incrementObservation(checkpoint.observationCounters.toolAttempts, countScheduledToolAttempts(execution.results))
@@ -2053,6 +2351,15 @@ export class RunEngine {
             checkpoint.budgetCounters.modelTurns < checkpoint.modelLoopPolicy.maxModelTurns -
                 checkpoint.budgetLimits.maxCorrectionTurns;
         if (!forceCorrection && mayReserveNormal) {
+            if (generationPlanner) {
+                const next = await this.#commit(checkpoint, 'preparing', {
+                    ...common,
+                    step: checkpoint.step + 1,
+                    providerGeneration: checkpoint.providerGeneration
+                }, events);
+                this.#startedToolCalls.delete(checkpoint.runId);
+                return next;
+            }
             const reservationCheckpoint = Object.freeze({
                 ...checkpoint,
                 messages,

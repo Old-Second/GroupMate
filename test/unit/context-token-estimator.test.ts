@@ -75,7 +75,49 @@ test('canonical message JSON recursively sorts arbitrary tool and provider-state
   }])
 
   assert.equal(serializeModelMessages(first), serializeModelMessages(second))
-  assert.deepEqual(canonicalizeModelMessages(first), canonicalizeModelMessages(second))
+  const canonicalFirst = canonicalizeModelMessages(first)[0]
+  const canonicalSecond = canonicalizeModelMessages(second)[0]
+  assert.equal(canonicalFirst?.role, 'assistant')
+  assert.equal(canonicalSecond?.role, 'assistant')
+  if (canonicalFirst?.role !== 'assistant' || canonicalSecond?.role !== 'assistant') {
+    throw new Error('assistant messages expected')
+  }
+  assert.deepEqual(Object.keys(canonicalFirst.toolCalls?.[0]?.arguments ?? {}), ['z', 'a'])
+  assert.deepEqual(Object.keys(canonicalSecond.toolCalls?.[0]?.arguments ?? {}), ['a', 'z'])
+  assert.deepEqual(Object.keys(canonicalFirst.providerState?.payload ?? {}), ['z', 'a'])
+  assert.deepEqual(Object.keys(canonicalSecond.providerState?.payload ?? {}), ['a', 'z'])
+})
+
+test('canonical messages normalize ordinary text but preserve opaque provider wire values', () => {
+  const decomposed = 'e\u0301'
+  const argumentsText = `{ "second": "${decomposed}", "first": 1 }`
+  const messages = deepFreeze([{
+    role: 'assistant' as const,
+    content: decomposed,
+    toolCalls: [{
+      callId: 'call-1',
+      name: 'fixture',
+      argumentsText,
+      arguments: { second: decomposed, first: 1 }
+    }],
+    providerState: {
+      profileId: 'fixture',
+      profileVersion: 1,
+      payload: { second: decomposed, first: 1 }
+    }
+  }])
+
+  const canonical = canonicalizeModelMessages(messages)
+  const assistant = canonical[0]
+  assert.equal(assistant?.role, 'assistant')
+  if (assistant?.role !== 'assistant') throw new Error('assistant message expected')
+  assert.equal(assistant.content, 'é')
+  assert.equal(assistant.toolCalls?.[0]?.argumentsText, argumentsText)
+  assert.deepEqual(Object.keys(assistant.toolCalls?.[0]?.arguments ?? {}), ['second', 'first'])
+  assert.equal(assistant.toolCalls?.[0]?.arguments.second, decomposed)
+  assert.deepEqual(Object.keys(assistant.providerState?.payload ?? {}), ['second', 'first'])
+  assert.equal((assistant.providerState?.payload as { second?: string }).second, decomposed)
+  assert.match(serializeModelMessages(messages), /"argumentsText":/)
 })
 
 test('canonical JSON uses ASCII key order even for integer-shaped keys', () => {

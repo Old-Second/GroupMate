@@ -1018,6 +1018,7 @@ test('same-process resume reuses one active request context and creates one fina
   })
   let startedMetadata: ProviderRequestMetadata | undefined
   let resumedMetadata: ProviderRequestMetadata | undefined
+  let startedPlanner: unknown
   let monotonic = 200
   const service = new AgentService({
     sessions: contractSessions(),
@@ -1031,6 +1032,7 @@ test('same-process resume reuses one active request context and creates one fina
     createEngine: () => contractEngine({
       start: async input => {
         startedMetadata = input.runtime.providerRequestMetadata
+        startedPlanner = input.runtime.planModelTurn
         return Object.freeze({
           kind: 'paused' as const,
           runId,
@@ -1074,6 +1076,7 @@ test('same-process resume reuses one active request context and creates one fina
   )
   assert.strictEqual(startedMetadata, providerRequestMetadata)
   assert.strictEqual(resumedMetadata, providerRequestMetadata)
+  assert.equal(typeof startedPlanner, 'function')
   assert.equal(await service.resume(runId), null)
 })
 
@@ -1102,6 +1105,7 @@ test('approval recovery defers each admission failure and retries with restart d
     cacheIsolationId: `gm_g_${'B'.repeat(43)}`
   })
   let decidedMetadata: ProviderRequestMetadata | undefined
+  let decidedPlanner: unknown
   const service = new AgentService({
     sessions: contractSessions(),
     runStore: new InMemoryRunStore(),
@@ -1122,6 +1126,7 @@ test('approval recovery defers each admission failure and retries with restart d
       loadCheckpoint: async () => checkpoint,
       decideApproval: async (input, binding) => {
         decidedMetadata = binding?.providerRequestMetadata
+        decidedPlanner = binding?.planModelTurn
         return completedResult(
           input.runId,
           runRef,
@@ -1170,6 +1175,7 @@ test('approval recovery defers each admission failure and retries with restart d
   assert.equal(completed.requestObservationDraft.sessionSaveDurationMs, 'not_attempted')
   assert.equal(completed.sessionPersistence, 'not_attempted')
   assert.strictEqual(decidedMetadata, recoveredMetadata)
+  assert.equal(typeof decidedPlanner, 'function')
   assert.equal(recoverCalls, 4)
   assert.equal(releases, 1)
 })

@@ -32,6 +32,7 @@ function semanticMessage (id: string, role: 'user' | 'assistant', text: string):
 }
 
 function protocolSpan (): ProviderProtocolSpan {
+  const argumentsText = '{ "url": "https://fixture.invalid", "label": "e\\u0301" }'
   return Object.freeze({
     kind: 'provider_protocol_span',
     id: 'span-1',
@@ -43,7 +44,12 @@ function protocolSpan (): ProviderProtocolSpan {
         role: 'assistant' as const,
         content: null,
         toolCalls: Object.freeze([
-          Object.freeze({ callId: 'call-1', name: 'website', arguments: Object.freeze({ url: 'https://fixture.invalid' }) }),
+          Object.freeze({
+            callId: 'call-1',
+            name: 'website',
+            argumentsText,
+            arguments: Object.freeze({ url: 'https://fixture.invalid', label: 'e\u0301' })
+          }),
           Object.freeze({ callId: 'call-2', name: 'weather', arguments: Object.freeze({ city: 'fixture' }) })
         ]),
         providerState: Object.freeze({
@@ -85,7 +91,48 @@ test('agent session codec round-trips semantic messages and one atomic provider 
   assert.deepEqual(decoded, canonicalRecord())
   assert.equal(Object.isFrozen(decoded.state.messages), true)
   assert.equal(Object.isFrozen(decoded.state.messages[1]), true)
+  const span = decoded.state.messages[1]
+  assert.equal(span?.kind, 'provider_protocol_span')
+  if (span?.kind !== 'provider_protocol_span') throw new Error('protocol span expected')
+  const assistant = span.messages[0]
+  assert.equal(assistant?.role, 'assistant')
+  if (assistant?.role !== 'assistant') throw new Error('assistant message expected')
+  assert.equal(
+    assistant.toolCalls?.[0]?.argumentsText,
+    '{ "url": "https://fixture.invalid", "label": "e\\u0301" }'
+  )
   assert.doesNotMatch(encoded, /reasoningView/)
+})
+
+test('agent session rejects oversized exact tool argument text while accepting legacy spans', () => {
+  const span = protocolSpan()
+  const assistant = span.messages[0]
+  assert.equal(assistant?.role, 'assistant')
+  if (assistant?.role !== 'assistant') throw new Error('assistant message expected')
+  assert.throws(() => parseAgentSessionState({
+    schemaVersion: 1,
+    messages: [{
+      ...span,
+      messages: [{
+        ...assistant,
+        toolCalls: [{
+          ...assistant.toolCalls?.[0],
+          argumentsText: 'x'.repeat(32 * 1_024 + 1)
+        }, assistant.toolCalls?.[1]]
+      }, ...span.messages.slice(1)]
+    }]
+  }), /argument/i)
+
+  assert.doesNotThrow(() => parseAgentSessionState({
+    schemaVersion: 1,
+    messages: [{
+      ...span,
+      messages: [{
+        ...assistant,
+        toolCalls: assistant.toolCalls?.map(({ argumentsText: _argumentsText, ...call }) => call)
+      }, ...span.messages.slice(1)]
+    }]
+  }))
 })
 
 test('agent session state rejects incomplete, mismatched or display-only protocol state', () => {

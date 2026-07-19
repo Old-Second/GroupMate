@@ -1,4 +1,5 @@
 import { parseJsonValue } from '../model/json-value.js';
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js';
 import { parseToolResult, toolResultForModel } from '../tools/tool-result.js';
 const CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
@@ -61,6 +62,7 @@ export function createToolExecutionLedger(step, inputCalls) {
         if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
             throw new TypeError('tool ledger arguments are invalid');
         }
+        const argumentsText = parseExactToolArgumentsText(call.argumentsText, parsed);
         indexes.add(call.index);
         callIds.add(call.callId);
         return {
@@ -69,6 +71,7 @@ export function createToolExecutionLedger(step, inputCalls) {
             index: call.index,
             callId: call.callId,
             toolName: call.name,
+            argumentsText,
             arguments: parsed,
             status: 'planned',
             capability: null,

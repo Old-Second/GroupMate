@@ -24,7 +24,8 @@ import {
   parseModelPriceSnapshot,
   type ModelPriceSnapshotV1
 } from '../model/model-price-catalog.js'
-import { parseJsonValue } from '../model/json-value.js'
+import { parseJsonValue, type JsonObject } from '../model/json-value.js'
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 import { parseProviderTurnState } from './provider-state.js'
 import { parseApprovalInterruption, type ApprovalInterruption } from './interruption.js'
 import type {
@@ -32,7 +33,13 @@ import type {
   RunBudgetCounters,
   RunBudgetLimits
 } from './run-budget.js'
-import { parseContextPlanV1, type ContextPlanV1 } from '../context/context-plan.js'
+import {
+  contextWireHash,
+  parseContextPlanV1,
+  parseLegacyContextPlanV1,
+  type ContextPlanV1,
+  type LegacyContextPlanV1
+} from '../context/context-plan.js'
 import {
   CONTEXT_TOKEN_ESTIMATOR_VERSION,
   estimateModelMessagesTokens,
@@ -76,6 +83,10 @@ import {
   parseRunReasoningSegments,
   type RunReasoningSegment
 } from './run-reasoning-segment.js'
+import {
+  parseFrozenProviderGenerationV1,
+  type FrozenProviderGenerationV1
+} from './provider-generation.js'
 import {
   createInitialRunUsageSummary,
   parseRunUsageSummary,
@@ -172,9 +183,22 @@ export interface RunCheckpointV5 extends Omit<
   readonly schemaVersion: 5
   readonly budgetLimits: RunBudgetLimits
   readonly modelLoopPolicy: RunModelLoopPolicyV1
-  readonly contextPlan: ContextPlanV1 | null
+  readonly contextPlan: ContextPlanV1 | LegacyContextPlanV1 | null
   readonly contextArtifactRefs: readonly string[]
   readonly toolWireSnapshot: ToolWireSnapshotV1 | null
+}
+
+export type RunContextRuntimeModeV1 = 'legacy_compatible' | 'generation_planner'
+
+export interface RunCheckpointV6 extends Omit<
+RunCheckpointV5,
+'schemaVersion' | 'contextPlan'
+> {
+  readonly schemaVersion: 6
+  readonly contextPlan: ContextPlanV1 | null
+  readonly contextRuntimeMode: RunContextRuntimeModeV1
+  readonly pendingContextMessages: readonly ModelMessage[]
+  readonly providerGeneration: FrozenProviderGenerationV1 | null
 }
 
 export type LoadedRunCheckpoint =
@@ -183,7 +207,8 @@ export type LoadedRunCheckpoint =
   | RunCheckpointV3
   | RunCheckpointV4
   | RunCheckpointV5
-export type RunCheckpoint = RunCheckpointV5
+  | RunCheckpointV6
+export type RunCheckpoint = RunCheckpointV6
 
 export interface CreateRunCheckpointInput {
   readonly profileId: string
@@ -206,6 +231,7 @@ export interface CreateRunCheckpointInput {
   readonly contextPlan?: ContextPlanV1 | null
   readonly contextArtifactRefs?: readonly string[]
   readonly toolWireSnapshot?: ToolWireSnapshotV1 | null
+  readonly contextRuntimeMode?: RunContextRuntimeModeV1
   readonly deadlineAt: string
   readonly createdAt: string
   readonly event: AgentEvent
@@ -215,6 +241,10 @@ export type RunCheckpointChanges = Partial<Pick<RunCheckpoint,
   | 'step'
   | 'messages'
   | 'estimatedInputTokens'
+  | 'contextPlan'
+  | 'contextArtifactRefs'
+  | 'pendingContextMessages'
+  | 'providerGeneration'
   | 'modelTurn'
   | 'toolLedgers'
   | 'preparedBatch'
@@ -317,6 +347,10 @@ const CHECKPOINT_V4_KEYS = Object.freeze([
 const CHECKPOINT_V5_KEYS = Object.freeze([
   ...CHECKPOINT_V4_KEYS,
   'modelLoopPolicy', 'contextPlan', 'contextArtifactRefs', 'toolWireSnapshot'
+])
+const CHECKPOINT_V6_KEYS = Object.freeze([
+  ...CHECKPOINT_V5_KEYS,
+  'contextRuntimeMode', 'pendingContextMessages', 'providerGeneration'
 ])
 const MODEL_KEYS = Object.freeze([
   'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
@@ -430,7 +464,12 @@ function validateModelMessages (
       const ids = new Set<string>()
       for (const rawCall of message.toolCalls) {
         const call = record(rawCall, 'assistant tool call')
-        exactKeys(call, ['callId', 'name', 'arguments'], ['callId', 'name', 'arguments'], 'assistant tool call')
+        exactKeys(
+          call,
+          ['callId', 'name', 'argumentsText', 'arguments'],
+          ['callId', 'name', 'arguments'],
+          'assistant tool call'
+        )
         if (!CODE.test(String(call.callId)) || !CODE.test(String(call.name)) || ids.has(String(call.callId))) {
           throw new TypeError('assistant tool call identity is invalid')
         }
@@ -441,6 +480,9 @@ function validateModelMessages (
         })
         if (argumentsValue === null || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) {
           throw new TypeError('assistant tool call arguments are invalid')
+        }
+        if (call.argumentsText !== undefined) {
+          parseExactToolArgumentsText(call.argumentsText, argumentsValue as JsonObject)
         }
         ids.add(String(call.callId))
       }
@@ -494,7 +536,7 @@ function validateToolLedgers (value: unknown, snapshotId: string): void {
     for (const [index, rawCall] of ledger.calls.entries()) {
       const call = record(rawCall, 'tool ledger call')
       exactKeys(call, [
-        'occurrenceId', 'step', 'index', 'callId', 'toolName', 'arguments',
+        'occurrenceId', 'step', 'index', 'callId', 'toolName', 'argumentsText', 'arguments',
         'status', 'capability', 'result'
       ], [
         'occurrenceId', 'step', 'index', 'callId', 'toolName', 'arguments',
@@ -513,6 +555,9 @@ function validateToolLedgers (value: unknown, snapshotId: string): void {
       })
       if (args === null || typeof args !== 'object' || Array.isArray(args)) {
         throw new TypeError('tool ledger arguments are invalid')
+      }
+      if (call.argumentsText !== undefined) {
+        parseExactToolArgumentsText(call.argumentsText, args as JsonObject)
       }
       if (call.capability !== null) {
         const capability = parseSerializablePreparedCapability(call.capability)
@@ -656,7 +701,7 @@ function validateObservationState (
 }
 
 function validateCheckpointV2OrLater (
-  parsed: RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5
+  parsed: RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5 | RunCheckpointV6
 ): void {
   if (!RUN_REF_PATTERN.test(parsed.runRef) || !RUN_REF_PATTERN.test(parsed.requestRef)) {
     throw new TypeError('run checkpoint reference is invalid')
@@ -710,6 +755,90 @@ function validateCheckpointV2OrLater (
   }
 }
 
+function validateContextPlanState (
+  parsed: RunCheckpointV5 | RunCheckpointV6
+): ContextPlanV1 | LegacyContextPlanV1 | null {
+  const modelLoopPolicy = parseRunModelLoopPolicyV1(parsed.modelLoopPolicy)
+  const toolWireSnapshot = parsed.toolWireSnapshot === null
+    ? null
+    : parseToolWireSnapshotV1(parsed.toolWireSnapshot)
+  if ((modelLoopPolicy.kind === 'adaptive_context') !== (toolWireSnapshot !== null)) {
+    throw new TypeError('run tool wire snapshot is inconsistent')
+  }
+  let plan: ContextPlanV1 | LegacyContextPlanV1 | null = null
+  if (parsed.contextPlan !== null) {
+    if (parsed.schemaVersion === 6) {
+      plan = parseContextPlanV1(parsed.contextPlan)
+    } else {
+      try {
+        plan = parseContextPlanV1(parsed.contextPlan)
+      } catch {
+        plan = parseLegacyContextPlanV1(parsed.contextPlan)
+      }
+    }
+  }
+  if (!Array.isArray(parsed.contextArtifactRefs) || parsed.contextArtifactRefs.length > 128 ||
+    parsed.contextArtifactRefs.some(ref => typeof ref !== 'string') ||
+    new Set(parsed.contextArtifactRefs).size !== parsed.contextArtifactRefs.length) {
+    throw new TypeError('run context artifact references are invalid')
+  }
+  if (plan === null) {
+    if (parsed.contextArtifactRefs.length !== 0) {
+      throw new TypeError('run context plan references are inconsistent')
+    }
+  } else if (plan.namespaceRef !== parsed.runRef ||
+    plan.messageCount !== parsed.messages.length ||
+    plan.estimatedInputTokens !== parsed.estimatedInputTokens ||
+    plan.estimatorVersion !== CONTEXT_TOKEN_ESTIMATOR_VERSION ||
+    plan.estimatedInputTokens !== estimateModelMessagesTokens(parsed.messages) ||
+    plan.serializedMessageBytes !== serializedModelMessagesBytes(parsed.messages) ||
+    plan.capabilityHash !== modelCapabilityStableHash(parsed.modelCapability) ||
+    plan.artifactRefs.length !== parsed.contextArtifactRefs.length ||
+    plan.artifactRefs.some((ref, index) => ref !== parsed.contextArtifactRefs[index])) {
+    throw new TypeError('run context plan is inconsistent')
+  }
+  const currentPlan = parsed.schemaVersion === 6
+    ? plan as ContextPlanV1 | null
+    : null
+  if (currentPlan !== null && currentPlan.included.some(entry => (
+    contextWireHash(Object.freeze(parsed.messages.slice(
+      entry.wireStart,
+      entry.wireStart + entry.wireCount
+    ))) !== entry.wireHash
+  ))) {
+    throw new TypeError('run context plan wire is inconsistent')
+  }
+  return plan
+}
+
+function validatePendingContextMessages (
+  value: unknown,
+  profileId: string,
+  profileVersion: number
+): readonly ModelMessage[] {
+  if (!Array.isArray(value)) throw new TypeError('pending context messages are invalid')
+  validateModelMessages(value, profileId, profileVersion)
+  const messages = value as readonly ModelMessage[]
+  if (messages.length === 0) return Object.freeze([])
+  if (Buffer.byteLength(JSON.stringify(messages), 'utf8') >
+    RUN_RESOURCE_LIMITS.providerProtocolChainBytes) {
+    throw new TypeError('pending context messages exceed their limit')
+  }
+  const assistant = messages[0]
+  if (assistant?.role !== 'assistant' || assistant.toolCalls === undefined ||
+    assistant.toolCalls.length === 0) {
+    throw new TypeError('pending context protocol is invalid')
+  }
+  const results = messages.slice(1)
+  if (results.length !== 0 && (results.length !== assistant.toolCalls.length ||
+    results.some((message, index) => (
+      message.role !== 'tool' || message.toolCallId !== assistant.toolCalls?.[index]?.callId
+    )))) {
+    throw new TypeError('pending context protocol is invalid')
+  }
+  return Object.freeze([...messages])
+}
+
 function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   const parsedJson = parseJsonValue(value, {
     maxBytes: RUN_RESOURCE_LIMITS.checkpointBytes + RUN_RESOURCE_LIMITS.eventBytes,
@@ -727,6 +856,8 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
           ? CHECKPOINT_V4_KEYS
           : unparsed.schemaVersion === 5
             ? CHECKPOINT_V5_KEYS
+            : unparsed.schemaVersion === 6
+              ? CHECKPOINT_V6_KEYS
           : undefined
   if (checkpointKeys === undefined) throw new TypeError('run checkpoint schema version is invalid')
   exactKeys(unparsed, checkpointKeys, checkpointKeys, 'checkpoint')
@@ -736,7 +867,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   }
   const parsed = unparsed as unknown as LoadedRunCheckpoint
   const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4 ||
-    parsed.schemaVersion === 5
+    parsed.schemaVersion === 5 || parsed.schemaVersion === 6
     ? parseRunReasoningSegments(parsed.reasoningSegments)
     : undefined
   const split = splitCheckpoint(parsed)
@@ -796,7 +927,9 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   validateBudgets(
     parsed.budgetLimits,
     parsed.budgetCounters,
-    parsed.schemaVersion === 5 ? parsed.modelLoopPolicy : undefined
+    parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+      ? parsed.modelLoopPolicy
+      : undefined
   )
   if (typeof parsed.recoveryUsed !== 'boolean' || typeof parsed.forceCorrection !== 'boolean' ||
     (parsed.schemaVersion === 1 && typeof parsed.visibleOutput !== 'boolean')) {
@@ -824,7 +957,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   } else {
     validateCheckpointV2OrLater(parsed)
   }
-  if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5) {
+  if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5 || parsed.schemaVersion === 6) {
     const capability = parseModelCapabilitySnapshot(parsed.modelCapability)
     const price = parsed.modelPrice === null ? null : parseModelPriceSnapshot(parsed.modelPrice)
     parseRunUsageSummary(parsed.usage)
@@ -833,34 +966,54 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
       throw new TypeError('run model price catalog is inconsistent')
     }
   }
-  if (parsed.schemaVersion === 5) {
-    const modelLoopPolicy = parseRunModelLoopPolicyV1(parsed.modelLoopPolicy)
-    const toolWireSnapshot = parsed.toolWireSnapshot === null
+  const contextPlan = parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+    ? validateContextPlanState(parsed)
+    : null
+  const currentContextPlan = parsed.schemaVersion === 6
+    ? contextPlan as ContextPlanV1 | null
+    : null
+  let pendingContextMessages: readonly ModelMessage[] | undefined
+  let providerGeneration: FrozenProviderGenerationV1 | null | undefined
+  if (parsed.schemaVersion === 6) {
+    if (parsed.contextRuntimeMode !== 'legacy_compatible' &&
+      parsed.contextRuntimeMode !== 'generation_planner') {
+      throw new TypeError('run context runtime mode is invalid')
+    }
+    pendingContextMessages = validatePendingContextMessages(
+      parsed.pendingContextMessages,
+      parsed.profileId,
+      parsed.profileVersion
+    )
+    providerGeneration = parsed.providerGeneration === null
       ? null
-      : parseToolWireSnapshotV1(parsed.toolWireSnapshot)
-    if ((modelLoopPolicy.kind === 'adaptive_context') !== (toolWireSnapshot !== null)) {
-      throw new TypeError('run tool wire snapshot is inconsistent')
+      : parseFrozenProviderGenerationV1(parsed.providerGeneration)
+    const modelTurnKind = parsed.modelTurn?.kind ?? null
+    if ((parsed.status === 'correcting') !== (modelTurnKind === 'correction') ||
+      (modelTurnKind === 'normal' && parsed.status !== 'calling_model') ||
+      (modelTurnKind === null && parsed.status === 'correcting') ||
+      (parsed.status !== 'calling_model' && parsed.status !== 'correcting' &&
+        modelTurnKind !== null) ||
+      (parsed.providerDispatch.state === 'reserved' && modelTurnKind === null)) {
+      throw new TypeError('run provider dispatch state matrix is invalid')
     }
-    const plan = parsed.contextPlan === null ? null : parseContextPlanV1(parsed.contextPlan)
-    if (!Array.isArray(parsed.contextArtifactRefs) || parsed.contextArtifactRefs.length > 128 ||
-      parsed.contextArtifactRefs.some(ref => typeof ref !== 'string') ||
-      new Set(parsed.contextArtifactRefs).size !== parsed.contextArtifactRefs.length) {
-      throw new TypeError('run context artifact references are invalid')
-    }
-    if (plan === null) {
-      if (parsed.contextArtifactRefs.length !== 0) {
-        throw new TypeError('run context plan references are inconsistent')
+    if (parsed.contextRuntimeMode === 'legacy_compatible') {
+      if (pendingContextMessages.length !== 0 || providerGeneration !== null) {
+        throw new TypeError('legacy context runtime state is invalid')
       }
-    } else if (plan.namespaceRef !== parsed.runRef ||
-      plan.messageCount !== parsed.messages.length ||
-      plan.estimatedInputTokens !== parsed.estimatedInputTokens ||
-      plan.estimatorVersion !== CONTEXT_TOKEN_ESTIMATOR_VERSION ||
-      plan.estimatedInputTokens !== estimateModelMessagesTokens(parsed.messages) ||
-      plan.serializedMessageBytes !== serializedModelMessagesBytes(parsed.messages) ||
-      plan.capabilityHash !== modelCapabilityStableHash(parsed.modelCapability) ||
-      plan.artifactRefs.length !== parsed.contextArtifactRefs.length ||
-      plan.artifactRefs.some((ref, index) => ref !== parsed.contextArtifactRefs[index])) {
-      throw new TypeError('run context plan is inconsistent')
+    } else {
+      if (parsed.modelLoopPolicy.kind !== 'adaptive_context') {
+        throw new TypeError('generation planner requires adaptive context')
+      }
+      if (providerGeneration !== null && (currentContextPlan === null ||
+        providerGeneration.planHash !== currentContextPlan.planHash ||
+        providerGeneration.generation !== currentContextPlan.generation ||
+        (parsed.modelTurn?.kind === 'correction' && providerGeneration.kind !== 'correction') ||
+        (parsed.modelTurn?.kind === 'normal' && providerGeneration.kind === 'correction'))) {
+        throw new TypeError('provider generation does not match context plan')
+      }
+      if (parsed.modelTurn !== null && providerGeneration === null) {
+        throw new TypeError('reserved model turn lacks provider generation')
+      }
     }
   }
   if (parsed.status === 'failed' && (parsed.error === null || parsed.cancellationReason !== null)) {
@@ -872,6 +1025,25 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   if ((parsed.status === 'waiting_approval') !== (parsed.interruption !== null) ||
     (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
     throw new TypeError('run approval checkpoint state is invalid')
+  }
+  if (parsed.schemaVersion === 6) {
+    return Object.freeze({
+      ...parsed,
+      reasoningSegments,
+      modelCapability: parseModelCapabilitySnapshot(parsed.modelCapability),
+      modelPrice: parsed.modelPrice === null
+        ? null
+        : parseModelPriceSnapshot(parsed.modelPrice),
+      usage: parseRunUsageSummary(parsed.usage),
+      modelLoopPolicy: parseRunModelLoopPolicyV1(parsed.modelLoopPolicy),
+      toolWireSnapshot: parsed.toolWireSnapshot === null
+        ? null
+        : parseToolWireSnapshotV1(parsed.toolWireSnapshot),
+      contextPlan: currentContextPlan,
+      contextArtifactRefs: Object.freeze([...parsed.contextArtifactRefs]),
+      pendingContextMessages: pendingContextMessages as readonly ModelMessage[],
+      providerGeneration
+    }) as RunCheckpointV6
   }
   if (parsed.schemaVersion === 5) {
     return Object.freeze({
@@ -886,7 +1058,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
       toolWireSnapshot: parsed.toolWireSnapshot === null
         ? null
         : parseToolWireSnapshotV1(parsed.toolWireSnapshot),
-      contextPlan: parsed.contextPlan === null ? null : parseContextPlanV1(parsed.contextPlan),
+      contextPlan,
       contextArtifactRefs: Object.freeze([...parsed.contextArtifactRefs])
     }) as RunCheckpointV5
   }
@@ -908,8 +1080,8 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
 
 export function parseRunCheckpoint (value: unknown): RunCheckpoint {
   const parsed = parseLoadedRunCheckpoint(value)
-  if (parsed.schemaVersion !== 5) {
-    throw new TypeError('runtime run checkpoint must use schema version 5')
+  if (parsed.schemaVersion !== 6) {
+    throw new TypeError('runtime run checkpoint must use schema version 6')
   }
   return parsed
 }
@@ -971,11 +1143,21 @@ export function createInitialRunCheckpoint (
     levelAtStart: 'off' as const,
     sampledSuccess: false
   })
+  const modelLoopPolicy = input.modelLoopPolicy ?? ADAPTIVE_CONTEXT_LOOP_POLICY
+  const contextRuntimeMode = input.contextRuntimeMode ?? (
+    modelLoopPolicy.kind === 'adaptive_context'
+      ? 'generation_planner'
+      : 'legacy_compatible'
+  )
+  if (contextRuntimeMode === 'generation_planner' &&
+    modelLoopPolicy.kind !== 'adaptive_context') {
+    throw new TypeError('generation planner requires adaptive context')
+  }
   timestamp(input.deadlineAt, 'run deadline')
   timestamp(input.createdAt, 'run creation time')
   validateEvents([input.event], 0, input.runId, input.sessionId)
   return freezeCheckpoint({
-    schemaVersion: 5,
+    schemaVersion: 6,
     kernelVersion: 1,
     profileId: input.profileId,
     profileVersion: input.profileVersion,
@@ -1002,12 +1184,15 @@ export function createInitialRunCheckpoint (
     interruption: null,
     approvalHistory: Object.freeze([]),
     budgetLimits: input.budgetLimits,
-    modelLoopPolicy: input.modelLoopPolicy ?? ADAPTIVE_CONTEXT_LOOP_POLICY,
+    modelLoopPolicy,
     contextPlan: input.contextPlan ?? null,
     contextArtifactRefs: Object.freeze([...(input.contextArtifactRefs ?? [])]),
     toolWireSnapshot: input.toolWireSnapshot === undefined
       ? createToolWireSnapshotV1(Object.freeze([]))
       : input.toolWireSnapshot,
+    contextRuntimeMode,
+    pendingContextMessages: Object.freeze([]),
+    providerGeneration: null,
     budgetCounters: input.budgetCounters,
     recoveryUsed: false,
     forceCorrection: false,
@@ -1071,6 +1256,9 @@ const CHECKPOINT_V4_STATE_KEYS = Object.freeze(
 const CHECKPOINT_V5_STATE_KEYS = Object.freeze(
   CHECKPOINT_V5_KEYS.filter(key => key !== 'events')
 )
+const CHECKPOINT_V6_STATE_KEYS = Object.freeze(
+  CHECKPOINT_V6_KEYS.filter(key => key !== 'events')
+)
 const EVENT_ENVELOPE_KEYS = Object.freeze([
   'schemaVersion', 'revision', 'events'
 ])
@@ -1081,7 +1269,7 @@ export interface EncodedRunCheckpoint {
 }
 
 interface RunEventEnvelope {
-  readonly schemaVersion: 1 | 2 | 3 | 4 | 5
+  readonly schemaVersion: 1 | 2 | 3 | 4 | 5 | 6
   readonly revision: number
   readonly events: readonly AgentEvent[]
 }
@@ -1102,7 +1290,7 @@ export class RunCheckpointCodec {
     const parsed = parseRunCheckpoint(value)
     const split = splitCheckpoint(parsed)
     const envelope: RunEventEnvelope = Object.freeze({
-      schemaVersion: 5,
+      schemaVersion: 6,
       revision: parsed.revision,
       events: split.events
     })
@@ -1132,6 +1320,8 @@ export class RunCheckpointCodec {
             ? CHECKPOINT_V4_STATE_KEYS
             : state.schemaVersion === 5
               ? CHECKPOINT_V5_STATE_KEYS
+              : state.schemaVersion === 6
+                ? CHECKPOINT_V6_STATE_KEYS
             : undefined
     if (checkpointKeys === undefined) {
       throw new TypeError('run checkpoint schema version is invalid')

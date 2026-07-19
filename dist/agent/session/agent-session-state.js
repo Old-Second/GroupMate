@@ -2,6 +2,7 @@ import { parseAgentMessage } from '../contracts/content.js';
 import { jsonByteLength, parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js';
+import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js';
 const SESSION_STATE_BYTES = 512 * 1_024;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROFILE = /^[a-z][a-z0-9_.-]{0,63}$/;
@@ -40,7 +41,7 @@ function protocolAssistant(value, profileId, profileVersion) {
     const callIds = new Set();
     const toolCalls = message.toolCalls.map(rawCall => {
         const call = record(rawCall, 'provider protocol tool call');
-        exact(call, ['callId', 'name', 'arguments'], 'provider protocol tool call');
+        exact(call, ['callId', 'name', 'argumentsText', 'arguments'], 'provider protocol tool call');
         if (typeof call.callId !== 'string' || !IDENTIFIER.test(call.callId) ||
             typeof call.name !== 'string' || !IDENTIFIER.test(call.name) || callIds.has(call.callId)) {
             throw new TypeError('provider protocol span tool call is invalid');
@@ -54,10 +55,14 @@ function protocolAssistant(value, profileId, profileVersion) {
             Array.isArray(parsedArguments)) {
             throw new TypeError('provider protocol span tool arguments are invalid');
         }
+        const argumentsText = call.argumentsText === undefined
+            ? undefined
+            : parseExactToolArgumentsText(call.argumentsText, parsedArguments);
         callIds.add(call.callId);
         return Object.freeze({
             callId: call.callId,
             name: call.name,
+            ...(argumentsText === undefined ? {} : { argumentsText }),
             arguments: parsedArguments
         });
     });

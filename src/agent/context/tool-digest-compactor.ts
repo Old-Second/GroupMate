@@ -259,7 +259,7 @@ function parseEvidence (
   try {
     assertDeepFrozenData(value)
     const input = inspectContextRecord(value, ['schemaVersion', 'step', 'calls'])
-    if (input.schemaVersion !== 1 || requireSafeInteger(input.step, { positive: true }) !== span.toolProtocol?.step) {
+    if (input.schemaVersion !== 1 || requireSafeInteger(input.step) !== span.toolProtocol?.step) {
       return null
     }
     const calls = Object.freeze(inspectContextArray(input.calls, MAX_CONSUMED_TOOL_DIGEST_CALLS).map(

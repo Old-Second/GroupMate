@@ -26,6 +26,7 @@ interface FakeRedisEntry {
 }
 
 export class FakeRedis implements RedisSessionClient, RedisRunClient {
+  infoCalls = 0
   readonly getCalls: string[] = []
   readonly scanCalls: Array<{ cursor: number; MATCH: string; COUNT: number }> = []
   readonly setCalls: Array<{ key: string; options?: { EX?: number; NX?: boolean; XX?: boolean } }> = []
@@ -36,10 +37,23 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   private readonly pendingGetFailures = new Set<string>()
   private artifactEvalHook?: (operation: string) => boolean
   private artifactTtlComputationHook?: () => void
+  private redisServerInfo = '# Server\r\nredis_version:7.2.4\r\n'
   private readonly now: () => number
 
   constructor (now: () => number = () => Date.now()) {
     this.now = now
+  }
+
+  async info (section?: string): Promise<string> {
+    this.infoCalls += 1
+    if (section !== undefined && section !== 'server') {
+      throw new TypeError('fake Redis INFO section is invalid')
+    }
+    return this.redisServerInfo
+  }
+
+  setServerInfoForTest (value: string): void {
+    this.redisServerInfo = value
   }
 
   async get (key: string): Promise<string | null> {
@@ -264,6 +278,13 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const reference = this.entryValue(referenceKey)
       if (oldCheckpoint !== args[1] || oldEvents !== args[2] ||
         reference !== args[6]) return 'conflict'
+      const artifactKeys = options.keys.slice(4, -1)
+      if (artifactKeys.some((key, index) => {
+        const entry = this.entries.get(key)
+        return entry === undefined || entry.expiresAtMs === undefined ||
+          entry.expiresAtMs <= this.now() || args[8 + index * 2] !== '1' ||
+          entry.value !== args[7 + index * 2]
+      })) return 'artifact_missing'
       const projected = {
         bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents) +
           this.bytes(args[3]) + this.bytes(args[4]),
@@ -279,6 +300,14 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       this.setDirect(checkpointKey, args[3], Number(args[5]))
       this.setDirect(eventKey, args[4], Number(args[5]))
       this.setDirect(referenceKey, args[6], Number(args[5]))
+      for (const key of artifactKeys) {
+        const entry = this.entries.get(key)
+        if (entry === undefined) throw new TypeError('context artifact disappeared during CAS')
+        this.entries.set(key, {
+          value: entry.value,
+          expiresAtMs: this.now() + Number(args[5]) * 1_000
+        })
+      }
       this.saveRunNamespaceUsage(metadataKey, projected)
       return 'ok'
     }
@@ -407,6 +436,13 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     const checkpointEntry = this.entries.get(checkpointKey as string)
     const eventEntry = this.entries.get(eventKey as string)
     if (checkpointEntry?.expiresAtMs === undefined || eventEntry?.expiresAtMs === undefined) return 'ttl'
+    const artifactKeys = keys.slice(5)
+    if (artifactKeys.some((key, index) => {
+      const entry = this.entries.get(key)
+      return entry === undefined || entry.expiresAtMs === undefined ||
+        entry.expiresAtMs <= this.now() || args[7 + index * 2] !== '1' ||
+        entry.value !== args[6 + index * 2]
+    })) return 'artifact_missing'
     const isV1 = args[5] === '1'
     const referenceValue = this.entryValue(referenceKey)
     const reference = this.entries.get(referenceKey as string)
@@ -436,6 +472,14 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     if (isV1) {
       this.entries.set(referenceKey as string, {
         value: args[4] as string,
+        expiresAtMs: Math.max(checkpointEntry.expiresAtMs, eventEntry.expiresAtMs)
+      })
+    }
+    for (const key of artifactKeys) {
+      const entry = this.entries.get(key)
+      if (entry === undefined) throw new TypeError('context artifact disappeared during migration')
+      this.entries.set(key, {
+        value: entry.value,
         expiresAtMs: Math.max(checkpointEntry.expiresAtMs, eventEntry.expiresAtMs)
       })
     }

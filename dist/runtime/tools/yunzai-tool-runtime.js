@@ -164,11 +164,14 @@ async function sourceFor(options, event, masters, trustedIdentity) {
     const botMember = members === null ? undefined : memberFromMap(members, botId);
     const actorRole = role(actorMember?.role ?? event.sender?.role);
     const botRole = groupId === null ? 'none' : role(botMember?.role);
+    const displayName = [event.sender?.card, event.sender?.nickname]
+        .map(value => typeof value === 'string' ? value : '')
+        .find(value => value.trim().length > 0) ?? '';
     return {
         botId,
         actor: {
             userId: actorId,
-            displayName: String(event.sender?.card ?? event.sender?.nickname ?? '').slice(0, 100),
+            displayName: displayName.slice(0, 100),
             role: actorRole
         },
         channel: groupId === null

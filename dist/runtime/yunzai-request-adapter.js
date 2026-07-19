@@ -21,6 +21,13 @@ function timestamp(value, label) {
 function actorRole(value) {
     return value === 'owner' || value === 'admin' ? value : 'member';
 }
+function firstNonBlankDisplayName(...values) {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim().length > 0)
+            return value.slice(0, 256);
+    }
+    return undefined;
+}
 function publicImageReference(value) {
     try {
         const url = new URL(value);
@@ -225,12 +232,10 @@ export async function adaptYunzaiRequest(input) {
     const channel = isGroup
         ? Object.freeze({ kind: 'group', botId, groupId: groupId })
         : Object.freeze({ kind: 'private', botId, userId: actorId });
-    const displayName = input.event.sender?.card ?? input.event.sender?.nickname;
+    const displayName = firstNonBlankDisplayName(input.event.sender?.card, input.event.sender?.nickname);
     const actor = Object.freeze({
         userId: actorId,
-        ...(typeof displayName === 'string' && displayName.length > 0
-            ? { displayName: displayName.slice(0, 256) }
-            : {}),
+        ...(displayName === undefined ? {} : { displayName }),
         role: actorRole(input.event.sender?.role)
     });
     const messageId = messageInput.currentMessageId ?? requestId;

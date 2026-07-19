@@ -131,6 +131,7 @@ function plannerInput (
     schemaVersion: 1 as const,
     namespaceRef: 'namespace:test',
     generation: 1,
+    transition: 'normal' as const,
     previousPlan: null,
     estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
     capabilityHash: '2'.repeat(64),
@@ -255,6 +256,103 @@ test('complete ready tool protocols are atomic while active or malformed protoco
     status: 'blocked',
     code: 'tool_protocol_incomplete'
   })
+})
+
+test('ready to consumed lifecycle changes preserve the previous wire as a full prefix', () => {
+  const active = protocolSpan({
+    id: 'span:protocol:lifecycle', order: 30, phase: 'ready', originGeneration: 1
+  })
+  const firstSpans = deepFreeze([...mandatorySpans(), active])
+  const first = ready(planModelTurn(plannerInput(firstSpans)))
+  const consumed = parseContextSpanV1(deepFreeze({
+    ...active,
+    requirement: 'optional' as const,
+    toolProtocol: {
+      ...active.toolProtocol,
+      phase: 'consumed' as const
+    }
+  }))
+  const appended = span({
+    id: 'span:after-tool', order: 40, content: 'continue', source: 'runtime_fact',
+    requirement: 'mandatory', originGeneration: 2
+  })
+  const second = ready(planModelTurn(plannerInput(deepFreeze([
+    ...mandatorySpans(), consumed, appended
+  ]), {
+    generation: 2,
+    previousPlan: first.plan,
+    transition: 'normal'
+  })))
+  const firstEntry = first.plan.included.find(entry => entry.spanId === active.spanId)
+  const secondEntry = second.plan.included.find(entry => entry.spanId === consumed.spanId)
+
+  assert.notEqual(contextSpanHash(active), contextSpanHash(consumed))
+  assert.equal(Reflect.get(firstEntry as object, 'wireHash'), Reflect.get(secondEntry as object, 'wireHash'))
+  assert.equal(firstEntry?.contentHash, contextSpanHash(active))
+  assert.equal(secondEntry?.contentHash, contextSpanHash(consumed))
+  assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages)
+  assert.equal(second.plan.prefixMessageCount, first.messages.length)
+})
+
+test('only recovery_prefix_reset may intentionally replace a normal previous prefix', () => {
+  const optional = span({ id: 'span:recovery:optional', order: 30, content: 'drop-me' })
+  const firstSpans = deepFreeze([...mandatorySpans(), optional])
+  const first = ready(planModelTurn(plannerInput(firstSpans)))
+  const recoveredSpans = deepFreeze(mandatorySpans())
+
+  assert.deepEqual(planModelTurn(plannerInput(recoveredSpans, {
+    generation: 2,
+    previousPlan: first.plan,
+    transition: 'normal'
+  })), { status: 'blocked', code: 'context_budget_exceeded' })
+
+  const recovered = ready(planModelTurn(plannerInput(recoveredSpans, {
+    generation: 2,
+    previousPlan: first.plan,
+    transition: 'recovery_prefix_reset'
+  })))
+  assert.deepEqual(recovered.messages, mandatorySpans().flatMap(value => value.messages))
+  assert.equal(recovered.plan.prefixMessageCount, 0)
+})
+
+test('a recovery baseline reconstructs a previous complete tool wire after restart', () => {
+  const active = protocolSpan({
+    id: 'span:protocol:restart', order: 30, phase: 'ready', originGeneration: 1
+  })
+  const first = ready(planModelTurn(plannerInput(deepFreeze([...mandatorySpans(), active]))))
+  const baseline = createContextSpanV1(deepFreeze({
+    spanId: 'span:recovery:baseline:1',
+    namespaceRef: 'namespace:test',
+    kind: 'message' as const,
+    source: 'recovery_baseline' as const,
+    trust: 'trusted' as const,
+    requirement: 'mandatory' as const,
+    priority: 'critical' as const,
+    semanticOrder: 10,
+    originGeneration: first.plan.generation,
+    provenance: {
+      kind: 'run' as const,
+      ref: `plan:${first.plan.planHash}`,
+      revision: first.plan.generation,
+      contentHash: first.plan.planHash
+    },
+    supersedes: null,
+    messages: first.messages,
+    sourceRefs: [{ ref: `plan:${first.plan.planHash}`, contentHash: first.plan.planHash }],
+    toolProtocol: null
+  }))
+  const appended = span({
+    id: 'span:recovery:next', order: 20, content: 'next', source: 'runtime_fact',
+    requirement: 'mandatory', originGeneration: first.plan.generation
+  })
+  const resumed = ready(planModelTurn(plannerInput(deepFreeze([baseline, appended]), {
+    generation: 2,
+    previousPlan: first.plan,
+    transition: 'normal'
+  })))
+
+  assert.deepEqual(resumed.messages.slice(0, first.messages.length), first.messages)
+  assert.equal(resumed.plan.prefixMessageCount, first.messages.length)
 })
 
 test('mandatory spans fail closed independently at token, byte and message limits', () => {

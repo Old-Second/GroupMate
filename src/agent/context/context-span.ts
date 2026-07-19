@@ -25,6 +25,7 @@ export type ContextSpanKind = 'message' | 'tool_protocol' | 'artifact'
 export type ContextSpanSource =
   | 'system_instruction'
   | 'current_request'
+  | 'recovery_baseline'
   | 'runtime_fact'
   | 'session_history'
   | 'group_context'
@@ -82,7 +83,7 @@ ContextSpanV1,
 
 const KINDS: readonly ContextSpanKind[] = ['message', 'tool_protocol', 'artifact']
 const SOURCES: readonly ContextSpanSource[] = [
-  'system_instruction', 'current_request', 'runtime_fact', 'session_history',
+  'system_instruction', 'current_request', 'recovery_baseline', 'runtime_fact', 'session_history',
   'group_context', 'memory', 'approval', 'tool_chain', 'artifact'
 ]
 const PROVENANCE_KINDS: readonly ContextSpanProvenanceV1['kind'][] = [
@@ -128,9 +129,26 @@ function parseToolProtocol (value: unknown): ContextToolProtocolV1 | null {
   if (callIds.length === 0 || new Set(callIds).size !== callIds.length) return invalidContextValue()
   return Object.freeze({
     phase: enumValue(input.phase, PHASES),
-    step: requireSafeInteger(input.step, { positive: true }),
+    step: requireSafeInteger(input.step),
     callIds
   })
+}
+
+export function contextWireProtocolIsValid (messages: readonly ModelMessage[]): boolean {
+  const seenCallIds = new Set<string>()
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]
+    if (message?.role === 'tool') return false
+    if (message?.role !== 'assistant' || message.toolCalls === undefined) continue
+    for (const [offset, call] of message.toolCalls.entries()) {
+      if (seenCallIds.has(call.callId)) return false
+      seenCallIds.add(call.callId)
+      const result = messages[index + offset + 1]
+      if (result?.role !== 'tool' || result.toolCallId !== call.callId) return false
+    }
+    index += message.toolCalls.length
+  }
+  return true
 }
 
 function hasProtocolFields (message: ModelMessage): boolean {
@@ -167,6 +185,7 @@ function validateSourceMatrix (span: ContextSpanV1): void {
   const expectedProvenance: Readonly<Record<ContextSpanSource, ContextSpanProvenanceV1['kind']>> = {
     system_instruction: 'run',
     current_request: 'run',
+    recovery_baseline: 'run',
     runtime_fact: 'run',
     session_history: 'session_item',
     group_context: 'group_snapshot',
@@ -185,6 +204,15 @@ function validateSourceMatrix (span: ContextSpanV1): void {
   } else if (span.source === 'current_request') {
     if (span.kind !== 'message' || span.requirement !== 'mandatory' || span.toolProtocol !== null ||
       span.messages.length !== 1 || span.messages[0]?.role !== 'user') return invalidContextValue()
+  } else if (span.source === 'recovery_baseline') {
+    const baselineRef = span.sourceRefs[0]
+    if (span.kind !== 'message' || span.trust !== 'trusted' ||
+      span.requirement !== 'mandatory' || span.priority !== 'critical' ||
+      span.originGeneration === 0 || span.supersedes !== null || span.toolProtocol !== null ||
+      span.messages.length === 0 || !contextWireProtocolIsValid(span.messages) ||
+      span.provenance.revision !== span.originGeneration || span.sourceRefs.length !== 1 ||
+      baselineRef?.ref !== span.provenance.ref ||
+      baselineRef.contentHash !== span.provenance.contentHash) return invalidContextValue()
   } else if (span.source === 'session_history') {
     if (span.kind !== 'message' || span.requirement !== 'optional' || span.toolProtocol !== null ||
       !ordinary || span.messages.length === 0 ||

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { AgentError } from '../contracts/error.js';
 import { canonicalSessionKey } from '../session/conversation-scope.js';
+import { decodeContextArtifactV1, encodeContextArtifactV1 } from '../context/context-artifact.js';
+import { redisContextArtifactKey } from '../context/redis-context-artifact-store.js';
 import { RunCheckpointCodec } from './run-checkpoint.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { isTerminalRunStatus } from './run-state.js';
@@ -11,6 +13,35 @@ export const RUN_STORE_NAMESPACE = 'GROUPMATE:RUN:v1:';
 export const RUN_STORE_LUA_MARKER = '-- GROUPMATE_RUN_STORE_V1';
 export const RUN_STORE_MIGRATION_LUA_MARKER = '-- GROUPMATE_RUN_STORE_MIGRATION_V1';
 export const RUN_STORE_METADATA_KEY = `${RUN_STORE_NAMESPACE}approval-index:namespace-budget`;
+export const REDIS_RUN_MIGRATION_MINIMUM_MAJOR = 6;
+export async function preflightRedisRunMigration(client) {
+    if (typeof client.info !== 'function') {
+        throw storageUnavailable('migration_preflight', new TypeError('Redis INFO capability is unavailable'));
+    }
+    let info;
+    try {
+        info = await client.info('server');
+    }
+    catch (error) {
+        throw storageUnavailable('migration_preflight', error);
+    }
+    const match = /(?:^|\r?\n)redis_version:(\d+)\.(\d+)(?:\.(\d+))?(?:\r?\n|$)/.exec(info);
+    if (match === null) {
+        throw storageUnavailable('migration_preflight', new TypeError('Redis version is unavailable'));
+    }
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    const patch = Number(match[3] ?? '0');
+    if (![major, minor, patch].every(Number.isSafeInteger) ||
+        major < REDIS_RUN_MIGRATION_MINIMUM_MAJOR) {
+        throw storageUnavailable('migration_preflight', new TypeError('Redis KEEPTTL is unsupported'));
+    }
+    return Object.freeze({
+        schemaVersion: 1,
+        redisVersion: `${major}.${minor}.${patch}`,
+        keepTtlSupported: true
+    });
+}
 export const RUN_STORE_MIGRATION_LUA_SCRIPT = `${RUN_STORE_MIGRATION_LUA_MARKER}
 local oldCheckpoint = redis.call('GET', KEYS[1])
 local oldEvents = redis.call('GET', KEYS[2])
@@ -19,6 +50,15 @@ if oldCheckpoint ~= ARGV[1] or oldEvents ~= ARGV[2] or
 local checkpointTtl = redis.call('PTTL', KEYS[1])
 local eventsTtl = redis.call('PTTL', KEYS[2])
 if checkpointTtl <= 0 or eventsTtl <= 0 then return 'ttl' end
+local artifactTtl = math.max(checkpointTtl, eventsTtl)
+for index = 6, #KEYS do
+  local artifactArg = 7 + (index - 6) * 2
+  if ARGV[artifactArg + 1] ~= '1' or
+    redis.call('GET', KEYS[index]) ~= ARGV[artifactArg] or
+    redis.call('PTTL', KEYS[index]) <= 0 then
+    return 'artifact_missing'
+  end
+end
 local isV1 = ARGV[6] == '1'
 if isV1 then
   if redis.call('EXISTS', KEYS[4]) > 0 then return 'reference_conflict' end
@@ -64,9 +104,11 @@ if projected.bytes > ${RUN_RESOURCE_LIMITS.namespaceBytes} or
 redis.call('SET', KEYS[1], ARGV[3], 'KEEPTTL')
 redis.call('SET', KEYS[2], ARGV[4], 'KEEPTTL')
 if isV1 then
-  local referenceTtl = math.max(checkpointTtl, eventsTtl)
-  local created = redis.call('SET', KEYS[4], ARGV[5], 'PX', referenceTtl, 'NX')
+  local created = redis.call('SET', KEYS[4], ARGV[5], 'PX', artifactTtl, 'NX')
   if not created then return 'reference_conflict' end
+end
+for index = 6, #KEYS do
+  redis.call('PEXPIRE', KEYS[index], artifactTtl)
 end
 redis.call('SET', KEYS[5], table.concat({
   projected.bytes, projected.checkpoints, projected.events, projected.tombstones,
@@ -203,6 +245,14 @@ if operation == 'cas' then
   local reference = redis.call('GET', KEYS[4])
   if oldCheckpoint ~= ARGV[2] or oldEvents ~= ARGV[3] or
     reference ~= ARGV[7] then return 'conflict' end
+  for index = 5, #KEYS - 1 do
+    local artifactArg = 8 + (index - 5) * 2
+    if ARGV[artifactArg + 1] ~= '1' or
+      redis.call('GET', KEYS[index]) ~= ARGV[artifactArg] or
+      redis.call('PTTL', KEYS[index]) <= 0 then
+      return 'artifact_missing'
+    end
+  end
   local projected = {
     bytes = current.bytes - string.len(oldCheckpoint) - string.len(oldEvents) +
       string.len(ARGV[4]) + string.len(ARGV[5]),
@@ -218,6 +268,10 @@ if operation == 'cas' then
   redis.call('SET', KEYS[1], ARGV[4], 'EX', tonumber(ARGV[6]))
   redis.call('SET', KEYS[2], ARGV[5], 'EX', tonumber(ARGV[6]))
   redis.call('SET', KEYS[4], ARGV[7], 'EX', tonumber(ARGV[6]))
+  local artifactTtl = tonumber(ARGV[6]) * 1000
+  for index = 5, #KEYS - 1 do
+    redis.call('PEXPIRE', KEYS[index], artifactTtl)
+  end
   save(projected)
   return 'ok'
 end
@@ -508,6 +562,30 @@ async function evaluateMigration(client, keys, args) {
         throw storageUnavailable('upgrade', error);
     }
 }
+async function loadExactContextArtifacts(client, artifactRefs, operation) {
+    const artifacts = await Promise.all(artifactRefs.map(async (artifactRef) => {
+        let raw;
+        try {
+            raw = await client.get(redisContextArtifactKey(artifactRef));
+        }
+        catch (error) {
+            throw storageUnavailable(`${operation}_artifact_read`, error);
+        }
+        if (raw === null)
+            return Object.freeze(['', '0']);
+        try {
+            const artifact = decodeContextArtifactV1(raw);
+            if (artifact.artifactId !== artifactRef || encodeContextArtifactV1(artifact) !== raw) {
+                throw new TypeError();
+            }
+            return Object.freeze([raw, '1']);
+        }
+        catch {
+            return Object.freeze(['', '0']);
+        }
+    }));
+    return Object.freeze(artifacts.flat());
+}
 async function reconcileNamespace(client) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
         let expected;
@@ -552,6 +630,9 @@ function requireMutationSuccess(result, operation) {
         throw new RunStoreConflictError();
     if (result === 'budget')
         throw runBudgetExceeded(operation);
+    if (result === 'artifact_missing') {
+        throw checkpointInvalid(operation, new TypeError('referenced context artifact is missing, expired, or corrupt'));
+    }
     throw storageUnavailable(operation, new TypeError('unexpected Lua result'));
 }
 function encodeTombstone(value) {
@@ -625,6 +706,7 @@ export class RedisRunStore {
     #client;
     #codec = new RunCheckpointCodec();
     #activeTtlSeconds;
+    #migrationPreflight = null;
     constructor(options) {
         this.#client = options.client;
         this.#activeTtlSeconds = options.activeTtlSeconds ?? ACTIVE_TTL_SECONDS;
@@ -681,7 +763,7 @@ export class RedisRunStore {
         }
     }
     async upgrade(expected, next) {
-        if (next.schemaVersion !== 5 ||
+        if (next.schemaVersion !== 6 ||
             next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
             next.revision !== expected.revision + 1 ||
             (expected.schemaVersion !== 1 &&
@@ -694,29 +776,48 @@ export class RedisRunStore {
         catch {
             throw new RunStoreConflictError();
         }
+        await this.#ensureMigrationPreflight();
         const expectedEncoded = this.#encodeLoaded(expected, 'upgrade_expected');
         const nextEncoded = this.#encode(next, 'upgrade_next');
         const keys = redisRunKeys(expected.runId);
         const referenceKey = redisRunReferenceKey(next.runRef);
+        const artifactKeys = next.contextArtifactRefs.map(redisContextArtifactKey);
+        const artifactValues = await loadExactContextArtifacts(this.#client, next.contextArtifactRefs, 'upgrade');
         let result = await evaluateMigration(this.#client, [
-            keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY
+            keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY,
+            ...artifactKeys
         ], [
             expectedEncoded.checkpoint, expectedEncoded.events,
             nextEncoded.checkpoint, nextEncoded.events, next.runId,
-            expected.schemaVersion === 1 ? '1' : '0'
+            expected.schemaVersion === 1 ? '1' : '0',
+            ...artifactValues
         ]);
         if (result === 'reconcile' || result === 'budget') {
             await reconcileNamespace(this.#client);
             result = await evaluateMigration(this.#client, [
-                keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY
+                keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY,
+                ...artifactKeys
             ], [
                 expectedEncoded.checkpoint, expectedEncoded.events,
                 nextEncoded.checkpoint, nextEncoded.events, next.runId,
-                expected.schemaVersion === 1 ? '1' : '0'
+                expected.schemaVersion === 1 ? '1' : '0',
+                ...artifactValues
             ]);
         }
         requireMutationSuccess(result, 'upgrade');
         return next;
+    }
+    async #ensureMigrationPreflight() {
+        const pending = this.#migrationPreflight ?? preflightRedisRunMigration(this.#client);
+        this.#migrationPreflight = pending;
+        try {
+            return await pending;
+        }
+        catch (error) {
+            if (this.#migrationPreflight === pending)
+                this.#migrationPreflight = null;
+            throw error;
+        }
     }
     async compareAndSet(expected, next) {
         if (next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
@@ -732,15 +833,18 @@ export class RedisRunStore {
         const activeTtlSeconds = next.status === 'waiting_approval'
             ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
             : this.#activeTtlSeconds;
+        const artifactKeys = next.contextArtifactRefs.map(redisContextArtifactKey);
+        const artifactValues = await loadExactContextArtifacts(this.#client, next.contextArtifactRefs, 'compare_and_set');
         const result = await mutate(this.#client, 'cas', [
-            keys.checkpoint, keys.events, keys.tombstone, referenceKey
+            keys.checkpoint, keys.events, keys.tombstone, referenceKey, ...artifactKeys
         ], [
             expectedEncoded.checkpoint,
             expectedEncoded.events,
             nextEncoded.checkpoint,
             nextEncoded.events,
             String(activeTtlSeconds),
-            expected.runId
+            expected.runId,
+            ...artifactValues
         ]);
         requireMutationSuccess(result, 'compare_and_set');
         return next;
@@ -868,7 +972,7 @@ export class RedisRunStore {
         }
     }
     #encodeLoaded(checkpoint, operation) {
-        if (checkpoint.schemaVersion === 5)
+        if (checkpoint.schemaVersion === 6)
             return this.#encode(checkpoint, operation);
         try {
             const { events, ...state } = checkpoint;

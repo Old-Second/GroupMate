@@ -13,7 +13,8 @@ import {
   type RunCheckpointV2,
   type RunCheckpointV3,
   type RunCheckpointV4,
-  type RunCheckpointV5
+  type RunCheckpointV5,
+  type RunCheckpointV6
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   upgradeCompletionFromRunCheckpointV1,
@@ -21,6 +22,7 @@ import {
   upgradeRunCheckpointV2,
   upgradeRunCheckpointV3,
   upgradeRunCheckpointV4,
+  upgradeRunCheckpointV5,
   validateExactRunCheckpointMigration
 } from '../../src/agent/run/run-checkpoint-migration.js'
 import {
@@ -29,9 +31,17 @@ import {
   parseFrozenObservationPolicy,
   parseRunObservationCounters
 } from '../../src/agent/run/run-observation.js'
-import { createContextPlanV1 } from '../../src/agent/context/context-plan.js'
+import {
+  CONTEXT_PLAN_HASH_DOMAIN,
+  contextWireHash,
+  createContextPlanV1,
+  type ContextPlanV1,
+  type LegacyContextPlanV1
+} from '../../src/agent/context/context-plan.js'
+import { domainSeparatedContextHash } from '../../src/agent/context/context-span.js'
 import {
   CONTEXT_TOKEN_ESTIMATOR_VERSION,
+  estimateModelMessagesTokens,
   serializedModelMessagesBytes
 } from '../../src/agent/context/context-token-estimator.js'
 import { modelCapabilityStableHash } from '../../src/agent/model/model-capability.js'
@@ -44,6 +54,46 @@ const snapshotFingerprint = createHash('sha256').update('[]').digest('hex')
 const budget = createDefaultRunBudget({
   providerTimeoutMs: 120_000,
   outputTokens: 256
+})
+
+test('checkpoint codec preserves exact tool argument text in messages and ledgers', () => {
+  const argumentsText = '{ "second": "e\\u0301", "first": 1 }'
+  const pending = pendingApprovalState()
+  const calls = pending.toolLedgers[0]?.calls.map(call => Object.freeze({
+    ...call,
+    argumentsText,
+    arguments: Object.freeze({ second: 'e\u0301', first: 1 })
+  })) ?? []
+  const source = legacyCheckpoint({
+    status: 'waiting_approval',
+    ...pending,
+    messages: Object.freeze([Object.freeze({
+      role: 'assistant' as const,
+      content: null,
+      toolCalls: Object.freeze([Object.freeze({
+        callId: 'call-1',
+        name: 'fixture',
+        argumentsText,
+        arguments: Object.freeze({ second: 'e\u0301', first: 1 })
+      })])
+    })]),
+    toolLedgers: Object.freeze([Object.freeze({
+      ...pending.toolLedgers[0],
+      calls: Object.freeze(calls)
+    })])
+  } as unknown as Partial<RunCheckpointV1>)
+  const { events, ...state } = source
+  const loaded = new RunCheckpointCodec().decode(JSON.stringify(state), JSON.stringify({
+    schemaVersion: 1,
+    revision: source.revision,
+    events
+  }))
+
+  const assistant = loaded.messages[0]
+  assert.equal(assistant?.role, 'assistant')
+  if (assistant?.role !== 'assistant') throw new Error('assistant message expected')
+  assert.equal(assistant.toolCalls?.[0]?.argumentsText, argumentsText)
+  assert.equal(loaded.toolLedgers[0]?.calls[0]?.argumentsText, argumentsText)
 })
 const legacyBudgetLimits = createLegacyRunBudgetLimits(budget.limits)
 
@@ -259,6 +309,54 @@ function checkpointV3 (
   })
 }
 
+function checkpointV4 (): RunCheckpointV4 {
+  const source = upgradeRunCheckpointV3(checkpointV3())
+  const {
+    schemaVersion: _schemaVersion,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
+    budgetLimits: _budgetLimits,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 4, budgetLimits: legacyBudgetLimits })
+}
+
+function checkpointV5 (): RunCheckpointV5 {
+  const source = upgradeRunCheckpointV4(checkpointV4())
+  const {
+    schemaVersion: _schemaVersion,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 5 })
+}
+
+function legacyPlanFromCurrent (plan: ContextPlanV1): LegacyContextPlanV1 {
+  const included = Object.freeze(plan.included.map(entry => {
+    const { wireHash: _wireHash, ...legacy } = entry
+    return Object.freeze(legacy)
+  }))
+  const includedJson = `[${included.map(entry => (
+    `{"spanId":${JSON.stringify(entry.spanId)},"representation":${JSON.stringify(entry.representation)},"wireStart":${entry.wireStart},"wireCount":${entry.wireCount},"contentHash":${JSON.stringify(entry.contentHash)}}`
+  )).join(',')}]`
+  const omittedJson = `[${plan.omitted.map(entry => (
+    `{"spanId":${JSON.stringify(entry.spanId)},"reason":${JSON.stringify(entry.reason)}}`
+  )).join(',')}]`
+  const preimage = `{"schemaVersion":1,"namespaceRef":${JSON.stringify(plan.namespaceRef)},"generation":${plan.generation},"previousPlanHash":${plan.previousPlanHash === null ? 'null' : JSON.stringify(plan.previousPlanHash)},"estimatorVersion":${JSON.stringify(plan.estimatorVersion)},"capabilityHash":${JSON.stringify(plan.capabilityHash)},"mode":${JSON.stringify(plan.mode)},"included":${includedJson},"omitted":${omittedJson},"artifactRefs":[${plan.artifactRefs.map(value => JSON.stringify(value)).join(',')}],"prefixMessageCount":${plan.prefixMessageCount},"estimatedInputTokens":${plan.estimatedInputTokens},"estimatedToolTokens":${plan.estimatedToolTokens},"reservedOutputTokens":${plan.reservedOutputTokens},"serializedMessageBytes":${plan.serializedMessageBytes},"messageCount":${plan.messageCount}}`
+  return Object.freeze({
+    ...plan,
+    planHash: domainSeparatedContextHash(CONTEXT_PLAN_HASH_DOMAIN, preimage),
+    included
+  })
+}
+
 test('frozen observation policy uses the locked SHA-256 sample and off fails closed', () => {
   assert.deepEqual(createFrozenObservationPolicy({
     levelAtStart: 'basic',
@@ -335,11 +433,14 @@ test('observation counter sentinels are field-specific and initial values are ex
   }
 })
 
-test('v1 migration upgrades directly to v5 once and marks historical usage unavailable', () => {
+test('v1 migration upgrades directly to v6 once and marks historical usage unavailable', () => {
   const active = legacyCheckpoint()
   const upgraded = upgradeRunCheckpointV1(active, { runRef, requestRef })
 
-  assert.equal(upgraded.schemaVersion, 5)
+  assert.equal(upgraded.schemaVersion, 6)
+  assert.equal(upgraded.contextRuntimeMode, 'legacy_compatible')
+  assert.deepEqual(upgraded.pendingContextMessages, [])
+  assert.equal(upgraded.providerGeneration, null)
   assert.equal(upgraded.modelLoopPolicy.kind, 'legacy_fixed')
   assert.equal(upgraded.contextPlan, null)
   assert.deepEqual(upgraded.contextArtifactRefs, [])
@@ -408,7 +509,7 @@ test('v1 migration upgrades directly to v5 once and marks historical usage unava
   })
 })
 
-test('v2 migration upgrades directly to v5 once and preserves references and ledgers', () => {
+test('v2 migration upgrades directly to v6 once and preserves references and ledgers', () => {
   const pending = pendingApprovalState()
   const source = checkpointV2({
     status: 'waiting_approval',
@@ -417,7 +518,8 @@ test('v2 migration upgrades directly to v5 once and preserves references and led
 
   const upgraded = upgradeRunCheckpointV2(source)
 
-  assert.equal(upgraded.schemaVersion, 5)
+  assert.equal(upgraded.schemaVersion, 6)
+  assert.equal(upgraded.contextRuntimeMode, 'legacy_compatible')
   assert.equal(upgraded.revision, source.revision + 1)
   assert.equal(upgraded.runRef, source.runRef)
   assert.equal(upgraded.requestRef, source.requestRef)
@@ -428,38 +530,98 @@ test('v2 migration upgrades directly to v5 once and preserves references and led
   assert.deepEqual(upgraded.observationPolicy, source.observationPolicy)
 })
 
-test('v3 migration upgrades directly to v5 once without changing legacy model config', () => {
+test('v3 migration upgrades directly to v6 once without changing legacy model config', () => {
   const source = checkpointV3()
   const upgraded = upgradeRunCheckpointV3(source)
-  assert.equal(upgraded.schemaVersion, 5)
+  assert.equal(upgraded.schemaVersion, 6)
   assert.equal(upgraded.revision, source.revision + 1)
   assert.deepEqual(upgraded.model, source.model)
   assert.deepEqual(upgraded.reasoningSegments, source.reasoningSegments)
   assert.equal(upgraded.usage.availability, 'unavailable')
 })
 
-test('v4 migration upgrades directly to v5 while preserving frozen capability and usage', () => {
-  const v5 = upgradeRunCheckpointV3(checkpointV3())
-  const {
-    schemaVersion: _schemaVersion,
-    modelLoopPolicy: _modelLoopPolicy,
-    contextPlan: _contextPlan,
-    contextArtifactRefs: _contextArtifactRefs,
-    toolWireSnapshot: _toolWireSnapshot,
-    budgetLimits: _budgetLimits,
-    ...state
-  } = v5
-  const source: RunCheckpointV4 = Object.freeze({
-    ...state,
-    schemaVersion: 4,
-    budgetLimits: legacyBudgetLimits
-  })
+test('v4 migration upgrades directly to v6 while preserving frozen capability and usage', () => {
+  const source = checkpointV4()
   const upgraded = upgradeRunCheckpointV4(source)
-  assert.equal(upgraded.schemaVersion, 5)
+  assert.equal(upgraded.schemaVersion, 6)
   assert.equal(upgraded.revision, source.revision + 1)
   assert.deepEqual(upgraded.modelCapability, source.modelCapability)
   assert.deepEqual(upgraded.usage, source.usage)
   assert.equal(upgraded.toolWireSnapshot, null)
+})
+
+test('v5 migration upgrades directly to v6 and preserves its frozen planner inputs', () => {
+  const source = checkpointV5()
+
+  const upgraded = upgradeRunCheckpointV5(source)
+
+  assert.equal(upgraded.schemaVersion, 6)
+  assert.equal(upgraded.revision, source.revision + 1)
+  assert.equal(upgraded.contextRuntimeMode, 'legacy_compatible')
+  assert.deepEqual(upgraded.pendingContextMessages, [])
+  assert.equal(upgraded.providerGeneration, null)
+  assert.deepEqual(upgraded.modelLoopPolicy, source.modelLoopPolicy)
+  assert.deepEqual(upgraded.contextPlan, source.contextPlan)
+  assert.deepEqual(upgraded.contextArtifactRefs, source.contextArtifactRefs)
+})
+
+test('v5 codec preserves a legacy plan byte-for-byte and migration adds wire hashes', () => {
+  const message = Object.freeze({ role: 'user' as const, content: 'legacy context' })
+  const messages = Object.freeze([message])
+  const base = checkpointV5()
+  const estimatedInputTokens = estimateModelMessagesTokens(messages)
+  const currentPlan = createContextPlanV1(Object.freeze({
+    namespaceRef: base.runRef,
+    generation: 1,
+    previousPlanHash: null,
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: modelCapabilityStableHash(base.modelCapability),
+    mode: 'normal' as const,
+    included: Object.freeze([Object.freeze({
+      spanId: 'span:legacy',
+      representation: 'raw' as const,
+      wireStart: 0,
+      wireCount: 1,
+      wireHash: contextWireHash(messages),
+      contentHash: '4'.repeat(64)
+    })]),
+    omitted: Object.freeze([]),
+    artifactRefs: Object.freeze([]),
+    prefixMessageCount: 0,
+    estimatedInputTokens,
+    estimatedToolTokens: 0,
+    reservedOutputTokens: 1,
+    serializedMessageBytes: serializedModelMessagesBytes(messages),
+    messageCount: 1
+  }))
+  const legacyPlan = legacyPlanFromCurrent(currentPlan)
+  const source = Object.freeze({
+    ...base,
+    messages,
+    estimatedInputTokens,
+    contextPlan: legacyPlan
+  }) satisfies RunCheckpointV5
+  const { events, ...state } = source
+  const checkpointRaw = JSON.stringify(state)
+  const eventsRaw = JSON.stringify({
+    schemaVersion: 5,
+    revision: source.revision,
+    events
+  })
+
+  const loaded = new RunCheckpointCodec().decode(checkpointRaw, eventsRaw)
+
+  assert.equal(loaded.schemaVersion, 5)
+  if (loaded.schemaVersion !== 5) throw new Error('v5 checkpoint expected')
+  const { events: loadedEvents, ...loadedState } = loaded
+  assert.equal(JSON.stringify(loadedState), checkpointRaw)
+  assert.deepEqual(loadedEvents, events)
+  assert.deepEqual(loaded.contextPlan, legacyPlan)
+
+  const upgraded = upgradeRunCheckpointV5(loaded)
+  assert.equal(upgraded.contextPlan?.included[0]?.wireHash, contextWireHash(messages))
+  assert.notEqual(upgraded.contextPlan?.planHash, legacyPlan.planHash)
+  assert.deepEqual(validateExactRunCheckpointMigration(loaded, upgraded), upgraded)
 })
 
 test('exact migration ignores object insertion order but preserves array order', () => {
@@ -525,7 +687,7 @@ test('v1 completion upgrade covers text, visible output, failed, cancelled, acti
   }
 })
 
-test('codec reads schema v1, v2 and v3, single-writes schema v5 and synchronizes envelope revision', () => {
+test('codec reads schema v1 through v5, single-writes schema v6 and synchronizes envelope revision', () => {
   const codec = new RunCheckpointCodec()
   const legacy = legacyCheckpoint()
   const { events, ...legacyState } = legacy
@@ -552,11 +714,27 @@ test('codec reads schema v1, v2 and v3, single-writes schema v5 and synchronizes
     events: v3Events
   })).schemaVersion, 3)
 
+  const sourceV4 = checkpointV4()
+  const { events: v4Events, ...v4State } = sourceV4
+  assert.equal(codec.decode(JSON.stringify(v4State), JSON.stringify({
+    schemaVersion: 4,
+    revision: sourceV4.revision,
+    events: v4Events
+  })).schemaVersion, 4)
+
+  const sourceV5 = checkpointV5()
+  const { events: v5Events, ...v5State } = sourceV5
+  assert.equal(codec.decode(JSON.stringify(v5State), JSON.stringify({
+    schemaVersion: 5,
+    revision: sourceV5.revision,
+    events: v5Events
+  })).schemaVersion, 5)
+
   const upgraded = upgradeRunCheckpointV1(legacy, { runRef, requestRef })
   const encoded = codec.encode(upgraded)
-  assert.equal(JSON.parse(encoded.checkpoint).schemaVersion, 5)
+  assert.equal(JSON.parse(encoded.checkpoint).schemaVersion, 6)
   assert.deepEqual(JSON.parse(encoded.events), {
-    schemaVersion: 5,
+    schemaVersion: 6,
     revision: upgraded.revision,
     events: upgraded.events
   })
@@ -602,7 +780,7 @@ test('codec rejects string-encoded token budget limits', () => {
         maxEstimatedTokens
       }
     }), JSON.stringify({
-      schemaVersion: 5,
+      schemaVersion: 6,
       revision: source.revision,
       events
     })), /loop policy|budget limits/i)
@@ -622,14 +800,14 @@ test('codec rejects string-encoded run budget counters', () => {
         [key]: String(state.budgetCounters[key as keyof typeof state.budgetCounters])
       }
     }), JSON.stringify({
-      schemaVersion: 5,
+      schemaVersion: 6,
       revision: source.revision,
       events
     })), new RegExp(`run budget counter ${key} is invalid`, 'i'))
   }
 })
 
-test('v5 codec requires frozen capability, price and usage with a consistent catalog', () => {
+test('v6 codec requires frozen capability, price and usage with a consistent catalog', () => {
   const codec = new RunCheckpointCodec()
   const upgraded = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })
   const ordinaryRoute = Object.freeze({
@@ -656,24 +834,24 @@ test('v5 codec requires frozen capability, price and usage with a consistent cat
   assert.throws(() => codec.encode({
     ...upgraded,
     secret: 'must-not-persist'
-  } as unknown as RunCheckpointV5), /unknown checkpoint key/i)
+  } as unknown as RunCheckpointV6), /unknown checkpoint key/i)
   const { reasoningSegments: _reasoningSegments, ...missingReasoning } = upgraded
   assert.throws(() => codec.encode(
-    missingReasoning as unknown as RunCheckpointV5
+    missingReasoning as unknown as RunCheckpointV6
   ), /reasoning|missing/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     requestKind: 'ordinary_chat',
     presentationRoute: null
-  } as RunCheckpointV5), /route|request kind|matrix/i)
+  } as RunCheckpointV6), /route|request kind|matrix/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     presentationRoute: ordinaryRoute
-  } as RunCheckpointV5), /legacy|route/i)
+  } as RunCheckpointV6), /legacy|route/i)
   assert.throws(() => codec.encode({
     ...ordinary,
     requestKind: 'proactive_chat'
-  } as RunCheckpointV5), /route|matrix/i)
+  } as RunCheckpointV6), /route|matrix/i)
   assert.throws(() => codec.encode({
     ...ordinary,
     presentationRoute: {
@@ -683,13 +861,13 @@ test('v5 codec requires frozen capability, price and usage with a consistent cat
         scope: { kind: 'group', groupId: 'another-group' }
       }
     }
-  } as RunCheckpointV5), /route|matrix/i)
+  } as RunCheckpointV6), /route|matrix/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     status: 'completed',
     completion: Object.freeze({ kind: 'already_visible', source: 'tool_output' }),
     output: assistantOutput('不应同时存在')
-  } as RunCheckpointV5), /completion|output/i)
+  } as RunCheckpointV6), /completion|output/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     observationPolicy: Object.freeze({
@@ -700,7 +878,7 @@ test('v5 codec requires frozen capability, price and usage with a consistent cat
         runRef: upgraded.runRef
       }).sampledSuccess
     })
-  } as RunCheckpointV5), /policy|sample/i)
+  } as RunCheckpointV6), /policy|sample/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     modelCapability: {
@@ -708,14 +886,14 @@ test('v5 codec requires frozen capability, price and usage with a consistent cat
       priceCatalogVersion: 'catalog-v1'
     },
     modelPrice: null
-  } as RunCheckpointV5), /price|catalog/i)
+  } as RunCheckpointV6), /price|catalog/i)
   assert.throws(() => codec.encode({
     ...upgraded,
     usage: { ...upgraded.usage, extra: true }
-  } as unknown as RunCheckpointV5), /usage/i)
+  } as unknown as RunCheckpointV6), /usage/i)
 })
 
-test('v5 codec cross-validates context plan against run, wire and frozen capability', () => {
+test('v6 codec cross-validates context plan against run, wire and frozen capability', () => {
   const codec = new RunCheckpointCodec()
   const upgraded = upgradeRunCheckpointV1(legacyCheckpoint(), { runRef, requestRef })
   const plan = createContextPlanV1(Object.freeze({
@@ -740,11 +918,11 @@ test('v5 codec cross-validates context plan against run, wire and frozen capabil
   assert.throws(() => codec.encode(Object.freeze({
     ...planned,
     contextPlan: Object.freeze({ ...plan, namespaceRef: 'f'.repeat(32) })
-  }) as RunCheckpointV5), /context plan|invalid canonical/i)
+  }) as RunCheckpointV6), /context plan|invalid canonical/i)
   assert.throws(() => codec.encode(Object.freeze({
     ...planned,
     estimatedInputTokens: 1
-  }) as RunCheckpointV5), /context plan/i)
+  }) as RunCheckpointV6), /context plan/i)
   const { schemaVersion: _planSchema, planHash: _planHash, ...planDraft } = plan
   const wrongCapabilityPlan = createContextPlanV1(Object.freeze({
     ...planDraft,
@@ -753,7 +931,7 @@ test('v5 codec cross-validates context plan against run, wire and frozen capabil
   assert.throws(() => codec.encode(Object.freeze({
     ...planned,
     contextPlan: wrongCapabilityPlan
-  }) as RunCheckpointV5), /context plan/i)
+  }) as RunCheckpointV6), /context plan/i)
   const wrongBytesPlan = createContextPlanV1(Object.freeze({
     ...planDraft,
     serializedMessageBytes: plan.serializedMessageBytes + 1
@@ -761,7 +939,7 @@ test('v5 codec cross-validates context plan against run, wire and frozen capabil
   assert.throws(() => codec.encode(Object.freeze({
     ...planned,
     contextPlan: wrongBytesPlan
-  }) as RunCheckpointV5), /context plan/i)
+  }) as RunCheckpointV6), /context plan/i)
   const wrongCountPlan = createContextPlanV1(Object.freeze({
     ...planDraft,
     included: Object.freeze([Object.freeze({
@@ -769,6 +947,7 @@ test('v5 codec cross-validates context plan against run, wire and frozen capabil
       representation: 'raw' as const,
       wireStart: 0,
       wireCount: 1,
+      wireHash: '2'.repeat(64),
       contentHash: '1'.repeat(64)
     })]),
     messageCount: 1
@@ -776,14 +955,66 @@ test('v5 codec cross-validates context plan against run, wire and frozen capabil
   assert.throws(() => codec.encode(Object.freeze({
     ...planned,
     contextPlan: wrongCountPlan
-  }) as RunCheckpointV5), /context plan/i)
+  }) as RunCheckpointV6), /context plan/i)
+  const actualWire = Object.freeze([
+    Object.freeze({ role: 'user' as const, content: '甲' })
+  ])
+  const sameShapeWrongWire = Object.freeze([
+    Object.freeze({ role: 'user' as const, content: '乙' })
+  ])
+  const wrongWirePlan = createContextPlanV1(Object.freeze({
+    namespaceRef: upgraded.runRef,
+    generation: 1,
+    previousPlanHash: null,
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: modelCapabilityStableHash(upgraded.modelCapability),
+    mode: 'normal' as const,
+    included: Object.freeze([Object.freeze({
+      spanId: 'span-same-shape-wrong-wire',
+      representation: 'raw' as const,
+      wireStart: 0,
+      wireCount: 1,
+      wireHash: contextWireHash(sameShapeWrongWire),
+      contentHash: '1'.repeat(64)
+    })]),
+    omitted: Object.freeze([]),
+    artifactRefs: Object.freeze([]),
+    prefixMessageCount: 0,
+    estimatedInputTokens: estimateModelMessagesTokens(actualWire),
+    estimatedToolTokens: 0,
+    reservedOutputTokens: 1,
+    serializedMessageBytes: serializedModelMessagesBytes(actualWire),
+    messageCount: 1
+  }))
+  assert.throws(() => codec.encode(Object.freeze({
+    ...upgraded,
+    messages: actualWire,
+    estimatedInputTokens: estimateModelMessagesTokens(actualWire),
+    contextPlan: wrongWirePlan
+  }) as RunCheckpointV6), /context plan wire/i)
   assert.throws(() => codec.encode(Object.freeze({
     ...upgraded,
     contextArtifactRefs: Object.freeze(['artifact:'.concat('1'.repeat(64))])
-  }) as RunCheckpointV5), /artifact|references/i)
+  }) as RunCheckpointV6), /artifact|references/i)
   assert.throws(() => codec.encode(Object.freeze({
     ...upgraded,
     modelLoopPolicy: Object.freeze({ schemaVersion: 1, kind: 'adaptive_context' }),
     toolWireSnapshot: null
-  }) as RunCheckpointV5), /tool wire snapshot/i)
+  }) as RunCheckpointV6), /tool wire snapshot/i)
+  assert.throws(() => codec.encode(Object.freeze({
+    ...upgraded,
+    status: 'calling_model',
+    providerDispatch: Object.freeze({ state: 'reserved' }),
+    modelTurn: null
+  }) as RunCheckpointV6), /dispatch state matrix/i)
+  assert.throws(() => codec.encode(Object.freeze({
+    ...upgraded,
+    status: 'preparing',
+    modelTurn: Object.freeze({ kind: 'normal' as const, maxOutputTokens: 1 })
+  }) as RunCheckpointV6), /dispatch state matrix/i)
+  assert.throws(() => codec.encode(Object.freeze({
+    ...upgraded,
+    status: 'calling_model',
+    modelTurn: Object.freeze({ kind: 'correction' as const, maxOutputTokens: 1 })
+  }) as RunCheckpointV6), /dispatch state matrix/i)
 })

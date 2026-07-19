@@ -5,6 +5,7 @@ import type { AgentEvent } from '../../src/agent/contracts/event.js'
 import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import type {
   ModelAdapter,
+  ModelMessage,
   ModelRequest,
   ModelTurn,
   ProviderRequestMetadata
@@ -12,6 +13,13 @@ import type {
 import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
+import { createContextPlanV1, contextWireHash } from '../../src/agent/context/context-plan.js'
+import {
+  estimateModelMessagesTokens,
+  serializedModelMessagesBytes,
+  CONTEXT_TOKEN_ESTIMATOR_VERSION
+} from '../../src/agent/context/context-token-estimator.js'
+import { modelCapabilityStableHash } from '../../src/agent/model/model-capability.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import type {
   RunContentJournal,
@@ -360,6 +368,119 @@ class RecoveryCommitCrashStore extends InMemoryRunStore {
   }
 }
 
+class KnownFailureActionCommitCrashStore extends InMemoryRunStore {
+  #offline = false
+  crashed = false
+
+  restoreProcess (): void {
+    this.#offline = false
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    const stored = await super.compareAndSet(expected, next)
+    const committedKnownFailure = expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' &&
+      next.events.slice(expected.events.length).some(event => (
+        event.type === 'model.attempted' && event.payload.outcome === 'failed'
+      ))
+    if (!this.crashed && committedKnownFailure) {
+      this.crashed = true
+      this.#offline = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
+class CorrectionPlanCommitCrashStore extends InMemoryRunStore {
+  #offline = false
+
+  restoreProcess (): void {
+    this.#offline = false
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    const stored = await super.compareAndSet(expected, next)
+    const committedCorrectionPlan = expected.status === 'calling_model' &&
+      expected.modelTurn === null && expected.providerGeneration !== null &&
+      next.status === 'calling_model' && next.modelTurn === null &&
+      next.providerGeneration === null && next.contextPlan !== null &&
+      next.contextPlan.generation === (expected.contextPlan?.generation ?? 0) + 1
+    if (committedCorrectionPlan) {
+      this.#offline = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
+class PreCorrectionPlanCrashStore extends InMemoryRunStore {
+  #offline = false
+  #crashed = false
+  correctionRefsCleared = false
+
+  restoreProcess (): void {
+    this.#offline = false
+  }
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    const stored = await super.compareAndSet(expected, next)
+    if (expected.contextArtifactRefs.length > 0 &&
+      next.contextArtifactRefs.length === 0 &&
+      expected.providerGeneration !== null && next.providerGeneration === null) {
+      this.correctionRefsCleared = true
+    }
+    const awaitsCorrectionPlan = next.status === 'calling_model' &&
+      next.modelTurn === null && next.providerGeneration !== null &&
+      next.forceCorrection
+    if (!this.#crashed && awaitsCorrectionPlan) {
+      this.#crashed = true
+      this.#offline = true
+      throw new SimulatedProcessCrash()
+    }
+    return stored
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.#offline) throw new SimulatedProcessCrash()
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
 class PreSuccessCasCrashStore extends TerminalCaptureStore {
   crashed = false
   readonly crash = new SimulatedProcessCrash()
@@ -386,6 +507,38 @@ class PreSuccessCasCrashStore extends TerminalCaptureStore {
     if (!this.crashed && expected.providerDispatch.state === 'reserved' &&
       next.providerDispatch.state === 'idle') {
       this.crashed = true
+      throw this.crash
+    }
+    return await super.commitTerminal(expected, next, snapshot)
+  }
+}
+
+class RepeatedPreSuccessCasCrashStore extends TerminalCaptureStore {
+  crashes = 0
+  readonly crash = new SimulatedProcessCrash()
+
+  override async compareAndSet (
+    expected: RunCheckpoint,
+    next: RunCheckpoint
+  ): Promise<RunCheckpoint> {
+    const commitsSuccessfulTurn = expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle' &&
+      next.events.slice(expected.events.length).some(event => event.type === 'model.completed')
+    if (this.crashes < 2 && commitsSuccessfulTurn) {
+      this.crashes += 1
+      throw this.crash
+    }
+    return await super.compareAndSet(expected, next)
+  }
+
+  override async commitTerminal (
+    expected: RunCheckpoint,
+    next: RunCheckpoint,
+    snapshot: Parameters<RunStore['commitTerminal']>[2]
+  ): Promise<Awaited<ReturnType<RunStore['commitTerminal']>>> {
+    if (this.crashes < 2 && expected.providerDispatch.state === 'reserved' &&
+      next.providerDispatch.state === 'idle') {
+      this.crashes += 1
       throw this.crash
     }
     return await super.commitTerminal(expected, next, snapshot)
@@ -627,6 +780,7 @@ interface HarnessOptions {
   readonly maxOutputTokens?: number
   readonly prepareContext?: StartRunInput['runtime']['prepareContext']
   readonly recoverContext?: StartRunInput['runtime']['recoverContext']
+  readonly planModelTurn?: StartRunInput['runtime']['planModelTurn']
   readonly contextFor?: StartRunInput['runtime']['contextFor']
   readonly now?: () => Date
   readonly store?: RunStore
@@ -717,12 +871,100 @@ function harness (
         messages: Object.freeze([{ role: 'user' as const, content: '完成任务' }]),
         estimatedInputTokens: 16
       })),
+      ...(options.planModelTurn === undefined ? {} : { planModelTurn: options.planModelTurn }),
       prepareToolContext: async () => preparation(),
       contextFor: options.contextFor ?? (async () => execution()),
       ...(options.recoverContext === undefined ? {} : { recoverContext: options.recoverContext })
     })
   })
   return { adapter, tools, store, events, observedEvents, engine, input }
+}
+
+function generationPlan (
+  checkpoint: RunCheckpoint,
+  messages: readonly ModelMessage[]
+) {
+  const generation = (checkpoint.contextPlan?.generation ?? 0) + 1
+  const frozenMessages = Object.freeze([...messages])
+  const wireHash = contextWireHash(frozenMessages)
+  const estimatedInputTokens = estimateModelMessagesTokens(frozenMessages)
+  const plan = createContextPlanV1(Object.freeze({
+    namespaceRef: checkpoint.runRef,
+    generation,
+    previousPlanHash: checkpoint.contextPlan?.planHash ?? null,
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: modelCapabilityStableHash(checkpoint.modelCapability),
+    mode: 'normal' as const,
+    included: Object.freeze([Object.freeze({
+      spanId: `span:generation-${generation}`,
+      representation: 'raw' as const,
+      wireStart: 0,
+      wireCount: frozenMessages.length,
+      wireHash,
+      contentHash: wireHash
+    })]),
+    omitted: Object.freeze([]),
+    artifactRefs: Object.freeze([]),
+    prefixMessageCount: checkpoint.contextPlan === null ||
+      frozenMessages.length < checkpoint.contextPlan.messageCount
+      ? 0
+      : checkpoint.contextPlan.messageCount,
+    estimatedInputTokens,
+    estimatedToolTokens: checkpoint.toolWireSnapshot?.estimatedTokens ?? 0,
+    reservedOutputTokens: checkpoint.model.maxOutputTokens,
+    serializedMessageBytes: serializedModelMessagesBytes(frozenMessages),
+    messageCount: frozenMessages.length
+  }))
+  return Object.freeze({
+    plan,
+    messages: frozenMessages,
+    estimatedInputTokens,
+    artifactRefs: Object.freeze([])
+  })
+}
+
+function generationPlanWithArtifact (
+  checkpoint: RunCheckpoint,
+  messages: readonly ModelMessage[],
+  artifactRef: string
+) {
+  const generation = (checkpoint.contextPlan?.generation ?? 0) + 1
+  const frozenMessages = Object.freeze([...messages])
+  const wireHash = contextWireHash(frozenMessages)
+  const estimatedInputTokens = estimateModelMessagesTokens(frozenMessages)
+  const plan = createContextPlanV1(Object.freeze({
+    namespaceRef: checkpoint.runRef,
+    generation,
+    previousPlanHash: checkpoint.contextPlan?.planHash ?? null,
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: modelCapabilityStableHash(checkpoint.modelCapability),
+    mode: 'normal' as const,
+    included: Object.freeze([Object.freeze({
+      spanId: artifactRef,
+      representation: 'artifact' as const,
+      wireStart: 0,
+      wireCount: frozenMessages.length,
+      wireHash,
+      contentHash: wireHash
+    })]),
+    omitted: Object.freeze([]),
+    artifactRefs: Object.freeze([artifactRef]),
+    prefixMessageCount: checkpoint.contextPlan === null ||
+      frozenMessages.length < checkpoint.contextPlan.messageCount
+      ? 0
+      : checkpoint.contextPlan.messageCount,
+    estimatedInputTokens,
+    estimatedToolTokens: checkpoint.toolWireSnapshot?.estimatedTokens ?? 0,
+    reservedOutputTokens: checkpoint.model.maxOutputTokens,
+    serializedMessageBytes: serializedModelMessagesBytes(frozenMessages),
+    messageCount: frozenMessages.length
+  }))
+  return Object.freeze({
+    plan,
+    messages: frozenMessages,
+    estimatedInputTokens,
+    artifactRefs: Object.freeze([artifactRef])
+  })
 }
 
 class TerminalRaceRunStore implements RunStore {
@@ -1407,8 +1649,8 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const reserved = await fixture.store.load('run-1')
-    assert.equal(reserved?.schemaVersion, 5)
-    if (reserved?.schemaVersion !== 5) throw new TypeError('reserved checkpoint is missing')
+    assert.equal(reserved?.schemaVersion, 6)
+    if (reserved?.schemaVersion !== 6) throw new TypeError('reserved checkpoint is missing')
     assert.deepEqual(reserved.modelCapability, FIXTURE_MODEL_CAPABILITY)
     assert.equal(reserved.modelPrice, null)
     assert.deepEqual(reserved.usage, {
@@ -1831,12 +2073,12 @@ test('RunEngine propagates success persistence errors without a stale checkpoint
       error === store.sentinel && (error as Error).message === 'success store sentinel'
     ))
     const reserved = await store.load(fixture.input.runId)
-    assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
+    assert.equal(reserved?.schemaVersion === 6 ? reserved.status : null, 'calling_model')
     assert.equal(
-      reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
+      reserved?.schemaVersion === 6 ? reserved.providerDispatch.state : null,
       'reserved'
     )
-    assert.deepEqual(reserved?.schemaVersion === 5 ? reserved.usage : null, {
+    assert.deepEqual(reserved?.schemaVersion === 6 ? reserved.usage : null, {
       schemaVersion: 1,
       availability: 'complete',
       inputTokens: 0,
@@ -1870,9 +2112,9 @@ test('RunEngine never treats an abort-named Store failure as run cancellation', 
       (error as Error).message === 'success store abort-named sentinel'
     ))
     const reserved = await store.load(fixture.input.runId)
-    assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
+    assert.equal(reserved?.schemaVersion === 6 ? reserved.status : null, 'calling_model')
     assert.equal(
-      reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
+      reserved?.schemaVersion === 6 ? reserved.providerDispatch.state : null,
       'reserved'
     )
     assert.equal(await store.loadTombstone(fixture.input.runId), null)
@@ -1892,9 +2134,9 @@ test('RunEngine unwraps semantic-failure Store errors before aborted-controller 
     error === store.sentinel && (error as Error).message === 'success store sentinel'
   ))
   const reserved = await store.load(fixture.input.runId)
-  assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
+  assert.equal(reserved?.schemaVersion === 6 ? reserved.status : null, 'calling_model')
   assert.equal(
-    reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
+    reserved?.schemaVersion === 6 ? reserved.providerDispatch.state : null,
     'reserved'
   )
 })
@@ -2094,8 +2336,8 @@ test('RunEngine permits resend after pre-success-CAS crash without claiming exte
   assert.equal(first.adapter.requests.length, 1)
   const crashed = await store.load(first.input.runId)
   assert.equal(store.crashed, true)
-  assert.equal(crashed?.schemaVersion === 5 ? crashed.providerDispatch.state : null, 'reserved')
-  assert.deepEqual(crashed?.schemaVersion === 5 ? crashed.usage : null, {
+  assert.equal(crashed?.schemaVersion === 6 ? crashed.providerDispatch.state : null, 'reserved')
+  assert.deepEqual(crashed?.schemaVersion === 6 ? crashed.usage : null, {
     schemaVersion: 1,
     availability: 'complete',
     inputTokens: 0,
@@ -2131,6 +2373,46 @@ test('RunEngine permits resend after pre-success-CAS crash without claiming exte
   })
 })
 
+test('RunEngine fails closed instead of resending a second ambiguous Provider success', async () => {
+  const store = new RepeatedPreSuccessCasCrashStore()
+  const planModelTurn: NonNullable<HarnessOptions['planModelTurn']> = async checkpoint => (
+    generationPlan(checkpoint, Object.freeze([
+      Object.freeze({ role: 'user' as const, content: '完成任务' })
+    ]))
+  )
+  const first = harness([modelText('first external success')], { store, planModelTurn })
+
+  await assert.rejects(first.engine.start(first.input), error => error === store.crash)
+  const firstCrash = await store.load(first.input.runId)
+  assert.equal(firstCrash?.schemaVersion === 6
+    ? firstCrash.providerGeneration?.ambiguityRecoveryUsed
+    : null, false)
+
+  const second = harness([modelText('one allowed ambiguous resend')], { store, planModelTurn })
+  await assert.rejects(
+    second.engine.resume(first.input.runId, second.input.runtime),
+    error => error === store.crash
+  )
+  assert.equal(second.adapter.requests.length, 1)
+  const secondCrash = await store.load(first.input.runId)
+  assert.equal(secondCrash?.schemaVersion === 6
+    ? secondCrash.providerDispatch.state
+    : null, 'reserved')
+  assert.equal(secondCrash?.schemaVersion === 6
+    ? secondCrash.providerGeneration?.ambiguityRecoveryUsed
+    : null, true)
+
+  const third = harness([modelText('must not be sent')], { store, planModelTurn })
+  const result = await third.engine.resume(first.input.runId, third.input.runtime)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' ? result.error.code : null, 'provider_unavailable')
+  assert.equal(result.kind === 'failed' ? result.error.details?.reason : null,
+    'ambiguous_dispatch_recovery_exhausted')
+  assert.equal(third.adapter.requests.length, 0)
+  assert.equal(store.crashes, 2)
+})
+
 test('RunEngine persists a tool success transition before return crash and recovery never resends it', async () => {
   const store = new PostSuccessCasCrashStore()
   const first = harness([Object.freeze({
@@ -2140,9 +2422,9 @@ test('RunEngine persists a tool success transition before return crash and recov
 
   await assert.rejects(first.engine.start(first.input), error => error === store.crash)
   const crashed = await store.load(first.input.runId)
-  assert.equal(crashed?.schemaVersion === 5 ? crashed.status : null, 'evaluating_tools')
-  assert.equal(crashed?.schemaVersion === 5 ? crashed.providerDispatch.state : null, 'idle')
-  assert.deepEqual(crashed?.schemaVersion === 5 ? crashed.usage : null, {
+  assert.equal(crashed?.schemaVersion === 6 ? crashed.status : null, 'evaluating_tools')
+  assert.equal(crashed?.schemaVersion === 6 ? crashed.providerDispatch.state : null, 'idle')
+  assert.deepEqual(crashed?.schemaVersion === 6 ? crashed.usage : null, {
     schemaVersion: 1,
     availability: 'complete',
     inputTokens: 7,
@@ -2180,7 +2462,7 @@ test('RunEngine freezes DeepSeek capability and canonical alias price at creatio
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const checkpoint = await fixture.store.load('run-1')
-    if (checkpoint?.schemaVersion !== 5) throw new TypeError('checkpoint is missing')
+    if (checkpoint?.schemaVersion !== 6) throw new TypeError('checkpoint is missing')
     assert.equal(checkpoint.model.model, 'deepseek-reasoner')
     assert.deepEqual(checkpoint.modelCapability, {
       schemaVersion: 1,
@@ -2294,7 +2576,7 @@ test('RunEngine active resume keeps accumulated usage and the original frozen al
     model: Object.freeze({ ...first.input.model, model: 'deepseek-reasoner' })
   })), error => error === store.crash)
   const checkpoint = await store.load(first.input.runId)
-  assert.equal(checkpoint?.schemaVersion === 5
+  assert.equal(checkpoint?.schemaVersion === 6
     ? checkpoint.modelPrice?.catalogVersion
     : null, 'deepseek-cny-2026-07-19')
 
@@ -2603,6 +2885,22 @@ test('RunEngine rejects duplicate or malformed call IDs before ledger preparatio
     assert.equal(terminalSnapshot(result)?.counters.toolCalls, 0)
     assert.equal(terminalSnapshot(result)?.counters.toolAttempts, 0)
   }
+})
+
+test('RunEngine rejects a call ID reused by a later model turn before executing it twice', async () => {
+  const fixture = harness([
+    modelTools([toolCall(0, 'reused-call-id', 'normalRead', 'first')]),
+    modelTools([toolCall(0, 'reused-call-id', 'normalRead', 'second')])
+  ])
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' ? result.error.code : null, 'provider_protocol_error')
+  assert.equal(result.kind === 'failed' ? result.error.details?.reason : null,
+    'invalid_tool_call_identity')
+  assert.deepEqual(fixture.tools.startedCalls, ['reused-call-id'])
+  assert.equal(fixture.tools.executions, 1)
 })
 
 test('RunEngine returns one ordered terminal result for unknown, failed and denied tools', async () => {
@@ -3159,6 +3457,118 @@ test('RunEngine preserves a pending retry attempt kind across process restart', 
   ])
 })
 
+test('RunEngine atomically commits a known Provider failure with its retry reservation', async () => {
+  const store = new KnownFailureActionCommitCrashStore()
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  let planCalls = 0
+  const planModelTurn: NonNullable<HarnessOptions['planModelTurn']> = async checkpoint => {
+    planCalls += 1
+    return generationPlan(checkpoint, Object.freeze([
+      Object.freeze({ role: 'user' as const, content: '完成原子重试任务' })
+    ]))
+  }
+  const crashed = harness([unavailable], { store, planModelTurn })
+
+  await assert.rejects(
+    crashed.engine.start(crashed.input),
+    SimulatedProcessCrash
+  )
+  const committed = await store.load(crashed.input.runId)
+  assert.equal(store.crashed, true)
+  assert.equal(committed?.schemaVersion, 6)
+  if (committed?.schemaVersion !== 6) throw new TypeError('retry checkpoint is missing')
+  assert.equal(committed.providerDispatch.state, 'idle')
+  assert.equal(committed.budgetCounters.providerRetries, 1)
+  assert.equal(committed.providerGeneration?.ambiguityRecoveryUsed, false)
+  assert.notEqual(committed.providerGeneration?.requestHash, undefined)
+  const firstRequest = JSON.stringify(crashed.adapter.requests[0])
+  store.restoreProcess()
+
+  const candidates: TraceCandidateV1[] = []
+  const resumed = harness([modelText('原子重试完成')], {
+    store,
+    planModelTurn,
+    onCommittedTraceCandidate: candidate => { candidates.push(candidate) }
+  })
+  const result = await resumed.engine.resume(crashed.input.runId, resumed.input.runtime)
+
+  assert.equal(outputText(result), '原子重试完成')
+  assert.equal(planCalls, 1)
+  assert.equal(JSON.stringify(resumed.adapter.requests[0]), firstRequest)
+  assert.equal(terminalSnapshot(result)?.counters.providerRetries, 1)
+  assert.equal(store.crashed, true)
+  assert.deepEqual(candidates[0]?.metricSummary.providerRequests.map(row => ({
+    outcome: row.outcome,
+    attemptKind: row.attemptKind,
+    count: row.count
+  })), [
+    { outcome: 'failed', attemptKind: 'primary', count: 1 },
+    { outcome: 'succeeded', attemptKind: 'retry', count: 1 }
+  ])
+})
+
+test('RunEngine atomically commits a known Provider failure with its recovery plan', async () => {
+  const store = new KnownFailureActionCommitCrashStore()
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const planningKinds: string[] = []
+  const planModelTurn: NonNullable<HarnessOptions['planModelTurn']> = async (
+    checkpoint,
+    request
+  ) => {
+    planningKinds.push(request.kind)
+    return generationPlan(checkpoint, Object.freeze([
+      Object.freeze({
+        role: 'user' as const,
+        content: request.kind === 'context_recovery'
+          ? '精简后的请求'
+          : '这是一个需要在模型拒绝后压缩的很长原始上下文请求'
+      })
+    ]))
+  }
+  const runtimeOptions = {
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    planModelTurn
+  }
+  const crashed = harness([legacyContext], { ...runtimeOptions, store })
+
+  await assert.rejects(
+    crashed.engine.start(crashed.input),
+    SimulatedProcessCrash
+  )
+  const committed = await store.load(crashed.input.runId)
+  assert.equal(store.crashed, true)
+  assert.equal(committed?.schemaVersion, 6)
+  if (committed?.schemaVersion !== 6) throw new TypeError('recovery checkpoint is missing')
+  assert.equal(committed.providerDispatch.state, 'idle')
+  assert.equal(committed.budgetCounters.recoveryAttempts, 1)
+  assert.equal(committed.contextPlan?.generation, 2)
+  assert.equal(committed.providerGeneration?.kind, 'context_recovery')
+  assert.equal(committed.providerGeneration?.ambiguityRecoveryUsed, false)
+  assert.deepEqual(committed.messages, [
+    { role: 'user', content: '精简后的请求' }
+  ])
+  assert.notEqual(committed.providerGeneration?.requestHash, undefined)
+  store.restoreProcess()
+
+  const resumed = harness([modelText('原子恢复完成')], { ...runtimeOptions, store })
+  const result = await resumed.engine.resume(crashed.input.runId, resumed.input.runtime)
+
+  assert.equal(outputText(result), '原子恢复完成')
+  assert.deepEqual(planningKinds, ['normal', 'context_recovery'])
+  assert.deepEqual(resumed.adapter.requests[0]?.messages, [
+    { role: 'user', content: '精简后的请求' }
+  ])
+  assert.equal(terminalSnapshot(result)?.counters.recoveryAttempts, 1)
+})
+
 test('RunEngine skips Provider journal attempts when a recovered ordinal is unavailable', async () => {
   const crashStore = new RetryReservationCrashStore()
   const unavailable = new ModelProviderError({
@@ -3168,8 +3578,8 @@ test('RunEngine skips Provider journal attempts when a recovered ordinal is unav
   const crashed = harness([unavailable], { store: crashStore })
   await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
   const loaded = await crashStore.load('run-1')
-  assert.equal(loaded?.schemaVersion, 5)
-  if (loaded?.schemaVersion !== 5) throw new TypeError('recovered checkpoint is missing')
+  assert.equal(loaded?.schemaVersion, 6)
+  if (loaded?.schemaVersion !== 6) throw new TypeError('recovered checkpoint is missing')
 
   const recovered = parseRunCheckpoint({
     ...loaded,
@@ -3342,6 +3752,7 @@ test('RunEngine enters the fourth Provider call for the production multi-stage t
       manifest: fixture.input.runtime.snapshot.manifest
     }),
     toolWireSnapshot: createToolWireSnapshotV1(fixture.input.runtime.snapshot.modelTools),
+    contextRuntimeMode: 'legacy_compatible',
     budgetLimits: currentBudget.limits,
     budgetCounters: currentBudget.initialCounters,
     deadlineAt: fixture.input.deadlineAt,
@@ -3580,6 +3991,321 @@ test('RunEngine keeps a stable DeepSeek cache prefix across tool turns', async (
   }
   assert.equal(fixture.tools.executions, 2)
   assert.deepEqual(fixture.tools.startedCalls, ['cache-call-1', 'cache-call-2'])
+})
+
+test('RunEngine plans one frozen generation for each completed tool loop', async () => {
+  let planCalls = 0
+  const fixture = harness([
+    modelTools([toolCall(0, 'planned-call-1', 'normalRead', '第一阶段')]),
+    modelTools([toolCall(0, 'planned-call-2', 'normalRead', '第二阶段')]),
+    modelText('逐轮规划完成')
+  ], {
+    planModelTurn: async checkpoint => {
+      planCalls += 1
+      const messages = checkpoint.contextPlan === null
+        ? Object.freeze([Object.freeze({ role: 'user' as const, content: '完成两阶段任务' })])
+        : Object.freeze([...checkpoint.messages, ...checkpoint.pendingContextMessages])
+      return generationPlan(checkpoint, messages)
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'completed', JSON.stringify(result))
+  assert.equal(outputText(result), '逐轮规划完成')
+  assert.equal(planCalls, 3)
+  assert.equal(fixture.adapter.requests.length, 3)
+  for (let index = 1; index < fixture.adapter.requests.length; index += 1) {
+    const previous = fixture.adapter.requests[index - 1]
+    const current = fixture.adapter.requests[index]
+    assert.deepEqual(current?.messages.slice(0, previous?.messages.length), previous?.messages)
+  }
+  assert.deepEqual(fixture.tools.startedCalls, ['planned-call-1', 'planned-call-2'])
+})
+
+test('RunEngine rejects skipped, detached and wrong-wire context generations before Provider wire', async () => {
+  for (const fault of ['generation', 'previous_hash', 'wire'] as const) {
+    const fixture = harness([modelText('must not be sent')], {
+      planModelTurn: async checkpoint => {
+        const actualMessages = Object.freeze([
+          Object.freeze({ role: 'user' as const, content: '甲' })
+        ])
+        const plannedMessages = fault === 'wire'
+          ? Object.freeze([Object.freeze({ role: 'user' as const, content: '乙' })])
+          : actualMessages
+        const base = generationPlan(checkpoint, plannedMessages)
+        const { schemaVersion: _schemaVersion, planHash: _planHash, ...draft } = base.plan
+        const plan = createContextPlanV1(Object.freeze({
+          ...draft,
+          ...(fault === 'generation' ? { generation: base.plan.generation + 1 } : {}),
+          ...(fault === 'previous_hash' ? { previousPlanHash: 'f'.repeat(64) } : {})
+        }))
+        return Object.freeze({
+          ...base,
+          plan,
+          messages: actualMessages,
+          estimatedInputTokens: estimateModelMessagesTokens(actualMessages)
+        })
+      }
+    })
+
+    const result = await fixture.engine.start(fixture.input)
+
+    assert.equal(result.kind, 'failed', fault)
+    assert.equal(fixture.adapter.requests.length, 0, fault)
+  }
+})
+
+test('RunEngine retries one generation with byte-stable request identity without replanning', async () => {
+  let planCalls = 0
+  const unavailable = new ModelProviderError({
+    code: 'provider_unavailable', stage: 'model.response', retryable: true,
+    userMessage: 'AI 服务繁忙，请稍后重试。', statusCode: 503
+  })
+  const fixture = harness([unavailable, modelText('重试成功')], {
+    planModelTurn: async checkpoint => {
+      planCalls += 1
+      return generationPlan(checkpoint, Object.freeze([
+        Object.freeze({ role: 'user' as const, content: '保持请求不变' })
+      ]))
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '重试成功')
+  assert.equal(planCalls, 1)
+  assert.equal(fixture.adapter.requests.length, 2)
+  assert.deepEqual(fixture.adapter.requests[1], fixture.adapter.requests[0])
+})
+
+test('RunEngine creates one explicit prefix-reset generation for optional-context recovery', async () => {
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  const planningKinds: string[] = []
+  const store = new TerminalCaptureStore()
+  const fixture = harness([legacyContext, modelText('精简后成功')], {
+    store,
+    profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+    planModelTurn: async (checkpoint, request) => {
+      planningKinds.push(`${request.kind}:${request.transition}`)
+      const messages = request.kind === 'context_recovery'
+        ? Object.freeze([Object.freeze({ role: 'user' as const, content: '必要请求' })])
+        : Object.freeze([
+            Object.freeze({ role: 'user' as const, content: '可选历史' }),
+            Object.freeze({ role: 'user' as const, content: '必要请求' })
+          ])
+      return generationPlan(checkpoint, messages)
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '精简后成功')
+  assert.deepEqual(planningKinds, [
+    'normal:normal',
+    'context_recovery:recovery_prefix_reset'
+  ])
+  assert.equal(fixture.adapter.requests.length, 2)
+  assert.equal(fixture.adapter.requests[0]?.messages.length, 2)
+  assert.equal(fixture.adapter.requests[1]?.messages.length, 1)
+  assert.equal(store.terminalCheckpoint?.providerGeneration?.kind, 'context_recovery')
+})
+
+test('RunEngine rejects a detached recovery generation before a second Provider request', async () => {
+  const legacyContext = new ModelProviderError({
+    code: 'provider_invalid_request', stage: 'model.response', retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。', statusCode: 400,
+    providerCode: 'invalid_request_error',
+    profileCode: 'deepseek_invalid_legacy_context'
+  })
+  for (const fault of ['generation', 'previous_hash'] as const) {
+    const fixture = harness([legacyContext, modelText('must not be sent')], {
+      profile: deepSeekCompatibilityProfile as typeof standardOpenAIProfile,
+      planModelTurn: async (checkpoint, request) => {
+        const messages = request.kind === 'context_recovery'
+          ? Object.freeze([Object.freeze({ role: 'user' as const, content: '必要请求' })])
+          : Object.freeze([
+              Object.freeze({ role: 'user' as const, content: '可选历史' }),
+              Object.freeze({ role: 'user' as const, content: '必要请求' })
+            ])
+        const base = generationPlan(checkpoint, messages)
+        if (request.kind !== 'context_recovery') return base
+        const { schemaVersion: _schemaVersion, planHash: _planHash, ...draft } = base.plan
+        return Object.freeze({
+          ...base,
+          plan: createContextPlanV1(Object.freeze({
+            ...draft,
+            ...(fault === 'generation' ? { generation: base.plan.generation + 1 } : {}),
+            ...(fault === 'previous_hash' ? { previousPlanHash: 'f'.repeat(64) } : {})
+          }))
+        })
+      }
+    })
+
+    const result = await fixture.engine.start(fixture.input)
+
+    assert.equal(result.kind, 'failed', fault)
+    assert.equal(fixture.adapter.requests.length, 1, fault)
+  }
+})
+
+test('RunEngine plans correction as a separate tool-disabled generation', async () => {
+  const planningKinds: string[] = []
+  const fixture = harness([modelText(''), modelText('纠正后的答复')], {
+    planModelTurn: async (checkpoint, request) => {
+      planningKinds.push(request.kind)
+      const messages = request.kind === 'correction'
+        ? Object.freeze([
+            ...checkpoint.messages,
+            Object.freeze({ role: 'user' as const, content: '请给出非空最终答复。' })
+          ])
+        : Object.freeze([Object.freeze({ role: 'user' as const, content: '请回答' })])
+      return generationPlan(checkpoint, messages)
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), '纠正后的答复')
+  assert.deepEqual(planningKinds, ['normal', 'correction'])
+  assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode), [
+    'auto', 'disabled'
+  ])
+})
+
+test('RunEngine rejects a correction generation that rewrites its committed prefix', async () => {
+  const fixture = harness([modelText(''), modelText('must not be sent')], {
+    planModelTurn: async (checkpoint, request) => {
+      const messages = request.kind === 'correction'
+        ? Object.freeze([
+            Object.freeze({ role: 'user' as const, content: '被改写的旧前缀' }),
+            Object.freeze({ role: 'user' as const, content: '请给出最终答复。' })
+          ])
+        : Object.freeze([Object.freeze({ role: 'user' as const, content: '原始前缀' })])
+      return generationPlan(checkpoint, messages)
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(fixture.adapter.requests.length, 1)
+})
+
+test('RunEngine rejects a correction generation that replaces committed artifact refs', async () => {
+  const originalRef = `artifact:${'a'.repeat(64)}`
+  const replacementRef = `artifact:${'b'.repeat(64)}`
+  const fixture = harness([modelText(''), modelText('must not be sent')], {
+    planModelTurn: async (checkpoint, request) => {
+      const messages = request.kind === 'correction'
+        ? Object.freeze([
+            ...checkpoint.messages,
+            Object.freeze({ role: 'user' as const, content: '请给出最终答复。' })
+          ])
+        : Object.freeze([Object.freeze({ role: 'user' as const, content: '原始前缀' })])
+      return generationPlanWithArtifact(
+        checkpoint,
+        messages,
+        request.kind === 'correction' ? replacementRef : originalRef
+      )
+    }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(fixture.adapter.requests.length, 1)
+})
+
+test('RunEngine resumes a committed correction plan without replanning after a crash', async () => {
+  const store = new CorrectionPlanCommitCrashStore()
+  let planCalls = 0
+  const planModelTurn: NonNullable<HarnessOptions['planModelTurn']> = async (
+    checkpoint,
+    request
+  ) => {
+    planCalls += 1
+    const messages = request.kind === 'correction'
+      ? Object.freeze([
+          ...checkpoint.messages,
+          Object.freeze({ role: 'user' as const, content: '请给出非空最终答复。' })
+        ])
+      : Object.freeze([Object.freeze({ role: 'user' as const, content: '请回答' })])
+    return generationPlan(checkpoint, messages)
+  }
+  const crashed = harness([modelText('')], { store, planModelTurn })
+
+  await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
+  const checkpoint = await store.load(crashed.input.runId)
+  assert.equal(checkpoint?.schemaVersion, 6)
+  assert.equal(checkpoint?.status, 'calling_model')
+  assert.equal(checkpoint?.modelTurn, null)
+  assert.equal(checkpoint?.providerGeneration, null)
+  assert.equal(checkpoint?.contextPlan?.generation, 2)
+
+  store.restoreProcess()
+  const resumed = harness([modelText('纠正后的答复')], { store, planModelTurn })
+  const result = await resumed.engine.resume(crashed.input.runId, resumed.input.runtime)
+
+  assert.equal(outputText(result), '纠正后的答复')
+  assert.equal(planCalls, 2)
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.equal(resumed.adapter.requests[0]?.toolMode, 'disabled')
+})
+
+test('RunEngine restart correction atomically clears rebased artifact refs', async () => {
+  const artifactRef = `artifact:${'a'.repeat(64)}`
+  const store = new PreCorrectionPlanCrashStore()
+  const initialPlanner: NonNullable<HarnessOptions['planModelTurn']> = async checkpoint => (
+    generationPlanWithArtifact(
+      checkpoint,
+      Object.freeze([Object.freeze({ role: 'user' as const, content: '请回答' })]),
+      artifactRef
+    )
+  )
+  const crashed = harness([modelText('')], { store, planModelTurn: initialPlanner })
+
+  await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
+  const checkpoint = await store.load(crashed.input.runId)
+  assert.equal(checkpoint?.schemaVersion, 6)
+  if (checkpoint?.schemaVersion !== 6) throw new TypeError('correction checkpoint is missing')
+  assert.equal(checkpoint.status, 'calling_model')
+  assert.equal(checkpoint.modelTurn, null)
+  assert.notEqual(checkpoint.providerGeneration, null)
+  assert.equal(checkpoint.forceCorrection, true)
+  assert.deepEqual(checkpoint.contextArtifactRefs, [artifactRef])
+
+  store.restoreProcess()
+  let correctionPlans = 0
+  const restartedPlanner: NonNullable<HarnessOptions['planModelTurn']> = async (
+    current,
+    request
+  ) => {
+    assert.equal(request.kind, 'correction')
+    correctionPlans += 1
+    return generationPlan(current, Object.freeze([
+      ...current.messages,
+      ...current.pendingContextMessages,
+      Object.freeze({ role: 'user' as const, content: '请给出非空最终答复。' })
+    ]))
+  }
+  const resumed = harness([modelText('纠正后的答复')], {
+    store,
+    planModelTurn: restartedPlanner
+  })
+
+  const result = await resumed.engine.resume(crashed.input.runId, resumed.input.runtime)
+
+  assert.equal(outputText(result), '纠正后的答复')
+  assert.equal(correctionPlans, 1)
+  assert.equal(resumed.adapter.requests.length, 1)
+  assert.equal(resumed.adapter.requests[0]?.toolMode, 'disabled')
+  assert.equal(store.correctionRefsCleared, true)
 })
 
 test('RunEngine preserves recovery then retry attempt kinds across process restart', async () => {

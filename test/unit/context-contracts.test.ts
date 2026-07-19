@@ -17,8 +17,10 @@ import {
 } from '../../src/agent/context/context-span.js'
 import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../../src/agent/context/context-token-estimator.js'
 import {
+  CONTEXT_WIRE_HASH_DOMAIN,
   CONTEXT_PLAN_HASH_DOMAIN,
   MAX_CONTEXT_PLAN_BYTES,
+  contextWireHash,
   contextPlanHash,
   createContextPlanV1,
   parseContextPlanV1
@@ -114,6 +116,7 @@ test('context hash domains and the artifact-content vector are frozen', () => {
   assert.equal(CONTEXT_ARTIFACT_CONTENT_HASH_DOMAIN, 'groupmate.context.artifact-content.v1')
   assert.equal(CONTEXT_ARTIFACT_ID_HASH_DOMAIN, 'groupmate.context.artifact-id.v1')
   assert.equal(CONTEXT_PLAN_HASH_DOMAIN, 'groupmate.context.plan.v1')
+  assert.equal(CONTEXT_WIRE_HASH_DOMAIN, 'groupmate.context.wire.v1')
   assert.equal(
     contextArtifactContentHash('fixture'),
     '6805e1b941a69bf607c9630b915ad83f5e01124fc1f1b409c987dff002b35e22'
@@ -135,6 +138,7 @@ test('plan hash excludes only itself and matches the fixed canonical vector', ()
       representation: 'raw' as const,
       wireStart: 0,
       wireCount: 1,
+      wireHash: contextWireHash(deepFreeze([{ role: 'user' as const, content: 'fixture' }])),
       contentHash: 'f629704b6c0ce0dad9684ca7ef0691f185c8125d15ad2977f9f1fb56744a03f4'
     }],
     omitted: [],
@@ -149,7 +153,7 @@ test('plan hash excludes only itself and matches the fixed canonical vector', ()
 
   assert.equal(
     created.planHash,
-    '176e6d6957d80a88bbd35918ea4ea4843f9bc4b28d4c93111fb26b4ba7c6b595'
+    'f521f505b569372a0bbc35ec9bb152fc3f77a6bee1e68d18423ed06396525bcd'
   )
   assert.equal(contextPlanHash(created), created.planHash)
   assert.deepEqual(parseContextPlanV1(created), created)
@@ -183,6 +187,20 @@ test('span codec rebuilds a detached deeply frozen value and verifies declared s
   })
   assert.throws(() => parseContextSpanV1(wrongBytes), TypeError)
   assert.throws(() => parseContextSpanV1(wrongTokens), TypeError)
+})
+
+test('tool protocol step zero is a valid first ledger step', () => {
+  const created = createContextSpanV1(deepFreeze({
+    ...toolSpanDraft({ value: 'first-step' }),
+    toolProtocol: {
+      phase: 'ready' as const,
+      step: 0,
+      callIds: ['call-1']
+    }
+  }))
+
+  assert.equal(created.toolProtocol?.step, 0)
+  assert.deepEqual(parseContextSpanV1(created), created)
 })
 
 test('span codec rejects root and nested proxies without invoking their traps', () => {
@@ -271,7 +289,7 @@ test('plan and artifact codecs reject root proxies and hostile nested descriptor
     mode: 'normal' as const,
     included: [{
       spanId: 'span:session:1', representation: 'raw' as const,
-      wireStart: 0, wireCount: 1, contentHash: '3'.repeat(64)
+      wireStart: 0, wireCount: 1, wireHash: '6'.repeat(64), contentHash: '3'.repeat(64)
     }],
     omitted: [],
     artifactRefs: [],
@@ -440,6 +458,7 @@ test('plan artifact representation requires a content-addressed artifact ID', ()
       representation: 'artifact' as const,
       wireStart: 0,
       wireCount: 1,
+      wireHash: '6'.repeat(64),
       contentHash: '3'.repeat(64)
     }],
     omitted: [],
@@ -455,8 +474,8 @@ test('plan artifact representation requires a content-addressed artifact ID', ()
 
 test('plan structural ranges, ref counts and message hard limits are exact', () => {
   const included = [
-    { spanId: 'span:a', representation: 'raw' as const, wireStart: 0, wireCount: 1, contentHash: '3'.repeat(64) },
-    { spanId: 'span:b', representation: 'raw' as const, wireStart: 1, wireCount: 1, contentHash: '4'.repeat(64) }
+    { spanId: 'span:a', representation: 'raw' as const, wireStart: 0, wireCount: 1, wireHash: '6'.repeat(64), contentHash: '3'.repeat(64) },
+    { spanId: 'span:b', representation: 'raw' as const, wireStart: 1, wireCount: 1, wireHash: '7'.repeat(64), contentHash: '4'.repeat(64) }
   ]
   const draft = {
     namespaceRef: 'namespace:test',
@@ -542,6 +561,7 @@ test('plan structural ranges, ref counts and message hard limits are exact', () 
         representation: 'raw' as const,
         wireStart: index,
         wireCount: 1,
+        wireHash: '6'.repeat(64),
         contentHash: '5'.repeat(64)
       }
     })

@@ -4,6 +4,23 @@ import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
 import type { AgentEvent } from '../../src/agent/contracts/event.js'
 import {
+  CONTEXT_ARTIFACT_SAFE_PREFIX,
+  createContextArtifactV1,
+  encodeContextArtifactV1,
+  type ContextArtifactV1
+} from '../../src/agent/context/context-artifact.js'
+import {
+  contextWireHash,
+  createContextPlanV1
+} from '../../src/agent/context/context-plan.js'
+import {
+  CONTEXT_TOKEN_ESTIMATOR_VERSION,
+  estimateModelMessagesTokens,
+  serializedModelMessagesBytes
+} from '../../src/agent/context/context-token-estimator.js'
+import { redisContextArtifactKey } from '../../src/agent/context/redis-context-artifact-store.js'
+import { modelCapabilityStableHash } from '../../src/agent/model/model-capability.js'
+import {
   createDefaultRunBudget,
   createLegacyRunBudgetLimits
 } from '../../src/agent/run/run-budget.js'
@@ -15,13 +32,15 @@ import {
   type RunCheckpointV2,
   type RunCheckpointV3,
   type RunCheckpointV4,
+  type RunCheckpointV5,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   upgradeRunCheckpointV1,
   upgradeRunCheckpointV2,
   upgradeRunCheckpointV3,
-  upgradeRunCheckpointV4
+  upgradeRunCheckpointV4,
+  upgradeRunCheckpointV5
 } from '../../src/agent/run/run-checkpoint-migration.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
@@ -37,6 +56,7 @@ import {
   RUN_STORE_MIGRATION_LUA_MARKER,
   RUN_STORE_LUA_SCRIPT,
   RUN_STORE_METADATA_KEY,
+  preflightRedisRunMigration,
   redisRunReferenceKey,
   redisRunKeys
 } from '../../src/agent/run/redis-run-store.js'
@@ -47,6 +67,18 @@ const deadlineAt = '2026-07-14T00:04:00.000Z'
 const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
 const legacyBudgetLimits = createLegacyRunBudgetLimits(budget.limits)
 const emptyManifestFingerprint = createHash('sha256').update('[]').digest('hex')
+
+test('RedisRunStore migration preflight records a Redis 6+ KEEPTTL capability', async () => {
+  const redis = new FakeRedis()
+  redis.setServerInfoForTest('# Server\r\nredis_version:6.0.0\r\n')
+
+  assert.deepEqual(await preflightRedisRunMigration(redis), {
+    schemaVersion: 1,
+    redisVersion: '6.0.0',
+    keepTtlSupported: true
+  })
+  assert.equal(redis.infoCalls, 1)
+})
 
 class RepairRaceRedis extends FakeRedis {
   #beforeCorruptRepair?: () => Promise<void>
@@ -63,6 +95,28 @@ class RepairRaceRedis extends FakeRedis {
       const callback = this.#beforeCorruptRepair
       this.#beforeCorruptRepair = undefined
       await callback?.()
+    }
+    return await super.eval(script, options)
+  }
+}
+
+class RunArtifactRaceRedis extends FakeRedis {
+  #beforeRunArtifactCommit?: () => void
+
+  beforeRunArtifactCommit (callback: () => void): void {
+    this.#beforeRunArtifactCommit = callback
+  }
+
+  override async eval (script: string, options: {
+    keys: string[]
+    arguments: string[]
+  }): Promise<unknown> {
+    const marker = script.split('\n', 1)[0] ?? ''
+    if (marker === RUN_STORE_MIGRATION_LUA_MARKER ||
+      (marker === RUN_STORE_LUA_MARKER && options.arguments[0] === 'cas')) {
+      const callback = this.#beforeRunArtifactCommit
+      this.#beforeRunArtifactCommit = undefined
+      callback?.()
     }
     return await super.eval(script, options)
   }
@@ -158,6 +212,9 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     contextPlan: _contextPlan,
     contextArtifactRefs: _contextArtifactRefs,
     toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
     ...state
   } = source
   return Object.freeze({
@@ -180,6 +237,9 @@ function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
     contextPlan: _contextPlan,
     contextArtifactRefs: _contextArtifactRefs,
     toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 2, budgetLimits: legacyBudgetLimits })
@@ -196,6 +256,9 @@ function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
     contextPlan: _contextPlan,
     contextArtifactRefs: _contextArtifactRefs,
     toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 3, budgetLimits: legacyBudgetLimits })
@@ -208,10 +271,24 @@ function checkpointV4 (source: RunCheckpoint): RunCheckpointV4 {
     contextPlan: _contextPlan,
     contextArtifactRefs: _contextArtifactRefs,
     toolWireSnapshot: _toolWireSnapshot,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
     budgetLimits: _budgetLimits,
     ...state
   } = source
   return Object.freeze({ ...state, schemaVersion: 4, budgetLimits: legacyBudgetLimits })
+}
+
+function checkpointV5 (source: RunCheckpoint): RunCheckpointV5 {
+  const {
+    schemaVersion: _schemaVersion,
+    contextRuntimeMode: _contextRuntimeMode,
+    pendingContextMessages: _pendingContextMessages,
+    providerGeneration: _providerGeneration,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 5 })
 }
 
 function preparing (
@@ -222,6 +299,88 @@ function preparing (
     messages: Object.freeze([{ role: 'user' as const, content: marker }]),
     estimatedInputTokens: 4
   }, [event(source.runId, source.nextEventSequence, 'run.started', { marker })], timestamp)
+}
+
+function artifactFor (
+  source: Readonly<{ readonly runRef: string }>,
+  suffix = '1'
+): ContextArtifactV1 {
+  return createContextArtifactV1(Object.freeze({
+    namespaceRef: source.runRef,
+    generation: 1,
+    kind: 'tool_digest' as const,
+    sourceSpanIds: Object.freeze([`tool-protocol-${suffix}`]),
+    sourceRefs: Object.freeze([Object.freeze({
+      ref: `tool-call-${suffix}`,
+      contentHash: createHash('sha256').update(`tool-call-${suffix}`).digest('hex')
+    })]),
+    content: suffix === '1' ? 'compact tool result' : `compact tool result ${suffix}`,
+    generator: Object.freeze({ kind: 'deterministic' as const, version: 'test-v1' }),
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION
+  }))
+}
+
+function invalidArtifactPayloads (artifact: ContextArtifactV1): readonly string[] {
+  const encoded = encodeContextArtifactV1(artifact)
+  const wrongId = JSON.parse(encoded) as Record<string, unknown>
+  wrongId.artifactId = `artifact:${'f'.repeat(64)}`
+  const wrongContentHash = JSON.parse(encoded) as Record<string, unknown>
+  wrongContentHash.contentHash = 'f'.repeat(64)
+  return Object.freeze([
+    '{',
+    ` ${encoded}`,
+    JSON.stringify(wrongId),
+    JSON.stringify(wrongContentHash)
+  ])
+}
+
+function preparingWithArtifact (
+  source: RunCheckpoint
+): RunCheckpoint {
+  return preparingWithArtifacts(source, Object.freeze([artifactFor(source)]))
+}
+
+function preparingWithArtifacts (
+  source: RunCheckpoint,
+  artifacts: readonly ContextArtifactV1[]
+): RunCheckpoint {
+  const messages = Object.freeze(artifacts.map(artifact => Object.freeze({
+      role: 'user' as const,
+      content: `${CONTEXT_ARTIFACT_SAFE_PREFIX}${artifact.content}`
+    })))
+  const estimatedInputTokens = estimateModelMessagesTokens(messages)
+  const contextPlan = createContextPlanV1(Object.freeze({
+    namespaceRef: source.runRef,
+    generation: 1,
+    previousPlanHash: null,
+    estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: modelCapabilityStableHash(source.modelCapability),
+    mode: 'compacting' as const,
+    included: Object.freeze(artifacts.map((artifact, index) => Object.freeze({
+      spanId: artifact.artifactId,
+      representation: 'artifact' as const,
+      wireStart: index,
+      wireCount: 1,
+      wireHash: contextWireHash(Object.freeze([messages[index] as typeof messages[number]])),
+      contentHash: artifact.contentHash
+    }))),
+    omitted: Object.freeze([]),
+    artifactRefs: Object.freeze(artifacts.map(artifact => artifact.artifactId)),
+    prefixMessageCount: 0,
+    estimatedInputTokens,
+    estimatedToolTokens: 0,
+    reservedOutputTokens: source.model.maxOutputTokens,
+    serializedMessageBytes: serializedModelMessagesBytes(messages),
+    messageCount: messages.length
+  }))
+  return nextRunCheckpoint(source, 'preparing', {
+    messages,
+    estimatedInputTokens,
+    contextPlan,
+    contextArtifactRefs: Object.freeze(artifacts.map(artifact => artifact.artifactId))
+  }, [event(source.runId, source.nextEventSequence, 'run.started', {
+    marker: 'artifact'
+  })], timestamp)
 }
 
 test('RedisRunStore round-trips split checkpoint state and event stream under hashed keys', async () => {
@@ -287,7 +446,7 @@ test('RedisRunStore claims runRef atomically and upgrades one exact v1 checkpoin
     requestRef: v2.requestRef
   })
   assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
-  assert.equal((await store.load(legacy.runId))?.schemaVersion, 5)
+  assert.equal((await store.load(legacy.runId))?.schemaVersion, 6)
   assert.equal(await redis.get(redisRunReferenceKey(upgraded.runRef)), upgraded.runId)
   assert.equal(redis.artifactExpiryForTest(keys.checkpoint), checkpointExpiry)
   assert.equal(redis.artifactExpiryForTest(keys.events), eventExpiry)
@@ -415,6 +574,189 @@ test('RedisRunStore migrates v4 with separate absolute TTLs and never rewrites i
   assert.equal(await redis.get(referenceKey), source.runId)
 })
 
+test('RedisRunStore migrates v5 to v6 while preserving absolute TTLs and its reference', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const source = checkpointV5(checkpoint('run-v5-upgrade'))
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 5, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  const expiries = [keys.checkpoint, keys.events, referenceKey]
+    .map(key => redis.artifactExpiryForTest(key))
+
+  const loaded = await store.load(source.runId)
+  if (loaded?.schemaVersion !== 5) throw new TypeError('v5 fixture was not loaded')
+  const upgraded = upgradeRunCheckpointV5(loaded)
+
+  assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
+  assert.deepEqual(await store.load(source.runId), upgraded)
+  assert.deepEqual([keys.checkpoint, keys.events, referenceKey]
+    .map(key => redis.artifactExpiryForTest(key)), expiries)
+  assert.equal(await redis.get(referenceKey), source.runId)
+})
+
+test('RedisRunStore rejects Redis below 6 before any migration mutation', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  redis.setServerInfoForTest('# Server\r\nredis_version:5.0.14\r\n')
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const source = checkpointV5(checkpoint('run-v5-unsupported-redis'))
+  const upgraded = upgradeRunCheckpointV5(source)
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 5, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ])
+
+  await assert.rejects(store.upgrade(source, upgraded), error => (
+    error instanceof AgentError && error.code === 'storage_unavailable' &&
+    error.details?.operation === 'migration_preflight'
+  ))
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ]), before)
+  assert.equal(redis.evalCalls.some(call => call.marker === RUN_STORE_MIGRATION_LUA_MARKER), false)
+})
+
+test('RedisRunStore migration atomically retains every referenced context artifact', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const planned = preparingWithArtifact(checkpoint('run-v5-artifact-upgrade'))
+  const source = checkpointV5(planned)
+  const upgraded = upgradeRunCheckpointV5(source)
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const artifactKey = redisContextArtifactKey(source.contextArtifactRefs[0] as string)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 5, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  redis.seedArtifactForTest(
+    artifactKey,
+    encodeContextArtifactV1(artifactFor(source)),
+    now + 30_000
+  )
+
+  assert.deepEqual(await store.upgrade(source, upgraded), upgraded)
+  assert.equal(await redis.ttl(artifactKey), 400)
+})
+
+test('RedisRunStore migration rejects an artifact replaced after exact preflight without mutating legacy state', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new RunArtifactRaceRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const planned = preparingWithArtifact(checkpoint('run-v5-artifact-race'))
+  const source = checkpointV5(planned)
+  const upgraded = upgradeRunCheckpointV5(source)
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const artifactKey = redisContextArtifactKey(source.contextArtifactRefs[0] as string)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 5, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  redis.seedArtifactForTest(
+    artifactKey,
+    encodeContextArtifactV1(artifactFor(source)),
+    now + 30_000
+  )
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ])
+  redis.beforeRunArtifactCommit(() => {
+    redis.seedArtifactForTest(artifactKey, '{"corrupt":true}', now + 30_000)
+  })
+
+  await assert.rejects(store.upgrade(source, upgraded), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ]), before)
+})
+
+test('RedisRunStore migration rejects a missing context artifact without changing legacy state', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const planned = preparingWithArtifact(checkpoint('run-v5-artifact-missing'))
+  const source = checkpointV5(planned)
+  const upgraded = upgradeRunCheckpointV5(source)
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 5, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey)
+  ])
+
+  await assert.rejects(store.upgrade(source, upgraded), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey)
+  ]), before)
+})
+
+test('RedisRunStore migration rejects noncanonical and hash-invalid artifacts without writes', async () => {
+  const now = Date.parse(timestamp)
+  for (let index = 0; index < 4; index += 1) {
+    const redis = new FakeRedis(() => now)
+    const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+    const planned = preparingWithArtifact(checkpoint(`run-v5-invalid-artifact-${index}`))
+    const source = checkpointV5(planned)
+    const payload = invalidArtifactPayloads(artifactFor(source))[index] as string
+    const upgraded = upgradeRunCheckpointV5(source)
+    const keys = redisRunKeys(source.runId)
+    const referenceKey = redisRunReferenceKey(source.runRef)
+    const artifactKey = redisContextArtifactKey(source.contextArtifactRefs[0] as string)
+    const { events, ...state } = source
+    await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+    await redis.set(keys.events, JSON.stringify({
+      schemaVersion: 5, revision: source.revision, events
+    }), { EX: 400 })
+    await redis.set(referenceKey, source.runId, { EX: 350 })
+    redis.seedArtifactForTest(artifactKey, payload, now + 30_000)
+    const before = await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+      redis.get(RUN_STORE_METADATA_KEY), redis.ttl(artifactKey)
+    ])
+
+    await assert.rejects(store.upgrade(source, upgraded), error => (
+      error instanceof AgentError && error.code === 'checkpoint_invalid'
+    ))
+    assert.deepEqual(await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+      redis.get(RUN_STORE_METADATA_KEY), redis.ttl(artifactKey)
+    ]), before)
+  }
+})
+
 test('RedisRunStore migration failures leave every surviving legacy key unchanged', async () => {
   for (const failure of [
     'checkpoint_persistent', 'checkpoint_expired', 'event_expired', 'missing',
@@ -488,6 +830,159 @@ test('RedisRunStore create is NX and exactly one revision CAS wins', async () =>
   assert.equal(await redis.ttl(redisRunReferenceKey(created.runRef)), 300)
   const rejected = first.status === 'rejected' ? first.reason : second.status === 'rejected' ? second.reason : null
   assert.equal(rejected instanceof AgentError && rejected.code, 'checkpoint_conflict')
+})
+
+test('RedisRunStore CAS atomically retains referenced context artifacts with the active TTL', async () => {
+  let now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const created = await store.create(checkpoint('run-artifact-cas'))
+  const next = preparingWithArtifact(created)
+  const artifactKey = redisContextArtifactKey(next.contextArtifactRefs[0] as string)
+  redis.seedArtifactForTest(
+    artifactKey,
+    encodeContextArtifactV1(artifactFor(created)),
+    now + 30_000
+  )
+  now += 10_000
+
+  assert.deepEqual(await store.compareAndSet(created, next), next)
+  assert.equal(await redis.ttl(artifactKey), 300)
+})
+
+test('RedisRunStore stale CAS conflict does not extend a referenced artifact TTL', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const created = await store.create(checkpoint('run-artifact-conflict'))
+  const staleNext = preparingWithArtifact(created)
+  const artifactKey = redisContextArtifactKey(staleNext.contextArtifactRefs[0] as string)
+  redis.seedArtifactForTest(
+    artifactKey,
+    encodeContextArtifactV1(artifactFor(created)),
+    now + 30_000
+  )
+  await store.compareAndSet(created, preparing(created, 'winner'))
+  const expiryBefore = redis.artifactExpiryForTest(artifactKey)
+
+  await assert.rejects(store.compareAndSet(created, staleNext), error => (
+    error instanceof AgentError && error.code === 'checkpoint_conflict'
+  ))
+  assert.equal(redis.artifactExpiryForTest(artifactKey), expiryBefore)
+})
+
+test('RedisRunStore CAS rejects an artifact replaced after exact preflight without committing the checkpoint', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new RunArtifactRaceRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const created = await store.create(checkpoint('run-artifact-race'))
+  const next = preparingWithArtifact(created)
+  const keys = redisRunKeys(created.runId)
+  const referenceKey = redisRunReferenceKey(created.runRef)
+  const artifactKey = redisContextArtifactKey(next.contextArtifactRefs[0] as string)
+  redis.seedArtifactForTest(
+    artifactKey,
+    encodeContextArtifactV1(artifactFor(created)),
+    now + 30_000
+  )
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ])
+  redis.beforeRunArtifactCommit(() => {
+    redis.seedArtifactForTest(artifactKey, '{"corrupt":true}', now + 30_000)
+  })
+
+  await assert.rejects(store.compareAndSet(created, next), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY)
+  ]), before)
+  assert.deepEqual(await store.load(created.runId), created)
+})
+
+test('RedisRunStore CAS rejects a missing context artifact without changing the checkpoint', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const created = await store.create(checkpoint('run-artifact-missing'))
+  const next = preparingWithArtifact(created)
+  const keys = redisRunKeys(created.runId)
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events),
+    redis.get(redisRunReferenceKey(created.runRef))
+  ])
+
+  await assert.rejects(store.compareAndSet(created, next), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.deepEqual(await store.load(created.runId), created)
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events),
+    redis.get(redisRunReferenceKey(created.runRef))
+  ]), before)
+})
+
+test('RedisRunStore CAS rejects noncanonical and hash-invalid artifacts without writes', async () => {
+  const now = Date.parse(timestamp)
+  for (let index = 0; index < 4; index += 1) {
+    const redis = new FakeRedis(() => now)
+    const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+    const created = await store.create(checkpoint(`run-invalid-artifact-${index}`))
+    const next = preparingWithArtifact(created)
+    const payload = invalidArtifactPayloads(artifactFor(created))[index] as string
+    const keys = redisRunKeys(created.runId)
+    const referenceKey = redisRunReferenceKey(created.runRef)
+    const artifactKey = redisContextArtifactKey(next.contextArtifactRefs[0] as string)
+    redis.seedArtifactForTest(artifactKey, payload, now + 30_000)
+    const before = await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+      redis.get(RUN_STORE_METADATA_KEY), redis.ttl(artifactKey)
+    ])
+
+    await assert.rejects(store.compareAndSet(created, next), error => (
+      error instanceof AgentError && error.code === 'checkpoint_invalid'
+    ))
+    assert.deepEqual(await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+      redis.get(RUN_STORE_METADATA_KEY), redis.ttl(artifactKey)
+    ]), before)
+    assert.deepEqual(await store.load(created.runId), created)
+  }
+})
+
+test('RedisRunStore CAS rejects a multi-artifact batch atomically when one value is corrupt', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const created = await store.create(checkpoint('run-artifact-batch-corrupt'))
+  const artifacts = Object.freeze([artifactFor(created, '1'), artifactFor(created, '2')])
+  const next = preparingWithArtifacts(created, artifacts)
+  const keys = redisRunKeys(created.runId)
+  const referenceKey = redisRunReferenceKey(created.runRef)
+  const artifactKeys = artifacts.map(artifact => redisContextArtifactKey(artifact.artifactId))
+  redis.seedArtifactForTest(
+    artifactKeys[0] as string,
+    encodeContextArtifactV1(artifacts[0] as ContextArtifactV1),
+    now + 30_000
+  )
+  redis.seedArtifactForTest(artifactKeys[1] as string, '{"corrupt":true}', now + 30_000)
+  const before = await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY),
+    ...artifactKeys.map(async key => await redis.ttl(key))
+  ])
+
+  await assert.rejects(store.compareAndSet(created, next), error => (
+    error instanceof AgentError && error.code === 'checkpoint_invalid'
+  ))
+  assert.deepEqual(await Promise.all([
+    redis.get(keys.checkpoint), redis.get(keys.events), redis.get(referenceKey),
+    redis.get(RUN_STORE_METADATA_KEY),
+    ...artifactKeys.map(async key => await redis.ttl(key))
+  ]), before)
+  assert.deepEqual(await store.load(created.runId), created)
 })
 
 test('RedisRunStore atomically replaces terminal state with one bounded 24-hour tombstone', async () => {
