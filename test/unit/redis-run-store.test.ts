@@ -3,7 +3,10 @@ import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
 import type { AgentEvent } from '../../src/agent/contracts/event.js'
-import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import {
+  createDefaultRunBudget,
+  createLegacyRunBudgetLimits
+} from '../../src/agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
@@ -11,12 +14,14 @@ import {
   type RunCheckpointV1,
   type RunCheckpointV2,
   type RunCheckpointV3,
+  type RunCheckpointV4,
   type RunCheckpoint
 } from '../../src/agent/run/run-checkpoint.js'
 import {
   upgradeRunCheckpointV1,
   upgradeRunCheckpointV2,
-  upgradeRunCheckpointV3
+  upgradeRunCheckpointV3,
+  upgradeRunCheckpointV4
 } from '../../src/agent/run/run-checkpoint-migration.js'
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
@@ -29,6 +34,7 @@ import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 import {
   RedisRunStore,
   RUN_STORE_LUA_MARKER,
+  RUN_STORE_MIGRATION_LUA_MARKER,
   RUN_STORE_LUA_SCRIPT,
   RUN_STORE_METADATA_KEY,
   redisRunReferenceKey,
@@ -39,6 +45,7 @@ import { FakeRedis } from '../helpers/fake-redis.js'
 const timestamp = '2026-07-14T00:00:00.000Z'
 const deadlineAt = '2026-07-14T00:04:00.000Z'
 const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
+const legacyBudgetLimits = createLegacyRunBudgetLimits(budget.limits)
 const emptyManifestFingerprint = createHash('sha256').update('[]').digest('hex')
 
 class RepairRaceRedis extends FakeRedis {
@@ -146,11 +153,17 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
   return Object.freeze({
     ...state,
     schemaVersion: 1,
+    budgetLimits: legacyBudgetLimits,
     visibleOutput: false
   })
 }
@@ -162,9 +175,14 @@ function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 2 })
+  return Object.freeze({ ...state, schemaVersion: 2, budgetLimits: legacyBudgetLimits })
 }
 
 function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
@@ -173,9 +191,27 @@ function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 3 })
+  return Object.freeze({ ...state, schemaVersion: 3, budgetLimits: legacyBudgetLimits })
+}
+
+function checkpointV4 (source: RunCheckpoint): RunCheckpointV4 {
+  const {
+    schemaVersion: _schemaVersion,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
+    budgetLimits: _budgetLimits,
+    ...state
+  } = source
+  return Object.freeze({ ...state, schemaVersion: 4, budgetLimits: legacyBudgetLimits })
 }
 
 function preparing (
@@ -240,7 +276,9 @@ test('RedisRunStore claims runRef atomically and upgrades one exact v1 checkpoin
     schemaVersion: 1,
     revision: legacy.revision,
     events
-  }), { EX: 300 })
+  }), { EX: 400 })
+  const checkpointExpiry = redis.artifactExpiryForTest(keys.checkpoint)
+  const eventExpiry = redis.artifactExpiryForTest(keys.events)
   const loaded = await store.load(legacy.runId)
   assert.equal(loaded?.schemaVersion, 1)
   if (loaded?.schemaVersion !== 1) throw new TypeError('legacy fixture was not loaded')
@@ -249,9 +287,14 @@ test('RedisRunStore claims runRef atomically and upgrades one exact v1 checkpoin
     requestRef: v2.requestRef
   })
   assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
-  assert.equal((await store.load(legacy.runId))?.schemaVersion, 4)
+  assert.equal((await store.load(legacy.runId))?.schemaVersion, 5)
   assert.equal(await redis.get(redisRunReferenceKey(upgraded.runRef)), upgraded.runId)
-  assert.equal(await redis.ttl(redisRunReferenceKey(upgraded.runRef)), 300)
+  assert.equal(redis.artifactExpiryForTest(keys.checkpoint), checkpointExpiry)
+  assert.equal(redis.artifactExpiryForTest(keys.events), eventExpiry)
+  assert.equal(
+    redis.artifactExpiryForTest(redisRunReferenceKey(upgraded.runRef)),
+    eventExpiry
+  )
 })
 
 test('RedisRunStore upgrades v2 through CAS without duplicating its runRef', async () => {
@@ -282,7 +325,7 @@ test('RedisRunStore upgrades v2 through CAS without duplicating its runRef', asy
   assert.deepEqual(await store.load(source.runId), upgraded)
   assert.equal(await redis.get(referenceKey), source.runId)
   assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|')[5], '1')
-  assert.equal(redis.evalCalls.some(call => call.operation === 'cas'), true)
+  assert.equal(redis.evalCalls.some(call => call.marker === RUN_STORE_MIGRATION_LUA_MARKER), true)
 })
 
 test('RedisRunStore upgrades one exact v3 through CAS and leaves conflicts untouched', async () => {
@@ -304,14 +347,126 @@ test('RedisRunStore upgrades one exact v3 through CAS and leaves conflicts untou
   assert.equal(loaded?.schemaVersion, 3)
   if (loaded?.schemaVersion !== 3) throw new TypeError('v3 fixture was not loaded')
   const upgraded = upgradeRunCheckpointV3(loaded)
-  await assert.rejects(store.upgrade(loaded, Object.freeze({
-    ...upgraded,
-    requestRef: 'f'.repeat(32)
-  })), error => error instanceof AgentError && error.code === 'checkpoint_conflict')
-  assert.deepEqual(await store.load(source.runId), source)
+  for (const tampered of [
+    Object.freeze({ ...upgraded, requestRef: 'f'.repeat(32) }),
+    Object.freeze({
+      ...upgraded,
+      messages: Object.freeze([{ role: 'user' as const, content: 'tampered' }])
+    }),
+    Object.freeze({
+      ...upgraded,
+      budgetCounters: Object.freeze({
+        ...upgraded.budgetCounters,
+        estimatedTokens: upgraded.budgetCounters.estimatedTokens + 1
+      })
+    }),
+    Object.freeze({ ...upgraded, status: 'preparing' as const }),
+    Object.freeze({
+      ...upgraded,
+      toolLedgers: Object.freeze([{ schemaVersion: 1, step: 0, calls: Object.freeze([]) }])
+    })
+  ]) {
+    await assert.rejects(store.upgrade(loaded, tampered as typeof upgraded), error => (
+      error instanceof AgentError && error.code === 'checkpoint_conflict'
+    ))
+    assert.deepEqual(await store.load(source.runId), source)
+  }
   assert.deepEqual(await store.upgrade(loaded, upgraded), upgraded)
   assert.deepEqual(await store.load(source.runId), upgraded)
   assert.equal(await redis.get(referenceKey), source.runId)
+})
+
+test('RedisRunStore migrates v4 with separate absolute TTLs and never rewrites its reference', async () => {
+  const now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+  const source = checkpointV4(checkpoint('run-v4-upgrade'))
+  const keys = redisRunKeys(source.runId)
+  const referenceKey = redisRunReferenceKey(source.runRef)
+  const { events, ...state } = source
+  await redis.set(keys.checkpoint, JSON.stringify(state), { EX: 300 })
+  await redis.set(keys.events, JSON.stringify({
+    schemaVersion: 4, revision: source.revision, events
+  }), { EX: 400 })
+  await redis.set(referenceKey, source.runId, { EX: 350 })
+  redis.seedArtifactForTest(
+    RUN_STORE_METADATA_KEY,
+    '0|9999999|9999999|9999999|9999999|9999999|9999999'
+  )
+  const expiries = [keys.checkpoint, keys.events, referenceKey]
+    .map(key => redis.artifactExpiryForTest(key))
+  const loaded = await store.load(source.runId)
+  if (loaded?.schemaVersion !== 4) throw new TypeError('v4 fixture was not loaded')
+  const upgraded = upgradeRunCheckpointV4(loaded)
+  const checkpointBeforeJump = await redis.get(keys.checkpoint)
+  await assert.rejects(store.upgrade(loaded, Object.freeze({
+    ...upgraded,
+    revision: upgraded.revision + 1
+  })), error => error instanceof AgentError && error.code === 'checkpoint_conflict')
+  assert.equal(await redis.get(keys.checkpoint), checkpointBeforeJump)
+  const settled = await Promise.allSettled([
+    store.upgrade(loaded, upgraded),
+    store.upgrade(loaded, upgraded)
+  ])
+  assert.equal(settled.filter(result => result.status === 'fulfilled').length, 1)
+  assert.equal(settled.filter(result => result.status === 'rejected').length, 1)
+  assert.deepEqual([keys.checkpoint, keys.events, referenceKey]
+    .map(key => redis.artifactExpiryForTest(key)), expiries)
+  assert.equal(await redis.get(referenceKey), source.runId)
+})
+
+test('RedisRunStore migration failures leave every surviving legacy key unchanged', async () => {
+  for (const failure of [
+    'checkpoint_persistent', 'checkpoint_expired', 'event_expired', 'missing',
+    'reference_wrong', 'reference_missing', 'reference_expired',
+    'reference_persistent', 'tombstone'
+  ] as const) {
+    let now = Date.parse(timestamp)
+    const redis = new FakeRedis(() => now)
+    const store = new RedisRunStore({ client: redis, activeTtlSeconds: 300 })
+    const source = checkpointV4(checkpoint(`run-v4-failure-${failure}`))
+    const upgraded = upgradeRunCheckpointV4(source)
+    const keys = redisRunKeys(source.runId)
+    const referenceKey = redisRunReferenceKey(source.runRef)
+    const { events, ...state } = source
+    const checkpointRaw = JSON.stringify(state)
+    const eventRaw = JSON.stringify({
+      schemaVersion: 4, revision: source.revision, events
+    })
+    if (failure !== 'missing') {
+      await redis.set(
+        keys.checkpoint,
+        checkpointRaw,
+        failure === 'checkpoint_persistent'
+          ? undefined
+          : { EX: failure === 'checkpoint_expired' ? 100 : 300 }
+      )
+    }
+    await redis.set(keys.events, eventRaw, { EX: failure === 'event_expired' ? 100 : 400 })
+    if (failure !== 'reference_missing') {
+      await redis.set(
+        referenceKey,
+        failure === 'reference_wrong' ? 'wrong-run' : source.runId,
+        failure === 'reference_persistent'
+          ? undefined
+          : { EX: failure === 'reference_expired' ? 100 : 350 }
+      )
+    }
+    if (failure === 'tombstone') await redis.set(keys.tombstone, 'terminal', { EX: 300 })
+    if (failure === 'checkpoint_expired' || failure === 'event_expired' ||
+      failure === 'reference_expired') now += 150_000
+    const before = await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(keys.tombstone),
+      redis.get(referenceKey), redis.get(RUN_STORE_METADATA_KEY)
+    ])
+
+    await assert.rejects(store.upgrade(source, upgraded), AgentError)
+
+    assert.deepEqual(await Promise.all([
+      redis.get(keys.checkpoint), redis.get(keys.events), redis.get(keys.tombstone),
+      redis.get(referenceKey), redis.get(RUN_STORE_METADATA_KEY)
+    ]), before)
+  }
 })
 
 test('RedisRunStore create is NX and exactly one revision CAS wins', async () => {

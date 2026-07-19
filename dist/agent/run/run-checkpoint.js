@@ -4,11 +4,15 @@ import { completionFromTerminalOutput, parseCompletionDisposition } from '../con
 import { isAgentErrorCode } from '../contracts/error.js';
 import { parsePresentationRoute } from '../contracts/interaction.js';
 import { parseAgentEvent } from '../contracts/event.js';
-import { parseModelCapabilitySnapshot } from '../model/model-capability.js';
+import { modelCapabilityStableHash, parseModelCapabilitySnapshot } from '../model/model-capability.js';
 import { parseModelPriceSnapshot } from '../model/model-price-catalog.js';
 import { parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from './provider-state.js';
 import { parseApprovalInterruption } from './interruption.js';
+import { parseContextPlanV1 } from '../context/context-plan.js';
+import { CONTEXT_TOKEN_ESTIMATOR_VERSION, estimateModelMessagesTokens, serializedModelMessagesBytes } from '../context/context-token-estimator.js';
+import { ADAPTIVE_CONTEXT_LOOP_POLICY, parseRunModelLoopPolicyV1 } from './run-loop-policy.js';
+import { createToolWireSnapshotV1, parseToolWireSnapshotV1 } from './model-turn-capacity.js';
 import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { assertRunTransition, isTerminalRunStatus, parseRunStatus } from './run-state.js';
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../session/conversation-scope.js';
@@ -87,6 +91,10 @@ const CHECKPOINT_V4_KEYS = Object.freeze([
     ...CHECKPOINT_V3_KEYS,
     'modelCapability', 'modelPrice', 'usage'
 ]);
+const CHECKPOINT_V5_KEYS = Object.freeze([
+    ...CHECKPOINT_V4_KEYS,
+    'modelLoopPolicy', 'contextPlan', 'contextArtifactRefs', 'toolWireSnapshot'
+]);
 const MODEL_KEYS = Object.freeze([
     'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
 ]);
@@ -97,6 +105,11 @@ const BUDGET_LIMIT_KEYS = Object.freeze([
     'activeRuntimeMs', 'providerTimeoutMs', 'maxModelTurns', 'maxToolCalls',
     'maxEstimatedTokens', 'maxProgressEvents', 'maxProviderRetries',
     'maxRecoveryAttempts', 'maxCorrectionTurns'
+]);
+const BUDGET_LIMIT_V2_KEYS = Object.freeze([
+    'schemaVersion', 'activeRuntimeMs', 'providerTimeoutMs', 'maxToolCalls',
+    'maxProgressEvents', 'maxProviderRetries', 'maxRecoveryAttempts',
+    'maxCorrectionTurns'
 ]);
 const BUDGET_COUNTER_KEYS = Object.freeze([
     'modelTurns', 'toolCalls', 'estimatedTokens', 'providerReportedTokens',
@@ -318,26 +331,31 @@ function validatePreparedBatch(value, snapshotId) {
         }
     }
 }
-function validateBudgets(limitsValue, countersValue) {
+function validateBudgets(limitsValue, countersValue, loopPolicyValue) {
     const limits = record(limitsValue, 'run budget limits');
-    exactKeys(limits, BUDGET_LIMIT_KEYS, BUDGET_LIMIT_KEYS, 'run budget limits');
+    const v2 = loopPolicyValue !== undefined;
+    exactKeys(limits, v2 ? BUDGET_LIMIT_V2_KEYS : BUDGET_LIMIT_KEYS, v2 ? BUDGET_LIMIT_V2_KEYS : BUDGET_LIMIT_KEYS, 'run budget limits');
     const fixed = Object.freeze({
         activeRuntimeMs: 240_000,
-        maxModelTurns: 6,
         maxToolCalls: 8,
         maxProgressEvents: 5,
         maxProviderRetries: 1,
         maxRecoveryAttempts: 1,
         maxCorrectionTurns: 1
     });
+    if (v2 && limits.schemaVersion !== 2) {
+        throw new TypeError('run budget limits are incompatible');
+    }
     for (const [key, expected] of Object.entries(fixed)) {
         if (limits[key] !== expected)
             throw new TypeError('run budget limits are incompatible');
     }
-    const maxEstimatedTokens = limits.maxEstimatedTokens;
-    if (typeof maxEstimatedTokens !== 'number' ||
-        !Number.isSafeInteger(maxEstimatedTokens) ||
-        (maxEstimatedTokens !== 49_152 && maxEstimatedTokens !== 196_608)) {
+    const loopPolicy = v2 ? parseRunModelLoopPolicyV1(loopPolicyValue) : null;
+    const maxEstimatedTokens = v2
+        ? loopPolicy?.kind === 'legacy_fixed' ? loopPolicy.maxEstimatedTokens : null
+        : typeof limits.maxEstimatedTokens === 'number' ? limits.maxEstimatedTokens : null;
+    if (!v2 && (limits.maxModelTurns !== 6 ||
+        (maxEstimatedTokens !== 49_152 && maxEstimatedTokens !== 196_608))) {
         throw new TypeError('run budget limits are incompatible');
     }
     if (!Number.isSafeInteger(limits.providerTimeoutMs) || Number(limits.providerTimeoutMs) <= 0 ||
@@ -352,8 +370,11 @@ function validateBudgets(limitsValue, countersValue) {
             throw new TypeError(`run budget counter ${key} is invalid`);
         nonNegative(value, `run budget counter ${key}`);
     }
-    if (Number(counters.modelTurns) > 6 || Number(counters.toolCalls) > 8 ||
-        Number(counters.estimatedTokens) > maxEstimatedTokens || Number(counters.progressEvents) > 5 ||
+    if ((loopPolicy?.kind === 'legacy_fixed' &&
+        Number(counters.modelTurns) > loopPolicy.maxModelTurns) ||
+        Number(counters.toolCalls) > 8 ||
+        (maxEstimatedTokens !== null && Number(counters.estimatedTokens) > maxEstimatedTokens) ||
+        Number(counters.progressEvents) > 5 ||
         Number(counters.providerRetries) > 1 || Number(counters.recoveryAttempts) > 1 ||
         Number(counters.correctionTurns) > 1 || Number(counters.usedActiveRuntimeMs) > 240_000) {
         throw new TypeError('run budget counters exceed their limits');
@@ -452,7 +473,9 @@ function parseLoadedRunCheckpoint(value) {
                 ? CHECKPOINT_V3_KEYS
                 : unparsed.schemaVersion === 4
                     ? CHECKPOINT_V4_KEYS
-                    : undefined;
+                    : unparsed.schemaVersion === 5
+                        ? CHECKPOINT_V5_KEYS
+                        : undefined;
     if (checkpointKeys === undefined)
         throw new TypeError('run checkpoint schema version is invalid');
     exactKeys(unparsed, checkpointKeys, checkpointKeys, 'checkpoint');
@@ -462,7 +485,8 @@ function parseLoadedRunCheckpoint(value) {
         throw new TypeError('run event count limit exceeded');
     }
     const parsed = unparsed;
-    const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4
+    const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4 ||
+        parsed.schemaVersion === 5
         ? parseRunReasoningSegments(parsed.reasoningSegments)
         : undefined;
     const split = splitCheckpoint(parsed);
@@ -519,7 +543,7 @@ function parseLoadedRunCheckpoint(value) {
     if (parsed.interruption !== null && approvalIds.has(parsed.interruption.approvalId)) {
         throw new TypeError('active run approval is already in history');
     }
-    validateBudgets(parsed.budgetLimits, parsed.budgetCounters);
+    validateBudgets(parsed.budgetLimits, parsed.budgetCounters, parsed.schemaVersion === 5 ? parsed.modelLoopPolicy : undefined);
     if (typeof parsed.recoveryUsed !== 'boolean' || typeof parsed.forceCorrection !== 'boolean' ||
         (parsed.schemaVersion === 1 && typeof parsed.visibleOutput !== 'boolean')) {
         throw new TypeError('run checkpoint flags are invalid');
@@ -549,13 +573,44 @@ function parseLoadedRunCheckpoint(value) {
     else {
         validateCheckpointV2OrLater(parsed);
     }
-    if (parsed.schemaVersion === 4) {
+    if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5) {
         const capability = parseModelCapabilitySnapshot(parsed.modelCapability);
         const price = parsed.modelPrice === null ? null : parseModelPriceSnapshot(parsed.modelPrice);
         parseRunUsageSummary(parsed.usage);
         if ((capability.priceCatalogVersion === null) !== (price === null) ||
             (price !== null && price.catalogVersion !== capability.priceCatalogVersion)) {
             throw new TypeError('run model price catalog is inconsistent');
+        }
+    }
+    if (parsed.schemaVersion === 5) {
+        const modelLoopPolicy = parseRunModelLoopPolicyV1(parsed.modelLoopPolicy);
+        const toolWireSnapshot = parsed.toolWireSnapshot === null
+            ? null
+            : parseToolWireSnapshotV1(parsed.toolWireSnapshot);
+        if ((modelLoopPolicy.kind === 'adaptive_context') !== (toolWireSnapshot !== null)) {
+            throw new TypeError('run tool wire snapshot is inconsistent');
+        }
+        const plan = parsed.contextPlan === null ? null : parseContextPlanV1(parsed.contextPlan);
+        if (!Array.isArray(parsed.contextArtifactRefs) || parsed.contextArtifactRefs.length > 128 ||
+            parsed.contextArtifactRefs.some(ref => typeof ref !== 'string') ||
+            new Set(parsed.contextArtifactRefs).size !== parsed.contextArtifactRefs.length) {
+            throw new TypeError('run context artifact references are invalid');
+        }
+        if (plan === null) {
+            if (parsed.contextArtifactRefs.length !== 0) {
+                throw new TypeError('run context plan references are inconsistent');
+            }
+        }
+        else if (plan.namespaceRef !== parsed.runRef ||
+            plan.messageCount !== parsed.messages.length ||
+            plan.estimatedInputTokens !== parsed.estimatedInputTokens ||
+            plan.estimatorVersion !== CONTEXT_TOKEN_ESTIMATOR_VERSION ||
+            plan.estimatedInputTokens !== estimateModelMessagesTokens(parsed.messages) ||
+            plan.serializedMessageBytes !== serializedModelMessagesBytes(parsed.messages) ||
+            plan.capabilityHash !== modelCapabilityStableHash(parsed.modelCapability) ||
+            plan.artifactRefs.length !== parsed.contextArtifactRefs.length ||
+            plan.artifactRefs.some((ref, index) => ref !== parsed.contextArtifactRefs[index])) {
+            throw new TypeError('run context plan is inconsistent');
         }
     }
     if (parsed.status === 'failed' && (parsed.error === null || parsed.cancellationReason !== null)) {
@@ -567,6 +622,23 @@ function parseLoadedRunCheckpoint(value) {
     if ((parsed.status === 'waiting_approval') !== (parsed.interruption !== null) ||
         (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
         throw new TypeError('run approval checkpoint state is invalid');
+    }
+    if (parsed.schemaVersion === 5) {
+        return Object.freeze({
+            ...parsed,
+            reasoningSegments,
+            modelCapability: parseModelCapabilitySnapshot(parsed.modelCapability),
+            modelPrice: parsed.modelPrice === null
+                ? null
+                : parseModelPriceSnapshot(parsed.modelPrice),
+            usage: parseRunUsageSummary(parsed.usage),
+            modelLoopPolicy: parseRunModelLoopPolicyV1(parsed.modelLoopPolicy),
+            toolWireSnapshot: parsed.toolWireSnapshot === null
+                ? null
+                : parseToolWireSnapshotV1(parsed.toolWireSnapshot),
+            contextPlan: parsed.contextPlan === null ? null : parseContextPlanV1(parsed.contextPlan),
+            contextArtifactRefs: Object.freeze([...parsed.contextArtifactRefs])
+        });
     }
     if (parsed.schemaVersion === 4) {
         return Object.freeze({
@@ -585,8 +657,8 @@ function parseLoadedRunCheckpoint(value) {
 }
 export function parseRunCheckpoint(value) {
     const parsed = parseLoadedRunCheckpoint(value);
-    if (parsed.schemaVersion !== 4) {
-        throw new TypeError('runtime run checkpoint must use schema version 4');
+    if (parsed.schemaVersion !== 5) {
+        throw new TypeError('runtime run checkpoint must use schema version 5');
     }
     return parsed;
 }
@@ -642,7 +714,7 @@ export function createInitialRunCheckpoint(input) {
     timestamp(input.createdAt, 'run creation time');
     validateEvents([input.event], 0, input.runId, input.sessionId);
     return freezeCheckpoint({
-        schemaVersion: 4,
+        schemaVersion: 5,
         kernelVersion: 1,
         profileId: input.profileId,
         profileVersion: input.profileVersion,
@@ -669,6 +741,12 @@ export function createInitialRunCheckpoint(input) {
         interruption: null,
         approvalHistory: Object.freeze([]),
         budgetLimits: input.budgetLimits,
+        modelLoopPolicy: input.modelLoopPolicy ?? ADAPTIVE_CONTEXT_LOOP_POLICY,
+        contextPlan: input.contextPlan ?? null,
+        contextArtifactRefs: Object.freeze([...(input.contextArtifactRefs ?? [])]),
+        toolWireSnapshot: input.toolWireSnapshot === undefined
+            ? createToolWireSnapshotV1(Object.freeze([]))
+            : input.toolWireSnapshot,
         budgetCounters: input.budgetCounters,
         recoveryUsed: false,
         forceCorrection: false,
@@ -709,6 +787,7 @@ const CHECKPOINT_V1_STATE_KEYS = Object.freeze(CHECKPOINT_V1_KEYS.filter(key => 
 const CHECKPOINT_V2_STATE_KEYS = Object.freeze(CHECKPOINT_V2_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V3_STATE_KEYS = Object.freeze(CHECKPOINT_V3_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V4_STATE_KEYS = Object.freeze(CHECKPOINT_V4_KEYS.filter(key => key !== 'events'));
+const CHECKPOINT_V5_STATE_KEYS = Object.freeze(CHECKPOINT_V5_KEYS.filter(key => key !== 'events'));
 const EVENT_ENVELOPE_KEYS = Object.freeze([
     'schemaVersion', 'revision', 'events'
 ]);
@@ -728,7 +807,7 @@ export class RunCheckpointCodec {
         const parsed = parseRunCheckpoint(value);
         const split = splitCheckpoint(parsed);
         const envelope = Object.freeze({
-            schemaVersion: 4,
+            schemaVersion: 5,
             revision: parsed.revision,
             events: split.events
         });
@@ -752,7 +831,9 @@ export class RunCheckpointCodec {
                     ? CHECKPOINT_V3_STATE_KEYS
                     : state.schemaVersion === 4
                         ? CHECKPOINT_V4_STATE_KEYS
-                        : undefined;
+                        : state.schemaVersion === 5
+                            ? CHECKPOINT_V5_STATE_KEYS
+                            : undefined;
         if (checkpointKeys === undefined) {
             throw new TypeError('run checkpoint schema version is invalid');
         }

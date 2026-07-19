@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  modelCapabilityStableHash,
   parseModelCapabilitySnapshot,
   resolveModelCapabilitySnapshot
 } from '../../src/agent/model/model-capability.js'
@@ -77,6 +78,72 @@ test('uses the safe default when no profile capability or override exists', () =
   })
 })
 
+test('known capability overrides may only narrow provider-declared features', () => {
+  assert.deepEqual(resolveModelCapabilitySnapshot({
+    profile: deepSeekCompatibilityProfile,
+    model: 'deepseek-v4-flash',
+    override: {
+      contextWindowTokens: 65_536,
+      promptCaching: 'unknown',
+      usageExtensions: ['prompt_cache_hit_tokens']
+    },
+    now: BEFORE_ALIAS_EXPIRY
+  }), {
+    schemaVersion: 1,
+    source: 'user_override',
+    contextWindowTokens: 65_536,
+    maxOutputTokens: 65_536,
+    promptCaching: 'unknown',
+    usageExtensions: ['prompt_cache_hit_tokens'],
+    priceCatalogVersion: 'deepseek-cny-2026-07-19'
+  })
+
+  assert.throws(() => resolveModelCapabilitySnapshot({
+    profile: deepSeekCompatibilityProfile,
+    model: 'deepseek-v4-flash',
+    override: { contextWindowTokens: 1_000_001 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), /override/i)
+  assert.throws(() => resolveModelCapabilitySnapshot({
+    profile: deepSeekCompatibilityProfile,
+    model: 'deepseek-v4-flash',
+    override: { maxOutputTokens: 500_000 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), /override/i)
+  assert.throws(() => resolveModelCapabilitySnapshot({
+    profile: deepSeekCompatibilityProfile,
+    model: 'deepseek-v4-flash',
+    override: { contextWindowTokens: 65_536, maxOutputTokens: 65_537 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), /override|context/i)
+  assert.throws(() => resolveModelCapabilitySnapshot({
+    profile: standardOpenAIProfile,
+    model: 'unlisted-openai-compatible-model',
+    override: { contextWindowTokens: 0 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), /override/i)
+  assert.throws(() => resolveModelCapabilitySnapshot({
+    profile: standardOpenAIProfile,
+    model: 'unlisted-openai-compatible-model',
+    override: { promptCaching: 'deepseek_disk' },
+    now: BEFORE_ALIAS_EXPIRY
+  }), /override/i)
+  assert.deepEqual(resolveModelCapabilitySnapshot({
+    profile: standardOpenAIProfile,
+    model: 'unlisted-openai-compatible-model',
+    override: { contextWindowTokens: 1_000_000, maxOutputTokens: 500_000 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), {
+    schemaVersion: 1,
+    source: 'user_override',
+    contextWindowTokens: 1_000_000,
+    maxOutputTokens: 500_000,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+  })
+})
+
 test('expires only the documented DeepSeek aliases at their exact cutoff instant', () => {
   const before = resolveModelCapabilitySnapshot({
     profile: deepSeekCompatibilityProfile,
@@ -118,4 +185,16 @@ test('capability codec accepts only exact safe-integer snapshot keys', () => {
     priceCatalogVersion: 'deepseek-cny-2026-07-19',
     guessed: true
   }), /capability/i)
+})
+
+test('capability stable hash has a domain-separated fixed vector', () => {
+  assert.equal(modelCapabilityStableHash({
+    schemaVersion: 1,
+    source: 'safe_default',
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+  }), '5ae13d264e71c7f1ae28fc9f23b4fb323f3e816353b30116525284cfb1590dd8')
 })

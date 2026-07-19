@@ -1,4 +1,6 @@
 import type { OpenAICompatibleProfile } from './openai-compatible-profile.js'
+import { createHash } from 'node:crypto'
+import { types as utilTypes } from 'node:util'
 
 export interface ModelCapabilitySnapshotV1 {
   readonly schemaVersion: 1
@@ -54,9 +56,25 @@ const SAFE_DEFAULT: ModelCapabilitySnapshotV1 = Object.freeze({
   priceCatalogVersion: null
 })
 
-function isPlainRecord (value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
-    Object.getPrototypeOf(value) === Object.prototype
+function plainDataRecord (value: unknown): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    utilTypes.isProxy(value)) return null
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype) return null
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    const keys = Reflect.ownKeys(value)
+    if (keys.some(key => typeof key !== 'string')) return null
+    const result: Record<string, unknown> = {}
+    for (const key of keys as string[]) {
+      const descriptor = descriptors[key]
+      if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') ||
+        descriptor.enumerable !== true) return null
+      result[key] = descriptor.value
+    }
+    return result
+  } catch {
+    return null
+  }
 }
 
 function hasExactKeys (value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -80,51 +98,53 @@ function parseUsageExtensions (value: unknown): ModelCapabilitySnapshotV1['usage
 }
 
 function parseOverride (value: ModelCapabilityOverride): ModelCapabilityOverride {
-  if (!isPlainRecord(value) || Object.keys(value).some(key => !OVERRIDE_KEYS.includes(key)) ||
-      Object.keys(value).length === 0) {
+  const input = plainDataRecord(value)
+  if (input === null || Object.keys(input).some(key => !OVERRIDE_KEYS.includes(key)) ||
+      Object.keys(input).length === 0) {
     throw new TypeError('model capability override is invalid')
   }
-  if (value.contextWindowTokens !== undefined && !isTokenCount(value.contextWindowTokens)) {
+  if (input.contextWindowTokens !== undefined && !isTokenCount(input.contextWindowTokens)) {
     throw new TypeError('model capability override is invalid')
   }
-  if (value.maxOutputTokens !== undefined && !isTokenCount(value.maxOutputTokens)) {
+  if (input.maxOutputTokens !== undefined && !isTokenCount(input.maxOutputTokens)) {
     throw new TypeError('model capability override is invalid')
   }
-  if (value.promptCaching !== undefined && value.promptCaching !== 'deepseek_disk' &&
-      value.promptCaching !== 'unknown') {
+  if (input.promptCaching !== undefined && input.promptCaching !== 'deepseek_disk' &&
+      input.promptCaching !== 'unknown') {
     throw new TypeError('model capability override is invalid')
   }
   return Object.freeze({
-    ...(value.contextWindowTokens === undefined ? {} : { contextWindowTokens: value.contextWindowTokens }),
-    ...(value.maxOutputTokens === undefined ? {} : { maxOutputTokens: value.maxOutputTokens }),
-    ...(value.promptCaching === undefined ? {} : { promptCaching: value.promptCaching }),
-    ...(value.usageExtensions === undefined
+    ...(input.contextWindowTokens === undefined ? {} : { contextWindowTokens: input.contextWindowTokens as number }),
+    ...(input.maxOutputTokens === undefined ? {} : { maxOutputTokens: input.maxOutputTokens as number }),
+    ...(input.promptCaching === undefined ? {} : { promptCaching: input.promptCaching as 'deepseek_disk' | 'unknown' }),
+    ...(input.usageExtensions === undefined
       ? {}
-      : { usageExtensions: parseUsageExtensions(value.usageExtensions) })
+      : { usageExtensions: parseUsageExtensions(input.usageExtensions) })
   })
 }
 
 export function parseModelCapabilitySnapshot (value: unknown): ModelCapabilitySnapshotV1 {
-  if (!isPlainRecord(value) || !hasExactKeys(value, CAPABILITY_KEYS) ||
-      value.schemaVersion !== 1 ||
-      (value.source !== 'profile' && value.source !== 'user_override' && value.source !== 'safe_default') ||
-      !isTokenCount(value.contextWindowTokens) || !isTokenCount(value.maxOutputTokens) ||
-      value.maxOutputTokens > value.contextWindowTokens ||
-      (value.promptCaching !== 'deepseek_disk' && value.promptCaching !== 'unknown') ||
-      (typeof value.priceCatalogVersion !== 'string' && value.priceCatalogVersion !== null)) {
+  const input = plainDataRecord(value)
+  if (input === null || !hasExactKeys(input, CAPABILITY_KEYS) ||
+      input.schemaVersion !== 1 ||
+      (input.source !== 'profile' && input.source !== 'user_override' && input.source !== 'safe_default') ||
+      !isTokenCount(input.contextWindowTokens) || !isTokenCount(input.maxOutputTokens) ||
+      input.maxOutputTokens > input.contextWindowTokens ||
+      (input.promptCaching !== 'deepseek_disk' && input.promptCaching !== 'unknown') ||
+      (typeof input.priceCatalogVersion !== 'string' && input.priceCatalogVersion !== null)) {
     throw new TypeError('model capability is invalid')
   }
-  const priceCatalogVersion = value.priceCatalogVersion
+  const priceCatalogVersion = input.priceCatalogVersion
   if (typeof priceCatalogVersion === 'string' && priceCatalogVersion.length === 0) {
     throw new TypeError('model capability is invalid')
   }
   return Object.freeze({
     schemaVersion: 1,
-    source: value.source,
-    contextWindowTokens: value.contextWindowTokens,
-    maxOutputTokens: value.maxOutputTokens,
-    promptCaching: value.promptCaching,
-    usageExtensions: parseUsageExtensions(value.usageExtensions),
+    source: input.source,
+    contextWindowTokens: input.contextWindowTokens,
+    maxOutputTokens: input.maxOutputTokens,
+    promptCaching: input.promptCaching,
+    usageExtensions: parseUsageExtensions(input.usageExtensions),
     priceCatalogVersion
   })
 }
@@ -141,9 +161,49 @@ export function resolveModelCapabilitySnapshot (
     ? SAFE_DEFAULT
     : parseModelCapabilitySnapshot(profileSnapshot)
   const override = input.override === undefined ? undefined : parseOverride(input.override)
+  if (override === undefined) return base
+  const known = profileSnapshot !== undefined
+  if (known) {
+    if ((override.contextWindowTokens ?? base.contextWindowTokens) > base.contextWindowTokens ||
+      (override.maxOutputTokens ?? 0) > base.maxOutputTokens ||
+      (override.promptCaching !== undefined && override.promptCaching !== 'unknown' &&
+        override.promptCaching !== base.promptCaching) ||
+      (override.usageExtensions !== undefined && override.usageExtensions
+        .some(extension => !base.usageExtensions.includes(extension)))) {
+      throw new TypeError('model capability override may only narrow a known profile')
+    }
+  } else if ((override.promptCaching !== undefined && override.promptCaching !== 'unknown') ||
+    (override.usageExtensions !== undefined && override.usageExtensions.length > 0)) {
+    throw new TypeError('model capability override cannot infer provider features')
+  }
+  const contextWindowTokens = override.contextWindowTokens ?? base.contextWindowTokens
+  const maxOutputTokens = override.maxOutputTokens ??
+    Math.min(base.maxOutputTokens, contextWindowTokens)
+  if (maxOutputTokens > contextWindowTokens) {
+    throw new TypeError('model capability override output exceeds context')
+  }
   return parseModelCapabilitySnapshot({
     ...base,
     ...override,
-    source: override === undefined ? base.source : 'user_override'
+    contextWindowTokens,
+    maxOutputTokens,
+    source: 'user_override'
   })
+}
+
+export function modelCapabilityStableHash (value: ModelCapabilitySnapshotV1): string {
+  const capability = parseModelCapabilitySnapshot(value)
+  const wire = JSON.stringify({
+    schemaVersion: capability.schemaVersion,
+    source: capability.source,
+    contextWindowTokens: capability.contextWindowTokens,
+    maxOutputTokens: capability.maxOutputTokens,
+    promptCaching: capability.promptCaching,
+    usageExtensions: capability.usageExtensions,
+    priceCatalogVersion: capability.priceCatalogVersion
+  })
+  return createHash('sha256')
+    .update('groupmate.model-capability.v1\0', 'ascii')
+    .update(wire, 'utf8')
+    .digest('hex')
 }

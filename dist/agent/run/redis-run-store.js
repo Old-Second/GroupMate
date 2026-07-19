@@ -6,9 +6,74 @@ import { RUN_RESOURCE_LIMITS } from './run-limits.js';
 import { isTerminalRunStatus } from './run-state.js';
 import { checkpointWithAppendedEvents, createRunTombstoneV2, normalizeRunTombstone, parseTerminalCommitReceipt, parseRunTombstone, RunReferenceConflictError, RunStoreConflictError, validateTerminalCommitInput } from './run-store.js';
 import { RUN_REF_PATTERN } from './run-reference.js';
+import { validateExactRunCheckpointMigration } from './run-checkpoint-migration.js';
 export const RUN_STORE_NAMESPACE = 'GROUPMATE:RUN:v1:';
 export const RUN_STORE_LUA_MARKER = '-- GROUPMATE_RUN_STORE_V1';
+export const RUN_STORE_MIGRATION_LUA_MARKER = '-- GROUPMATE_RUN_STORE_MIGRATION_V1';
 export const RUN_STORE_METADATA_KEY = `${RUN_STORE_NAMESPACE}approval-index:namespace-budget`;
+export const RUN_STORE_MIGRATION_LUA_SCRIPT = `${RUN_STORE_MIGRATION_LUA_MARKER}
+local oldCheckpoint = redis.call('GET', KEYS[1])
+local oldEvents = redis.call('GET', KEYS[2])
+if oldCheckpoint ~= ARGV[1] or oldEvents ~= ARGV[2] or
+  redis.call('EXISTS', KEYS[3]) > 0 then return 'conflict' end
+local checkpointTtl = redis.call('PTTL', KEYS[1])
+local eventsTtl = redis.call('PTTL', KEYS[2])
+if checkpointTtl <= 0 or eventsTtl <= 0 then return 'ttl' end
+local isV1 = ARGV[6] == '1'
+if isV1 then
+  if redis.call('EXISTS', KEYS[4]) > 0 then return 'reference_conflict' end
+else
+  if redis.call('GET', KEYS[4]) ~= ARGV[5] or redis.call('PTTL', KEYS[4]) <= 0 then
+    return 'conflict'
+  end
+end
+local metadata = redis.call('GET', KEYS[5])
+if not metadata then return 'reconcile' end
+local bytes, checkpoints, events, tombstones, indexes, references, tombstoneBytes = string.match(
+  metadata, '^(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)|(%d+)$'
+)
+if not bytes or not tombstoneBytes then return 'reconcile' end
+local currentBytes = tonumber(bytes)
+local nextBytes = currentBytes - string.len(oldCheckpoint) - string.len(oldEvents) +
+  string.len(ARGV[3]) + string.len(ARGV[4])
+local nextReferences = tonumber(references)
+if isV1 then
+  nextBytes = nextBytes + string.len(KEYS[4]) + string.len(ARGV[5])
+  nextReferences = nextReferences + 1
+end
+local projected = {
+  bytes = nextBytes,
+  checkpoints = tonumber(checkpoints),
+  events = tonumber(events),
+  tombstones = tonumber(tombstones),
+  indexes = tonumber(indexes),
+  references = nextReferences,
+  tombstoneBytes = tonumber(tombstoneBytes)
+}
+if projected.bytes < 0 or projected.checkpoints < 0 or projected.events < 0 or
+  projected.tombstones < 0 or projected.indexes < 0 or projected.references < 0 or
+  projected.tombstoneBytes < 0 or projected.tombstoneBytes > projected.bytes then
+  return 'reconcile'
+end
+if projected.bytes > ${RUN_RESOURCE_LIMITS.namespaceBytes} or
+  projected.checkpoints > ${RUN_RESOURCE_LIMITS.checkpointKeys} or
+  projected.events > ${RUN_RESOURCE_LIMITS.eventKeys} or
+  projected.tombstones > ${RUN_RESOURCE_LIMITS.tombstoneKeys} or
+  projected.indexes > ${RUN_RESOURCE_LIMITS.indexAdmissionKeys} or
+  projected.references > ${RUN_RESOURCE_LIMITS.referenceKeys} then return 'budget' end
+redis.call('SET', KEYS[1], ARGV[3], 'KEEPTTL')
+redis.call('SET', KEYS[2], ARGV[4], 'KEEPTTL')
+if isV1 then
+  local referenceTtl = math.max(checkpointTtl, eventsTtl)
+  local created = redis.call('SET', KEYS[4], ARGV[5], 'PX', referenceTtl, 'NX')
+  if not created then return 'reference_conflict' end
+end
+redis.call('SET', KEYS[5], table.concat({
+  projected.bytes, projected.checkpoints, projected.events, projected.tombstones,
+  projected.indexes, projected.references, projected.tombstoneBytes
+}, '|'))
+return 'ok'
+`;
 export const RUN_STORE_LUA_SCRIPT = `${RUN_STORE_LUA_MARKER}
 local operation = ARGV[1]
 
@@ -432,6 +497,17 @@ async function evaluate(client, operation, keys, args) {
         throw storageUnavailable(operation, error);
     }
 }
+async function evaluateMigration(client, keys, args) {
+    try {
+        return await client.eval(RUN_STORE_MIGRATION_LUA_SCRIPT, {
+            keys: [...keys],
+            arguments: [...args]
+        });
+    }
+    catch (error) {
+        throw storageUnavailable('upgrade', error);
+    }
+}
 async function reconcileNamespace(client) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
         let expected;
@@ -605,32 +681,40 @@ export class RedisRunStore {
         }
     }
     async upgrade(expected, next) {
-        if ((expected.schemaVersion !== 1 && expected.schemaVersion !== 2 &&
-            expected.schemaVersion !== 3) || next.schemaVersion !== 4 ||
+        if (next.schemaVersion !== 5 ||
             next.runId !== expected.runId || next.sessionId !== expected.sessionId ||
             next.revision !== expected.revision + 1 ||
             (expected.schemaVersion !== 1 &&
                 (next.runRef !== expected.runRef || next.requestRef !== expected.requestRef))) {
             throw new RunStoreConflictError();
         }
+        try {
+            validateExactRunCheckpointMigration(expected, next);
+        }
+        catch {
+            throw new RunStoreConflictError();
+        }
         const expectedEncoded = this.#encodeLoaded(expected, 'upgrade_expected');
         const nextEncoded = this.#encode(next, 'upgrade_next');
         const keys = redisRunKeys(expected.runId);
         const referenceKey = redisRunReferenceKey(next.runRef);
-        const activeTtlSeconds = next.status === 'waiting_approval'
-            ? Math.max(this.#activeTtlSeconds, APPROVAL_WAIT_TTL_SECONDS)
-            : this.#activeTtlSeconds;
-        const operation = expected.schemaVersion === 1 ? 'upgrade' : 'cas';
-        const result = await mutate(this.#client, operation, [
-            keys.checkpoint, keys.events, keys.tombstone, referenceKey
+        let result = await evaluateMigration(this.#client, [
+            keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY
         ], [
-            expectedEncoded.checkpoint,
-            expectedEncoded.events,
-            nextEncoded.checkpoint,
-            nextEncoded.events,
-            String(activeTtlSeconds),
-            next.runId
+            expectedEncoded.checkpoint, expectedEncoded.events,
+            nextEncoded.checkpoint, nextEncoded.events, next.runId,
+            expected.schemaVersion === 1 ? '1' : '0'
         ]);
+        if (result === 'reconcile' || result === 'budget') {
+            await reconcileNamespace(this.#client);
+            result = await evaluateMigration(this.#client, [
+                keys.checkpoint, keys.events, keys.tombstone, referenceKey, RUN_STORE_METADATA_KEY
+            ], [
+                expectedEncoded.checkpoint, expectedEncoded.events,
+                nextEncoded.checkpoint, nextEncoded.events, next.runId,
+                expected.schemaVersion === 1 ? '1' : '0'
+            ]);
+        }
         requireMutationSuccess(result, 'upgrade');
         return next;
     }
@@ -784,7 +868,7 @@ export class RedisRunStore {
         }
     }
     #encodeLoaded(checkpoint, operation) {
-        if (checkpoint.schemaVersion === 4)
+        if (checkpoint.schemaVersion === 5)
             return this.#encode(checkpoint, operation);
         try {
             const { events, ...state } = checkpoint;

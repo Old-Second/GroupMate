@@ -1,6 +1,7 @@
 import type { RedisSessionClient } from '../../src/agent/session/redis-session-store.js'
 import {
   RUN_STORE_LUA_MARKER,
+  RUN_STORE_MIGRATION_LUA_MARKER,
   RUN_STORE_METADATA_KEY,
   type RedisRunClient
 } from '../../src/agent/run/redis-run-store.js'
@@ -165,6 +166,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     }
     if (marker === TRACE_STORE_LUA_MARKER) {
       return this.evalTrace(operation, options.keys, options.arguments)
+    }
+    if (marker === RUN_STORE_MIGRATION_LUA_MARKER) {
+      return this.evalRunMigration(options.keys, options.arguments)
     }
     if (marker !== RUN_STORE_LUA_MARKER) {
       throw new TypeError('unsupported Lua script')
@@ -390,6 +394,53 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     }
 
     return 'invalid_operation'
+  }
+
+  private evalRunMigration (keys: string[], args: string[]): string {
+    const [checkpointKey, eventKey, tombstoneKey, referenceKey, metadataKey] = keys
+    if ([checkpointKey, eventKey, tombstoneKey, referenceKey, metadataKey]
+      .some(key => key === undefined)) return 'conflict'
+    const oldCheckpoint = this.entryValue(checkpointKey)
+    const oldEvents = this.entryValue(eventKey)
+    if (oldCheckpoint !== args[0] || oldEvents !== args[1] ||
+      this.entryValue(tombstoneKey) !== null) return 'conflict'
+    const checkpointEntry = this.entries.get(checkpointKey as string)
+    const eventEntry = this.entries.get(eventKey as string)
+    if (checkpointEntry?.expiresAtMs === undefined || eventEntry?.expiresAtMs === undefined) return 'ttl'
+    const isV1 = args[5] === '1'
+    const referenceValue = this.entryValue(referenceKey)
+    const reference = this.entries.get(referenceKey as string)
+    if (isV1 ? referenceValue !== null :
+      referenceValue !== args[4] || reference?.expiresAtMs === undefined) {
+      return isV1 ? 'reference_conflict' : 'conflict'
+    }
+    const usage = this.parseRunNamespaceUsage(this.entryValue(metadataKey))
+    if (usage === null) return 'reconcile'
+    const projected = {
+      ...usage,
+      bytes: usage.bytes - this.bytes(oldCheckpoint) - this.bytes(oldEvents) +
+        this.bytes(args[2]) + this.bytes(args[3]) +
+        (isV1 ? this.bytes(referenceKey) + this.bytes(args[4]) : 0),
+      references: usage.references + (isV1 ? 1 : 0)
+    }
+    if (this.invalidRunUsage(projected)) return 'reconcile'
+    if (this.exceedsRunLimits(projected)) return 'budget'
+    this.entries.set(checkpointKey as string, {
+      value: args[2] as string,
+      expiresAtMs: checkpointEntry.expiresAtMs
+    })
+    this.entries.set(eventKey as string, {
+      value: args[3] as string,
+      expiresAtMs: eventEntry.expiresAtMs
+    })
+    if (isV1) {
+      this.entries.set(referenceKey as string, {
+        value: args[4] as string,
+        expiresAtMs: Math.max(checkpointEntry.expiresAtMs, eventEntry.expiresAtMs)
+      })
+    }
+    this.saveRunNamespaceUsage(metadataKey, projected)
+    return 'ok'
   }
 
   private evalTrace (
@@ -634,7 +685,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   private entryValue (key: string | undefined): string | null {
-    return key === undefined ? null : this.entries.get(key)?.value ?? null
+    if (key === undefined) return null
+    this.purgeExpired(key)
+    return this.entries.get(key)?.value ?? null
   }
 
   private evalArtifact (operation: string, keys: string[], args: string[]): unknown {

@@ -1,7 +1,11 @@
 import { AgentError } from '../contracts/error.js'
-import { MODEL_TURN_CAPACITY_LIMITS } from './model-turn-capacity.js'
+import {
+  ADAPTIVE_CONTEXT_LOOP_POLICY,
+  parseRunModelLoopPolicyV1,
+  type RunModelLoopPolicyV1
+} from './run-loop-policy.js'
 
-export interface RunBudgetLimits {
+export interface LegacyRunBudgetLimitsV1 {
   readonly activeRuntimeMs: 240_000
   readonly providerTimeoutMs: number
   readonly maxModelTurns: 6
@@ -12,6 +16,19 @@ export interface RunBudgetLimits {
   readonly maxRecoveryAttempts: 1
   readonly maxCorrectionTurns: 1
 }
+
+export interface RunBudgetLimitsV2 {
+  readonly schemaVersion: 2
+  readonly activeRuntimeMs: 240_000
+  readonly providerTimeoutMs: number
+  readonly maxToolCalls: 8
+  readonly maxProgressEvents: 5
+  readonly maxProviderRetries: 1
+  readonly maxRecoveryAttempts: 1
+  readonly maxCorrectionTurns: 1
+}
+
+export type RunBudgetLimits = RunBudgetLimitsV2
 
 export interface RunBudgetCounters {
   readonly modelTurns: number
@@ -41,7 +58,8 @@ export interface RunUsageRecord {
 export interface RunBudget {
   readonly limits: RunBudgetLimits
   readonly initialCounters: RunBudgetCounters
-  withLimits(limits: RunBudgetLimits): RunBudget
+  readonly loopPolicy: RunModelLoopPolicyV1
+  withLimits(limits: RunBudgetLimits, loopPolicy?: RunModelLoopPolicyV1): RunBudget
   reserveModelTurn(counters: RunBudgetCounters, input: ModelTurnReservation): RunBudgetCounters
   reserveToolBatch(counters: RunBudgetCounters, count: number): RunBudgetCounters
   recordProviderRetry(counters: RunBudgetCounters): RunBudgetCounters
@@ -60,9 +78,7 @@ const ACTIVE_RUNTIME_MS = 240_000
 const MAX_PROVIDER_TIMEOUT_MS = 120_000
 const MAX_MODEL_TURNS = 6
 const MAX_TOOL_CALLS = 8
-const MAX_ESTIMATED_TOKENS = (
-  MODEL_TURN_CAPACITY_LIMITS.contextWindowTokens * MAX_MODEL_TURNS
-) as 196_608
+const MAX_ESTIMATED_TOKENS = 196_608
 const MAX_PROGRESS_EVENTS = 5
 const MAX_PROVIDER_RETRIES = 1
 const MAX_RECOVERY_ATTEMPTS = 1
@@ -108,13 +124,10 @@ function assertPositiveInteger (value: number, field: string): void {
 }
 
 function freezeCompatibleLimits (limits: RunBudgetLimits): RunBudgetLimits {
-  if (limits.activeRuntimeMs !== ACTIVE_RUNTIME_MS ||
+  if (limits.schemaVersion !== 2 || limits.activeRuntimeMs !== ACTIVE_RUNTIME_MS ||
     !Number.isSafeInteger(limits.providerTimeoutMs) || limits.providerTimeoutMs <= 0 ||
     limits.providerTimeoutMs > MAX_PROVIDER_TIMEOUT_MS ||
-    limits.maxModelTurns !== MAX_MODEL_TURNS ||
     limits.maxToolCalls !== MAX_TOOL_CALLS ||
-    (limits.maxEstimatedTokens !== 49_152 &&
-      limits.maxEstimatedTokens !== MAX_ESTIMATED_TOKENS) ||
     limits.maxProgressEvents !== MAX_PROGRESS_EVENTS ||
     limits.maxProviderRetries !== MAX_PROVIDER_RETRIES ||
     limits.maxRecoveryAttempts !== MAX_RECOVERY_ATTEMPTS ||
@@ -125,11 +138,10 @@ function freezeCompatibleLimits (limits: RunBudgetLimits): RunBudgetLimits {
 }
 
 function sameLimits (left: RunBudgetLimits, right: RunBudgetLimits): boolean {
-  return left.activeRuntimeMs === right.activeRuntimeMs &&
+  return left.schemaVersion === right.schemaVersion &&
+    left.activeRuntimeMs === right.activeRuntimeMs &&
     left.providerTimeoutMs === right.providerTimeoutMs &&
-    left.maxModelTurns === right.maxModelTurns &&
     left.maxToolCalls === right.maxToolCalls &&
-    left.maxEstimatedTokens === right.maxEstimatedTokens &&
     left.maxProgressEvents === right.maxProgressEvents &&
     left.maxProviderRetries === right.maxProviderRetries &&
     left.maxRecoveryAttempts === right.maxRecoveryAttempts &&
@@ -159,19 +171,24 @@ function budgetExceeded (
 
 class DefaultRunBudget implements RunBudget {
   readonly limits: RunBudgetLimits
+  readonly loopPolicy: RunModelLoopPolicyV1
   readonly initialCounters = INITIAL_COUNTERS
   readonly #outputTokens: number
 
-  constructor (input: DefaultRunBudgetInput, limits?: RunBudgetLimits) {
+  constructor (
+    input: DefaultRunBudgetInput,
+    limits?: RunBudgetLimits,
+    loopPolicy: RunModelLoopPolicyV1 = ADAPTIVE_CONTEXT_LOOP_POLICY
+  ) {
     assertPositiveInteger(input.providerTimeoutMs, 'provider timeout')
     assertPositiveInteger(input.outputTokens, 'output token limit')
     this.#outputTokens = Math.min(input.outputTokens, MAX_ESTIMATED_TOKENS)
+    this.loopPolicy = parseRunModelLoopPolicyV1(loopPolicy)
     this.limits = limits === undefined ? Object.freeze({
+      schemaVersion: 2 as const,
       activeRuntimeMs: ACTIVE_RUNTIME_MS,
       providerTimeoutMs: Math.min(input.providerTimeoutMs, MAX_PROVIDER_TIMEOUT_MS),
-      maxModelTurns: MAX_MODEL_TURNS,
       maxToolCalls: MAX_TOOL_CALLS,
-      maxEstimatedTokens: MAX_ESTIMATED_TOKENS,
       maxProgressEvents: MAX_PROGRESS_EVENTS,
       maxProviderRetries: MAX_PROVIDER_RETRIES,
       maxRecoveryAttempts: MAX_RECOVERY_ATTEMPTS,
@@ -179,13 +196,18 @@ class DefaultRunBudget implements RunBudget {
     }) : freezeCompatibleLimits(limits)
   }
 
-  withLimits (limits: RunBudgetLimits): RunBudget {
+  withLimits (
+    limits: RunBudgetLimits,
+    loopPolicy: RunModelLoopPolicyV1 = this.loopPolicy
+  ): RunBudget {
     const compatible = freezeCompatibleLimits(limits)
-    if (sameLimits(this.limits, compatible)) return this
+    const policy = parseRunModelLoopPolicyV1(loopPolicy)
+    if (sameLimits(this.limits, compatible) &&
+      JSON.stringify(this.loopPolicy) === JSON.stringify(policy)) return this
     return new DefaultRunBudget({
       providerTimeoutMs: compatible.providerTimeoutMs,
       outputTokens: this.#outputTokens
-    }, compatible)
+    }, compatible, policy)
   }
 
   reserveModelTurn (
@@ -196,20 +218,32 @@ class DefaultRunBudget implements RunBudget {
     if (input.maxOutputTokens !== undefined) {
       assertPositiveInteger(input.maxOutputTokens, 'model output tokens')
     }
-    const maxNormalTurns = this.limits.maxModelTurns - this.limits.maxCorrectionTurns
+    if (!Number.isSafeInteger(counters.modelTurns) || counters.modelTurns < 0 ||
+      counters.modelTurns === Number.MAX_SAFE_INTEGER ||
+      !Number.isSafeInteger(counters.estimatedTokens) || counters.estimatedTokens < 0) {
+      throw budgetExceeded('model_turns', counters.modelTurns, 1)
+    }
+    const fixed = this.loopPolicy.kind === 'legacy_fixed' ? this.loopPolicy : null
+    const maxNormalTurns = fixed === null
+      ? Number.MAX_SAFE_INTEGER
+      : fixed.maxModelTurns - this.limits.maxCorrectionTurns
     if (input.kind === 'normal' && counters.modelTurns >= maxNormalTurns) {
       throw budgetExceeded('model_turns', counters.modelTurns, 1)
     }
     if (input.kind === 'correction' && counters.correctionTurns < 1) {
       throw new TypeError('correction turn must be reserved before the model turn')
     }
-    if (counters.modelTurns >= this.limits.maxModelTurns) {
+    if (fixed !== null && counters.modelTurns >= fixed.maxModelTurns) {
       throw budgetExceeded('model_turns', counters.modelTurns, 1)
     }
 
     const outputTokens = input.maxOutputTokens ?? this.#outputTokens
+    if (input.estimatedInputTokens > Number.MAX_SAFE_INTEGER - outputTokens) {
+      throw budgetExceeded('estimated_tokens', counters.estimatedTokens, input.estimatedInputTokens)
+    }
     const tokenReservation = input.estimatedInputTokens + outputTokens
-    if (counters.estimatedTokens + tokenReservation > this.limits.maxEstimatedTokens) {
+    if (tokenReservation > Number.MAX_SAFE_INTEGER - counters.estimatedTokens ||
+      (fixed !== null && counters.estimatedTokens + tokenReservation > fixed.maxEstimatedTokens)) {
       throw budgetExceeded('estimated_tokens', counters.estimatedTokens, tokenReservation)
     }
     return freezeCounters(counters, {
@@ -269,7 +303,9 @@ class DefaultRunBudget implements RunBudget {
     if (counters.usedActiveRuntimeMs + activeRuntimeMs > this.limits.activeRuntimeMs) {
       throw budgetExceeded('active_runtime_ms', counters.usedActiveRuntimeMs, activeRuntimeMs)
     }
-    if (counters.estimatedTokens + estimatedTokens > this.limits.maxEstimatedTokens) {
+    if (estimatedTokens > Number.MAX_SAFE_INTEGER - counters.estimatedTokens ||
+      (this.loopPolicy.kind === 'legacy_fixed' &&
+        counters.estimatedTokens + estimatedTokens > this.loopPolicy.maxEstimatedTokens)) {
       throw budgetExceeded('estimated_tokens', counters.estimatedTokens, estimatedTokens)
     }
     if (counters.progressEvents + progressEvents > this.limits.maxProgressEvents) {
@@ -308,4 +344,22 @@ class DefaultRunBudget implements RunBudget {
 
 export function createDefaultRunBudget (input: DefaultRunBudgetInput): RunBudget {
   return new DefaultRunBudget(input)
+}
+
+export function createLegacyRunBudgetLimits (
+  limits: RunBudgetLimits,
+  maxEstimatedTokens: 49_152 | 196_608 = 196_608
+): LegacyRunBudgetLimitsV1 {
+  const parsed = freezeCompatibleLimits(limits)
+  return Object.freeze({
+    activeRuntimeMs: parsed.activeRuntimeMs,
+    providerTimeoutMs: parsed.providerTimeoutMs,
+    maxModelTurns: 6,
+    maxToolCalls: parsed.maxToolCalls,
+    maxEstimatedTokens,
+    maxProgressEvents: parsed.maxProgressEvents,
+    maxProviderRetries: parsed.maxProviderRetries,
+    maxRecoveryAttempts: parsed.maxRecoveryAttempts,
+    maxCorrectionTurns: parsed.maxCorrectionTurns
+  })
 }

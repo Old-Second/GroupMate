@@ -7,7 +7,10 @@ import type { RunAdvanceResult } from '../../src/agent/contracts/result.js'
 import { ModelProviderError, type ModelAdapter, type ModelRequest, type ModelTurn } from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { RunAdmission } from '../../src/agent/run/run-admission.js'
-import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import {
+  createDefaultRunBudget,
+  createLegacyRunBudgetLimits
+} from '../../src/agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
@@ -25,7 +28,11 @@ import {
 import { createRunEvent } from '../../src/agent/run/run-events.js'
 import { recordRunUsage } from '../../src/agent/run/run-usage.js'
 import { createFrozenObservationPolicy } from '../../src/agent/run/run-observation.js'
-import { RedisRunStore, redisRunKeys } from '../../src/agent/run/redis-run-store.js'
+import {
+  RedisRunStore,
+  RUN_STORE_MIGRATION_LUA_MARKER,
+  redisRunKeys
+} from '../../src/agent/run/redis-run-store.js'
 import {
   RunReferenceConflictError,
   RunStoreConflictError,
@@ -76,6 +83,7 @@ const preparation: ToolPreparationContext = Object.freeze({
   now: timestamp
 })
 const budget = createDefaultRunBudget({ providerTimeoutMs: 120_000, outputTokens: 256 })
+const legacyBudgetLimits = createLegacyRunBudgetLimits(budget.limits)
 const emptyManifestFingerprint = createHash('sha256').update('[]').digest('hex')
 
 function runEvent (runId: string, sequence: number, type: 'run.created' | 'run.started' | 'model.started' | 'model.completed' | 'tool.batch_planned' | 'tool.requested' | 'tool.started'): ReturnType<typeof createRunEvent> {
@@ -168,9 +176,16 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
+  return Object.freeze({
+    ...state, schemaVersion: 1, budgetLimits: legacyBudgetLimits, visibleOutput: false
+  })
 }
 
 function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
@@ -180,9 +195,14 @@ function checkpointV2 (source: RunCheckpoint): RunCheckpointV2 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 2 })
+  return Object.freeze({ ...state, schemaVersion: 2, budgetLimits: legacyBudgetLimits })
 }
 
 function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
@@ -191,9 +211,14 @@ function checkpointV3 (source: RunCheckpoint): RunCheckpointV3 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits: _budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 3 })
+  return Object.freeze({ ...state, schemaVersion: 3, budgetLimits: legacyBudgetLimits })
 }
 
 test('InMemoryRunStore rejects a stale v3 upgrade without rewriting the checkpoint', async () => {
@@ -209,6 +234,11 @@ test('InMemoryRunStore rejects a stale v3 upgrade without rewriting the checkpoi
     store.upgrade(stale, upgradeRunCheckpointV3(source)),
     RunStoreConflictError
   )
+  await assert.rejects(store.upgrade(source, Object.freeze({
+    ...upgradeRunCheckpointV3(source),
+    messages: Object.freeze([{ role: 'user' as const, content: 'tampered' }])
+  })), RunStoreConflictError)
+  assert.deepEqual(await store.load(source.runId), source)
   assert.deepEqual(await store.load(source.runId), source)
 })
 
@@ -533,7 +563,7 @@ test('RunEngine upgrades v2 without allocating or changing its request reference
 
   const upgraded = await engine.loadCheckpoint(source.runId)
 
-  assert.equal(upgraded?.schemaVersion, 4)
+  assert.equal(upgraded?.schemaVersion, 5)
   assert.equal(upgraded?.runRef, source.runRef)
   assert.equal(upgraded?.requestRef, source.requestRef)
   assert.deepEqual(upgraded?.reasoningSegments, [])
@@ -564,8 +594,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
     ),
     executePrepared: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 4)
-      if (checkpoint?.schemaVersion !== 4) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 5)
+      if (checkpoint?.schemaVersion !== 5) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       toolObservedUpgrade = true
@@ -575,8 +605,8 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
   const adapter: ModelAdapter = Object.freeze({
     complete: async () => {
       const checkpoint = await store.load(source.runId)
-      assert.equal(checkpoint?.schemaVersion, 4)
-      if (checkpoint?.schemaVersion !== 4) throw new TypeError('v1 was not upgraded')
+      assert.equal(checkpoint?.schemaVersion, 5)
+      if (checkpoint?.schemaVersion !== 5) throw new TypeError('v1 was not upgraded')
       assert.equal(checkpoint.runRef, upgradedRunRef)
       assert.equal(checkpoint.requestRef, upgradedRequestRef)
       providerObservedUpgrade = true
@@ -608,7 +638,7 @@ test('RunEngine upgrades v1 before any recovered tool or Provider action', async
   assert.equal(providerObservedUpgrade, true)
   assert.equal(runRefAllocations, 1)
   assert.equal(requestRefAllocations, 1)
-  assert.equal(redis.evalCalls.some(call => call.operation === 'upgrade'), true)
+  assert.equal(redis.evalCalls.some(call => call.marker === RUN_STORE_MIGRATION_LUA_MARKER), true)
 })
 
 test('RunEngine lets a v1 runRef upgrade conflict escape before recovery actions', async () => {
@@ -883,7 +913,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   )
   assert.equal(paused.kind, 'paused')
   const waiting = await store.load(source.runId)
-  if (waiting?.schemaVersion !== 4 || waiting.status !== 'waiting_approval') {
+  if (waiting?.schemaVersion !== 5 || waiting.status !== 'waiting_approval') {
     throw new TypeError('waiting approval fixture is missing')
   }
   assert.equal(waiting.engineActivity.state, 'idle')
@@ -911,7 +941,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
 
   const recoveredResult = await recoveryEngine.resume(source.runId)
   const recovered = await store.load(source.runId)
-  assert.deepEqual(recovered?.schemaVersion === 4 ? {
+  assert.deepEqual(recovered?.schemaVersion === 5 ? {
     resultKind: recoveredResult.kind,
     revision: recovered.revision,
     providerDispatch: recovered.providerDispatch.state,
@@ -930,7 +960,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
     })
   })
 
-  if (recovered?.schemaVersion !== 4) {
+  if (recovered?.schemaVersion !== 5) {
     throw new TypeError('recovered waiting checkpoint is missing')
   }
   const idleRevision = recovered.revision
@@ -939,7 +969,7 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   assert.equal(idleResult.kind, 'paused')
   assert.equal(stillIdle?.revision, idleRevision)
   assert.equal(
-    stillIdle?.schemaVersion === 4 ? stillIdle.engineActivity.state : null,
+    stillIdle?.schemaVersion === 5 ? stillIdle.engineActivity.state : null,
     'idle'
   )
   assert.equal(recoveryClockCalls, 0)

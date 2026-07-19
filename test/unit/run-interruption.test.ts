@@ -8,7 +8,10 @@ import type {
   ModelTurn
 } from '../../src/agent/model/model-adapter.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
-import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
+import {
+  createDefaultRunBudget,
+  createLegacyRunBudgetLimits
+} from '../../src/agent/run/run-budget.js'
 import type {
   RunCheckpoint,
   RunCheckpointV1
@@ -432,9 +435,19 @@ function legacyCheckpoint (source: RunCheckpoint): RunCheckpointV1 {
     modelCapability: _modelCapability,
     modelPrice: _modelPrice,
     usage: _usage,
+    budgetLimits,
+    modelLoopPolicy: _modelLoopPolicy,
+    contextPlan: _contextPlan,
+    contextArtifactRefs: _contextArtifactRefs,
+    toolWireSnapshot: _toolWireSnapshot,
     ...state
   } = source
-  return Object.freeze({ ...state, schemaVersion: 1, visibleOutput: false })
+  return Object.freeze({
+    ...state,
+    schemaVersion: 1,
+    budgetLimits: createLegacyRunBudgetLimits(budgetLimits),
+    visibleOutput: false
+  })
 }
 
 async function displayCurrent (
@@ -462,8 +475,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const undisplayed = await source.store.load(paused.runId)
-  assert.equal(undisplayed?.schemaVersion, 4)
-  if (undisplayed?.schemaVersion !== 4) throw new TypeError('approval checkpoint is missing')
+  assert.equal(undisplayed?.schemaVersion, 5)
+  if (undisplayed?.schemaVersion !== 5) throw new TypeError('approval checkpoint is missing')
   await displayCurrent(
     source,
     paused.interruption,
@@ -471,8 +484,8 @@ test('RunEngine upgrades waiting-approval v1 before display, decide and cancel',
     '2026-07-14T00:00:01.000Z'
   )
   const displayed = await source.store.load(paused.runId)
-  assert.equal(displayed?.schemaVersion, 4)
-  if (displayed?.schemaVersion !== 4) throw new TypeError('displayed checkpoint is missing')
+  assert.equal(displayed?.schemaVersion, 5)
+  if (displayed?.schemaVersion !== 5) throw new TypeError('displayed checkpoint is missing')
 
   const recovered = (
     legacy: RunCheckpointV1,
@@ -602,8 +615,8 @@ test('RunEngine restores approval reasoning from a V4 checkpoint without duplica
   assert.equal(paused.kind, 'paused')
   if (paused.kind !== 'paused') return
   const stored = await store.load(paused.runId)
-  assert.equal(stored?.schemaVersion, 4)
-  if (stored?.schemaVersion !== 4) throw new TypeError('V4 approval checkpoint is missing')
+  assert.equal(stored?.schemaVersion, 5)
+  if (stored?.schemaVersion !== 5) throw new TypeError('V5 approval checkpoint is missing')
   assert.deepEqual(stored.reasoningSegments.map(item => item.text), [
     '审批前思考'
   ])

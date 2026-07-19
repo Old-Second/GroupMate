@@ -15,6 +15,7 @@ import {
   terminalObservationId
 } from '../../src/agent/run/run-observation.js'
 import { assertRunTransition } from '../../src/agent/run/run-state.js'
+import { legacyFixedLoopPolicy } from '../../src/agent/run/run-loop-policy.js'
 
 const timestamp = '2026-07-14T00:00:00.000Z'
 
@@ -116,25 +117,26 @@ test('freezes the production-adjusted balanced run budget', () => {
   })
 
   assert.deepEqual(budget.limits, {
+    schemaVersion: 2,
     activeRuntimeMs: 240_000,
     providerTimeoutMs: 120_000,
-    maxModelTurns: 6,
     maxToolCalls: 8,
-    maxEstimatedTokens: 196_608,
     maxProgressEvents: 5,
     maxProviderRetries: 1,
     maxRecoveryAttempts: 1,
     maxCorrectionTurns: 1
   })
+  assert.deepEqual(budget.loopPolicy, { schemaVersion: 1, kind: 'adaptive_context' })
   assert.equal(Object.isFrozen(budget.limits), true)
   assert.equal(Object.isFrozen(budget.initialCounters), true)
 })
 
 test('does not exhaust cumulative tokens before six full-context model turns', () => {
-  const budget = createDefaultRunBudget({
+  const base = createDefaultRunBudget({
     providerTimeoutMs: 120_000,
     outputTokens: 4_096
   })
+  const budget = base.withLimits(base.limits, legacyFixedLoopPolicy(196_608))
   let counters = budget.initialCounters
 
   for (let index = 0; index < 5; index += 1) {
@@ -162,10 +164,11 @@ test('does not exhaust cumulative tokens before six full-context model turns', (
 })
 
 test('allows the production multi-stage token sequence to enter final summary', () => {
-  const budget = createDefaultRunBudget({
+  const base = createDefaultRunBudget({
     providerTimeoutMs: 120_000,
     outputTokens: 4_096
   })
+  const budget = base.withLimits(base.limits, legacyFixedLoopPolicy(196_608))
   let counters = budget.initialCounters
   for (let index = 0; index < 3; index += 1) {
     counters = budget.reserveModelTurn(counters, {
@@ -185,10 +188,11 @@ test('allows the production multi-stage token sequence to enter final summary', 
 })
 
 test('reserves run budget without mutating earlier counter snapshots', () => {
-  const budget = createDefaultRunBudget({
+  const base = createDefaultRunBudget({
     providerTimeoutMs: 120_000,
     outputTokens: 4_096
   })
+  const budget = base.withLimits(base.limits, legacyFixedLoopPolicy(196_608))
   const initial = budget.initialCounters
   let counters = initial
 

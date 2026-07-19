@@ -32,7 +32,10 @@ import type {
 import { ModelProviderError, modelProtocolError } from '../model/model-adapter.js'
 import { parseJsonValue, type JsonObject, type JsonValue } from '../model/json-value.js'
 import type { OpenAICompatibleProfile } from '../model/openai-compatible-profile.js'
-import { resolveModelCapabilitySnapshot } from '../model/model-capability.js'
+import {
+  resolveModelCapabilitySnapshot,
+  type ModelCapabilityOverride
+} from '../model/model-capability.js'
 import { canonicalSessionKey } from '../session/conversation-scope.js'
 import type { ToolExecutionContext, ToolPreparationContext } from '../tools/tool-context.js'
 import type { ToolCall } from '../tools/tool-call.js'
@@ -58,7 +61,10 @@ import {
   type RunBudget,
   type RunBudgetCounters
 } from './run-budget.js'
-import { availableModelOutputTokens } from './model-turn-capacity.js'
+import {
+  availableModelOutputTokens,
+  createToolWireSnapshotV1
+} from './model-turn-capacity.js'
 import {
   createInitialRunCheckpoint,
   nextRunCheckpoint,
@@ -79,7 +85,8 @@ import {
 import {
   upgradeRunCheckpointV1,
   upgradeRunCheckpointV2,
-  upgradeRunCheckpointV3
+  upgradeRunCheckpointV3,
+  upgradeRunCheckpointV4
 } from './run-checkpoint-migration.js'
 import { RUN_RESOURCE_LIMITS } from './run-limits.js'
 import { parseProviderTurnState } from './provider-state.js'
@@ -192,6 +199,7 @@ export interface StartRunInput {
   readonly sessionAddress: SessionAddress
   readonly deadlineAt: string
   readonly model: RunModelConfig
+  readonly modelCapabilityOverride?: ModelCapabilityOverride
   readonly runtime: RunRuntimeBinding
 }
 
@@ -969,7 +977,10 @@ export class RunEngine {
 
   async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
     const loaded = await this.#store.load(runId)
-    if (loaded === null || loaded.schemaVersion === 4) return loaded
+    if (loaded === null || loaded.schemaVersion === 5) return loaded
+    if (isTerminalRunStatus(loaded.status)) {
+      throw new TypeError('terminal active checkpoint cannot be migrated')
+    }
     const upgraded = loaded.schemaVersion === 1
       ? upgradeRunCheckpointV1(loaded, {
           runRef: this.#createRunRef(),
@@ -977,7 +988,9 @@ export class RunEngine {
         })
       : loaded.schemaVersion === 2
         ? upgradeRunCheckpointV2(loaded)
-        : upgradeRunCheckpointV3(loaded)
+        : loaded.schemaVersion === 3
+          ? upgradeRunCheckpointV3(loaded)
+          : upgradeRunCheckpointV4(loaded)
     return await this.#store.upgrade(loaded, upgraded)
   }
 
@@ -1306,6 +1319,9 @@ export class RunEngine {
     const modelCapability = resolveModelCapabilitySnapshot({
       profile: this.#profile,
       model: model.model,
+      ...(input.modelCapabilityOverride === undefined
+        ? {}
+        : { override: input.modelCapabilityOverride }),
       now: snapshotAt
     })
     const modelPrice = modelCapability.priceCatalogVersion === null
@@ -1330,6 +1346,7 @@ export class RunEngine {
         fingerprint: input.runtime.snapshot.fingerprint,
         manifest: input.runtime.snapshot.manifest
       }),
+      toolWireSnapshot: createToolWireSnapshotV1(input.runtime.snapshot.modelTools),
       budgetLimits: this.#budget.limits,
       budgetCounters: this.#budget.initialCounters,
       deadlineAt: input.deadlineAt,
@@ -1780,15 +1797,20 @@ export class RunEngine {
     estimatedInputTokens: number,
     kind: 'normal' | 'correction'
   ): number {
+    this.#assertSnapshot(checkpoint, this.#runtime(checkpoint.runId).snapshot)
     const perTurnCapacity = availableModelOutputTokens({
+      capability: checkpoint.modelCapability,
       estimatedInputTokens,
       requestedOutputTokens: checkpoint.model.maxOutputTokens,
-      toolsEnabled: kind === 'normal'
+      toolSchemaTokens: kind === 'normal'
+        ? checkpoint.toolWireSnapshot?.estimatedTokens ?? 4_096
+        : 0
     })
-    if (checkpoint.budgetLimits.maxEstimatedTokens !== 49_152) {
+    if (checkpoint.modelLoopPolicy.kind !== 'legacy_fixed' ||
+      checkpoint.modelLoopPolicy.maxEstimatedTokens !== 49_152) {
       return perTurnCapacity
     }
-    const legacyRemaining = checkpoint.budgetLimits.maxEstimatedTokens -
+    const legacyRemaining = checkpoint.modelLoopPolicy.maxEstimatedTokens -
       counters.estimatedTokens - estimatedInputTokens
     return Math.min(perTurnCapacity, Math.max(1, legacyRemaining))
   }
@@ -2012,11 +2034,15 @@ export class RunEngine {
                 messages = Object.freeze([...recovered.messages])
                 estimatedInputTokens = recovered.estimatedInputTokens
                 const recoveredCapacity = availableModelOutputTokens({
+                  capability: checkpoint.modelCapability,
                   estimatedInputTokens,
                   requestedOutputTokens: checkpoint.model.maxOutputTokens,
-                  toolsEnabled: reserved.kind === 'normal'
+                  toolSchemaTokens: reserved.kind === 'normal'
+                    ? checkpoint.toolWireSnapshot?.estimatedTokens ?? 4_096
+                    : 0
                 })
-                maxOutputTokens = checkpoint.budgetLimits.maxEstimatedTokens === 49_152
+                maxOutputTokens = checkpoint.modelLoopPolicy.kind === 'legacy_fixed' &&
+                  checkpoint.modelLoopPolicy.maxEstimatedTokens === 49_152
                   ? Math.min(reserved.maxOutputTokens, recoveredCapacity)
                   : recoveredCapacity
                 current = await this.#commit(current, current.status, {
@@ -2627,9 +2653,10 @@ export class RunEngine {
       return failed
     }
 
-    const normalLimit = checkpoint.budgetLimits.maxModelTurns -
-      checkpoint.budgetLimits.maxCorrectionTurns
-    if (!forceCorrection && checkpoint.budgetCounters.modelTurns < normalLimit) {
+    const mayReserveNormal = checkpoint.modelLoopPolicy.kind === 'adaptive_context' ||
+      checkpoint.budgetCounters.modelTurns < checkpoint.modelLoopPolicy.maxModelTurns -
+        checkpoint.budgetLimits.maxCorrectionTurns
+    if (!forceCorrection && mayReserveNormal) {
       const reservationCheckpoint = Object.freeze({
         ...checkpoint,
         messages,
@@ -2723,7 +2750,7 @@ export class RunEngine {
   }
 
   #runBudget (checkpoint: RunCheckpoint): RunBudget {
-    return this.#budget.withLimits(checkpoint.budgetLimits)
+    return this.#budget.withLimits(checkpoint.budgetLimits, checkpoint.modelLoopPolicy)
   }
 
   #recordProviderUsage (
@@ -3268,8 +3295,14 @@ export class RunEngine {
   }
 
   #assertSnapshot (checkpoint: RunCheckpoint, snapshot: ToolSnapshot): void {
+    const toolWireSnapshot = checkpoint.toolWireSnapshot === null
+      ? null
+      : createToolWireSnapshotV1(snapshot.modelTools)
     if (snapshot.id !== checkpoint.toolSnapshot.id ||
-      snapshot.fingerprint !== checkpoint.toolSnapshot.fingerprint) {
+      snapshot.fingerprint !== checkpoint.toolSnapshot.fingerprint ||
+      (checkpoint.toolWireSnapshot !== null &&
+        (toolWireSnapshot?.hash !== checkpoint.toolWireSnapshot.hash ||
+          toolWireSnapshot.estimatedTokens !== checkpoint.toolWireSnapshot.estimatedTokens))) {
       throw new AgentError({
         code: 'checkpoint_invalid',
         stage: 'run.snapshot',

@@ -31,6 +31,7 @@ import {
 } from '../../src/agent/run/run-engine.js'
 import { createRunTerminalSnapshot } from '../../src/agent/run/run-observation.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
+import { createToolWireSnapshotV1 } from '../../src/agent/run/model-turn-capacity.js'
 import type { TraceCandidateV1 } from '../../src/agent/run/run-trace.js'
 import {
   RunReferenceConflictError,
@@ -634,6 +635,7 @@ interface HarnessOptions {
   readonly onCommittedTraceCandidate?: RunEngineOptions['onCommittedTraceCandidate']
   readonly onTraceCandidateProjectionFailure?: RunEngineOptions['onTraceCandidateProjectionFailure']
   readonly contentJournal?: RunContentJournal
+  readonly modelCapabilityOverride?: StartRunInput['modelCapabilityOverride']
 }
 
 function harness (
@@ -703,6 +705,9 @@ function harness (
       model: 'fixture-model', streaming: false, maxOutputTokens,
       reasoning: Object.freeze({ enabled: false })
     }),
+    ...(options.modelCapabilityOverride === undefined
+      ? {}
+      : { modelCapabilityOverride: options.modelCapabilityOverride }),
     runtime: Object.freeze({
       snapshot: snapshot(),
       ...(options.providerRequestMetadata === undefined
@@ -1402,8 +1407,8 @@ test('RunEngine persists Provider dispatch reservation before wire and trusted u
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const reserved = await fixture.store.load('run-1')
-    assert.equal(reserved?.schemaVersion, 4)
-    if (reserved?.schemaVersion !== 4) throw new TypeError('reserved checkpoint is missing')
+    assert.equal(reserved?.schemaVersion, 5)
+    if (reserved?.schemaVersion !== 5) throw new TypeError('reserved checkpoint is missing')
     assert.deepEqual(reserved.modelCapability, FIXTURE_MODEL_CAPABILITY)
     assert.equal(reserved.modelPrice, null)
     assert.deepEqual(reserved.usage, {
@@ -1826,12 +1831,12 @@ test('RunEngine propagates success persistence errors without a stale checkpoint
       error === store.sentinel && (error as Error).message === 'success store sentinel'
     ))
     const reserved = await store.load(fixture.input.runId)
-    assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+    assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
     assert.equal(
-      reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+      reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
       'reserved'
     )
-    assert.deepEqual(reserved?.schemaVersion === 4 ? reserved.usage : null, {
+    assert.deepEqual(reserved?.schemaVersion === 5 ? reserved.usage : null, {
       schemaVersion: 1,
       availability: 'complete',
       inputTokens: 0,
@@ -1865,9 +1870,9 @@ test('RunEngine never treats an abort-named Store failure as run cancellation', 
       (error as Error).message === 'success store abort-named sentinel'
     ))
     const reserved = await store.load(fixture.input.runId)
-    assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+    assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
     assert.equal(
-      reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+      reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
       'reserved'
     )
     assert.equal(await store.loadTombstone(fixture.input.runId), null)
@@ -1887,9 +1892,9 @@ test('RunEngine unwraps semantic-failure Store errors before aborted-controller 
     error === store.sentinel && (error as Error).message === 'success store sentinel'
   ))
   const reserved = await store.load(fixture.input.runId)
-  assert.equal(reserved?.schemaVersion === 4 ? reserved.status : null, 'calling_model')
+  assert.equal(reserved?.schemaVersion === 5 ? reserved.status : null, 'calling_model')
   assert.equal(
-    reserved?.schemaVersion === 4 ? reserved.providerDispatch.state : null,
+    reserved?.schemaVersion === 5 ? reserved.providerDispatch.state : null,
     'reserved'
   )
 })
@@ -2089,8 +2094,8 @@ test('RunEngine permits resend after pre-success-CAS crash without claiming exte
   assert.equal(first.adapter.requests.length, 1)
   const crashed = await store.load(first.input.runId)
   assert.equal(store.crashed, true)
-  assert.equal(crashed?.schemaVersion === 4 ? crashed.providerDispatch.state : null, 'reserved')
-  assert.deepEqual(crashed?.schemaVersion === 4 ? crashed.usage : null, {
+  assert.equal(crashed?.schemaVersion === 5 ? crashed.providerDispatch.state : null, 'reserved')
+  assert.deepEqual(crashed?.schemaVersion === 5 ? crashed.usage : null, {
     schemaVersion: 1,
     availability: 'complete',
     inputTokens: 0,
@@ -2135,9 +2140,9 @@ test('RunEngine persists a tool success transition before return crash and recov
 
   await assert.rejects(first.engine.start(first.input), error => error === store.crash)
   const crashed = await store.load(first.input.runId)
-  assert.equal(crashed?.schemaVersion === 4 ? crashed.status : null, 'evaluating_tools')
-  assert.equal(crashed?.schemaVersion === 4 ? crashed.providerDispatch.state : null, 'idle')
-  assert.deepEqual(crashed?.schemaVersion === 4 ? crashed.usage : null, {
+  assert.equal(crashed?.schemaVersion === 5 ? crashed.status : null, 'evaluating_tools')
+  assert.equal(crashed?.schemaVersion === 5 ? crashed.providerDispatch.state : null, 'idle')
+  assert.deepEqual(crashed?.schemaVersion === 5 ? crashed.usage : null, {
     schemaVersion: 1,
     availability: 'complete',
     inputTokens: 7,
@@ -2175,7 +2180,7 @@ test('RunEngine freezes DeepSeek capability and canonical alias price at creatio
   let fixture: ReturnType<typeof harness>
   fixture = harness([async () => {
     const checkpoint = await fixture.store.load('run-1')
-    if (checkpoint?.schemaVersion !== 4) throw new TypeError('checkpoint is missing')
+    if (checkpoint?.schemaVersion !== 5) throw new TypeError('checkpoint is missing')
     assert.equal(checkpoint.model.model, 'deepseek-reasoner')
     assert.deepEqual(checkpoint.modelCapability, {
       schemaVersion: 1,
@@ -2206,6 +2211,30 @@ test('RunEngine freezes DeepSeek capability and canonical alias price at creatio
     })
   }))
   assert.equal(result.kind, 'completed')
+})
+
+test('RunEngine freezes an explicit unknown-model capability override at start', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([modelText('override complete')], {
+    store,
+    modelCapabilityOverride: Object.freeze({
+      contextWindowTokens: 65_536,
+      maxOutputTokens: 16_384
+    })
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+
+  assert.equal(outputText(result), 'override complete')
+  assert.deepEqual(store.terminalCheckpoint?.modelCapability, {
+    schemaVersion: 1,
+    source: 'user_override',
+    contextWindowTokens: 65_536,
+    maxOutputTokens: 16_384,
+    promptCaching: 'unknown',
+    usageExtensions: [],
+    priceCatalogVersion: null
+  })
 })
 
 test('RunEngine projects completed usage from the terminal checkpoint frozen price', async () => {
@@ -2265,7 +2294,7 @@ test('RunEngine active resume keeps accumulated usage and the original frozen al
     model: Object.freeze({ ...first.input.model, model: 'deepseek-reasoner' })
   })), error => error === store.crash)
   const checkpoint = await store.load(first.input.runId)
-  assert.equal(checkpoint?.schemaVersion === 4
+  assert.equal(checkpoint?.schemaVersion === 5
     ? checkpoint.modelPrice?.catalogVersion
     : null, 'deepseek-cny-2026-07-19')
 
@@ -2422,26 +2451,24 @@ test('RunEngine never exposes companion text from a turn that still contains too
   )
 })
 
-test('RunEngine uses at most five normal turns and one tools-disabled correction', async () => {
-  const turns = Array.from({ length: 5 }, (_, index) => (
+test('RunEngine adaptive context permits a seventh model turn without a fixed loop cutoff', async () => {
+  const turns = Array.from({ length: 7 }, (_, index) => (
     modelTools([toolCall(0, `call-${index}`, 'normalRead')])
   ))
   const fixture = harness([
     ...turns,
-    modelTools([toolCall(0, 'correction-call', 'normalRead')])
+    modelText('第八轮完成')
   ])
 
   const result = await fixture.engine.start(fixture.input)
 
-  assert.equal(result.kind, 'failed')
-  assert.equal(result.kind === 'failed' && result.error.code, 'provider_protocol_error')
-  assert.equal(fixture.adapter.requests.length, 6)
-  assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode), [
-    'auto', 'auto', 'auto', 'auto', 'auto', 'disabled'
-  ])
+  assert.equal(outputText(result), '第八轮完成')
+  assert.equal(fixture.adapter.requests.length, 8)
+  assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode),
+    Array.from({ length: 8 }, () => 'auto'))
   const snapshot = terminalSnapshot(result)
-  assert.equal(snapshot?.counters.modelTurns, 6)
-  assert.equal(snapshot?.counters.correctionTurns, 1)
+  assert.equal(snapshot?.counters.modelTurns, 8)
+  assert.equal(snapshot?.counters.correctionTurns, 0)
 })
 
 test('RunEngine corrects one empty response but keeps refusal distinct', async () => {
@@ -3039,7 +3066,7 @@ test('RunEngine recalculates output capacity after legacy context recovery', asy
   const result = await fixture.engine.start(fixture.input)
 
   assert.equal(outputText(result), '恢复后完成')
-  assert.deepEqual(fixture.adapter.requests.map(request => request.maxOutputTokens), [1, 256])
+  assert.deepEqual(fixture.adapter.requests.map(request => request.maxOutputTokens), [256, 256])
 })
 
 test('RunEngine persists recovered output capacity across a process restart', async () => {
@@ -3141,8 +3168,8 @@ test('RunEngine skips Provider journal attempts when a recovered ordinal is unav
   const crashed = harness([unavailable], { store: crashStore })
   await assert.rejects(crashed.engine.start(crashed.input), SimulatedProcessCrash)
   const loaded = await crashStore.load('run-1')
-  assert.equal(loaded?.schemaVersion, 4)
-  if (loaded?.schemaVersion !== 4) throw new TypeError('recovered checkpoint is missing')
+  assert.equal(loaded?.schemaVersion, 5)
+  if (loaded?.schemaVersion !== 5) throw new TypeError('recovered checkpoint is missing')
 
   const recovered = parseRunCheckpoint({
     ...loaded,
@@ -3192,10 +3219,11 @@ test('RunEngine keeps a recovered run on its frozen legacy token budget', async 
       fingerprint: fixture.input.runtime.snapshot.fingerprint,
       manifest: fixture.input.runtime.snapshot.manifest
     }),
-    budgetLimits: Object.freeze({
-      ...currentBudget.limits,
-      maxEstimatedTokens: 49_152 as const
+    budgetLimits: currentBudget.limits,
+    modelLoopPolicy: Object.freeze({
+      schemaVersion: 1, kind: 'legacy_fixed', maxModelTurns: 6, maxEstimatedTokens: 49_152
     }),
+    toolWireSnapshot: null,
     budgetCounters: Object.freeze({
       ...currentBudget.initialCounters,
       estimatedTokens: 49_152
@@ -3253,10 +3281,11 @@ test('RunEngine clamps a recovered legacy run to its remaining token budget', as
       fingerprint: fixture.input.runtime.snapshot.fingerprint,
       manifest: fixture.input.runtime.snapshot.manifest
     }),
-    budgetLimits: Object.freeze({
-      ...currentBudget.limits,
-      maxEstimatedTokens: 49_152 as const
+    budgetLimits: currentBudget.limits,
+    modelLoopPolicy: Object.freeze({
+      schemaVersion: 1, kind: 'legacy_fixed', maxModelTurns: 6, maxEstimatedTokens: 49_152
     }),
+    toolWireSnapshot: null,
     budgetCounters: Object.freeze({
       ...currentBudget.initialCounters,
       estimatedTokens: 49_000
@@ -3312,6 +3341,7 @@ test('RunEngine enters the fourth Provider call for the production multi-stage t
       fingerprint: fixture.input.runtime.snapshot.fingerprint,
       manifest: fixture.input.runtime.snapshot.manifest
     }),
+    toolWireSnapshot: createToolWireSnapshotV1(fixture.input.runtime.snapshot.modelTools),
     budgetLimits: currentBudget.limits,
     budgetCounters: currentBudget.initialCounters,
     deadlineAt: fixture.input.deadlineAt,
@@ -3371,12 +3401,15 @@ test('RunEngine enters the fourth Provider call for the production multi-stage t
 })
 
 test('RunEngine rejects a normal turn with no context output capacity before Provider', async () => {
+  let estimatedInputTokens = 0
   const fixture = harness([modelText('不应执行')], {
     prepareContext: async () => Object.freeze({
       messages: Object.freeze([{ role: 'user' as const, content: '超长请求' }]),
-      estimatedInputTokens: 27_648
+      estimatedInputTokens
     })
   })
+  estimatedInputTokens = 32_768 - 1_024 -
+    createToolWireSnapshotV1(fixture.input.runtime.snapshot.modelTools).estimatedTokens
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -3387,13 +3420,88 @@ test('RunEngine rejects a normal turn with no context output capacity before Pro
   assert.equal(terminalSnapshot(result)?.counters.modelTurns, 0)
 })
 
+test('RunEngine rejects tool description drift with an unchanged legacy manifest fingerprint', async () => {
+  const store = new InMemoryRunStore()
+  const fixture = harness([modelText('不应执行')], { store })
+  const original = fixture.input.runtime.snapshot
+  const changed = Object.freeze({
+    ...original,
+    modelTools: Object.freeze(original.modelTools.map((tool, index) => index === 0
+      ? Object.freeze({
+          ...tool,
+          function: Object.freeze({
+            ...tool.function,
+            description: `${tool.function.description} changed`
+          })
+        })
+      : tool))
+  })
+  assert.equal(changed.fingerprint, original.fingerprint)
+  const created = createInitialRunCheckpoint({
+    profileId: standardOpenAIProfile.id,
+    profileVersion: standardOpenAIProfile.version,
+    runId: fixture.input.runId,
+    sessionId: fixture.input.sessionId,
+    sessionAddress: fixture.input.sessionAddress,
+    runRef: fixture.input.runRef,
+    requestRef: fixture.input.requestRef,
+    requestKind: fixture.input.requestKind,
+    presentationRoute: fixture.input.presentationRoute,
+    observationPolicy: fixture.input.observationPolicy,
+    model: fixture.input.model,
+    modelCapability: FIXTURE_MODEL_CAPABILITY,
+    modelPrice: null,
+    toolSnapshot: Object.freeze({
+      id: original.id,
+      fingerprint: original.fingerprint,
+      manifest: original.manifest
+    }),
+    toolWireSnapshot: createToolWireSnapshotV1(original.modelTools),
+    budgetLimits: createDefaultRunBudget({
+      providerTimeoutMs: 120_000,
+      outputTokens: 256
+    }).limits,
+    budgetCounters: createDefaultRunBudget({
+      providerTimeoutMs: 120_000,
+      outputTokens: 256
+    }).initialCounters,
+    deadlineAt: fixture.input.deadlineAt,
+    createdAt: timestamp,
+    event: createRunEvent({
+      eventId: 'tool-wire-drift-created',
+      runId: fixture.input.runId,
+      sessionId: fixture.input.sessionId,
+      sequence: 0,
+      occurredAt: timestamp,
+      type: 'run.created',
+      payload: Object.freeze({})
+    })
+  })
+  store.seedLoadedCheckpoint(created)
+
+  const result = await fixture.engine.resume(fixture.input.runId, Object.freeze({
+    ...fixture.input.runtime,
+    snapshot: changed
+  }))
+
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.code, 'checkpoint_invalid')
+  assert.equal(fixture.adapter.requests.length, 0)
+  assert.equal(fixture.tools.preparations, 0)
+  assert.equal(fixture.tools.executions, 0)
+  assert.equal(terminalSnapshot(result)?.counters.modelTurns, 0)
+})
+
 test('RunEngine only reserves tool schema capacity for normal turns', async () => {
+  let estimatedInputTokens = 0
   const fixture = harness([modelText(''), modelText('纠错完成')], {
     prepareContext: async () => Object.freeze({
       messages: Object.freeze([{ role: 'user' as const, content: '接近容量的请求' }]),
-      estimatedInputTokens: 27_647
+      estimatedInputTokens
     })
   })
+  estimatedInputTokens = 32_768 - 1_024 -
+    createToolWireSnapshotV1(fixture.input.runtime.snapshot.modelTools).estimatedTokens - 1
 
   const result = await fixture.engine.start(fixture.input)
 
@@ -3409,15 +3517,18 @@ test('RunEngine only reserves tool schema capacity for normal turns', async () =
 
 test('RunEngine persists completed tool evidence when the next model turn has no capacity', async () => {
   const store = new TerminalCaptureStore()
+  let estimatedInputTokens = 0
   const fixture = harness([
     modelTools([toolCall(0, 'capacity-tool-1', 'normalRead')])
   ], {
     store,
     prepareContext: async () => Object.freeze({
       messages: Object.freeze([{ role: 'user' as const, content: '接近容量的工具请求' }]),
-      estimatedInputTokens: 27_647
+      estimatedInputTokens
     })
   })
+  estimatedInputTokens = 32_768 - 1_024 -
+    createToolWireSnapshotV1(fixture.input.runtime.snapshot.modelTools).estimatedTokens - 1
 
   const result = await fixture.engine.start(fixture.input)
 
