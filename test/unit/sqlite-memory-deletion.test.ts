@@ -1,15 +1,25 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { DatabaseSync } from 'node:sqlite'
+import {
+  createMemoryAccessCapabilityIssuerV1,
+  issueMemoryAccessCapabilityV1
+} from '../../src/agent/memory/memory-access-gate.js'
 import { encodeMemoryTombstoneV1 } from '../../src/agent/memory/memory-codec.js'
-import type { MemoryRevisionV1 } from '../../src/agent/memory/memory-domain.js'
+import type {
+  MemoryRevisionV1,
+  MemoryTombstoneV1
+} from '../../src/agent/memory/memory-domain.js'
+import { createSqliteMemoryOutboxV1 } from '../../src/agent/memory/sqlite-memory-outbox.js'
 import * as sqliteRepository from '../../src/agent/memory/sqlite-memory-repository.js'
 import {
   FIXTURE_IDS,
   FIXTURE_TIMES,
+  deepFreezeFixture,
   memoryRecordFixture,
   memoryRevisionFixture,
-  memoryTombstoneFixture
+  memoryTombstoneFixture,
+  personalMemoryNamespaceFixture
 } from '../helpers/memory-fixture.js'
 import {
   approvedProposalV1,
@@ -45,12 +55,65 @@ type PurgeExpiredTombstonesV1 = (options: {
 
 type CheckpointDeletionV1 = (options: {
   readonly database: DatabaseSync
+  readonly tombstone: MemoryTombstoneV1
 }) => {
   readonly schemaVersion: 1
-  readonly logicalDeletion: 'committed'
+  readonly logicalDeletion: 'committed' | 'unverified'
   readonly payloadDeletion: 'secure_delete_on' | 'unverified'
   readonly walCheckpoint: 'truncated' | 'deferred'
-  readonly derivedCleanup: 'queued'
+  readonly derivedCleanup: 'queued' | 'unverified'
+}
+
+function capabilityAt (now: string) {
+  const namespace = personalMemoryNamespaceFixture()
+  return issueMemoryAccessCapabilityV1(
+    createMemoryAccessCapabilityIssuerV1(() => true),
+    deepFreezeFixture({
+      schemaVersion: 1,
+      botInstanceId: FIXTURE_IDS.botInstanceId,
+      adapter: 'qq',
+      accountId: FIXTURE_IDS.accountId,
+      scene: deepFreezeFixture({
+        kind: 'private',
+        peerUserId: FIXTURE_IDS.subjectUserId
+      })
+    }),
+    [namespace],
+    now
+  )
+}
+
+function atTime<T extends Readonly<Record<string, unknown>>> (request: T, now: string): T {
+  return { ...request, capability: capabilityAt(now) } as unknown as T
+}
+
+async function ackAllOutbox (
+  harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>,
+  now: string
+): Promise<void> {
+  const outbox = createSqliteMemoryOutboxV1({
+    database: harness.store.database,
+    now: () => now
+  })
+  const claimed = await outbox.execute({
+    schemaVersion: 1,
+    operation: 'claim',
+    ownerId: 'barrier-test-worker',
+    limit: 32
+  })
+  if (claimed.status === 'empty') return
+  assert.equal(claimed.status, 'claimed')
+  if (claimed.status !== 'claimed') assert.fail('outbox claim expected')
+  for (const event of claimed.events) {
+    assert.deepEqual(await outbox.execute({
+      schemaVersion: 1,
+      operation: 'ack',
+      ownerId: claimed.ownerId,
+      leaseToken: claimed.leaseToken,
+      eventId: event.eventId,
+      sequence: event.sequence
+    }), { status: 'acked' })
+  }
 }
 
 function forgetRequest (
@@ -183,6 +246,144 @@ test('sqlite memory deletion fails closed on conflicting tombstone reuse', async
   }
 })
 
+test('sqlite memory deletion validates every old revision and approved proposal before forget accounting', async () => {
+  const corruptions = [
+    {
+      name: 'old revision wire',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 2)
+        harness.store.database.prepare(`
+          UPDATE revision_payloads SET revision_wire = 'x' WHERE revision = 1
+        `).run()
+      }
+    },
+    {
+      name: 'old revision bytes',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 2)
+        harness.store.database.prepare(`
+          UPDATE revisions SET revision_wire_bytes = revision_wire_bytes + 1 WHERE revision = 1
+        `).run()
+      }
+    },
+    {
+      name: 'old revision hash',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 2)
+        harness.store.database.prepare(`
+          UPDATE revisions SET revision_hash = ? WHERE revision = 1
+        `).run('f'.repeat(64))
+      }
+    },
+    {
+      name: 'approved proposal wire',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 1)
+        harness.store.database.prepare("UPDATE proposals SET proposal_wire = 'x'").run()
+      }
+    },
+    {
+      name: 'approved proposal bytes',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 1)
+        harness.store.database.prepare(`
+          UPDATE proposals SET proposal_wire_bytes = proposal_wire_bytes + 1
+        `).run()
+      }
+    },
+    {
+      name: 'approved proposal resulting hash',
+      prepare: async (harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>) => {
+        await approvedRecordWithRevisions(harness, 1)
+        harness.store.database.prepare(`
+          UPDATE proposals SET resulting_revision_hash = ?
+        `).run('f'.repeat(64))
+      }
+    }
+  ] as const
+
+  for (const corruption of corruptions) {
+    const harness = createSqliteMemoryRepositoryHarnessV1()
+    try {
+      await corruption.prepare(harness)
+      const before = Object.freeze({
+        proposals: harness.store.database.prepare('SELECT count(*) AS value FROM proposals').get()!.value,
+        revisions: harness.store.database.prepare('SELECT count(*) AS value FROM revisions').get()!.value,
+        outbox: harness.store.database.prepare('SELECT count(*) AS value FROM outbox').get()!.value
+      })
+      const expectedRevision = Number(before.revisions)
+      assert.deepEqual(
+        await harness.repository.execute(forgetRequest(harness, expectedRevision)),
+        { status: 'corrupt', category: 'canonical_data' },
+        corruption.name
+      )
+      assert.deepEqual({
+        proposals: harness.store.database.prepare('SELECT count(*) AS value FROM proposals').get()!.value,
+        revisions: harness.store.database.prepare('SELECT count(*) AS value FROM revisions').get()!.value,
+        outbox: harness.store.database.prepare('SELECT count(*) AS value FROM outbox').get()!.value
+      }, before, corruption.name)
+      assert.equal(harness.store.database.prepare('SELECT count(*) AS value FROM tombstones').get()!.value, 0)
+    } finally {
+      harness.close()
+    }
+  }
+})
+
+test('sqlite memory namespace scrub validates proposal and historical revision bodies before deletion', async () => {
+  const scrub = sqliteRepository.scrubDeletedSqliteMemoryNamespaceV1
+  for (const branch of ['proposal', 'revision'] as const) {
+    const harness = createSqliteMemoryRepositoryHarnessV1()
+    try {
+      if (branch === 'proposal') {
+        await approvedRecordWithRevisions(harness, 1)
+      } else {
+        const initial = memoryRevisionFixture()
+        assert.equal((await harness.repository.execute(recordCreateRequestV1(
+          harness,
+          initial
+        ))).status, 'stored')
+        assert.equal((await harness.repository.execute(recordCorrectRequestV1(
+          harness,
+          correctedRevisionV1(initial)
+        ))).status, 'stored')
+      }
+      assert.equal((await harness.repository.execute(namespaceDeleteRequest(harness))).status, 'stored')
+      if (branch === 'proposal') {
+        harness.store.database.prepare("UPDATE proposals SET proposal_wire = 'x'").run()
+      } else {
+        harness.store.database.prepare(`
+          UPDATE revision_payloads SET revision_wire = 'x'
+          WHERE namespace_generation = 1 AND revision = 1
+        `).run()
+      }
+      const before = Object.freeze({
+        proposals: harness.store.database.prepare(`
+          SELECT count(*) AS value FROM proposals WHERE namespace_generation = 1
+        `).get()!.value,
+        revisions: harness.store.database.prepare(`
+          SELECT count(*) AS value FROM revisions WHERE namespace_generation = 1
+        `).get()!.value
+      })
+      assert.deepEqual(scrub({
+        database: harness.store.database,
+        namespaceRef: harness.namespaceRef,
+        namespaceGeneration: 1,
+        now: () => FIXTURE_TIMES.deletedAt
+      }), { status: 'corrupt', category: 'canonical_data' }, branch)
+      assert.deepEqual({
+        proposals: harness.store.database.prepare(`
+          SELECT count(*) AS value FROM proposals WHERE namespace_generation = 1
+        `).get()!.value,
+        revisions: harness.store.database.prepare(`
+          SELECT count(*) AS value FROM revisions WHERE namespace_generation = 1
+        `).get()!.value
+      }, before, branch)
+    } finally {
+      harness.close()
+    }
+  }
+})
+
 test('sqlite memory deletion advances namespace generation before bounded body scrub', async () => {
   const scrub = (
     sqliteRepository as unknown as {
@@ -311,7 +512,88 @@ test('sqlite memory deletion keeps a 30 day barrier and expires tombstones only 
   }
 })
 
-test('sqlite memory deletion checkpoint reports logical payload WAL and derived states separately', () => {
+test('sqlite memory deletion blocks direct recreation through the active barrier after old events are acked', async () => {
+  let now: string = FIXTURE_TIMES.observedAt
+  const harness = createSqliteMemoryRepositoryHarnessV1(':memory:', () => now)
+  try {
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    now = FIXTURE_TIMES.updatedAt
+    await ackAllOutbox(harness, now)
+
+    now = FIXTURE_TIMES.deletedAt
+    const request = atTime(forgetRequest(harness, 1), now)
+    assert.equal((await harness.repository.execute(request)).status, 'stored')
+    await ackAllOutbox(harness, now)
+    assert.equal((await harness.repository.execute(atTime(request, now))).status, 'unchanged')
+
+    now = new Date(Date.parse(FIXTURE_TIMES.tombstoneExpiresAt) - 1).toISOString()
+    assert.deepEqual(await harness.repository.execute(atTime(
+      recordCreateRequestV1(harness),
+      now
+    )), { status: 'conflict', category: 'idempotency' })
+
+    now = FIXTURE_TIMES.tombstoneExpiresAt
+    assert.deepEqual(await harness.repository.execute(atTime(request, now)), {
+      status: 'conflict',
+      category: 'revision'
+    })
+    assert.equal((await harness.repository.execute(atTime(
+      recordCreateRequestV1(harness),
+      now
+    ))).status, 'stored')
+  } finally {
+    harness.close()
+  }
+})
+
+test('sqlite memory deletion blocks pending proposal approval from reviving an actively forgotten memory', async () => {
+  let now: string = FIXTURE_TIMES.observedAt
+  const harness = createSqliteMemoryRepositoryHarnessV1(':memory:', () => now)
+  try {
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    now = FIXTURE_TIMES.updatedAt
+    await ackAllOutbox(harness, now)
+
+    now = FIXTURE_TIMES.deletedAt
+    assert.equal((await harness.repository.execute(atTime(
+      forgetRequest(harness, 1),
+      now
+    ))).status, 'stored')
+    assert.equal((await harness.repository.execute(atTime(
+      proposalCreateRequestV1(harness),
+      now
+    ))).status, 'stored')
+    assert.deepEqual(await harness.repository.execute(atTime(
+      proposalDecideRequestV1(harness, approvedProposalV1()),
+      now
+    )), { status: 'conflict', category: 'idempotency' })
+    assert.equal(harness.store.database.prepare('SELECT count(*) AS value FROM heads').get()!.value, 0)
+  } finally {
+    harness.close()
+  }
+})
+
+test('sqlite memory namespace deletion replays only while its exact tombstone is active', async () => {
+  let now: string = FIXTURE_TIMES.observedAt
+  const harness = createSqliteMemoryRepositoryHarnessV1(':memory:', () => now)
+  try {
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    now = FIXTURE_TIMES.deletedAt
+    const request = atTime(namespaceDeleteRequest(harness), now)
+    assert.equal((await harness.repository.execute(request)).status, 'stored')
+    assert.equal((await harness.repository.execute(atTime(request, now))).status, 'unchanged')
+
+    now = FIXTURE_TIMES.tombstoneExpiresAt
+    assert.deepEqual(await harness.repository.execute(atTime(request, now)), {
+      status: 'conflict',
+      category: 'generation'
+    })
+  } finally {
+    harness.close()
+  }
+})
+
+test('sqlite memory deletion checkpoint proves exact logical deletion and queued cleanup independently', async () => {
   const checkpoint = (
     sqliteRepository as unknown as {
       readonly checkpointSqliteMemoryDeletionV1?: CheckpointDeletionV1
@@ -322,29 +604,106 @@ test('sqlite memory deletion checkpoint reports logical payload WAL and derived 
 
   const harness = createSqliteMemoryRepositoryHarnessV1()
   try {
-    assert.deepEqual(checkpoint({ database: harness.store.database }), {
+    const request = forgetRequest(harness, 1)
+    assert.deepEqual(checkpoint({
+      database: harness.store.database,
+      tombstone: request.tombstone
+    }), {
+      schemaVersion: 1,
+      logicalDeletion: 'unverified',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'unverified'
+    })
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    assert.equal((await harness.repository.execute(request)).status, 'stored')
+    assert.deepEqual(checkpoint({
+      database: harness.store.database,
+      tombstone: request.tombstone
+    }), {
       schemaVersion: 1,
       logicalDeletion: 'committed',
       payloadDeletion: 'secure_delete_on',
       walCheckpoint: 'truncated',
       derivedCleanup: 'queued'
     })
+
+    const checkpointFailure = {
+      prepare (sql: string) {
+        if (sql === 'PRAGMA wal_checkpoint(TRUNCATE)') {
+          throw new Error('private-checkpoint-failure')
+        }
+        return harness.store.database.prepare(sql)
+      },
+      exec (sql: string) {
+        return harness.store.database.exec(sql)
+      }
+    } as unknown as DatabaseSync
+    assert.deepEqual(checkpoint({
+      database: checkpointFailure,
+      tombstone: request.tombstone
+    }), {
+      schemaVersion: 1,
+      logicalDeletion: 'committed',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'deferred',
+      derivedCleanup: 'queued'
+    })
+
+    harness.store.database.prepare(`
+      DELETE FROM outbox WHERE event_kind = 'record_forgotten'
+    `).run()
+    assert.deepEqual(checkpoint({
+      database: harness.store.database,
+      tombstone: request.tombstone
+    }), {
+      schemaVersion: 1,
+      logicalDeletion: 'committed',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'unverified'
+    })
+    assert.deepEqual(checkpoint({
+      database: harness.store.database,
+      tombstone: memoryTombstoneFixture({ tombstoneId: 'tombstone:wrong-checkpoint' })
+    }), {
+      schemaVersion: 1,
+      logicalDeletion: 'unverified',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'unverified'
+    })
   } finally {
     harness.close()
   }
+})
 
-  const checkpointFailure = {
-    prepare (sql: string) {
-      if (sql === 'PRAGMA secure_delete') return { get: () => ({ secure_delete: 1 }) }
-      throw new Error('private-checkpoint-failure')
-    },
-    exec () {}
-  } as unknown as DatabaseSync
-  assert.deepEqual(checkpoint({ database: checkpointFailure }), {
-    schemaVersion: 1,
-    logicalDeletion: 'committed',
-    payloadDeletion: 'secure_delete_on',
-    walCheckpoint: 'deferred',
-    derivedCleanup: 'queued'
-  })
+test('sqlite memory deletion checkpoint verifies namespace generation and exact tombstone wire', async () => {
+  const checkpoint = sqliteRepository.checkpointSqliteMemoryDeletionV1 as unknown as CheckpointDeletionV1
+  const harness = createSqliteMemoryRepositoryHarnessV1()
+  try {
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    const request = namespaceDeleteRequest(harness)
+    assert.equal((await harness.repository.execute(request)).status, 'stored')
+    assert.deepEqual(checkpoint({ database: harness.store.database, tombstone: request.tombstone }), {
+      schemaVersion: 1,
+      logicalDeletion: 'committed',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'queued'
+    })
+    harness.store.database.prepare(`
+      UPDATE tombstones SET tombstone_wire = 'x'
+      WHERE tombstone_id = ?
+    `).run(request.tombstone.tombstoneId)
+    assert.deepEqual(checkpoint({ database: harness.store.database, tombstone: request.tombstone }), {
+      schemaVersion: 1,
+      logicalDeletion: 'unverified',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'unverified'
+    })
+  } finally {
+    harness.close()
+  }
 })

@@ -415,6 +415,27 @@ test('sqlite memory v1 schema is strict, generation-bound and has no FTS objects
     assert.deepEqual(tablePrimaryKey(memory.database, 'tombstones'), [
       'namespace_ref', 'namespace_generation', 'tombstone_id'
     ])
+    const tombstoneIndexes = memory.database.prepare("PRAGMA index_list('tombstones')").all()
+    assert.ok(tombstoneIndexes.some(row => (
+      JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
+      JSON.stringify([
+        { name: 'namespace_ref', descending: 0 },
+        { name: 'namespace_generation', descending: 0 },
+        { name: 'memory_id', descending: 0 },
+        { name: 'deletion_kind', descending: 0 },
+        { name: 'expires_at_ms', descending: 0 },
+        { name: 'tombstone_id', descending: 0 }
+      ])
+    )), 'tombstones must index the active memory-forget barrier seek')
+    assert.ok(tombstoneIndexes.some(row => (
+      JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
+      JSON.stringify([
+        { name: 'namespace_ref', descending: 0 },
+        { name: 'expires_at_ms', descending: 0 },
+        { name: 'namespace_generation', descending: 0 },
+        { name: 'tombstone_id', descending: 0 }
+      ])
+    )), 'tombstones must index expiry-first purge order')
     assert.deepEqual(tablePrimaryKey(memory.database, 'usage'), [
       'namespace_ref', 'namespace_generation'
     ])
@@ -464,6 +485,41 @@ test('sqlite memory heads persist exact cursor constraints and restart-safe inde
       JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
         JSON.stringify(expectedSeek)
     )), 'heads must have the stable seek index')
+  } finally {
+    memory.close()
+  }
+})
+
+test('sqlite memory tombstone barrier and expiry purge use bounded covering index seeks', () => {
+  const memory = openSqliteMemoryDatabaseV1({ location: ':memory:', now: () => FIXED_NOW })
+  try {
+    const namespaceRef = 'a'.repeat(64)
+    const barrierPlan = memory.database.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tombstone_id, expires_at_ms
+      FROM tombstones
+      WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+        AND deletion_kind = 'memory_forgotten' AND expires_at_ms > ?
+      ORDER BY expires_at_ms ASC, tombstone_id ASC
+      LIMIT 2
+    `).all(namespaceRef, 1, 'memory:plan', 0)
+    assert.ok(barrierPlan.some(row => (
+      String(row.detail).includes('USING COVERING INDEX memory_tombstones_active_memory_v1')
+    )), JSON.stringify(barrierPlan))
+    assert.equal(barrierPlan.some(row => String(row.detail).includes('USE TEMP B-TREE')), false)
+
+    const expiryPlan = memory.database.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT namespace_generation, tombstone_id, tombstone_wire_bytes
+      FROM tombstones
+      WHERE namespace_ref = ? AND expires_at_ms <= ?
+      ORDER BY expires_at_ms ASC, namespace_generation ASC, tombstone_id ASC
+      LIMIT 32
+    `).all(namespaceRef, 0)
+    assert.ok(expiryPlan.some(row => (
+      String(row.detail).includes('USING INDEX memory_tombstones_expiry_v1')
+    )), JSON.stringify(expiryPlan))
+    assert.equal(expiryPlan.some(row => String(row.detail).includes('USE TEMP B-TREE')), false)
   } finally {
     memory.close()
   }

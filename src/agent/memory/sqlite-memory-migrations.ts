@@ -289,10 +289,18 @@ ON heads(namespace_ref ASC, namespace_generation ASC, purge_at_ms ASC, memory_id
   }),
   Object.freeze({
     type: 'index' as const,
+    name: 'memory_tombstones_active_memory_v1',
+    tableName: 'tombstones',
+    sql: `CREATE INDEX memory_tombstones_active_memory_v1
+ON tombstones(namespace_ref ASC, namespace_generation ASC, memory_id ASC,
+  deletion_kind ASC, expires_at_ms ASC, tombstone_id ASC)`
+  }),
+  Object.freeze({
+    type: 'index' as const,
     name: 'memory_tombstones_expiry_v1',
     tableName: 'tombstones',
     sql: `CREATE INDEX memory_tombstones_expiry_v1
-ON tombstones(namespace_ref ASC, namespace_generation ASC, expires_at_ms ASC, tombstone_id ASC)`
+ON tombstones(namespace_ref ASC, expires_at_ms ASC, namespace_generation ASC, tombstone_id ASC)`
   }),
   Object.freeze({
     type: 'index' as const,

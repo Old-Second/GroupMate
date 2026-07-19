@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { DatabaseSync } from 'node:sqlite'
+import {
+  createMemoryAccessCapabilityIssuerV1,
+  issueMemoryAccessCapabilityV1
+} from '../../src/agent/memory/memory-access-gate.js'
 import type { MemoryOutboxPortV1 } from '../../src/agent/memory/memory-outbox.js'
 import * as sqliteOutbox from '../../src/agent/memory/sqlite-memory-outbox.js'
+import { purgeExpiredSqliteMemoryTombstonesV1 } from '../../src/agent/memory/sqlite-memory-repository.js'
 import {
+  FIXTURE_IDS,
   FIXTURE_TIMES,
-  memoryTombstoneFixture
+  deepFreezeFixture,
+  memoryTombstoneFixture,
+  personalMemoryNamespaceFixture
 } from '../helpers/memory-fixture.js'
 import {
   createSqliteMemoryRepositoryHarnessV1,
@@ -31,6 +39,49 @@ function outboxFactory (): CreateSqliteOutboxV1 {
 
 function claim (ownerId: string, limit = 32) {
   return { schemaVersion: 1, operation: 'claim', ownerId, limit } as const
+}
+
+function capabilityAt (now: string) {
+  const namespace = personalMemoryNamespaceFixture()
+  return issueMemoryAccessCapabilityV1(
+    createMemoryAccessCapabilityIssuerV1(() => true),
+    deepFreezeFixture({
+      schemaVersion: 1,
+      botInstanceId: FIXTURE_IDS.botInstanceId,
+      adapter: 'qq',
+      accountId: FIXTURE_IDS.accountId,
+      scene: deepFreezeFixture({
+        kind: 'private',
+        peerUserId: FIXTURE_IDS.subjectUserId
+      })
+    }),
+    [namespace],
+    now
+  )
+}
+
+function atTime<T extends Readonly<Record<string, unknown>>> (request: T, now: string): T {
+  return { ...request, capability: capabilityAt(now) } as unknown as T
+}
+
+function forgetRequest (
+  harness: ReturnType<typeof createSqliteMemoryRepositoryHarnessV1>,
+  now: string,
+  tombstoneId: string = FIXTURE_IDS.tombstoneId
+) {
+  return atTime({
+    schemaVersion: 1,
+    operation: 'record.forget',
+    capability: harness.capability,
+    namespaceRef: harness.namespaceRef,
+    expectedRevision: 1,
+    expectedNamespaceGeneration: 1,
+    tombstone: memoryTombstoneFixture({
+      tombstoneId,
+      deletedAt: now,
+      expiresAt: new Date(Date.parse(now) + 30 * 24 * 60 * 60 * 1_000).toISOString()
+    })
+  }, now)
 }
 
 test('sqlite memory outbox leases ordered events for exactly 60 seconds and validates the strict ack tuple', async () => {
@@ -337,6 +388,128 @@ test('sqlite memory outbox rolls back ack when canonical event bytes cannot prov
     assert.equal(harness.store.database.prepare(`
       SELECT pending_outbox_records AS value FROM global_usage WHERE singleton = 1
     `).get()!.value, 1)
+  } finally {
+    harness.close()
+  }
+})
+
+test('sqlite memory outbox audits bounded global and namespace counters before usage and ack', async () => {
+  const corruptions = [
+    ['global_usage', 'pending_outbox_records', -1],
+    ['global_usage', 'pending_outbox_records', 1],
+    ['global_usage', 'outbox_logical_bytes', -1],
+    ['global_usage', 'outbox_logical_bytes', 1],
+    ['usage', 'pending_outbox_records', -1],
+    ['usage', 'pending_outbox_records', 1],
+    ['usage', 'outbox_logical_bytes', -1],
+    ['usage', 'outbox_logical_bytes', 1]
+  ] as const
+  for (const [table, column, delta] of corruptions) {
+    const harness = createSqliteMemoryRepositoryHarnessV1()
+    let now: string = FIXTURE_TIMES.observedAt
+    try {
+      assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+      now = FIXTURE_TIMES.updatedAt
+      const outbox = outboxFactory()({ database: harness.store.database, now: () => now })
+      const claimed = await outbox.execute(claim('counter-audit-worker', 1))
+      assert.equal(claimed.status, 'claimed')
+      if (claimed.status !== 'claimed') assert.fail('claimed event expected')
+      harness.store.database.prepare(`
+        UPDATE ${table} SET ${column} = ${column} + ?
+        ${table === 'global_usage'
+          ? 'WHERE singleton = 1'
+          : 'WHERE namespace_ref = ? AND namespace_generation = 1'}
+      `).run(...(table === 'global_usage' ? [delta] : [delta, harness.namespaceRef]))
+
+      if (table === 'global_usage') {
+        assert.deepEqual(await outbox.execute({ schemaVersion: 1, operation: 'usage' }), {
+          status: 'corrupt',
+          category: 'canonical_data'
+        }, `${table}.${column}.${delta}.usage`)
+      }
+      assert.deepEqual(await outbox.execute({
+        schemaVersion: 1,
+        operation: 'ack',
+        ownerId: claimed.ownerId,
+        leaseToken: claimed.leaseToken,
+        eventId: claimed.events[0]!.eventId,
+        sequence: claimed.events[0]!.sequence
+      }), { status: 'corrupt', category: 'canonical_data' }, `${table}.${column}.${delta}.ack`)
+      assert.equal(harness.store.database.prepare(`
+        SELECT count(*) AS value FROM outbox WHERE sequence = ?
+      `).get(claimed.events[0]!.sequence)!.value, 1, `${table}.${column}.${delta}.row`)
+    } finally {
+      harness.close()
+    }
+  }
+})
+
+test('sqlite memory outbox event ids distinguish a recreated memory incarnation from a blocked old forget event', async () => {
+  let now: string = FIXTURE_TIMES.observedAt
+  const harness = createSqliteMemoryRepositoryHarnessV1(':memory:', () => now)
+  try {
+    const outbox = outboxFactory()({ database: harness.store.database, now: () => now })
+    assert.equal((await harness.repository.execute(recordCreateRequestV1(harness))).status, 'stored')
+    now = FIXTURE_TIMES.updatedAt
+    const created = await outbox.execute(claim('incarnation-create-worker', 1))
+    assert.equal(created.status, 'claimed')
+    if (created.status !== 'claimed') assert.fail('create event expected')
+    assert.deepEqual(await outbox.execute({
+      schemaVersion: 1,
+      operation: 'ack',
+      ownerId: created.ownerId,
+      leaseToken: created.leaseToken,
+      eventId: created.events[0]!.eventId,
+      sequence: created.events[0]!.sequence
+    }), { status: 'acked' })
+
+    now = FIXTURE_TIMES.deletedAt
+    assert.equal((await harness.repository.execute(forgetRequest(harness, now))).status, 'stored')
+    let firstForgottenEventId = ''
+    for (let attempt = 1; attempt <= 16; attempt += 1) {
+      const forgotten = await outbox.execute(claim('incarnation-retry-worker', 1))
+      assert.equal(forgotten.status, 'claimed')
+      if (forgotten.status !== 'claimed') assert.fail(`forget attempt ${attempt} expected`)
+      firstForgottenEventId = forgotten.events[0]!.eventId
+      assert.deepEqual(await outbox.execute({
+        schemaVersion: 1,
+        operation: 'retry',
+        ownerId: forgotten.ownerId,
+        leaseToken: forgotten.leaseToken,
+        eventId: forgotten.events[0]!.eventId,
+        sequence: forgotten.events[0]!.sequence,
+        retryAt: now,
+        reasonCode: 'downstream_unavailable'
+      }), { status: 'retried' })
+    }
+    assert.deepEqual(await outbox.execute(claim('incarnation-blocked-worker', 1)), {
+      status: 'empty'
+    })
+
+    now = FIXTURE_TIMES.tombstoneExpiresAt
+    assert.deepEqual(purgeExpiredSqliteMemoryTombstonesV1({
+      database: harness.store.database,
+      namespaceRef: harness.namespaceRef,
+      now: () => now
+    }), { status: 'purged', processedTombstones: 1, hasMore: false })
+    assert.equal((await harness.repository.execute(atTime(
+      recordCreateRequestV1(harness),
+      now
+    ))).status, 'stored')
+    assert.equal((await harness.repository.execute(forgetRequest(
+      harness,
+      now,
+      'tombstone:incarnation-2'
+    ))).status, 'stored')
+
+    const forgottenRows = harness.store.database.prepare(`
+      SELECT event_id FROM outbox
+      WHERE event_kind = 'record_forgotten'
+      ORDER BY sequence ASC
+    `).all()
+    assert.equal(forgottenRows.length, 2)
+    assert.equal(forgottenRows[0]!.event_id, firstForgottenEventId)
+    assert.notEqual(forgottenRows[1]!.event_id, firstForgottenEventId)
   } finally {
     harness.close()
   }

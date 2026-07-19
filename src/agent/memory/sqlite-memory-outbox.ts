@@ -10,6 +10,7 @@ import {
   type MemoryOutboxResultV1
 } from './memory-outbox.js'
 import { inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js'
+import { MEMORY_RESOURCE_LIMITS } from './memory-resource-limits.js'
 
 export const SQLITE_MEMORY_OUTBOX_LEASE_DURATION_MS_V1 = 60_000
 export const SQLITE_MEMORY_OUTBOX_MAX_ATTEMPTS_V1 = 16
@@ -274,6 +275,79 @@ function runImmediate (
   }
 }
 
+function runDiagnostic (operation: () => MemoryOutboxResultV1): MemoryOutboxResultV1 {
+  try {
+    return operation()
+  } catch (error) {
+    if (error instanceof CanonicalMemoryOutboxDataErrorV1) {
+      return Object.freeze({ status: 'corrupt' as const, category: 'canonical_data' as const })
+    }
+    return sqliteFailure(error)
+  }
+}
+
+interface BoundedOutboxCountersV1 {
+  readonly records: number
+  readonly logicalBytes: number
+}
+
+function boundedOutboxCounters (
+  database: DatabaseSync,
+  namespace?: { readonly namespaceRef: string; readonly generation: number }
+): BoundedOutboxCountersV1 {
+  const where = namespace === undefined
+    ? ''
+    : 'WHERE namespace_ref = ? AND namespace_generation = ?'
+  const statement = database.prepare(`
+    SELECT COUNT(*) AS records, COALESCE(SUM(logical_bytes), 0) AS logical_bytes
+    FROM (
+      SELECT logical_bytes
+      FROM outbox
+      ${where}
+      ORDER BY sequence ASC
+      LIMIT ${MEMORY_RESOURCE_LIMITS.unackedOutboxRecords + 1}
+    )
+  `)
+  const row = namespace === undefined
+    ? statement.get()
+    : statement.get(namespace.namespaceRef, namespace.generation)
+  const counters = Object.freeze({
+    records: exactInteger(rowValue(row, 'records')),
+    logicalBytes: exactInteger(rowValue(row, 'logical_bytes'))
+  })
+  if (counters.records > MEMORY_RESOURCE_LIMITS.unackedOutboxRecords ||
+    counters.logicalBytes > MEMORY_RESOURCE_LIMITS.unackedOutboxLogicalBytes) {
+    throw new CanonicalMemoryOutboxDataErrorV1()
+  }
+  return counters
+}
+
+function auditOutboxCounters (
+  database: DatabaseSync,
+  namespace?: { readonly namespaceRef: string; readonly generation: number }
+): { readonly global: GlobalUsageStateV1; readonly usage?: UsageStateV1 } {
+  // Ack is destructive and usage is diagnostic, so both pay this bounded audit.
+  // Ordinary enqueue paths continue to maintain exact counters without scanning rows.
+  const global = loadGlobalUsage(database)
+  const globalCounters = boundedOutboxCounters(database)
+  if (global.pendingOutboxRecords !== globalCounters.records ||
+    global.outboxLogicalBytes !== globalCounters.logicalBytes ||
+    global.pendingOutboxRecords > MEMORY_RESOURCE_LIMITS.unackedOutboxRecords ||
+    global.outboxLogicalBytes > MEMORY_RESOURCE_LIMITS.unackedOutboxLogicalBytes) {
+    throw new CanonicalMemoryOutboxDataErrorV1()
+  }
+  if (namespace === undefined) return Object.freeze({ global })
+  const usage = loadUsage(database, namespace.namespaceRef, namespace.generation)
+  const namespaceCounters = boundedOutboxCounters(database, namespace)
+  if (usage.pendingOutboxRecords !== namespaceCounters.records ||
+    usage.outboxLogicalBytes !== namespaceCounters.logicalBytes ||
+    usage.pendingOutboxRecords > MEMORY_RESOURCE_LIMITS.unackedOutboxRecords ||
+    usage.outboxLogicalBytes > MEMORY_RESOURCE_LIMITS.unackedOutboxLogicalBytes) {
+    throw new CanonicalMemoryOutboxDataErrorV1()
+  }
+  return Object.freeze({ global, usage })
+}
+
 function decodeClaimedRow (
   row: Readonly<Record<string, SQLOutputValue>>
 ): ClaimedRowV1 {
@@ -393,8 +467,10 @@ function ackEvent (
   const namespaceRef = exactString(rowValue(row, 'namespace_ref'))
   const generation = positiveInteger(rowValue(row, 'namespace_generation'))
   const logicalBytes = positiveInteger(rowValue(row, 'logical_bytes'))
-  const usage = loadUsage(database, namespaceRef, generation)
-  const global = loadGlobalUsage(database)
+  const audited = auditOutboxCounters(database, { namespaceRef, generation })
+  const usage = audited.usage
+  if (usage === undefined) throw new CanonicalMemoryOutboxDataErrorV1()
+  const global = audited.global
   const nextUsage: UsageStateV1 = Object.freeze({
     ...usage,
     pendingOutboxRecords: usage.pendingOutboxRecords - 1,
@@ -463,7 +539,7 @@ function retryEvent (
 }
 
 function outboxUsage (database: DatabaseSync, nowMs: number): MemoryOutboxResultV1 {
-  const global = loadGlobalUsage(database)
+  const global = auditOutboxCounters(database).global
   const leasedRows = database.prepare(`
     SELECT sequence
     FROM outbox
@@ -501,7 +577,7 @@ function executeAdapter (
     case 'retry':
       return runImmediate(database, () => retryEvent(database, request, nowMs))
     case 'usage':
-      return outboxUsage(database, nowMs)
+      return runDiagnostic(() => outboxUsage(database, nowMs))
   }
 }
 
