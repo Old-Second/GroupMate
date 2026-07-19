@@ -32,6 +32,7 @@ import {
   memoryHotCacheRecordEntryBytesV1
 } from '../../src/agent/memory/redis-memory-hot-cache.js'
 import { MEMORY_RESOURCE_LIMITS } from '../../src/agent/memory/memory-resource-limits.js'
+import { MEMORY_HOT_CACHE_ACCOUNTING_V1 } from '../../src/agent/memory/memory-hot-cache.js'
 
 interface FakeRedisEntry {
   readonly value: string
@@ -151,6 +152,11 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     this.saveMemoryHotState(state)
   }
 
+  replaceMemoryHotRecordWithoutAccountingForTest (field: string, wire: string): void {
+    if (!this.memoryHotRecords.has(field)) throw new TypeError('memory hot record is missing')
+    this.memoryHotRecords.set(field, wire)
+  }
+
   replaceMemoryHotRecordForTest (field: string, wire: string, revision: number): void {
     this.corruptMemoryHotRecordForTest(field, wire)
     this.memoryHotMetadata.set(
@@ -181,6 +187,8 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     readonly wireBytes: number | readonly number[]
     readonly expiresAtMs: number | readonly number[]
     readonly lruMs: number | readonly number[]
+    readonly namespaceRef?: string
+    readonly fields?: readonly string[]
     readonly allowOverLimit?: boolean
   }): void {
     if (!Number.isSafeInteger(input.count) || input.count < 0 || input.count > 2_048) {
@@ -192,7 +200,12 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     this.memoryHotMetadata.clear()
     this.memoryHotScriptVersion = null
     if (!this.initializeMemoryHot()) throw new TypeError('memory hot seed initialization failed')
-    const generationField = `g:${'a'.repeat(64)}`
+    const namespaceRef = input.namespaceRef ?? 'a'.repeat(64)
+    if (!/^[0-9a-f]{64}$/.test(namespaceRef) ||
+      (input.fields !== undefined && input.fields.length !== input.count)) {
+      throw new TypeError('memory hot seed identity is invalid')
+    }
+    const generationField = `g:${namespaceRef}`
     const generationValue = '0000000000000001'
     this.memoryHotMetadata.set(generationField, generationValue)
     const state = {
@@ -211,11 +224,12 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       index: number
     ): number => typeof value === 'number' ? value : value[index] ?? Number.NaN
     for (let index = 0; index < input.count; index += 1) {
-      const field = index.toString(16).padStart(64, '0')
+      const field = input.fields?.[index] ?? index.toString(16).padStart(64, '0')
       const wireLength = selected(input.wireBytes, index)
       const expiry = selected(input.expiresAtMs, index)
       const lru = selected(input.lruMs, index)
-      if (!Number.isSafeInteger(wireLength) || wireLength < 0 ||
+      if (!/^[0-9a-f]{64}$/.test(field) || this.memoryHotRecords.has(field) ||
+        !Number.isSafeInteger(wireLength) || wireLength < 0 ||
         !Number.isSafeInteger(expiry) || !Number.isSafeInteger(lru)) {
         throw new TypeError('memory hot seed entry is invalid')
       }
@@ -621,7 +635,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const validUntilMs = Number(args[7])
       if (field === undefined || generationField === undefined || headField === undefined ||
         generationRaw === undefined || revisionRaw === undefined || wire === undefined ||
-        !/^\d{16}$/.test(generationRaw) || !/^\d{16}$/.test(revisionRaw) ||
+        !this.validMemoryHotPositiveFixed(generationRaw) ||
+        !this.validMemoryHotPositiveFixed(revisionRaw) ||
+        this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes ||
         !Number.isSafeInteger(validUntilMs)) return 'metadata'
       const generation = Number(generationRaw)
       const revision = Number(revisionRaw)
@@ -631,7 +647,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       if (removed < 0) return 'metadata'
       const fenceRaw = this.memoryHotMetadata.get(generationField)
       if (fenceRaw !== undefined) {
-        if (!this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+        if (!this.validMemoryHotPositiveFixed(fenceRaw)) return 'metadata'
         const fence = Number(fenceRaw)
         if (fence > generation) return 'stale'
         if (fence < generation) this.memoryHotMetadata.set(generationField, generationRaw)
@@ -650,13 +666,20 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         }
         if (this.memoryHotTotalBytes(state) + generationBytes >
           MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        const projected = {
+          ...state,
+          generationCount: state.generationCount + 1,
+          dynamicMetadataBytes: state.dynamicMetadataBytes + generationBytes
+        }
+        if (!this.validMemoryHotState(projected)) return 'metadata'
         this.memoryHotMetadata.set(generationField, generationRaw)
-        state.generationCount += 1
-        state.dynamicMetadataBytes += generationBytes
-        this.saveMemoryHotState(state)
+        Object.assign(state, projected)
+        this.saveMemoryHotState(projected)
       }
       const expectedHead = `${revisionRaw}|${field}`
-      const existing = this.memoryHotRecords.get(field)
+      const existingRead = this.boundedMemoryHotWire(field)
+      if (existingRead.status === 'oversize') return 'metadata'
+      const existing = existingRead.status === 'exact' ? existingRead.wire : undefined
       const existingHead = this.memoryHotMetadata.get(headField)
       if (existing !== undefined) {
         if (!this.validMemoryHotHead(existingHead, field) ||
@@ -669,36 +692,36 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
           this.saveMemoryHotState(state)
           return 'unchanged'
         }
-        const projectedRecordBytes = state.recordEntryBytes - this.bytes(existing) + this.bytes(wire)
-        const projectedMetadataBytes = state.dynamicMetadataBytes - this.bytes(existingHead) +
-          this.bytes(expectedHead)
-        let nextRecordBytes = projectedRecordBytes
-        let nextMetadataBytes = projectedMetadataBytes
-        while (this.memoryHotTotalBytes({
+        const projected = {
           ...state,
-          recordEntryBytes: nextRecordBytes,
-          dynamicMetadataBytes: nextMetadataBytes
-        }) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes && removed < 32) {
+          recordEntryBytes: state.recordEntryBytes - this.bytes(existing) + this.bytes(wire),
+          dynamicMetadataBytes: state.dynamicMetadataBytes - this.bytes(existingHead) +
+            this.bytes(expectedHead)
+        }
+        if (!this.validMemoryHotState(projected, true)) return 'metadata'
+        while (this.memoryHotTotalBytes(projected) >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes && removed < 32) {
           const evicted = this.evictOldestMemoryHot(state, field)
           if (evicted < 0) return 'metadata'
           if (evicted === 0) break
           removed += evicted
-          nextRecordBytes = state.recordEntryBytes - this.bytes(existing) + this.bytes(wire)
-          nextMetadataBytes = state.dynamicMetadataBytes - this.bytes(existingHead) +
+          projected.recordCount = state.recordCount
+          projected.recordEntryBytes = state.recordEntryBytes - this.bytes(existing) +
+            this.bytes(wire)
+          projected.expiryIndexBytes = state.expiryIndexBytes
+          projected.lruIndexBytes = state.lruIndexBytes
+          projected.dynamicMetadataBytes = state.dynamicMetadataBytes - this.bytes(existingHead) +
             this.bytes(expectedHead)
+          if (!this.validMemoryHotState(projected, true)) return 'metadata'
         }
-        if (this.memoryHotTotalBytes({
-          ...state,
-          recordEntryBytes: nextRecordBytes,
-          dynamicMetadataBytes: nextMetadataBytes
-        }) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        if (this.memoryHotTotalBytes(projected) >
+          MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
+        if (!this.validMemoryHotState(projected)) return 'metadata'
         this.memoryHotRecords.set(field, wire)
         this.memoryHotMetadata.set(headField, expectedHead)
         this.memoryHotExpires.set(field, currentTime + MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs)
         this.memoryHotLru.set(field, currentTime)
-        state.recordEntryBytes = nextRecordBytes
-        state.dynamicMetadataBytes = nextMetadataBytes
-        this.saveMemoryHotState(state)
+        this.saveMemoryHotState(projected)
         return 'stored'
       }
       if (existingHead !== undefined || this.memoryHotExpires.has(field) ||
@@ -732,6 +755,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         this.memoryHotTotalBytes(projected) > MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) {
         return 'capacity'
       }
+      if (!this.validMemoryHotState(projected)) return 'metadata'
       this.memoryHotRecords.set(field, wire)
       this.memoryHotExpires.set(field, currentTime + MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs)
       this.memoryHotLru.set(field, currentTime)
@@ -767,15 +791,18 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const generationRaw = args[4]
       const deletedRevisionRaw = args[5]
       if (field === undefined || generationField === undefined || headField === undefined ||
-        generationRaw === undefined || deletedRevisionRaw === undefined) return 'metadata'
+        !this.validMemoryHotPositiveFixed(generationRaw) ||
+        !this.validMemoryHotPositiveFixed(deletedRevisionRaw)) return 'metadata'
       const fenceRaw = this.memoryHotMetadata.get(generationField)
-      if (fenceRaw !== undefined && !this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+      if (fenceRaw !== undefined && !this.validMemoryHotPositiveFixed(fenceRaw)) return 'metadata'
       if (fenceRaw !== generationRaw) return 'unchanged'
-      const wire = this.memoryHotRecords.get(field)
-      if (wire === undefined) {
+      const wireRead = this.boundedMemoryHotWire(field)
+      if (wireRead.status === 'oversize') return 'metadata'
+      if (wireRead.status === 'missing') {
         return this.memoryHotMetadata.has(headField) || this.memoryHotExpires.has(field) ||
           this.memoryHotLru.has(field) ? 'metadata' : 'unchanged'
       }
+      const wire = wireRead.wire
       const headValue = this.memoryHotMetadata.get(headField)
       if (!this.validMemoryHotHead(headValue, field)) {
         return 'metadata'
@@ -793,8 +820,11 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       if (generationField === undefined || deletedRaw === undefined || nextRaw === undefined) {
         return 'metadata'
       }
+      if (!this.validMemoryHotPositiveFixed(deletedRaw) ||
+        !this.validMemoryHotPositiveFixed(nextRaw) ||
+        Number(nextRaw) !== Number(deletedRaw) + 1) return 'metadata'
       const fenceRaw = this.memoryHotMetadata.get(generationField)
-      if (fenceRaw !== undefined && !this.validMemoryHotFixed(fenceRaw)) return 'metadata'
+      if (fenceRaw !== undefined && !this.validMemoryHotPositiveFixed(fenceRaw)) return 'metadata'
       if (fenceRaw !== undefined && fenceRaw >= nextRaw) return 'unchanged'
       if (fenceRaw === undefined) {
         if (state.generationCount >= MEMORY_RESOURCE_LIMITS.deploymentNamespaces) return 'capacity'
@@ -810,8 +840,13 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
         }
         if (this.memoryHotTotalBytes(state) + generationBytes >
           MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes) return 'capacity'
-        state.generationCount += 1
-        state.dynamicMetadataBytes += generationBytes
+        const projected = {
+          ...state,
+          generationCount: state.generationCount + 1,
+          dynamicMetadataBytes: state.dynamicMetadataBytes + generationBytes
+        }
+        if (!this.validMemoryHotState(projected)) return 'metadata'
+        Object.assign(state, projected)
       } else if (fenceRaw > deletedRaw) {
         return 'unchanged'
       }
@@ -827,19 +862,23 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const generationRaw = args[4]
       const expectedHead = args[5]
       if (field === undefined || generationField === undefined || headField === undefined ||
-        generationRaw === undefined || expectedHead === undefined) return 'metadata'
+        !this.validMemoryHotPositiveFixed(generationRaw) || expectedHead === undefined) {
+        return 'metadata'
+      }
       const fenceRaw = this.memoryHotMetadata.get(generationField)
       if (fenceRaw === undefined) return 'missing'
-      if (!this.validMemoryHotFixed(fenceRaw) ||
+      if (!this.validMemoryHotPositiveFixed(fenceRaw) ||
         !this.validMemoryHotHead(expectedHead, field)) return 'metadata'
       if (fenceRaw > generationRaw) return 'stale'
       if (fenceRaw < generationRaw) return 'missing'
-      const wire = this.memoryHotRecords.get(field)
-      if (wire === undefined) {
+      const wireRead = this.boundedMemoryHotWire(field)
+      if (wireRead.status === 'oversize') return 'metadata'
+      if (wireRead.status === 'missing') {
         if (this.memoryHotMetadata.has(headField) || this.memoryHotExpires.has(field) ||
           this.memoryHotLru.has(field)) return 'metadata'
         return 'missing'
       }
+      const wire = wireRead.wire
       const headValue = this.memoryHotMetadata.get(headField)
       if (!this.validMemoryHotHead(headValue, field) ||
         !this.memoryHotLru.has(field)) return 'metadata'
@@ -851,11 +890,6 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       if (expiry <= this.now()) {
         return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
           ? 'expired'
-          : 'metadata'
-      }
-      if (this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes) {
-        return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
-          ? 'corrupt'
           : 'metadata'
       }
       return ['candidate', wire]
@@ -870,17 +904,20 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const wire = args[6]
       const validUntilMs = Number(args[7])
       if (field === undefined || generationField === undefined || headField === undefined ||
-        generationRaw === undefined || expectedHead === undefined || wire === undefined) {
+        !this.validMemoryHotPositiveFixed(generationRaw) || expectedHead === undefined ||
+        wire === undefined || this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes) {
         return 'metadata'
       }
       const fenceRaw = this.memoryHotMetadata.get(generationField)
       const headValue = this.memoryHotMetadata.get(headField)
-      if (!this.validMemoryHotFixed(fenceRaw) ||
+      if (!this.validMemoryHotPositiveFixed(fenceRaw) ||
         !this.validMemoryHotHead(headValue, field) ||
         !this.validMemoryHotHead(expectedHead, field)) return 'metadata'
       if (fenceRaw !== generationRaw) return 'stale'
-      if (headValue !== expectedHead ||
-        this.memoryHotRecords.get(field) !== wire) return 'mismatch'
+      if (headValue !== expectedHead) return 'mismatch'
+      const wireRead = this.boundedMemoryHotWire(field)
+      if (wireRead.status === 'oversize') return 'metadata'
+      if (wireRead.status !== 'exact' || wireRead.wire !== wire) return 'mismatch'
       const expiry = this.memoryHotExpires.get(field)
       if (expiry === undefined || !this.memoryHotLru.has(field)) return 'metadata'
       const currentTime = this.now()
@@ -899,7 +936,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       const headField = args[2]
       const wire = args[3]
       if (field === undefined || headField === undefined || wire === undefined) return 'metadata'
-      if (this.memoryHotRecords.get(field) !== wire) return 'unchanged'
+      const wireRead = this.boundedMemoryHotWire(field)
+      if (wireRead.status === 'oversize') return 'metadata'
+      if (wireRead.status !== 'exact' || wireRead.wire !== wire) return 'unchanged'
       const headValue = this.memoryHotMetadata.get(headField)
       if (!this.validMemoryHotHead(headValue, field)) return 'metadata'
       return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
@@ -935,18 +974,36 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     dynamicMetadataBytes: number
   } | null {
     if (this.memoryHotScriptVersion !== MEMORY_HOT_CACHE_SCRIPT_VERSION) return null
-    const value = (field: string): number | null => {
+    const value = (field: string, limit: number): number | null => {
       const raw = this.memoryHotMetadata.get(field)
-      if (raw === undefined || !/^\d{16}$/.test(raw)) return null
+      if (!this.validMemoryHotFixed(raw)) return null
       const parsed = Number(raw)
-      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+      return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= limit ? parsed : null
     }
-    const recordCount = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.recordCount)
-    const generationCount = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.generationCount)
-    const recordEntryBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.recordEntryBytes)
-    const expiryIndexBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.expiryIndexBytes)
-    const lruIndexBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.lruIndexBytes)
-    const dynamicMetadataBytes = value(MEMORY_HOT_CACHE_COUNTER_FIELDS.dynamicMetadataBytes)
+    const recordCount = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.recordCount,
+      MEMORY_RESOURCE_LIMITS.redisHotRecords
+    )
+    const generationCount = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.generationCount,
+      MEMORY_RESOURCE_LIMITS.deploymentNamespaces
+    )
+    const recordEntryBytes = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.recordEntryBytes,
+      MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes
+    )
+    const expiryIndexBytes = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.expiryIndexBytes,
+      MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes
+    )
+    const lruIndexBytes = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.lruIndexBytes,
+      MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes
+    )
+    const dynamicMetadataBytes = value(
+      MEMORY_HOT_CACHE_COUNTER_FIELDS.dynamicMetadataBytes,
+      MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes
+    )
     if (recordCount === null || generationCount === null || recordEntryBytes === null ||
       expiryIndexBytes === null || lruIndexBytes === null || dynamicMetadataBytes === null) {
       return null
@@ -959,13 +1016,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       lruIndexBytes,
       dynamicMetadataBytes
     }
-    if (recordCount > MEMORY_RESOURCE_LIMITS.redisHotRecords ||
-      generationCount > MEMORY_RESOURCE_LIMITS.deploymentNamespaces ||
-      expiryIndexBytes !== recordCount * 80 ||
-      lruIndexBytes !== recordCount * 80 ||
-      dynamicMetadataBytes !== recordCount * 147 + generationCount * 82 ||
-      recordEntryBytes < recordCount * 64 ||
-      recordEntryBytes > recordCount * (64 + MEMORY_RESOURCE_LIMITS.recordWireBytes) ||
+    if (!this.validMemoryHotState(state) ||
       this.memoryHotRecords.size !== recordCount || this.memoryHotExpires.size !== recordCount ||
       this.memoryHotLru.size !== recordCount ||
       this.memoryHotMetadata.size !== 6 + recordCount + generationCount ||
@@ -1019,12 +1070,54 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   private validMemoryHotFixed (value: string | undefined): value is string {
-    return value !== undefined && /^\d{16}$/.test(value)
+    return value !== undefined && /^\d{16}$/.test(value) && value <= '9007199254740991'
+  }
+
+  private validMemoryHotPositiveFixed (value: string | undefined): value is string {
+    return this.validMemoryHotFixed(value) && value !== '0000000000000000'
   }
 
   private validMemoryHotHead (value: string | undefined, field: string): value is string {
-    return value !== undefined && /^[0-9]{16}\|[0-9a-f]{64}$/.test(value) &&
+    return value !== undefined && this.validMemoryHotPositiveFixed(value.slice(0, 16)) &&
+      /^[0-9]{16}\|[0-9a-f]{64}$/.test(value) &&
       value.slice(17) === field
+  }
+
+  private validMemoryHotState (state: {
+    recordCount: number
+    generationCount: number
+    recordEntryBytes: number
+    expiryIndexBytes: number
+    lruIndexBytes: number
+    dynamicMetadataBytes: number
+  }, allowOverLimit = false): boolean {
+    if (Object.values(state).some(value => !Number.isSafeInteger(value) || value < 0) ||
+      state.recordCount > MEMORY_RESOURCE_LIMITS.redisHotRecords ||
+      state.generationCount > MEMORY_RESOURCE_LIMITS.deploymentNamespaces) return false
+    return state.expiryIndexBytes === state.recordCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.indexEntryBytes &&
+      state.lruIndexBytes === state.recordCount *
+        MEMORY_HOT_CACHE_ACCOUNTING_V1.indexEntryBytes &&
+      state.dynamicMetadataBytes === state.recordCount *
+        MEMORY_HOT_CACHE_ACCOUNTING_V1.headMetadataBytes + state.generationCount *
+        MEMORY_HOT_CACHE_ACCOUNTING_V1.generationMetadataBytes &&
+      state.recordEntryBytes >= state.recordCount *
+        MEMORY_HOT_CACHE_ACCOUNTING_V1.recordFieldBytes &&
+      state.recordEntryBytes <= state.recordCount *
+        (MEMORY_HOT_CACHE_ACCOUNTING_V1.recordFieldBytes +
+          MEMORY_RESOURCE_LIMITS.recordWireBytes) &&
+      (allowOverLimit || this.memoryHotTotalBytes(state) <=
+        MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes)
+  }
+
+  private boundedMemoryHotWire (field: string):
+  { readonly status: 'missing' } |
+  { readonly status: 'oversize' } |
+  { readonly status: 'exact'; readonly wire: string } {
+    const wire = this.memoryHotRecords.get(field)
+    if (wire === undefined) return { status: 'missing' }
+    if (this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes) return { status: 'oversize' }
+    return { status: 'exact', wire }
   }
 
   private removeMemoryHotRecord (
@@ -1041,7 +1134,9 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     headField: string,
     headValue: string
   ): boolean {
-    if (this.memoryHotRecords.get(field) !== wire ||
+    if (this.bytes(wire) > MEMORY_RESOURCE_LIMITS.recordWireBytes) return false
+    const wireRead = this.boundedMemoryHotWire(field)
+    if (wireRead.status !== 'exact' || wireRead.wire !== wire ||
       this.memoryHotMetadata.get(headField) !== headValue ||
       !this.memoryHotExpires.has(field) || !this.memoryHotLru.has(field)) return false
     const projected = {
@@ -1053,9 +1148,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       dynamicMetadataBytes: state.dynamicMetadataBytes -
         memoryHotCacheMetadataEntryBytesV1(headField, headValue)
     }
-    if (Object.values(projected).some(value => !Number.isSafeInteger(value) || value < 0)) {
-      return false
-    }
+    if (!this.validMemoryHotState(projected)) return false
     this.memoryHotRecords.delete(field)
     this.memoryHotExpires.delete(field)
     this.memoryHotLru.delete(field)
@@ -1117,11 +1210,11 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     field: string
   ): boolean {
     if (!/^[0-9a-f]{64}$/.test(field)) return false
-    const wire = this.memoryHotRecords.get(field)
+    const wireRead = this.boundedMemoryHotWire(field)
     const headField = memoryHotCacheHeadFieldV1(field)
     const headValue = this.memoryHotMetadata.get(headField)
-    if (wire === undefined || !this.validMemoryHotHead(headValue, field)) return false
-    return this.removeMemoryHotRecord(state, field, wire, headField, headValue)
+    if (wireRead.status !== 'exact' || !this.validMemoryHotHead(headValue, field)) return false
+    return this.removeMemoryHotRecord(state, field, wireRead.wire, headField, headValue)
   }
 
   private evalRunMigration (keys: string[], args: string[]): string {

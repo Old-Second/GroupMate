@@ -93,6 +93,14 @@ export interface MemoryHotCacheAdapterV1 {
   ) => Promise<unknown>
 }
 
+export const MEMORY_HOT_CACHE_ACCOUNTING_V1 = Object.freeze({
+  staticBytes: 357,
+  recordFieldBytes: 64,
+  indexEntryBytes: 80,
+  headMetadataBytes: 147,
+  generationMetadataBytes: 82
+})
+
 const REQUEST_OPERATIONS = [
   'record.get',
   'record.put',
@@ -273,7 +281,20 @@ function parseUsage (value: unknown): MemoryHotCacheUsageV1 {
       MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes
     )
   })
-  if (result.staticBytes === 0 || result.totalLogicalBytes !==
+  if (result.staticBytes !== MEMORY_HOT_CACHE_ACCOUNTING_V1.staticBytes ||
+    result.expiryIndexBytes !== result.recordCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.indexEntryBytes ||
+    result.lruIndexBytes !== result.recordCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.indexEntryBytes ||
+    result.dynamicMetadataBytes !== result.recordCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.headMetadataBytes + result.generationCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.generationMetadataBytes ||
+    result.recordEntryBytes < result.recordCount *
+      MEMORY_HOT_CACHE_ACCOUNTING_V1.recordFieldBytes ||
+    result.recordEntryBytes > result.recordCount *
+      (MEMORY_HOT_CACHE_ACCOUNTING_V1.recordFieldBytes +
+        MEMORY_RESOURCE_LIMITS.recordWireBytes) ||
+    result.totalLogicalBytes !==
     result.recordEntryBytes + result.expiryIndexBytes + result.lruIndexBytes +
       result.dynamicMetadataBytes + result.staticBytes) return invalidMemoryValue()
   return result
@@ -323,8 +344,12 @@ function parseResult (
     return Object.freeze({ status })
   }
   if (status === 'skipped') {
-    if (request.operation !== 'record.put') return invalidMemoryValue()
     const input = inspectMemoryRecord(value, ['status', 'reason'])
+    if (request.operation === 'namespace.invalidate') {
+      if (input.reason !== 'capacity') return invalidMemoryValue()
+      return Object.freeze({ status, reason: 'capacity' as const })
+    }
+    if (request.operation !== 'record.put') return invalidMemoryValue()
     return Object.freeze({
       status,
       reason: enumValue(input.reason, ['capacity', 'expired', 'stale'] as const)

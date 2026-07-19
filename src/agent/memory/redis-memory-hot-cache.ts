@@ -3,6 +3,7 @@ import { types as utilTypes } from 'node:util'
 import { decodeMemoryRecordV1, encodeMemoryRecordV1 } from './memory-codec.js'
 import type { MemoryRecordV1 } from './memory-domain.js'
 import {
+  MEMORY_HOT_CACHE_ACCOUNTING_V1,
   createMemoryHotCachePortV1,
   type MemoryHotCacheHeadV1,
   type MemoryHotCachePortV1,
@@ -115,12 +116,15 @@ export function memoryHotCacheHeadValueV1 (revision: number, recordField: string
   return `${fixedCounter(positiveInteger(revision))}|${recordField}`
 }
 
-export const MEMORY_HOT_CACHE_STATIC_BYTES = Object.freeze(
+const CALCULATED_MEMORY_HOT_CACHE_STATIC_BYTES =
   MEMORY_HOT_CACHE_KEYS.reduce((total, key) => total + utf8Bytes(key), 0) +
   utf8Bytes(MEMORY_HOT_CACHE_SCRIPT_VERSION) +
   Object.values(MEMORY_HOT_CACHE_COUNTER_FIELDS)
     .reduce((total, field) => total + utf8Bytes(field) + 16, 0)
-)
+if (CALCULATED_MEMORY_HOT_CACHE_STATIC_BYTES !== MEMORY_HOT_CACHE_ACCOUNTING_V1.staticBytes) {
+  invalidMemoryValue()
+}
+export const MEMORY_HOT_CACHE_STATIC_BYTES = MEMORY_HOT_CACHE_ACCOUNTING_V1.staticBytes
 
 export function memoryHotCacheRecordEntryBytesV1 (field: string, wire: string): number {
   return utf8Bytes(field) + utf8Bytes(wire)
@@ -148,6 +152,12 @@ local GENERATION_LIMIT = ${MEMORY_RESOURCE_LIMITS.deploymentNamespaces}
 local BYTE_LIMIT = ${MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes}
 local RECORD_WIRE_LIMIT = ${MEMORY_RESOURCE_LIMITS.recordWireBytes}
 local TTL_MS = ${MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs}
+local MAX_SAFE_FIXED = '9007199254740991'
+local ZERO_FIXED = '0000000000000000'
+local RECORD_FIELD_BYTES = ${MEMORY_HOT_CACHE_ACCOUNTING_V1.recordFieldBytes}
+local INDEX_ENTRY_BYTES = ${MEMORY_HOT_CACHE_ACCOUNTING_V1.indexEntryBytes}
+local HEAD_METADATA_BYTES = ${MEMORY_HOT_CACHE_ACCOUNTING_V1.headMetadataBytes}
+local GENERATION_METADATA_BYTES = ${MEMORY_HOT_CACHE_ACCOUNTING_V1.generationMetadataBytes}
 local COUNTER_RECORDS = '${MEMORY_HOT_CACHE_COUNTER_FIELDS.recordCount}'
 local COUNTER_GENERATIONS = '${MEMORY_HOT_CACHE_COUNTER_FIELDS.generationCount}'
 local COUNTER_RECORD_BYTES = '${MEMORY_HOT_CACHE_COUNTER_FIELDS.recordEntryBytes}'
@@ -187,7 +197,12 @@ local function initialize()
 end
 
 local function validFixed(value)
-  return value and string.len(value) == 16 and string.match(value, '^%d+$') ~= nil
+  return value and string.len(value) == 16 and string.match(value, '^%d+$') ~= nil and
+    value <= MAX_SAFE_FIXED
+end
+
+local function validPositiveFixed(value)
+  return validFixed(value) and value ~= ZERO_FIXED
 end
 
 local function validRecordField(field)
@@ -196,42 +211,55 @@ end
 
 local function validHeadValue(value, field)
   return validRecordField(field) and value and string.len(value) == 81 and
-    validFixed(string.sub(value, 1, 16)) and string.sub(value, 17, 17) == '|' and
+    validPositiveFixed(string.sub(value, 1, 16)) and string.sub(value, 17, 17) == '|' and
     string.sub(value, 18) == field
 end
 
-local function readCounter(field)
+local function readCounter(field, limit)
   local raw = redis.call('HGET', metadataKey, field)
   if not validFixed(raw) then return nil end
   local value = tonumber(raw)
-  if not value or value < 0 or value > BYTE_LIMIT then return nil end
+  if not value or value < 0 or value > limit then return nil end
   return value
+end
+
+local function totalBytes(state)
+  return STATIC_BYTES + state.recordBytes + state.expiryBytes + state.lruBytes + state.metadataBytes
+end
+
+local function validState(state, allowOverLimit)
+  if not state or state.records < 0 or state.records > RECORD_LIMIT or
+    state.generations < 0 or state.generations > GENERATION_LIMIT or
+    state.recordBytes < 0 or state.expiryBytes < 0 or state.lruBytes < 0 or
+    state.metadataBytes < 0 or state.records % 1 ~= 0 or state.generations % 1 ~= 0 or
+    state.recordBytes % 1 ~= 0 or state.expiryBytes % 1 ~= 0 or
+    state.lruBytes % 1 ~= 0 or state.metadataBytes % 1 ~= 0 then return false end
+  return state.expiryBytes == state.records * INDEX_ENTRY_BYTES and
+    state.lruBytes == state.records * INDEX_ENTRY_BYTES and
+    state.metadataBytes == state.records * HEAD_METADATA_BYTES +
+      state.generations * GENERATION_METADATA_BYTES and
+    state.recordBytes >= state.records * RECORD_FIELD_BYTES and
+    state.recordBytes <= state.records * (RECORD_FIELD_BYTES + RECORD_WIRE_LIMIT) and
+    (allowOverLimit or totalBytes(state) <= BYTE_LIMIT)
 end
 
 local function readState()
   if redis.call('GET', versionKey) ~= VERSION then return nil end
   local state = {
-    records = readCounter(COUNTER_RECORDS),
-    generations = readCounter(COUNTER_GENERATIONS),
-    recordBytes = readCounter(COUNTER_RECORD_BYTES),
-    expiryBytes = readCounter(COUNTER_EXPIRY_BYTES),
-    lruBytes = readCounter(COUNTER_LRU_BYTES),
-    metadataBytes = readCounter(COUNTER_METADATA_BYTES)
+    records = readCounter(COUNTER_RECORDS, RECORD_LIMIT),
+    generations = readCounter(COUNTER_GENERATIONS, GENERATION_LIMIT),
+    recordBytes = readCounter(COUNTER_RECORD_BYTES, BYTE_LIMIT),
+    expiryBytes = readCounter(COUNTER_EXPIRY_BYTES, BYTE_LIMIT),
+    lruBytes = readCounter(COUNTER_LRU_BYTES, BYTE_LIMIT),
+    metadataBytes = readCounter(COUNTER_METADATA_BYTES, BYTE_LIMIT)
   }
   if not state.records or not state.generations or not state.recordBytes or
-    not state.expiryBytes or not state.lruBytes or not state.metadataBytes then return nil end
-  if state.records > RECORD_LIMIT or state.generations > GENERATION_LIMIT or
-    state.expiryBytes ~= state.records * 80 or
-    state.lruBytes ~= state.records * 80 or
-    state.metadataBytes ~= state.records * 147 + state.generations * 82 or
-    state.recordBytes < state.records * 64 or
-    state.recordBytes > state.records * (64 + RECORD_WIRE_LIMIT) or
+    not state.expiryBytes or not state.lruBytes or not state.metadataBytes or
+    not validState(state) or
     redis.call('HLEN', recordsKey) ~= state.records or
     redis.call('ZCARD', expiresKey) ~= state.records or
     redis.call('ZCARD', lruKey) ~= state.records or
-    redis.call('HLEN', metadataKey) ~= 6 + state.records + state.generations or
-    STATIC_BYTES + state.recordBytes + state.expiryBytes + state.lruBytes +
-      state.metadataBytes > BYTE_LIMIT then return nil end
+    redis.call('HLEN', metadataKey) ~= 6 + state.records + state.generations then return nil end
   return state
 end
 
@@ -245,12 +273,19 @@ local function saveState(state)
     COUNTER_METADATA_BYTES, fixed(state.metadataBytes))
 end
 
-local function totalBytes(state)
-  return STATIC_BYTES + state.recordBytes + state.expiryBytes + state.lruBytes + state.metadataBytes
+local function boundedWire(field)
+  if redis.call('HSTRLEN', recordsKey, field) > RECORD_WIRE_LIMIT then
+    return nil, 'oversize'
+  end
+  local wire = redis.call('HGET', recordsKey, field)
+  if not wire then return nil, 'missing' end
+  return wire, 'exact'
 end
 
 local function removeRecord(state, field, wire, headField, headValue)
-  if redis.call('HGET', recordsKey, field) ~= wire or
+  if string.len(wire) > RECORD_WIRE_LIMIT then return false end
+  local currentWire, wireStatus = boundedWire(field)
+  if wireStatus ~= 'exact' or currentWire ~= wire or
     redis.call('HGET', metadataKey, headField) ~= headValue or
     not redis.call('ZSCORE', expiresKey, field) or
     not redis.call('ZSCORE', lruKey, field) then return false end
@@ -262,8 +297,7 @@ local function removeRecord(state, field, wire, headField, headValue)
     lruBytes = state.lruBytes - string.len(field) - 16,
     metadataBytes = state.metadataBytes - string.len(headField) - string.len(headValue)
   }
-  if projected.records < 0 or projected.recordBytes < 0 or projected.expiryBytes < 0 or
-    projected.lruBytes < 0 or projected.metadataBytes < 0 then return false end
+  if not validState(projected) then return false end
   redis.call('HDEL', recordsKey, field)
   redis.call('ZREM', expiresKey, field)
   redis.call('ZREM', lruKey, field)
@@ -280,10 +314,10 @@ end
 
 local function removeVictim(state, field)
   if not validRecordField(field) then return false end
-  local wire = redis.call('HGET', recordsKey, field)
+  local wire, wireStatus = boundedWire(field)
   local headField = 'h:' .. field
   local headValue = redis.call('HGET', metadataKey, headField)
-  if not wire or not validHeadValue(headValue, field) then
+  if wireStatus ~= 'exact' or not validHeadValue(headValue, field) then
     return false
   end
   return removeRecord(state, field, wire, headField, headValue)
@@ -319,14 +353,16 @@ if operation == 'put' then
   local wire, validUntilMs = ARGV[7], tonumber(ARGV[8])
   local generation, revision = tonumber(generationRaw), tonumber(revisionRaw)
   local currentTime = nowMs()
-  if not generation or not revision or not validUntilMs then return 'metadata' end
+  if not validPositiveFixed(generationRaw) or not validPositiveFixed(revisionRaw) or
+    not generation or not revision or not validUntilMs or
+    string.len(wire) > RECORD_WIRE_LIMIT then return 'metadata' end
   if validUntilMs <= currentTime then return 'expired' end
   local removed = cleanupExpired(state, currentTime, 32)
   if removed < 0 then return 'metadata' end
   local fenceRaw = redis.call('HGET', metadataKey, generationField)
   if fenceRaw then
     local fence = tonumber(fenceRaw)
-    if not fence or not validFixed(fenceRaw) then return 'metadata' end
+    if not fence or not validPositiveFixed(fenceRaw) then return 'metadata' end
     if fence > generation then return 'stale' end
     if fence < generation then
       redis.call('HSET', metadataKey, generationField, generationRaw)
@@ -341,15 +377,25 @@ if operation == 'put' then
       removed = removed + evicted
     end
     if totalBytes(state) + generationBytes > BYTE_LIMIT then return 'capacity' end
+    local projected = {
+      records = state.records,
+      generations = state.generations + 1,
+      recordBytes = state.recordBytes,
+      expiryBytes = state.expiryBytes,
+      lruBytes = state.lruBytes,
+      metadataBytes = state.metadataBytes + generationBytes
+    }
+    if not validState(projected) then return 'metadata' end
     redis.call('HSET', metadataKey, generationField, generationRaw)
-    state.generations = state.generations + 1
-    state.metadataBytes = state.metadataBytes + generationBytes
+    state.generations = projected.generations
+    state.metadataBytes = projected.metadataBytes
     saveState(state)
   end
   local expectedHead = revisionRaw .. '|' .. field
-  local existing = redis.call('HGET', recordsKey, field)
+  local existing, existingStatus = boundedWire(field)
+  if existingStatus == 'oversize' then return 'metadata' end
   local existingHead = redis.call('HGET', metadataKey, headField)
-  if existing then
+  if existingStatus == 'exact' then
     if not validHeadValue(existingHead, field) or
       not redis.call('ZSCORE', expiresKey, field) or
       not redis.call('ZSCORE', lruKey, field) then return 'metadata' end
@@ -362,26 +408,34 @@ if operation == 'put' then
       saveState(state)
       return 'unchanged'
     end
-    local projectedRecordBytes = state.recordBytes - string.len(existing) + string.len(wire)
-    local projectedMetadataBytes = state.metadataBytes - string.len(existingHead) + string.len(expectedHead)
-    while STATIC_BYTES + projectedRecordBytes + state.expiryBytes + state.lruBytes +
-      projectedMetadataBytes > BYTE_LIMIT and removed < 32 do
+    local projected = {
+      records = state.records,
+      generations = state.generations,
+      recordBytes = state.recordBytes - string.len(existing) + string.len(wire),
+      expiryBytes = state.expiryBytes,
+      lruBytes = state.lruBytes,
+      metadataBytes = state.metadataBytes - string.len(existingHead) + string.len(expectedHead)
+    }
+    if not validState(projected, true) then return 'metadata' end
+    while totalBytes(projected) > BYTE_LIMIT and removed < 32 do
       local evicted = evictOldest(state, field)
       if evicted < 0 then return 'metadata' end
       if evicted == 0 then break end
       removed = removed + evicted
-      projectedRecordBytes = state.recordBytes - string.len(existing) + string.len(wire)
-      projectedMetadataBytes = state.metadataBytes - string.len(existingHead) + string.len(expectedHead)
+      projected.recordBytes = state.recordBytes - string.len(existing) + string.len(wire)
+      projected.expiryBytes = state.expiryBytes
+      projected.lruBytes = state.lruBytes
+      projected.metadataBytes = state.metadataBytes - string.len(existingHead) + string.len(expectedHead)
+      projected.records = state.records
+      if not validState(projected, true) then return 'metadata' end
     end
-    if STATIC_BYTES + projectedRecordBytes + state.expiryBytes + state.lruBytes +
-      projectedMetadataBytes > BYTE_LIMIT then return 'capacity' end
+    if totalBytes(projected) > BYTE_LIMIT then return 'capacity' end
+    if not validState(projected) then return 'metadata' end
     redis.call('HSET', recordsKey, field, wire)
     redis.call('HSET', metadataKey, headField, expectedHead)
     redis.call('ZADD', expiresKey, currentTime + TTL_MS, field)
     redis.call('ZADD', lruKey, currentTime, field)
-    state.recordBytes = projectedRecordBytes
-    state.metadataBytes = projectedMetadataBytes
-    saveState(state)
+    saveState(projected)
     return 'stored'
   end
   if existingHead or redis.call('ZSCORE', expiresKey, field) or
@@ -389,28 +443,34 @@ if operation == 'put' then
   local recordBytes = string.len(field) + string.len(wire)
   local indexBytes = string.len(field) + 16
   local headBytes = string.len(headField) + string.len(expectedHead)
-  while (state.records + 1 > RECORD_LIMIT or
-    totalBytes(state) + recordBytes + indexBytes * 2 + headBytes > BYTE_LIMIT) and
-    removed < 32 do
+  local projected = {
+    records = state.records + 1,
+    generations = state.generations,
+    recordBytes = state.recordBytes + recordBytes,
+    expiryBytes = state.expiryBytes + indexBytes,
+    lruBytes = state.lruBytes + indexBytes,
+    metadataBytes = state.metadataBytes + headBytes
+  }
+  while (projected.records > RECORD_LIMIT or totalBytes(projected) > BYTE_LIMIT) and removed < 32 do
     local evicted = evictOldest(state, field)
     if evicted < 0 then return 'metadata' end
     if evicted == 0 then break end
     removed = removed + evicted
+    projected.records = state.records + 1
+    projected.recordBytes = state.recordBytes + recordBytes
+    projected.expiryBytes = state.expiryBytes + indexBytes
+    projected.lruBytes = state.lruBytes + indexBytes
+    projected.metadataBytes = state.metadataBytes + headBytes
   end
-  if state.records + 1 > RECORD_LIMIT or
-    totalBytes(state) + recordBytes + indexBytes * 2 + headBytes > BYTE_LIMIT then
+  if projected.records > RECORD_LIMIT or totalBytes(projected) > BYTE_LIMIT then
     return 'capacity'
   end
+  if not validState(projected) then return 'metadata' end
   redis.call('HSET', recordsKey, field, wire)
   redis.call('ZADD', expiresKey, currentTime + TTL_MS, field)
   redis.call('ZADD', lruKey, currentTime, field)
   redis.call('HSET', metadataKey, headField, expectedHead)
-  state.records = state.records + 1
-  state.recordBytes = state.recordBytes + recordBytes
-  state.expiryBytes = state.expiryBytes + indexBytes
-  state.lruBytes = state.lruBytes + indexBytes
-  state.metadataBytes = state.metadataBytes + headBytes
-  saveState(state)
+  saveState(projected)
   return 'stored'
 end
 
@@ -431,10 +491,12 @@ if operation == 'record_invalidate' then
   local field, generationField, headField = ARGV[2], ARGV[3], ARGV[4]
   local generationRaw, deletedRevisionRaw = ARGV[5], ARGV[6]
   local fenceRaw = redis.call('HGET', metadataKey, generationField)
-  if fenceRaw and not validFixed(fenceRaw) then return 'metadata' end
+  if not validPositiveFixed(generationRaw) or not validPositiveFixed(deletedRevisionRaw) or
+    (fenceRaw and not validPositiveFixed(fenceRaw)) then return 'metadata' end
   if not fenceRaw or fenceRaw ~= generationRaw then return 'unchanged' end
-  local wire = redis.call('HGET', recordsKey, field)
-  if not wire then
+  local wire, wireStatus = boundedWire(field)
+  if wireStatus == 'oversize' then return 'metadata' end
+  if wireStatus == 'missing' then
     if redis.call('HGET', metadataKey, headField) or
       redis.call('ZSCORE', expiresKey, field) or redis.call('ZSCORE', lruKey, field) then
       return 'metadata'
@@ -451,7 +513,9 @@ end
 if operation == 'namespace_invalidate' then
   local generationField, deletedRaw, nextRaw = ARGV[2], ARGV[3], ARGV[4]
   local fenceRaw = redis.call('HGET', metadataKey, generationField)
-  if fenceRaw and not validFixed(fenceRaw) then return 'metadata' end
+  if not validPositiveFixed(deletedRaw) or not validPositiveFixed(nextRaw) or
+    (fenceRaw and not validPositiveFixed(fenceRaw)) then return 'metadata' end
+  if tonumber(nextRaw) ~= tonumber(deletedRaw) + 1 then return 'metadata' end
   if fenceRaw and fenceRaw >= nextRaw then return 'unchanged' end
   if not fenceRaw then
     if state.generations >= GENERATION_LIMIT then return 'capacity' end
@@ -465,8 +529,16 @@ if operation == 'namespace_invalidate' then
       removed = removed + evicted
     end
     if totalBytes(state) + generationBytes > BYTE_LIMIT then return 'capacity' end
-    state.generations = state.generations + 1
-    state.metadataBytes = state.metadataBytes + generationBytes
+    local projected = {
+      records = state.records,
+      generations = state.generations + 1,
+      recordBytes = state.recordBytes,
+      expiryBytes = state.expiryBytes,
+      lruBytes = state.lruBytes,
+      metadataBytes = state.metadataBytes + generationBytes
+    }
+    if not validState(projected) then return 'metadata' end
+    state = projected
   elseif fenceRaw > deletedRaw then
     return 'unchanged'
   end
@@ -480,11 +552,13 @@ if operation == 'peek' then
   local generationRaw, expectedHead = ARGV[5], ARGV[6]
   local fenceRaw = redis.call('HGET', metadataKey, generationField)
   if not fenceRaw then return 'missing' end
-  if not validFixed(fenceRaw) or not validHeadValue(expectedHead, field) then return 'metadata' end
+  if not validPositiveFixed(generationRaw) or not validPositiveFixed(fenceRaw) or
+    not validHeadValue(expectedHead, field) then return 'metadata' end
   if fenceRaw > generationRaw then return 'stale' end
   if fenceRaw < generationRaw then return 'missing' end
-  local wire = redis.call('HGET', recordsKey, field)
-  if not wire then
+  local wire, wireStatus = boundedWire(field)
+  if wireStatus == 'oversize' then return 'metadata' end
+  if wireStatus == 'missing' then
     if redis.call('HGET', metadataKey, headField) or
       redis.call('ZSCORE', expiresKey, field) or redis.call('ZSCORE', lruKey, field) then
       return 'metadata'
@@ -505,10 +579,6 @@ if operation == 'peek' then
     if not removeRecord(state, field, wire, headField, headValue) then return 'metadata' end
     return 'expired'
   end
-  if redis.call('HSTRLEN', recordsKey, field) > RECORD_WIRE_LIMIT then
-    if not removeRecord(state, field, wire, headField, headValue) then return 'metadata' end
-    return 'corrupt'
-  end
   return {'candidate', wire}
 end
 
@@ -518,11 +588,14 @@ if operation == 'confirm_hit' then
   local validUntilMs = tonumber(ARGV[8])
   local fenceRaw = redis.call('HGET', metadataKey, generationField)
   local headValue = redis.call('HGET', metadataKey, headField)
-  if not validFixed(fenceRaw) or not validHeadValue(headValue, field) or
+  if not validPositiveFixed(generationRaw) or not validPositiveFixed(fenceRaw) or
+    not validHeadValue(headValue, field) or string.len(wire) > RECORD_WIRE_LIMIT or
     not validHeadValue(expectedHead, field) then return 'metadata' end
   if fenceRaw ~= generationRaw then return 'stale' end
   if headValue ~= expectedHead then return 'mismatch' end
-  if redis.call('HGET', recordsKey, field) ~= wire then return 'mismatch' end
+  local currentWire, wireStatus = boundedWire(field)
+  if wireStatus == 'oversize' then return 'metadata' end
+  if wireStatus ~= 'exact' or currentWire ~= wire then return 'mismatch' end
   local expiry = tonumber(redis.call('ZSCORE', expiresKey, field))
   if not expiry or not redis.call('ZSCORE', lruKey, field) then return 'metadata' end
   local currentTime = nowMs()
@@ -537,7 +610,9 @@ end
 if operation == 'delete_corrupt' then
   local field, headField, wire = ARGV[2], ARGV[3], ARGV[4]
   local headValue = redis.call('HGET', metadataKey, headField)
-  if redis.call('HGET', recordsKey, field) ~= wire then return 'unchanged' end
+  local currentWire, wireStatus = boundedWire(field)
+  if wireStatus == 'oversize' then return 'metadata' end
+  if wireStatus ~= 'exact' or currentWire ~= wire then return 'unchanged' end
   if not validHeadValue(headValue, field) then return 'metadata' end
   if not removeRecord(state, field, wire, headField, headValue) then return 'metadata' end
   return 'invalidated'
@@ -732,6 +807,8 @@ export class RedisMemoryHotCache implements MemoryHotCachePortV1 {
     ]))
     return result === 'invalidated' || result === 'unchanged'
       ? Object.freeze({ status: result })
+      : result === 'capacity'
+        ? Object.freeze({ status: 'skipped' as const, reason: 'capacity' as const })
       : Object.freeze({ status: 'unavailable' as const })
   }
 

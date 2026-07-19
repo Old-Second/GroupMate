@@ -260,14 +260,14 @@ test('memory hot cache port enforces the operation result matrix', async () => {
 test('memory hot cache port proves exact bounded usage and freezes the result', async () => {
   const usage = {
     schemaVersion: 1,
-    recordCount: 2_048,
-    generationCount: 4_096,
-    recordEntryBytes: 1,
-    expiryIndexBytes: 2,
-    lruIndexBytes: 3,
-    dynamicMetadataBytes: 4,
-    staticBytes: 5,
-    totalLogicalBytes: 15
+    recordCount: 1,
+    generationCount: 1,
+    recordEntryBytes: 64,
+    expiryIndexBytes: 80,
+    lruIndexBytes: 80,
+    dynamicMetadataBytes: 229,
+    staticBytes: 357,
+    totalLogicalBytes: 810
   }
   const port = createMemoryHotCachePortV1({
     execute: async () => ({ status: 'usage', value: usage })
@@ -282,7 +282,17 @@ test('memory hot cache port proves exact bounded usage and freezes the result', 
     { ...usage, generationCount: 4_097 },
     { ...usage, recordCount: -0 },
     { ...usage, totalLogicalBytes: 14 },
-    { ...usage, recordEntryBytes: 16 * 1_024 * 1_024 + 1 }
+    { ...usage, recordEntryBytes: 16 * 1_024 * 1_024 + 1 },
+    { ...usage, expiryIndexBytes: 81, totalLogicalBytes: 811 },
+    { ...usage, lruIndexBytes: 81, totalLogicalBytes: 811 },
+    { ...usage, dynamicMetadataBytes: 230, totalLogicalBytes: 811 },
+    { ...usage, staticBytes: 358, totalLogicalBytes: 811 },
+    { ...usage, recordEntryBytes: 63, totalLogicalBytes: 809 },
+    {
+      ...usage,
+      recordEntryBytes: 64 + MEMORY_RESOURCE_LIMITS.recordWireBytes + 1,
+      totalLogicalBytes: 810 + MEMORY_RESOURCE_LIMITS.recordWireBytes + 1
+    }
   ]) {
     const invalid = createMemoryHotCachePortV1({
       execute: async () => ({ status: 'usage', value: badUsage })
@@ -291,6 +301,26 @@ test('memory hot cache port proves exact bounded usage and freezes the result', 
       status: 'unavailable'
     })
   }
+})
+
+test('memory hot cache port permits namespace capacity skip and no other namespace skip', async () => {
+  const record = memoryRecordFixture()
+  const request = {
+    schemaVersion: 1,
+    operation: 'namespace.invalidate',
+    namespaceRef: record.namespaceRef,
+    deletedGeneration: 1,
+    nextGeneration: 2
+  } as const
+  const capacity = createMemoryHotCachePortV1({
+    execute: async () => ({ status: 'skipped', reason: 'capacity' })
+  })
+  assert.deepEqual(await capacity.execute(request), { status: 'skipped', reason: 'capacity' })
+
+  const stale = createMemoryHotCachePortV1({
+    execute: async () => ({ status: 'skipped', reason: 'stale' })
+  })
+  assert.deepEqual(await stale.execute(request), { status: 'unavailable' })
 })
 
 test('memory hot cache port returns fixed aborted before adapter execution', async () => {
@@ -530,6 +560,145 @@ test('RedisMemoryHotCache corrupt cleanup uses exact wire CAS and preserves a co
   }), { status: 'hit', record: winner })
 })
 
+test('RedisMemoryHotCache never confirms a concurrently installed unaccounted oversized wire', async () => {
+  const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const redis = new FakeRedis(() => nowMs)
+  const cache = new RedisMemoryHotCache({ client: redis })
+  const record = memoryRecordFixture()
+  const field = memoryHotCacheRecordFieldV1(recordHead(record))
+  const oversized = 'x'.repeat(MEMORY_RESOURCE_LIMITS.recordWireBytes + 1)
+  await cache.execute({ schemaVersion: 1, operation: 'record.put', record })
+  redis.afterNextMemoryHotEval(operation => {
+    if (operation !== 'peek') return false
+    redis.replaceMemoryHotRecordWithoutAccountingForTest(field, oversized)
+    return true
+  })
+
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'record.get',
+    head: recordHead(record)
+  }), { status: 'unavailable' })
+  assert.equal(redis.memoryHotSnapshotForTest().records[0]?.[1].length, oversized.length)
+})
+
+test('RedisMemoryHotCache rejects an unaccounted oversized wire before peek body transport', async () => {
+  const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const redis = new FakeRedis(() => nowMs)
+  const cache = new RedisMemoryHotCache({ client: redis })
+  const record = memoryRecordFixture()
+  const field = memoryHotCacheRecordFieldV1(recordHead(record))
+  const oversized = 'x'.repeat(MEMORY_RESOURCE_LIMITS.recordWireBytes + 1)
+  await cache.execute({ schemaVersion: 1, operation: 'record.put', record })
+  redis.replaceMemoryHotRecordWithoutAccountingForTest(field, oversized)
+
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'record.get',
+    head: recordHead(record)
+  }), { status: 'unavailable' })
+  assert.equal(redis.memoryHotSnapshotForTest().records[0]?.[1].length, oversized.length)
+})
+
+test('RedisMemoryHotCache fails closed on an oversized expired victim during put cleanup', async () => {
+  let nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const redis = new FakeRedis(() => nowMs)
+  const cache = new RedisMemoryHotCache({ client: redis })
+  const record = memoryRecordFixture()
+  const field = memoryHotCacheRecordFieldV1(recordHead(record))
+  const oversized = 'x'.repeat(MEMORY_RESOURCE_LIMITS.recordWireBytes + 1)
+  await cache.execute({ schemaVersion: 1, operation: 'record.put', record })
+  redis.replaceMemoryHotRecordWithoutAccountingForTest(field, oversized)
+  nowMs += MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs
+
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'record.put',
+    record: memoryRecordFixture({ memoryId: 'memory:cleanup-candidate' })
+  }), { status: 'unavailable' })
+  assert.equal(redis.memoryHotSnapshotForTest().records[0]?.[1].length, oversized.length)
+})
+
+test('RedisMemoryHotCache rejects replacement and removal projected counter underflow without writes', async () => {
+  const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const first = largeMemoryRecordFixture()
+  const newer = memoryRecordFixture({ revision: 2 })
+
+  const replacementRedis = new FakeRedis(() => nowMs)
+  const replacementCache = new RedisMemoryHotCache({ client: replacementRedis })
+  const field = memoryHotCacheRecordFieldV1(recordHead(first))
+  await replacementCache.execute({ schemaVersion: 1, operation: 'record.put', record: first })
+  replacementRedis.corruptMemoryHotMetadataForTest(
+    'record-entry-bytes',
+    '0000000000000064'
+  )
+  assert.deepEqual(await replacementCache.execute({
+    schemaVersion: 1,
+    operation: 'record.put',
+    record: newer
+  }), { status: 'unavailable' })
+  assert.equal(
+    replacementRedis.memoryHotSnapshotForTest().records[0]?.[1],
+    encodeMemoryRecordV1(first)
+  )
+
+  const removalRedis = new FakeRedis(() => nowMs)
+  const removalCache = new RedisMemoryHotCache({ client: removalRedis })
+  await removalCache.execute({ schemaVersion: 1, operation: 'record.put', record: first })
+  removalRedis.corruptMemoryHotMetadataForTest('record-entry-bytes', '0000000000000064')
+  assert.deepEqual(await removalCache.execute({
+    schemaVersion: 1,
+    operation: 'record.invalidate',
+    namespaceRef: first.namespaceRef,
+    namespaceGeneration: first.namespaceGeneration,
+    memoryId: first.memoryId,
+    deletedRevision: first.revision
+  }), { status: 'unavailable' })
+  assert.equal(removalRedis.memoryHotSnapshotForTest().records.length, 1)
+})
+
+test('RedisMemoryHotCache replacement may evict within byte pressure before storing', async () => {
+  const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const replacement = memoryRecordFixture({ revision: 2 })
+  const targetField = memoryHotCacheRecordFieldV1(recordHead(replacement))
+  const recordCount = 1_024
+  const wireBudget = MEMORY_RESOURCE_LIMITS.redisHotLogicalBytes -
+    MEMORY_HOT_CACHE_STATIC_BYTES - 82 - recordCount * 371
+  const remainingBase = Math.floor((wireBudget - 1) / (recordCount - 1))
+  const remainingExtra = (wireBudget - 1) % (recordCount - 1)
+  const wireBytes = Array.from(
+    { length: recordCount },
+    (_, index) => index === 0 ? 1 : remainingBase + (index <= remainingExtra ? 1 : 0)
+  )
+  assert.equal(wireBytes.every(bytes => bytes <= MEMORY_RESOURCE_LIMITS.recordWireBytes), true)
+  const fields = Array.from(
+    { length: recordCount },
+    (_, index) => index === 0 ? targetField : index.toString(16).padStart(64, '0')
+  )
+  const redis = new FakeRedis(() => nowMs)
+  redis.seedMemoryHotEntriesForTest({
+    count: recordCount,
+    wireBytes,
+    expiresAtMs: nowMs + MEMORY_RESOURCE_LIMITS.redisHotAbsoluteTtlMs,
+    lruMs: 1,
+    namespaceRef: replacement.namespaceRef,
+    fields
+  })
+  const cache = new RedisMemoryHotCache({ client: redis })
+
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'record.put',
+    record: replacement
+  }), { status: 'stored' })
+  assert.equal(redis.memoryHotSnapshotForTest().records.length, recordCount - 1)
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'record.get',
+    head: recordHead(replacement)
+  }), { status: 'hit', record: replacement })
+})
+
 test('RedisMemoryHotCache reports hand-calculated multibyte logical usage', async () => {
   const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
   const redis = new FakeRedis(() => nowMs)
@@ -742,6 +911,59 @@ test('RedisMemoryHotCache namespace invalidation advances a monotonic fence with
   assert.deepEqual(await cache.execute(invalidate), { status: 'unchanged' })
 })
 
+test('RedisMemoryHotCache maps the 4097th namespace fence to a capacity skip', async () => {
+  const redis = new FakeRedis(() => Date.parse(FIXTURE_TIMES.confirmedAt))
+  const cache = new RedisMemoryHotCache({ client: redis })
+  let result
+  for (let index = 1; index <= MEMORY_RESOURCE_LIMITS.deploymentNamespaces; index += 1) {
+    result = await cache.execute({
+      schemaVersion: 1,
+      operation: 'namespace.invalidate',
+      namespaceRef: index.toString(16).padStart(64, '0'),
+      deletedGeneration: 1,
+      nextGeneration: 2
+    })
+  }
+  assert.deepEqual(result, { status: 'invalidated' })
+  assert.deepEqual(await cache.execute({
+    schemaVersion: 1,
+    operation: 'namespace.invalidate',
+    namespaceRef: (MEMORY_RESOURCE_LIMITS.deploymentNamespaces + 1)
+      .toString(16).padStart(64, '0'),
+    deletedGeneration: 1,
+    nextGeneration: 2
+  }), { status: 'skipped', reason: 'capacity' })
+})
+
+test('RedisMemoryHotCache rejects zero and unsafe dynamic fence or head revisions', async () => {
+  const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
+  const record = memoryRecordFixture()
+  const field = memoryHotCacheRecordFieldV1(recordHead(record))
+  const generationField = memoryHotCacheNamespaceFieldV1(record.namespaceRef)
+  const headField = memoryHotCacheHeadFieldV1(field)
+  for (const invalid of ['0000000000000000', '9999999999999999']) {
+    const fenceRedis = new FakeRedis(() => nowMs)
+    const fenceCache = new RedisMemoryHotCache({ client: fenceRedis })
+    await fenceCache.execute({ schemaVersion: 1, operation: 'record.put', record })
+    fenceRedis.corruptMemoryHotMetadataForTest(generationField, invalid)
+    assert.deepEqual(await fenceCache.execute({
+      schemaVersion: 1,
+      operation: 'record.get',
+      head: recordHead(record)
+    }), { status: 'unavailable' })
+
+    const headRedis = new FakeRedis(() => nowMs)
+    const headCache = new RedisMemoryHotCache({ client: headRedis })
+    await headCache.execute({ schemaVersion: 1, operation: 'record.put', record })
+    headRedis.corruptMemoryHotMetadataForTest(headField, `${invalid}|${field}`)
+    assert.deepEqual(await headCache.execute({
+      schemaVersion: 1,
+      operation: 'record.get',
+      head: recordHead(record)
+    }), { status: 'unavailable' })
+  }
+})
+
 test('RedisMemoryHotCache rejects malformed, oversize, wrong-tuple, and wrong-hash bodies', async () => {
   const nowMs = Date.parse(FIXTURE_TIMES.confirmedAt)
   for (const corruption of ['oversize', 'tuple', 'hash'] as const) {
@@ -823,6 +1045,19 @@ test('memory hot Lua and production remain scan-free, timer-free, and unwired', 
     /redis\.call\(['"](?:SCAN|HSCAN|KEYS|WATCH|MULTI|EXPIRE|PEXPIRE|PEXPIREAT)['"]/
   )
   assert.match(MEMORY_HOT_CACHE_LUA_SCRIPT, /redis\.call\('TIME'\)/)
+  assert.equal(
+    [...MEMORY_HOT_CACHE_LUA_SCRIPT.matchAll(/redis\.call\('HGET', recordsKey/g)].length,
+    1
+  )
+  assert.equal(
+    MEMORY_HOT_CACHE_LUA_SCRIPT.indexOf("redis.call('HSTRLEN', recordsKey, field)") <
+      MEMORY_HOT_CACHE_LUA_SCRIPT.indexOf("redis.call('HGET', recordsKey, field)"),
+    true
+  )
+  assert.match(
+    MEMORY_HOT_CACHE_LUA_SCRIPT,
+    /local function removeRecord[\s\S]*?string\.len\(wire\) > RECORD_WIRE_LIMIT/
+  )
   const productionFiles = [
     'src/runtime/production-yunzai-agent.ts',
     'src/runtime/agent-service-bridge.ts'
