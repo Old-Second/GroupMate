@@ -9,6 +9,15 @@ export interface ContextBudget {
   readonly maxBytes: number
 }
 
+export interface ContextPlannerBudgetV1 {
+  readonly schemaVersion: 1
+  readonly maxInputTokens: number
+  readonly maxSerializedMessageBytes: number
+  readonly maxMessages: number
+  readonly estimatedToolTokens: number
+  readonly reservedOutputTokens: number
+}
+
 export interface ContextSnapshot {
   readonly items: readonly ContextItem[]
   readonly estimatedInputTokens: number

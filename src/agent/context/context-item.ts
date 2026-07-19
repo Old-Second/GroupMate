@@ -31,6 +31,8 @@ export interface ContextInput {
 }
 
 export interface TokenEstimator {
+  /** Legacy ContextEngine selector identity only; the strict V1 Planner uses its fixed estimator. */
+  readonly version?: string
   estimate(message: AgentMessage): number
   estimateModelMessage?(message: ModelMessage): number
 }
