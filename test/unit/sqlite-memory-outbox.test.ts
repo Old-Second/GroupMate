@@ -7,7 +7,10 @@ import {
 } from '../../src/agent/memory/memory-access-gate.js'
 import type { MemoryOutboxPortV1 } from '../../src/agent/memory/memory-outbox.js'
 import * as sqliteOutbox from '../../src/agent/memory/sqlite-memory-outbox.js'
-import { purgeExpiredSqliteMemoryTombstonesV1 } from '../../src/agent/memory/sqlite-memory-repository.js'
+import {
+  checkpointSqliteMemoryDeletionV1,
+  purgeExpiredSqliteMemoryTombstonesV1
+} from '../../src/agent/memory/sqlite-memory-repository.js'
 import {
   FIXTURE_IDS,
   FIXTURE_TIMES,
@@ -496,11 +499,22 @@ test('sqlite memory outbox event ids distinguish a recreated memory incarnation 
       recordCreateRequestV1(harness),
       now
     ))).status, 'stored')
-    assert.equal((await harness.repository.execute(forgetRequest(
+    const secondForget = forgetRequest(
       harness,
       now,
       'tombstone:incarnation-2'
-    ))).status, 'stored')
+    )
+    assert.equal((await harness.repository.execute(secondForget)).status, 'stored')
+    assert.deepEqual(checkpointSqliteMemoryDeletionV1({
+      database: harness.store.database,
+      tombstone: secondForget.tombstone
+    }), {
+      schemaVersion: 1,
+      logicalDeletion: 'committed',
+      payloadDeletion: 'secure_delete_on',
+      walCheckpoint: 'truncated',
+      derivedCleanup: 'queued'
+    })
 
     const forgottenRows = harness.store.database.prepare(`
       SELECT event_id FROM outbox

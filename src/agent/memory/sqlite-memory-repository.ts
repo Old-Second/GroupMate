@@ -2797,6 +2797,7 @@ function deletionOutboxQueued (
     FROM outbox
     WHERE namespace_ref = ? AND namespace_generation = ? AND aggregate = ?
       AND aggregate_id = ? AND revision = ? AND event_kind = ?
+      AND occurred_at_ms = ?
     ORDER BY sequence ASC
     LIMIT 2
   `).all(
@@ -2805,7 +2806,8 @@ function deletionOutboxQueued (
     aggregate,
     aggregateId,
     revision,
-    eventKind
+    eventKind,
+    instantMilliseconds(tombstone.deletedAt)
   )
   if (rows.length !== 1) return false
   const row = rows[0]

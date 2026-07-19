@@ -297,6 +297,14 @@ ON tombstones(namespace_ref ASC, namespace_generation ASC, memory_id ASC,
   }),
   Object.freeze({
     type: 'index' as const,
+    name: 'memory_tombstones_active_namespace_v1',
+    tableName: 'tombstones',
+    sql: `CREATE INDEX memory_tombstones_active_namespace_v1
+ON tombstones(namespace_ref ASC, namespace_generation ASC, deletion_kind ASC,
+  expires_at_ms ASC, tombstone_id ASC)`
+  }),
+  Object.freeze({
+    type: 'index' as const,
     name: 'memory_tombstones_expiry_v1',
     tableName: 'tombstones',
     sql: `CREATE INDEX memory_tombstones_expiry_v1

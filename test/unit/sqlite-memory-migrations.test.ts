@@ -431,6 +431,16 @@ test('sqlite memory v1 schema is strict, generation-bound and has no FTS objects
       JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
       JSON.stringify([
         { name: 'namespace_ref', descending: 0 },
+        { name: 'namespace_generation', descending: 0 },
+        { name: 'deletion_kind', descending: 0 },
+        { name: 'expires_at_ms', descending: 0 },
+        { name: 'tombstone_id', descending: 0 }
+      ])
+    )), 'tombstones must index the active namespace-delete replay seek')
+    assert.ok(tombstoneIndexes.some(row => (
+      JSON.stringify(indexKeyColumns(memory.database, String(row.name))) ===
+      JSON.stringify([
+        { name: 'namespace_ref', descending: 0 },
         { name: 'expires_at_ms', descending: 0 },
         { name: 'namespace_generation', descending: 0 },
         { name: 'tombstone_id', descending: 0 }
@@ -507,6 +517,30 @@ test('sqlite memory tombstone barrier and expiry purge use bounded covering inde
       String(row.detail).includes('USING COVERING INDEX memory_tombstones_active_memory_v1')
     )), JSON.stringify(barrierPlan))
     assert.equal(barrierPlan.some(row => String(row.detail).includes('USE TEMP B-TREE')), false)
+
+    const namespaceReplayPlan = memory.database.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tombstone_id
+      FROM tombstones
+      WHERE namespace_ref = ? AND namespace_generation = ?
+        AND deletion_kind = 'namespace_deleted' AND expires_at_ms > ?
+      ORDER BY expires_at_ms ASC, tombstone_id ASC
+      LIMIT 2
+    `).all(namespaceRef, 2, 0)
+    assert.ok(namespaceReplayPlan.some(row => {
+      const detail = String(row.detail)
+      return detail.includes('USING COVERING INDEX memory_tombstones_active_namespace_v1') &&
+        detail.includes('namespace_ref=?') && detail.includes('namespace_generation=?') &&
+        detail.includes('deletion_kind=?') && detail.includes('expires_at_ms>?')
+    }), JSON.stringify(namespaceReplayPlan))
+    assert.equal(
+      namespaceReplayPlan.some(row => String(row.detail).includes('USE TEMP B-TREE')),
+      false
+    )
+    assert.equal(
+      namespaceReplayPlan.some(row => String(row.detail).includes('memory_tombstones_expiry_v1')),
+      false
+    )
 
     const expiryPlan = memory.database.prepare(`
       EXPLAIN QUERY PLAN
