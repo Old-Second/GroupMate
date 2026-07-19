@@ -21,6 +21,7 @@ import {
   requireContextHash,
   requireSafeInteger
 } from './context-token-estimator.js'
+import { parseJsonValue } from '../model/json-value.js'
 
 export const CONTEXT_ARTIFACT_ID_HASH_DOMAIN = 'groupmate.context.artifact-id.v1'
 export {
@@ -169,6 +170,29 @@ export function createContextArtifactV1 (value: ContextArtifactDraftV1): Context
 
 export function parseContextArtifactV1 (value: unknown): ContextArtifactV1 {
   return parseArtifactFields(value, true)
+}
+
+export function encodeContextArtifactV1 (value: ContextArtifactV1): string {
+  return artifactJson(parseContextArtifactV1(value))
+}
+
+export function decodeContextArtifactV1 (raw: string): ContextArtifactV1 {
+  if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > MAX_CONTEXT_ARTIFACT_BYTES) {
+    return invalidContextValue()
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(raw) as unknown
+  } catch {
+    return invalidContextValue()
+  }
+  const artifact = parseContextArtifactV1(parseJsonValue(decoded, {
+    maxBytes: MAX_CONTEXT_ARTIFACT_BYTES,
+    maxDepth: 12,
+    maxNodes: 512
+  }))
+  if (artifactJson(artifact) !== raw) return invalidContextValue()
+  return artifact
 }
 
 export function contextArtifactToSpan (

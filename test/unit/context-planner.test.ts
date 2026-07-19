@@ -77,9 +77,14 @@ function protocolSpan (options: {
   phase: 'awaiting' | 'ready' | 'indeterminate' | 'consumed'
   originGeneration?: number
   callId?: string
+  callCount?: number
   sourceRefs?: readonly { readonly ref: string; readonly contentHash: string }[]
 }) {
+  const callCount = options.callCount ?? 1
   const callId = options.callId ?? `call:${options.id}`
+  const callIds = Array.from({ length: callCount }, (_, index) => (
+    callCount === 1 ? callId : `${callId}:${index}`
+  ))
   const complete = options.phase === 'ready' || options.phase === 'consumed'
   return createContextSpanV1(deepFreeze({
     spanId: options.id,
@@ -102,12 +107,12 @@ function protocolSpan (options: {
       {
         role: 'assistant' as const,
         content: null,
-        toolCalls: [{ callId, name: 'fixture', arguments: { value: options.id } }]
+        toolCalls: callIds.map(callId => ({ callId, name: 'fixture', arguments: { value: options.id } }))
       },
-      ...(complete ? [{ role: 'tool' as const, content: 'ok', toolCallId: callId }] : [])
+      ...(complete ? callIds.map(callId => ({ role: 'tool' as const, content: 'ok', toolCallId: callId })) : [])
     ],
     sourceRefs: options.sourceRefs ?? [{ ref: `ref:${options.id}`, contentHash: HASH }],
-    toolProtocol: { phase: options.phase, step: 1, callIds: [callId] }
+    toolProtocol: { phase: options.phase, step: 1, callIds }
   }))
 }
 
@@ -625,6 +630,19 @@ test('consumed spans whose full provenance exceeds 32 refs skip artifact request
     }))
   }))
   const spans = deepFreeze([...mandatorySpans(), withManyRefs])
+  const result = planModelTurn(plannerInput(spans, {
+    artifactPolicy: 'enabled',
+    budget: deepFreeze({ ...plannerInput(spans).budget, maxMessages: 4 })
+  }))
+
+  assert.equal(result.status, 'ready')
+})
+
+test('consumed protocols above the eight-call digest limit skip artifact requests', () => {
+  const consumed = protocolSpan({
+    id: 'span:protocol:nine-calls', order: 30, phase: 'consumed', callCount: 9
+  })
+  const spans = deepFreeze([...mandatorySpans(), consumed])
   const result = planModelTurn(plannerInput(spans, {
     artifactPolicy: 'enabled',
     budget: deepFreeze({ ...plannerInput(spans).budget, maxMessages: 4 })

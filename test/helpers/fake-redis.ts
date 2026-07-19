@@ -6,6 +6,11 @@ import {
 } from '../../src/agent/run/redis-run-store.js'
 import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 import {
+  CONTEXT_ARTIFACT_METADATA_KEY,
+  CONTEXT_ARTIFACT_STORE_LUA_MARKER
+} from '../../src/agent/context/redis-context-artifact-store.js'
+import { CONTEXT_ARTIFACT_RESOURCE_LIMITS } from '../../src/agent/context/context-resource-limits.js'
+import {
   TRACE_BYTES_KEY,
   TRACE_FAILURE_INDEX_KEY,
   TRACE_GENERATION_KEY,
@@ -20,13 +25,16 @@ interface FakeRedisEntry {
 }
 
 export class FakeRedis implements RedisSessionClient, RedisRunClient {
+  readonly getCalls: string[] = []
   readonly scanCalls: Array<{ cursor: number; MATCH: string; COUNT: number }> = []
   readonly setCalls: Array<{ key: string; options?: { EX?: number; NX?: boolean; XX?: boolean } }> = []
-  readonly evalCalls: Array<{ marker: string; operation: string }> = []
+  readonly evalCalls: Array<{ marker: string; operation: string; argumentBytes: number[] }> = []
   private readonly entries = new Map<string, FakeRedisEntry>()
   private readonly sortedSets = new Map<string, Map<string, number>>()
   private readonly traceLengths = new Map<string, number>()
   private readonly pendingGetFailures = new Set<string>()
+  private artifactEvalHook?: (operation: string) => boolean
+  private artifactTtlComputationHook?: () => void
   private readonly now: () => number
 
   constructor (now: () => number = () => Date.now()) {
@@ -34,6 +42,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
   }
 
   async get (key: string): Promise<string | null> {
+    this.getCalls.push(key)
     if (this.pendingGetFailures.delete(key)) throw new Error('fake redis get failure')
     this.purgeExpired(key)
     return this.entries.get(key)?.value ?? null
@@ -41,6 +50,25 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
 
   failNextGet (key: string): void {
     this.pendingGetFailures.add(key)
+  }
+
+  seedArtifactForTest (key: string, value: string, expiresAtMs?: number): void {
+    this.entries.set(key, {
+      value,
+      ...(expiresAtMs === undefined ? {} : { expiresAtMs })
+    })
+  }
+
+  afterNextArtifactEval (callback: (operation: string) => boolean): void {
+    this.artifactEvalHook = callback
+  }
+
+  advanceTimeDuringNextArtifactTtl (callback: () => void): void {
+    this.artifactTtlComputationHook = callback
+  }
+
+  artifactExpiryForTest (key: string): number | null {
+    return this.entries.get(key)?.expiresAtMs ?? null
   }
 
   seedTraceForTest (input: {
@@ -124,7 +152,17 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     this.purgeAllExpired()
     const marker = script.split('\n', 1)[0] ?? ''
     const operation = options.arguments[0] ?? ''
-    this.evalCalls.push({ marker, operation })
+    this.evalCalls.push({
+      marker,
+      operation,
+      argumentBytes: options.arguments.map(value => this.bytes(value))
+    })
+    if (marker === CONTEXT_ARTIFACT_STORE_LUA_MARKER) {
+      const result = this.evalArtifact(operation, options.keys, options.arguments)
+      const hook = this.artifactEvalHook
+      if (hook?.(operation) === true) this.artifactEvalHook = undefined
+      return result
+    }
     if (marker === TRACE_STORE_LUA_MARKER) {
       return this.evalTrace(operation, options.keys, options.arguments)
     }
@@ -597,6 +635,120 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
 
   private entryValue (key: string | undefined): string | null {
     return key === undefined ? null : this.entries.get(key)?.value ?? null
+  }
+
+  private evalArtifact (operation: string, keys: string[], args: string[]): unknown {
+    if (operation === 'read') {
+      const key = keys[0]
+      if (key !== undefined && this.pendingGetFailures.delete(key)) {
+        throw new Error('fake redis read failure')
+      }
+      const current = key === undefined ? undefined : this.entries.get(key)
+      if (current === undefined) return 'missing'
+      if (this.bytes(current.value) > CONTEXT_ARTIFACT_RESOURCE_LIMITS.artifactBytes) return 'too_large'
+      return ['exact', current.value]
+    }
+    if (operation === 'metadata_snapshot') {
+      const metadataKey = keys[0]
+      if (metadataKey !== CONTEXT_ARTIFACT_METADATA_KEY) return 'invalid_snapshot'
+      const current = this.entries.get(metadataKey)
+      if (current === undefined) return 'missing'
+      if (this.bytes(current.value) > CONTEXT_ARTIFACT_RESOURCE_LIMITS.metadataBytes) return 'oversized'
+      return ['exact', current.value]
+    }
+    if (operation === 'reconcile') {
+      const metadataKey = keys[0]
+      const expectedKind = args[1]
+      const expectedRaw = args[2]
+      const nextMetadata = args[3]
+      if (metadataKey !== CONTEXT_ARTIFACT_METADATA_KEY || nextMetadata === undefined) return 'conflict'
+      const current = this.entries.get(metadataKey)
+      const currentBytes = this.bytes(current?.value)
+      if ((expectedKind === 'missing' && current !== undefined) ||
+        (expectedKind === 'exact' && (
+          currentBytes > CONTEXT_ARTIFACT_RESOURCE_LIMITS.metadataBytes || current?.value !== expectedRaw
+        )) ||
+        (expectedKind === 'oversized' && currentBytes <= CONTEXT_ARTIFACT_RESOURCE_LIMITS.metadataBytes) ||
+        (expectedKind !== 'missing' && expectedKind !== 'exact' && expectedKind !== 'oversized')) {
+        return 'conflict'
+      }
+      this.entries.set(metadataKey, { value: nextMetadata })
+      return 'ok'
+    }
+    const minimumExpiresAtMs = Number(args[2])
+    const redisNowMs = this.now()
+    if (!Number.isSafeInteger(minimumExpiresAtMs) || minimumExpiresAtMs <= redisNowMs ||
+      minimumExpiresAtMs > redisNowMs + CONTEXT_ARTIFACT_RESOURCE_LIMITS.maximumExpiryHorizonMs) {
+      return 'invalid_expiry'
+    }
+    if (operation === 'validate_expiry') return 'ok'
+    const artifactKey = keys[0]
+    const metadataKey = keys[1]
+    const expected = args[1]
+    if (artifactKey === undefined || metadataKey !== CONTEXT_ARTIFACT_METADATA_KEY ||
+      expected === undefined || !Number.isSafeInteger(minimumExpiresAtMs)) {
+      return 'invalid_operation'
+    }
+    const existing = this.entries.get(artifactKey)
+    if (existing !== undefined &&
+      this.bytes(existing.value) > CONTEXT_ARTIFACT_RESOURCE_LIMITS.artifactBytes) return 'corrupt'
+    const metadata = this.entryValue(metadataKey)
+    const metadataMatch = /^1\|(\d+)\|(\d+)$/.exec(metadata ?? '')
+    const metadataCount = Number(metadataMatch?.[1])
+    const metadataValueBytes = Number(metadataMatch?.[2])
+    const metadataValid = metadata !== null &&
+      this.bytes(metadata) <= CONTEXT_ARTIFACT_RESOURCE_LIMITS.metadataBytes &&
+      metadataMatch !== null &&
+      Number.isSafeInteger(metadataCount) &&
+      Number.isSafeInteger(metadataValueBytes) &&
+      metadataCount <= CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceKeys &&
+      metadataValueBytes <= CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceBytes
+    if (operation === 'touch') {
+      if (existing === undefined) return 'missing'
+      if (existing.value !== expected) return 'corrupt'
+      if (existing.expiresAtMs === undefined) return 'corrupt_ttl'
+      if (!metadataValid || metadataCount < 1 || metadataValueBytes < this.bytes(expected)) return 'reconcile'
+      const ttl = existing.expiresAtMs - this.now()
+      const horizonBoundMs = redisNowMs + CONTEXT_ARTIFACT_RESOURCE_LIMITS.maximumExpiryHorizonMs
+      if (redisNowMs + ttl > horizonBoundMs) return 'corrupt_ttl'
+      const hook = this.artifactTtlComputationHook
+      this.artifactTtlComputationHook = undefined
+      hook?.()
+      const upperExistingExpiryMs = this.now() + ttl
+      this.entries.set(artifactKey, {
+        value: existing.value,
+        expiresAtMs: Math.min(Math.max(upperExistingExpiryMs, minimumExpiresAtMs), horizonBoundMs)
+      })
+      return 'ok'
+    }
+    if (operation !== 'put') return 'invalid_operation'
+    if (existing !== undefined) {
+      if (existing.value !== expected) return 'corrupt'
+      if (existing.expiresAtMs === undefined) return 'corrupt_ttl'
+      if (!metadataValid || metadataCount < 1 || metadataValueBytes < this.bytes(expected)) return 'reconcile'
+      const ttl = existing.expiresAtMs - this.now()
+      const horizonBoundMs = redisNowMs + CONTEXT_ARTIFACT_RESOURCE_LIMITS.maximumExpiryHorizonMs
+      if (redisNowMs + ttl > horizonBoundMs) return 'corrupt_ttl'
+      const hook = this.artifactTtlComputationHook
+      this.artifactTtlComputationHook = undefined
+      hook?.()
+      const upperExistingExpiryMs = this.now() + ttl
+      this.entries.set(artifactKey, {
+        value: existing.value,
+        expiresAtMs: Math.min(Math.max(upperExistingExpiryMs, minimumExpiresAtMs), horizonBoundMs)
+      })
+      return 'existing'
+    }
+    if (!metadataValid) return 'reconcile'
+    const count = metadataCount
+    const valueBytes = metadataValueBytes
+    const projectedCount = count + 1
+    const projectedBytes = valueBytes + this.bytes(expected)
+    if (projectedCount > CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceKeys ||
+      projectedBytes > CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceBytes) return 'capacity'
+    this.entries.set(artifactKey, { value: expected, expiresAtMs: minimumExpiresAtMs })
+    this.entries.set(metadataKey, { value: `1|${projectedCount}|${projectedBytes}` })
+    return 'stored'
   }
 
   private bytes (value: string | null | undefined): number {

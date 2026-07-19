@@ -5,6 +5,7 @@ import { asciiContextCompare, canonicalizeContextJsonValue, canonicalJsonStringi
 import { domainSeparatedContextHash } from './context-span.js';
 export const CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN = 'groupmate.context.compaction-request.v1';
 export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 512 * 1_024;
+export const MAX_CONTEXT_COMPACTION_TOOL_CALLS = 8;
 const BLOCKED_BUDGET = Object.freeze({
     status: 'blocked',
     code: 'context_budget_exceeded'
@@ -215,6 +216,9 @@ function requestJson(request) {
     return `{"schemaVersion":1,"namespaceRef":${JSON.stringify(request.namespaceRef)},"generation":${request.generation},"kind":${JSON.stringify(request.kind)},"sourceSpanIds":[${request.sourceSpanIds.map(value => JSON.stringify(value)).join(',')}],"sourceRefs":[${request.sourceRefs.map(ref => `{"ref":${JSON.stringify(ref.ref)},"contentHash":${JSON.stringify(ref.contentHash)}}`).join(',')}]}`;
 }
 function compactionRequest(span) {
+    if (span.toolProtocol === null ||
+        span.toolProtocol.callIds.length > MAX_CONTEXT_COMPACTION_TOOL_CALLS)
+        return null;
     const refs = [Object.freeze({
             ref: span.spanId,
             contentHash: contextSpanHash(span)

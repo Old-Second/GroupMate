@@ -1,5 +1,6 @@
 import { CONTEXT_ARTIFACT_CONTENT_HASH_DOMAIN, CONTEXT_ARTIFACT_SAFE_PREFIX, MAX_CONTEXT_ARTIFACT_CONTENT_BYTES, MAX_CONTEXT_ARTIFACT_REFS, createContextSpanV1, domainSeparatedContextHash, parseContextSourceRefs } from './context-span.js';
 import { estimateModelMessagesTokens, CONTEXT_TOKEN_ESTIMATOR_VERSION, inspectContextArray, inspectContextRecord, invalidContextValue, normalizeContextString, requireContextAscii, requireContextHash, requireSafeInteger } from './context-token-estimator.js';
+import { parseJsonValue } from '../model/json-value.js';
 export const CONTEXT_ARTIFACT_ID_HASH_DOMAIN = 'groupmate.context.artifact-id.v1';
 export { CONTEXT_ARTIFACT_CONTENT_HASH_DOMAIN, CONTEXT_ARTIFACT_SAFE_PREFIX, MAX_CONTEXT_ARTIFACT_CONTENT_BYTES, MAX_CONTEXT_ARTIFACT_REFS } from './context-span.js';
 export const MAX_CONTEXT_ARTIFACT_BYTES = 16 * 1_024;
@@ -104,6 +105,29 @@ export function createContextArtifactV1(value) {
 }
 export function parseContextArtifactV1(value) {
     return parseArtifactFields(value, true);
+}
+export function encodeContextArtifactV1(value) {
+    return artifactJson(parseContextArtifactV1(value));
+}
+export function decodeContextArtifactV1(raw) {
+    if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > MAX_CONTEXT_ARTIFACT_BYTES) {
+        return invalidContextValue();
+    }
+    let decoded;
+    try {
+        decoded = JSON.parse(raw);
+    }
+    catch {
+        return invalidContextValue();
+    }
+    const artifact = parseContextArtifactV1(parseJsonValue(decoded, {
+        maxBytes: MAX_CONTEXT_ARTIFACT_BYTES,
+        maxDepth: 12,
+        maxNodes: 512
+    }));
+    if (artifactJson(artifact) !== raw)
+        return invalidContextValue();
+    return artifact;
 }
 export function contextArtifactToSpan(artifactValue, semanticOrder, priority = 'low') {
     const artifact = parseContextArtifactV1(artifactValue);

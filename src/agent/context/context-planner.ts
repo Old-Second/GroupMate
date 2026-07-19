@@ -41,6 +41,7 @@ import { domainSeparatedContextHash } from './context-span.js'
 
 export const CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN = 'groupmate.context.compaction-request.v1'
 export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 512 * 1_024
+export const MAX_CONTEXT_COMPACTION_TOOL_CALLS = 8
 
 export interface ContextPlannerInputV1 {
   readonly schemaVersion: 1
@@ -290,6 +291,8 @@ function requestJson (request: Omit<ContextCompactionRequestV1, 'requestId'>): s
 }
 
 function compactionRequest (span: ContextSpanV1): ContextCompactionRequestV1 | null {
+  if (span.toolProtocol === null ||
+    span.toolProtocol.callIds.length > MAX_CONTEXT_COMPACTION_TOOL_CALLS) return null
   const refs: ContextSourceRefV1[] = [Object.freeze({
     ref: span.spanId,
     contentHash: contextSpanHash(span)
