@@ -66,6 +66,7 @@ export const MEMORY_MAINTENANCE_OPERATIONS_V1 = Object.freeze([
   'namespace.verifyScrubbed',
   'tombstone.purgeExpired',
   'audit.purgeExpired',
+  'command.purgeExpired',
   'export.releaseExpiredReservations',
   'deletion.checkpoint'
 ] as const)

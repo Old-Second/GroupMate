@@ -416,6 +416,7 @@ test('maintenance authority is exact, bounded and never grants content reads', (
     'record.purgeExpired',
     'tombstone.purgeExpired',
     'audit.purgeExpired',
+    'command.purgeExpired',
     'export.releaseExpiredReservations'
   ]) {
     assert.doesNotThrow(() => parseMemoryMaintenanceAuthorityContextV1({
