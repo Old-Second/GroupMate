@@ -90,6 +90,7 @@ const ACTOR_ROLES: readonly MemoryLifecycleActorRoleV1[] = [
 const AUTHORITY_REQUIREMENTS: readonly MemoryLifecycleActorAuthorityRequirementV1[] = [
   'safe', 'ordinary', 'elevated', 'delete_only'
 ]
+const MAX_CANONICAL_INSTANT_MS = 8_640_000_000_000_000
 const OLD_GENERATION_MAINTENANCE_OPERATIONS = new Set<MemoryMaintenanceOperationV1>([
   'namespace.scrubDeleted', 'namespace.verifyScrubbed', 'deletion.checkpoint'
 ])
@@ -275,7 +276,8 @@ function positiveInteger (value: unknown): number {
 function parseCanonicalInstant (value: unknown): string {
   if (typeof value !== 'string' || value.length > 32) return invalidMemoryValue()
   const milliseconds = Date.parse(value)
-  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 ||
+    milliseconds > MAX_CANONICAL_INSTANT_MS || new Date(milliseconds).toISOString() !== value) {
     return invalidMemoryValue()
   }
   return value
@@ -570,6 +572,9 @@ function capabilityWindow (
   const validFromMs = Date.parse(now)
   let validUntilMs = validFromMs +
     MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleCapabilityAbsoluteTtlMs
+  if (!Number.isSafeInteger(validUntilMs) || validUntilMs > MAX_CANONICAL_INSTANT_MS) {
+    return invalidMemoryValue()
+  }
   if (observedAt !== null) {
     const observedAtMs = Date.parse(observedAt)
     if (validFromMs - observedAtMs > MEMORY_RESOURCE_LIMITS.trustedMemberSnapshotMaxAgeMs ||

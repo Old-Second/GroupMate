@@ -132,6 +132,16 @@ test('actor role snapshot and capability both have an absolute sixty second wind
   assert.throws(() => issueMemoryLifecycleActorCapabilityV1(root, actorContext({
     roleObservedAt: '2026-07-22T08:00:05.001Z'
   }), NOW), TypeError)
+  assert.throws(() => issueMemoryLifecycleActorCapabilityV1(
+    root,
+    actorContext({ roleObservedAt: '+275760-09-12T23:59:30.001Z' }),
+    '+275760-09-12T23:59:59.999Z'
+  ), TypeError)
+  assert.throws(() => issueMemoryLifecycleActorCapabilityV1(
+    root,
+    actorContext({ roleObservedAt: '1969-12-31T23:59:59.999Z' }),
+    '1969-12-31T23:59:59.999Z'
+  ), TypeError)
 })
 
 test('strict authority parsers reject proxy, symbols, accessors and impossible role actions', () => {
