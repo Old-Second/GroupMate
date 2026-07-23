@@ -7,10 +7,14 @@ import {
   issueMemoryMaintenanceCapabilityV1,
   issueMemoryPolicyCapabilityV1,
   memoryLifecycleActorCapabilityAllowsV1,
+  memoryMaintenanceCapabilityAllowsRequestV1,
   memoryMaintenanceCapabilityAllowsV1,
+  memoryPolicyCapabilityAllowsBindingV1,
   memoryPolicyCapabilityAllowsV1,
   parseMemoryLifecycleActorAuthorityContextV1,
+  parseMemoryMaintenanceCapabilityRequestV1,
   parseMemoryMaintenanceAuthorityContextV1,
+  parseMemoryPolicyCapabilityBindingRequestV1,
   parseMemoryPolicyAuthorityContextV1
 } from '../../src/agent/memory/memory-lifecycle-authority.js'
 import {
@@ -344,6 +348,89 @@ test('policy authority is exact and enforces personal/owner and group/group pair
   }
 })
 
+test('policy binding advisory preserves branded identity without guessing proposal scope', () => {
+  const root = createMemoryLifecycleAuthorityRootV1(() => true)
+  const personal = namespace({ kind: 'personal', subjectUserId: '20002' })
+  const context = parseMemoryPolicyAuthorityContextV1({
+    schemaVersion: 1,
+    botInstanceId: personal.botInstanceId,
+    adapter: 'qq',
+    accountId: personal.accountId,
+    sceneRef: SCENE_REF,
+    namespace: personal,
+    namespaceRef: memoryNamespaceRefV1(personal),
+    generation: 2,
+    policyRef: 'policy:personal-auto-memory-v1',
+    policyGeneration: 3,
+    createdByActorRef: ACTOR_REF,
+    createdByUserId: '20002',
+    consent: 'owner_policy',
+    allowedKinds: ['profile_fact'],
+    allowedSensitivities: ['personal'],
+    allowedSourceKinds: ['current_message'],
+    allowedRetentionPolicyRefs: ['retention:memory-lifecycle-v1']
+  })
+  const capability = issueMemoryPolicyCapabilityV1(root, context, NOW)
+  const binding = parseMemoryPolicyCapabilityBindingRequestV1({
+    botInstanceId: context.botInstanceId,
+    accountId: context.accountId,
+    sceneRef: context.sceneRef,
+    namespaceRef: context.namespaceRef,
+    generation: context.generation,
+    policyRef: context.policyRef,
+    policyGeneration: context.policyGeneration,
+    consent: context.consent,
+    createdByActorRef: context.createdByActorRef
+  })
+
+  assert.equal(memoryPolicyCapabilityAllowsBindingV1(capability, binding, NOW), true)
+  assert.equal(Object.hasOwn(binding, 'kind'), false)
+  assert.equal(Object.hasOwn(binding, 'sensitivity'), false)
+  assert.equal(Object.hasOwn(binding, 'sourceKinds'), false)
+  assert.equal(Object.hasOwn(binding, 'retentionPolicyRef'), false)
+  assert.equal(memoryPolicyCapabilityAllowsBindingV1({ ...capability }, binding, NOW), false)
+  assert.equal(memoryPolicyCapabilityAllowsBindingV1(new Proxy(capability, {}), binding, NOW), false)
+  assert.equal(memoryPolicyCapabilityAllowsBindingV1(
+    capability,
+    binding,
+    '2026-07-22T08:01:00.001Z'
+  ), false)
+
+  for (const mutation of [
+    { botInstanceId: 'groupmate-secondary' },
+    { accountId: '10002' },
+    { sceneRef: 'b'.repeat(64) },
+    { namespaceRef: `ns1:${'f'.repeat(64)}` },
+    { generation: 3 },
+    { policyRef: 'policy:other-v1' },
+    { policyGeneration: 4 },
+    { consent: 'group_policy' },
+    { createdByActorRef: OTHER_ACTOR_REF }
+  ]) {
+    assert.equal(memoryPolicyCapabilityAllowsBindingV1(capability, {
+      ...binding,
+      ...mutation
+    }, NOW), false)
+  }
+
+  const withSymbol = { ...binding }
+  Object.defineProperty(withSymbol, Symbol('claim'), { value: true, enumerable: true })
+  const withGetter = { ...binding }
+  Object.defineProperty(withGetter, 'consent', {
+    get: () => 'owner_policy',
+    enumerable: true
+  })
+  for (const hostile of [
+    new Proxy(binding, {}),
+    withSymbol,
+    withGetter,
+    { ...binding, kind: 'profile_fact' }
+  ]) {
+    assert.throws(() => parseMemoryPolicyCapabilityBindingRequestV1(hostile), TypeError)
+    assert.equal(memoryPolicyCapabilityAllowsBindingV1(capability, hostile, NOW), false)
+  }
+})
+
 test('maintenance authority is exact, bounded and never grants content reads', () => {
   const root = createMemoryLifecycleAuthorityRootV1(() => true)
   const group = namespace({
@@ -432,12 +519,94 @@ test('maintenance authority is exact, bounded and never grants content reads', (
       operation
     }))
   }
-  for (const operation of [
-    'namespace.scrubDeleted', 'namespace.verifyScrubbed', 'deletion.checkpoint'
-  ]) {
+  for (const operation of ['namespace.scrubDeleted', 'namespace.verifyScrubbed']) {
     assert.doesNotThrow(() => parseMemoryMaintenanceAuthorityContextV1({
       ...context,
       operation
     }))
+  }
+  assert.doesNotThrow(() => parseMemoryMaintenanceAuthorityContextV1({
+    ...context,
+    currentGeneration: 5,
+    targetGeneration: 5,
+    deletionRef: null,
+    operation: 'deletion.checkpoint'
+  }))
+  assert.throws(() => parseMemoryMaintenanceAuthorityContextV1({
+    ...context,
+    operation: 'deletion.checkpoint'
+  }), TypeError)
+})
+
+test('narrow maintenance capability requests preserve brand, freshness and exact binding', () => {
+  const root = createMemoryLifecycleAuthorityRootV1(() => true)
+  const group = namespace({
+    kind: 'group',
+    groupId: '30003',
+    groupLifecycleId: 'group-30003-generation-1'
+  })
+  const context = parseMemoryMaintenanceAuthorityContextV1({
+    schemaVersion: 1,
+    botInstanceId: group.botInstanceId,
+    adapter: 'qq',
+    accountId: group.accountId,
+    namespace: group,
+    namespaceRef: memoryNamespaceRefV1(group),
+    currentGeneration: 5,
+    targetGeneration: 3,
+    deletionRef: DELETION_REF,
+    operation: 'namespace.scrubDeleted',
+    limit: 32
+  })
+  const capability = issueMemoryMaintenanceCapabilityV1(root, context, NOW)
+  const request = parseMemoryMaintenanceCapabilityRequestV1({
+    botInstanceId: context.botInstanceId,
+    accountId: context.accountId,
+    namespaceRef: context.namespaceRef,
+    currentGeneration: context.currentGeneration,
+    targetGeneration: context.targetGeneration,
+    deletionRef: context.deletionRef,
+    operation: context.operation,
+    limit: context.limit
+  })
+
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(capability, request, NOW), true)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1({ ...capability }, request, NOW), false)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(
+    new Proxy(capability, {}),
+    request,
+    NOW
+  ), false)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(capability, {
+    ...request,
+    accountId: '10002'
+  }, NOW), false)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(capability, {
+    ...request,
+    namespaceRef: `ns1:${'f'.repeat(64)}`
+  }, NOW), false)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(capability, {
+    ...request,
+    operation: 'proposal.expireDue'
+  }, NOW), false)
+  assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(
+    capability,
+    request,
+    '2026-07-22T08:01:00.001Z'
+  ), false)
+
+  const withSymbol = { ...request }
+  Object.defineProperty(withSymbol, Symbol('claim'), { value: true, enumerable: true })
+  const withGetter = { ...request }
+  Object.defineProperty(withGetter, 'limit', { get: () => 32, enumerable: true })
+  for (const hostile of [
+    new Proxy(request, {}),
+    withSymbol,
+    withGetter,
+    { ...request, operation: 'inspect' },
+    { ...request, deletionRef: 'deletion:plaintext' }
+  ]) {
+    assert.throws(() => parseMemoryMaintenanceCapabilityRequestV1(hostile), TypeError)
+    assert.equal(memoryMaintenanceCapabilityAllowsRequestV1(capability, hostile, NOW), false)
   }
 })

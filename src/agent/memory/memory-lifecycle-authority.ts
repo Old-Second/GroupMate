@@ -93,7 +93,7 @@ const AUTHORITY_REQUIREMENTS: readonly MemoryLifecycleActorAuthorityRequirementV
 ]
 const MAX_CANONICAL_INSTANT_MS = 8_640_000_000_000_000
 const OLD_GENERATION_MAINTENANCE_OPERATIONS = new Set<MemoryMaintenanceOperationV1>([
-  'namespace.scrubDeleted', 'namespace.verifyScrubbed', 'deletion.checkpoint'
+  'namespace.scrubDeleted', 'namespace.verifyScrubbed'
 ])
 
 const PERSONAL_SUBJECT_ACTIONS = new Set<MemoryLifecycleActorActionV1>(
@@ -234,6 +234,17 @@ export interface MemoryMaintenanceCapabilityV1 {
   readonly validFrom: string
   readonly validUntil: string
   readonly [maintenanceCapabilityBrand]: true
+}
+
+export interface MemoryMaintenanceCapabilityRequestV1 {
+  readonly botInstanceId: string
+  readonly accountId: string
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly currentGeneration: number
+  readonly targetGeneration: number
+  readonly deletionRef: string | null
+  readonly operation: MemoryMaintenanceOperationV1
+  readonly limit: number
 }
 
 interface TimedCapabilityStateV1 {
@@ -795,6 +806,66 @@ export interface MemoryPolicyCapabilityRequestV1 {
   readonly retentionPolicyRef: string
 }
 
+export interface MemoryPolicyCapabilityBindingRequestV1 {
+  readonly botInstanceId: string
+  readonly accountId: string
+  readonly sceneRef: string
+  readonly namespaceRef: MemoryNamespaceRefV1
+  readonly generation: number
+  readonly policyRef: string
+  readonly policyGeneration: number
+  readonly consent: MemoryPolicyConsentV1
+  readonly createdByActorRef: string
+}
+
+export function parseMemoryPolicyCapabilityBindingRequestV1 (
+  value: unknown
+): MemoryPolicyCapabilityBindingRequestV1 {
+  const input = inspectMemoryRecord(value, [
+    'botInstanceId', 'accountId', 'sceneRef', 'namespaceRef', 'generation', 'policyRef',
+    'policyGeneration', 'consent', 'createdByActorRef'
+  ])
+  return Object.freeze({
+    botInstanceId: parseMemoryBotInstanceIdV1(input.botInstanceId),
+    accountId: parseMemoryQqIdV1(input.accountId),
+    sceneRef: parseSceneRef(input.sceneRef),
+    namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
+    generation: positiveInteger(input.generation),
+    policyRef: parseOpaqueRef(input.policyRef, 'policy:'),
+    policyGeneration: positiveInteger(input.policyGeneration),
+    consent: enumValue(input.consent, ['owner_policy', 'group_policy'] as const),
+    createdByActorRef: parseActorRef(input.createdByActorRef)
+  })
+}
+
+export function memoryPolicyCapabilityAllowsBindingV1 (
+  capabilityValue: unknown,
+  requestValue: unknown,
+  freshNowValue: unknown
+): boolean {
+  if (capabilityValue === null || typeof capabilityValue !== 'object' ||
+    utilTypes.isProxy(capabilityValue) ||
+    !policyCapabilities.has(capabilityValue as MemoryPolicyCapabilityV1)) return false
+  const capability = capabilityValue as MemoryPolicyCapabilityV1
+  const state = policyStates.get(capability)
+  if (state === undefined) return false
+  try {
+    const request = parseMemoryPolicyCapabilityBindingRequestV1(requestValue)
+    return freshAt(state, freshNowValue) &&
+      capability.botInstanceId === request.botInstanceId &&
+      capability.accountId === request.accountId &&
+      capability.sceneRef === request.sceneRef &&
+      capability.namespaceRef === request.namespaceRef &&
+      capability.generation === request.generation &&
+      capability.policyRef === request.policyRef &&
+      capability.policyGeneration === request.policyGeneration &&
+      capability.consent === request.consent &&
+      capability.createdByActorRef === request.createdByActorRef
+  } catch {
+    return false
+  }
+}
+
 export function parseMemoryPolicyCapabilityRequestV1 (
   value: unknown
 ): MemoryPolicyCapabilityRequestV1 {
@@ -865,7 +936,39 @@ export function memoryLifecycleActorCapabilityRoleV1 (
   return actorStates.get(capabilityValue as MemoryLifecycleActorCapabilityV1)?.role ?? null
 }
 
-export function memoryMaintenanceCapabilityAllowsV1 (
+export function parseMemoryMaintenanceCapabilityRequestV1 (
+  value: unknown
+): MemoryMaintenanceCapabilityRequestV1 {
+  const input = inspectMemoryRecord(value, [
+    'botInstanceId', 'accountId', 'namespaceRef', 'currentGeneration', 'targetGeneration',
+    'deletionRef', 'operation', 'limit'
+  ])
+  const operation = enumValue(input.operation, MEMORY_MAINTENANCE_OPERATIONS_V1)
+  const currentGeneration = positiveInteger(input.currentGeneration)
+  const targetGeneration = positiveInteger(input.targetGeneration)
+  const deletionRef = input.deletionRef === null
+    ? null
+    : parseDeletionRef(input.deletionRef)
+  const limit = positiveInteger(input.limit)
+  if (limit > MEMORY_RESOURCE_LIMITS.operationBatchRecords) return invalidMemoryValue()
+  if (!OLD_GENERATION_MAINTENANCE_OPERATIONS.has(operation)) {
+    if (deletionRef !== null || targetGeneration !== currentGeneration) return invalidMemoryValue()
+  } else if (deletionRef === null || targetGeneration >= currentGeneration) {
+    return invalidMemoryValue()
+  }
+  return Object.freeze({
+    botInstanceId: parseMemoryBotInstanceIdV1(input.botInstanceId),
+    accountId: parseMemoryQqIdV1(input.accountId),
+    namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
+    currentGeneration,
+    targetGeneration,
+    deletionRef,
+    operation,
+    limit
+  })
+}
+
+export function memoryMaintenanceCapabilityAllowsRequestV1 (
   capabilityValue: unknown,
   requestValue: unknown,
   freshNowValue: unknown
@@ -877,7 +980,7 @@ export function memoryMaintenanceCapabilityAllowsV1 (
   const state = maintenanceStates.get(capability)
   if (state === undefined) return false
   try {
-    const request = parseMemoryMaintenanceAuthorityContextV1(requestValue)
+    const request = parseMemoryMaintenanceCapabilityRequestV1(requestValue)
     return freshAt(state, freshNowValue) &&
       capability.botInstanceId === request.botInstanceId &&
       capability.accountId === request.accountId &&
@@ -887,6 +990,28 @@ export function memoryMaintenanceCapabilityAllowsV1 (
       capability.deletionRef === request.deletionRef &&
       capability.operation === request.operation &&
       capability.limit === request.limit
+  } catch {
+    return false
+  }
+}
+
+export function memoryMaintenanceCapabilityAllowsV1 (
+  capabilityValue: unknown,
+  requestValue: unknown,
+  freshNowValue: unknown
+): boolean {
+  try {
+    const request = parseMemoryMaintenanceAuthorityContextV1(requestValue)
+    return memoryMaintenanceCapabilityAllowsRequestV1(capabilityValue, {
+      botInstanceId: request.botInstanceId,
+      accountId: request.accountId,
+      namespaceRef: request.namespaceRef,
+      currentGeneration: request.currentGeneration,
+      targetGeneration: request.targetGeneration,
+      deletionRef: request.deletionRef,
+      operation: request.operation,
+      limit: request.limit
+    }, freshNowValue)
   } catch {
     return false
   }
