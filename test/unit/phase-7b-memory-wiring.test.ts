@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
-import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import { buildGuobaSchemas } from '../../src/runtime/guoba-schema.js'
 import {
   PHASE_7B_PRODUCTION_TOOL_FACTORIES,
@@ -11,12 +10,12 @@ import {
   auditPhase7bProductionReachability,
   collectPhase7bProductionToolNames,
   phase7bBridgeDependenciesAreClosed,
-  phase7bBridgeNoopMemoryStoreIsExact,
+  phase7bBridgeMemoryDefaultOffIsExact,
   phase7bComputedImportBoundaryIsClosed,
   phase7bMemoryControlFieldIsForbidden,
   phase7bMemoryTelemetrySourceFindings,
   phase7bOutboxSurfaceIsBodyFree,
-  phase7bRuntimeMemoryStoreSeamIsClosed
+  phase7bRuntimeMemoryRecallSeamIsExact
 } from '../../src/verification/phase-7b-memory-report.js'
 
 const PROJECT_ROOT = process.cwd()
@@ -83,10 +82,10 @@ test('Phase 7B production wiring remains explicitly memory-disabled', async () =
   const audit = await auditPhase7bMemoryWiring(PROJECT_ROOT)
 
   assert.equal(audit.schemaVersion, 1)
-  assert.equal(audit.productionNoopStore, true)
+  assert.equal(audit.productionMemoryDefaultOff, true)
   assert.equal(audit.productionDependenciesClosed, true)
-  assert.equal(audit.memoryStoreSeamExact, true)
-  assert.equal(audit.runtimeMemoryImports, 0)
+  assert.equal(audit.memoryRecallSeamExact, true)
+  assert.equal(audit.runtimeMemoryImports, 1)
   assert.equal(audit.runtimeMemoryQueries, 0)
   assert.equal(audit.runtimeMemoryProposals, 0)
   assert.equal(audit.runtimeContextSourceImports, 0)
@@ -106,26 +105,6 @@ test('Phase 7B production wiring remains explicitly memory-disabled', async () =
     createdFiles: 0
   })
   assert.equal(audit.passed, true)
-})
-
-test('NoopMemoryStore remains a frozen empty kill switch', async () => {
-  const store = new NoopMemoryStore()
-  const query = Object.freeze({
-    botId: 'phase7b-bot',
-    namespace: Object.freeze({ kind: 'personal' as const, userId: '92000002' }),
-    requester: Object.freeze({
-      userId: '92000002',
-      displayName: 'fixture',
-      role: 'member' as const
-    }),
-    limit: 8,
-    maxTokens: 512
-  })
-  const first = await store.retrieve(query)
-  const second = await store.retrieve(query)
-  assert.equal(first, second)
-  assert.deepEqual(first, [])
-  assert.equal(Object.isFrozen(first), true)
 })
 
 test('production tool inventory is exact and has no memory capability', async () => {
@@ -148,21 +127,21 @@ test('production reachability follows indirect and comment-separated imports', (
   const indirect = auditPhase7bProductionReachability({
     'src/runtime/production-yunzai-agent.ts': "import './bridge.js'\n",
     'src/runtime/bridge.ts': "import '../middle.js'\n",
-    'src/middle.ts': "import './agent/memory/memory-domain.js'\n",
-    'src/agent/memory/memory-domain.ts': 'export const marker = true\n'
+    'src/middle.ts': "import './agent/memory/sqlite-memory-database.js'\n",
+    'src/agent/memory/sqlite-memory-database.ts': 'export const marker = true\n'
   })
   assert.equal(indirect.complete, true)
   assert.equal(indirect.reachableFiles, 4)
   assert.equal(indirect.forbiddenMemoryModules, 1)
 
   for (const source of [
-    "const marker = true; import '../agent/memory/memory-domain.js'\n",
-    "import /* reviewed-comment */ '../agent/memory/memory-domain.js'\n",
-    "void import /* reviewed-comment */('../agent/memory/memory-domain.js')\n"
+    "const marker = true; import '../agent/memory/sqlite-memory-database.js'\n",
+    "import /* reviewed-comment */ '../agent/memory/sqlite-memory-database.js'\n",
+    "void import /* reviewed-comment */('../agent/memory/sqlite-memory-database.js')\n"
   ]) {
     const audit = auditPhase7bProductionReachability({
       'src/runtime/production-yunzai-agent.ts': source,
-      'src/agent/memory/memory-domain.ts': 'export const marker = true\n'
+      'src/agent/memory/sqlite-memory-database.ts': 'export const marker = true\n'
     })
     assert.equal(audit.complete, true)
     assert.equal(audit.forbiddenMemoryModules, 1)
@@ -196,10 +175,10 @@ test('production bridge dependency surface and outbox payload fail closed on new
     'src/runtime/agent-service-bridge.ts'
   ), 'utf8')
   assert.equal(phase7bBridgeDependenciesAreClosed(bridge), true)
-  assert.equal(phase7bBridgeNoopMemoryStoreIsExact(bridge), true)
-  assert.equal(phase7bBridgeNoopMemoryStoreIsExact(bridge.replace(
-    "import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'",
-    "// import { NoopMemoryStore } from '../agent/context/noop-memory-store.js'\nimport { NoopMemoryStore } from './active-store.js'"
+  assert.equal(phase7bBridgeMemoryDefaultOffIsExact(bridge), true)
+  assert.equal(phase7bBridgeMemoryDefaultOffIsExact(bridge.replace(
+    '  readonly personalMemoryRecallSource?: YunzaiPersonalMemoryRecallSourceV1',
+    '  readonly personalMemoryRecallSource: YunzaiPersonalMemoryRecallSourceV1'
   )), false)
   assert.equal(phase7bBridgeDependenciesAreClosed(bridge.replace(
     '  readonly observations?:',
@@ -269,16 +248,19 @@ test('computed plugin imports and memory configuration aliases are exact', async
 
 test('runtime memory seam and telemetry edges reject shorthand and comment bypasses', () => {
   const exact = {
-    'src/runtime/bridge.ts': 'const value = { memoryStore: new NoopMemoryStore() }\n'
+    'src/runtime/agent-service-bridge.ts': [
+      'interface D { readonly personalMemoryRecallSource?: Source }',
+      'const value = dependencies.personalMemoryRecallSource'
+    ].join('\n')
   }
-  assert.equal(phase7bRuntimeMemoryStoreSeamIsClosed(exact), true)
+  assert.equal(phase7bRuntimeMemoryRecallSeamIsExact(exact), true)
   for (const source of [
-    'const memoryStore = new NoopMemoryStore()\nconst value = { memoryStore }\n',
-    'interface Options { readonly memoryStore?: unknown }\n',
-    'const value = { memoryStore: new OtherStore() }\n',
-    "const value = { ['memoryStore']: new NoopMemoryStore() }\n"
-  ]) assert.equal(phase7bRuntimeMemoryStoreSeamIsClosed({
-    'src/runtime/bridge.ts': source
+    'interface D { readonly personalMemoryRecallSource: Source }\nconst value = dependencies.personalMemoryRecallSource\n',
+    'interface D { readonly personalMemoryRecallSource?: Source }\n',
+    'const memoryStore = new OtherStore()\n',
+    'interface D { readonly personalMemoryRecallSource?: Source }\nconst value = other.personalMemoryRecallSource\n'
+  ]) assert.equal(phase7bRuntimeMemoryRecallSeamIsExact({
+    'src/runtime/agent-service-bridge.ts': source
   }), false)
 
   assert.equal(phase7bMemoryTelemetrySourceFindings(

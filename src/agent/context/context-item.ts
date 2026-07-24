@@ -1,5 +1,4 @@
 import type { AgentMessage } from '../contracts/content.js'
-import type { MemoryQuery } from '../contracts/memory.js'
 import type { ModelMessage } from '../model/model-adapter.js'
 
 export type ContextSource =
@@ -15,6 +14,12 @@ export interface ContextItem {
   readonly id: string
   readonly source: ContextSource
   readonly message: AgentMessage
+  readonly memoryRecord?: Readonly<{
+    readonly memoryId: string
+    readonly revision: number
+    readonly revisionHash: string
+    readonly namespaceRef: string
+  }>
   readonly atomicGroupId?: string
   readonly protocolSpanId?: string
   readonly modelMessage?: ModelMessage
@@ -25,9 +30,9 @@ export interface ContextInput {
   readonly runtimeFacts: readonly ContextItem[]
   readonly sessionHistory: readonly ContextItem[]
   readonly groupContext: readonly ContextItem[]
+  readonly memoryContext: readonly ContextItem[]
   readonly currentRequest: ContextItem
   readonly toolMessages: readonly ContextItem[]
-  readonly memoryQuery?: MemoryQuery
 }
 
 export interface TokenEstimator {

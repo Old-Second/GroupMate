@@ -245,9 +245,9 @@ export interface Phase7bMemoryColdImportAudit {
 
 export interface Phase7bMemoryWiringAudit {
   readonly schemaVersion: 1
-  readonly productionNoopStore: boolean
+  readonly productionMemoryDefaultOff: boolean
   readonly productionDependenciesClosed: boolean
-  readonly memoryStoreSeamExact: boolean
+  readonly memoryRecallSeamExact: boolean
   readonly runtimeMemoryImports: number
   readonly runtimeMemoryQueries: number
   readonly runtimeMemoryProposals: number
@@ -812,7 +812,12 @@ function sourceImportSpecifiers (
   const visit = (node: ts.Node): void => {
     if (!complete) return
     if (ts.isImportDeclaration(node)) {
-      acceptLiteral(node.moduleSpecifier)
+      const bindings = node.importClause?.namedBindings
+      const typeOnly = node.importClause?.isTypeOnly === true || (
+        bindings !== undefined && ts.isNamedImports(bindings) &&
+        bindings.elements.length > 0 && bindings.elements.every(element => element.isTypeOnly)
+      )
+      if (!typeOnly) acceptLiteral(node.moduleSpecifier)
     } else if (ts.isExportDeclaration(node)) {
       if (node.moduleSpecifier !== undefined) acceptLiteral(node.moduleSpecifier)
     } else if (ts.isImportEqualsDeclaration(node)) {
@@ -905,7 +910,14 @@ export function auditPhase7bProductionReachability (
     complete,
     reachableFiles: reachable.length,
     forbiddenMemoryModules: reachable.filter(relativePath => (
-      relativePath.startsWith('src/agent/memory/')
+      relativePath.startsWith('src/agent/memory/') && ![
+        'src/agent/memory/memory-access-gate.ts',
+        'src/agent/memory/memory-context-projection.ts',
+        'src/agent/memory/memory-domain.ts',
+        'src/agent/memory/memory-namespace.ts',
+        'src/agent/memory/memory-resource-limits.ts',
+        'src/agent/memory/memory-retrieval.ts'
+      ].includes(relativePath)
     )).length,
     forbiddenContextSourceModules: reachable.filter(relativePath => (
       relativePath === 'src/agent/context/context-source.ts'
@@ -913,7 +925,7 @@ export function auditPhase7bProductionReachability (
   })
 }
 
-export function phase7bRuntimeMemoryStoreSeamIsClosed (value: unknown): boolean {
+export function phase7bRuntimeMemoryRecallSeamIsExact (value: unknown): boolean {
   let input: Record<string, unknown>
   try {
     input = exactRecord(value, 'Phase 7B runtime source graph')
@@ -936,35 +948,29 @@ export function phase7bRuntimeMemoryStoreSeamIsClosed (value: unknown): boolean 
       ts.ScriptKind.TS
     )
     if (sourceHasParseDiagnostics(sourceFile)) return false
-    let closed = true
+    let closed = !/\b(?:NoopMemoryStore|MemoryStore|memoryStore)\b/.test(source)
     const visit = (node: ts.Node): void => {
       if (!closed) return
-      if ((ts.isStringLiteralLike(node) && node.text === 'memoryStore') ||
-        (ts.isPrivateIdentifier(node) && node.text === '#memoryStore')) {
-        closed = false
-        return
-      }
-      if (ts.isIdentifier(node) && node.text === 'memoryStore') {
+      if (ts.isIdentifier(node) && node.text === 'personalMemoryRecallSource') {
         const parent = node.parent
-        const initializer = ts.isPropertyAssignment(parent) && parent.name === node
-          ? parent.initializer
-          : undefined
-        if (initializer === undefined || !ts.isNewExpression(initializer) ||
-          !ts.isIdentifier(initializer.expression) ||
-          initializer.expression.text !== 'NoopMemoryStore' ||
-          (initializer.arguments?.length ?? 0) !== 0 ||
-          (initializer.typeArguments?.length ?? 0) !== 0) {
+        if (relativePath !== 'src/runtime/agent-service-bridge.ts') {
           closed = false
-          return
+        } else if (ts.isPropertySignature(parent) && parent.name === node &&
+          parent.questionToken !== undefined) {
+          exactSeams += 1
+        } else if (ts.isPropertyAccessExpression(parent) && parent.name === node &&
+          ts.isIdentifier(parent.expression) && parent.expression.text === 'dependencies') {
+          exactSeams += 1
+        } else {
+          closed = false
         }
-        exactSeams += 1
       }
       ts.forEachChild(node, visit)
     }
     visit(sourceFile)
     if (!closed) return false
   }
-  return exactSeams === 1
+  return exactSeams === 2
 }
 
 interface ExactInterfaceProperty {
@@ -984,6 +990,11 @@ const PHASE_7B_EXPECTED_BRIDGE_DEPENDENCIES = Object.freeze([
     name: 'providerIsolationIdSourceFactory',
     optional: true,
     type: 'ProviderIsolationIdSourceFactory'
+  },
+  {
+    name: 'personalMemoryRecallSource',
+    optional: true,
+    type: 'YunzaiPersonalMemoryRecallSourceV1'
   },
   {
     name: 'observations',
@@ -1057,7 +1068,7 @@ export function phase7bBridgeDependenciesAreClosed (value: unknown): boolean {
   )
 }
 
-export function phase7bBridgeNoopMemoryStoreIsExact (value: unknown): boolean {
+export function phase7bBridgeMemoryDefaultOffIsExact (value: unknown): boolean {
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_AUDIT_FILE_BYTES) {
     return false
   }
@@ -1069,35 +1080,26 @@ export function phase7bBridgeNoopMemoryStoreIsExact (value: unknown): boolean {
     ts.ScriptKind.TS
   )
   if (sourceHasParseDiagnostics(sourceFile)) return false
-  const imports = sourceFile.statements.filter((node): node is ts.ImportDeclaration => (
-    ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier) &&
-    node.moduleSpecifier.text === '../agent/context/noop-memory-store.js'
-  ))
-  if (imports.length !== 1) return false
-  const importClause = (imports[0] as ts.ImportDeclaration).importClause
-  if (importClause === undefined || importClause.isTypeOnly || importClause.name !== undefined ||
-    importClause.namedBindings === undefined || !ts.isNamedImports(importClause.namedBindings) ||
-    importClause.namedBindings.elements.length !== 1) return false
-  const imported = importClause.namedBindings.elements[0]
-  if (imported === undefined || imported.isTypeOnly || imported.propertyName !== undefined ||
-    imported.name.text !== 'NoopMemoryStore') return false
   let identifierCount = 0
-  let exactConstructionCount = 0
+  let optionalPropertyCount = 0
+  let dependencyReadCount = 0
   const visit = (node: ts.Node): void => {
-    if (ts.isIdentifier(node) && node.text === 'NoopMemoryStore') identifierCount += 1
-    if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) &&
-      node.expression.text === 'NoopMemoryStore') {
+    if (ts.isIdentifier(node) && node.text === 'personalMemoryRecallSource') {
+      identifierCount += 1
       const parent = node.parent
-      if (ts.isPropertyAssignment(parent) && parent.initializer === node &&
-        ts.isIdentifier(parent.name) && parent.name.text === 'memoryStore' &&
-        (node.arguments?.length ?? 0) === 0 && (node.typeArguments?.length ?? 0) === 0) {
-        exactConstructionCount += 1
+      if (ts.isPropertySignature(parent) && parent.name === node &&
+        parent.questionToken !== undefined) optionalPropertyCount += 1
+      if (ts.isPropertyAccessExpression(parent) && parent.name === node &&
+        ts.isIdentifier(parent.expression) && parent.expression.text === 'dependencies') {
+        dependencyReadCount += 1
       }
     }
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
-  return identifierCount === 2 && exactConstructionCount === 1
+  return identifierCount === 2 && optionalPropertyCount === 1 && dependencyReadCount === 1 &&
+    /if \(input\.source === undefined\) return Object\.freeze\(\[\]\)/.test(value) &&
+    !/\bnew\s+[A-Za-z0-9_$]*(?:Memory|Qdrant|Vector)[A-Za-z0-9_$]*\s*\(/.test(value)
 }
 
 function matchCount (source: string, pattern: RegExp): number {
@@ -1366,7 +1368,7 @@ export async function auditPhase7bMemoryWiring (
   const toolSource = sources.tools ?? ''
   const guobaSource = `${sources.guoba ?? ''}\n${sources.guobaSupport ?? ''}`
   const runtimeMemoryImports = matchCount(
-    runtimeSource,
+    bridge,
     /(?:from\s+|import\s*\(\s*)['"][^'"]*agent\/memory\/[^'"]+['"]/g
   )
   const runtimeMemoryQueries = matchCount(runtimeSource, /\bmemoryQuery\b/g)
@@ -1416,9 +1418,9 @@ export async function auditPhase7bMemoryWiring (
       configMemoryEnableFields = 1
     }
   }
-  const productionNoopStore = phase7bBridgeNoopMemoryStoreIsExact(bridge)
+  const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge)
   const bridgeDependenciesClosed = phase7bBridgeDependenciesAreClosed(bridge)
-  const memoryStoreSeamExact = phase7bRuntimeMemoryStoreSeamIsClosed(runtimeSourceGraph)
+  const memoryRecallSeamExact = phase7bRuntimeMemoryRecallSeamIsExact(runtimeSourceGraph)
   const service = sources.service ?? ''
   const sourceInputStart = service.indexOf(
     'const sourceInput = (dropOptional: boolean): ContextInput => {'
@@ -1427,7 +1429,7 @@ export async function auditPhase7bMemoryWiring (
   const sourceInput = sourceInputStart >= 0 && sourceInputEnd > sourceInputStart
     ? service.slice(sourceInputStart, sourceInputEnd)
     : ''
-  const exactProductionContextInput = /return Object\.freeze\(\{\s*systemInstructions,\s*runtimeFacts:\s*bounded\.runtimeFacts,\s*sessionHistory:\s*bounded\.sessionHistory,\s*groupContext:\s*bounded\.groupContext,\s*currentRequest,\s*toolMessages:\s*EMPTY_ITEMS\s*\}\)/.test(
+  const exactProductionContextInput = /return Object\.freeze\(\{\s*systemInstructions,\s*runtimeFacts:\s*bounded\.runtimeFacts,\s*sessionHistory:\s*bounded\.sessionHistory,\s*groupContext:\s*bounded\.groupContext,\s*memoryContext:\s*bounded\.memoryContext,\s*currentRequest,\s*toolMessages:\s*EMPTY_ITEMS\s*\}\)/.test(
     sourceInput
   ) && !/\bmemoryQuery\b|\.\.\./.test(
     sourceInput.slice(sourceInput.lastIndexOf('return Object.freeze({'))
@@ -1436,9 +1438,9 @@ export async function auditPhase7bMemoryWiring (
     runtimeSource,
     /\b(?:openSqliteMemoryDatabaseV1|createSqliteMemoryRepositoryV1|RedisMemoryHotCache|createMemoryHotProjectorV1|createSqliteMemoryHeadSourceV1|createSqliteMemoryOutboxV1)\b/g
   )
-  const productionDependenciesClosed = requiredSourcesPresent && productionNoopStore &&
-    bridgeDependenciesClosed && memoryStoreSeamExact &&
-    runtimeMemoryImports === 0 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
+  const productionDependenciesClosed = requiredSourcesPresent && productionMemoryDefaultOff &&
+    bridgeDependenciesClosed && memoryRecallSeamExact &&
+    runtimeMemoryImports === 1 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
     runtimeContextSourceImports === 0 && dangerousConstructionCount === 0 &&
     reachability.forbiddenMemoryModules === 0 &&
     reachability.forbiddenContextSourceModules === 0 &&
@@ -1447,9 +1449,9 @@ export async function auditPhase7bMemoryWiring (
   const coldImport = await runColdImportAudit(root)
   const result = Object.freeze({
     schemaVersion: 1 as const,
-    productionNoopStore,
+    productionMemoryDefaultOff,
     productionDependenciesClosed,
-    memoryStoreSeamExact,
+    memoryRecallSeamExact,
     runtimeMemoryImports,
     runtimeMemoryQueries,
     runtimeMemoryProposals,
@@ -1464,8 +1466,8 @@ export async function auditPhase7bMemoryWiring (
     configMemoryEnableFields,
     memoryTelemetryEdges: telemetryEdges,
     coldImport,
-    passed: productionNoopStore && productionDependenciesClosed &&
-      runtimeMemoryImports === 0 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
+    passed: productionMemoryDefaultOff && productionDependenciesClosed &&
+      runtimeMemoryImports === 1 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
       runtimeContextSourceImports === 0 && reachability.complete &&
       reachability.forbiddenMemoryModules === 0 &&
       reachability.forbiddenContextSourceModules === 0 &&

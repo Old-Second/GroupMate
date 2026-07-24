@@ -101,10 +101,10 @@ function reportInput () {
 function passingProductionAudit (): Phase7bMemoryWiringAudit {
   return {
     schemaVersion: 1,
-    productionNoopStore: true,
+    productionMemoryDefaultOff: true,
     productionDependenciesClosed: true,
-    memoryStoreSeamExact: true,
-    runtimeMemoryImports: 0,
+    memoryRecallSeamExact: true,
+    runtimeMemoryImports: 1,
     runtimeMemoryQueries: 0,
     runtimeMemoryProposals: 0,
     runtimeContextSourceImports: 0,

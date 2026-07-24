@@ -207,6 +207,7 @@ export interface AgentServiceRunRuntime {
   readonly progress?: ProgressDelivery
   readonly runtimeFacts?: readonly ContextItem[]
   readonly groupContext?: readonly ContextItem[]
+  readonly memoryContext?: readonly ContextItem[]
 }
 
 export interface ConversationSessionPort {
@@ -231,7 +232,10 @@ export interface AgentServiceOptions {
   readonly modelCapabilityOverride?: ModelCapabilityOverride
   readonly progressPresenter: RunProgressPresenter
   readonly createEngine: (observer: (event: AgentEvent) => void) => RunEngine
-  readonly createRuntime: (request: YunzaiAgentRequest) => Promise<AgentServiceRunRuntime>
+  readonly createRuntime: (
+    request: YunzaiAgentRequest,
+    signal: AbortSignal
+  ) => Promise<AgentServiceRunRuntime>
   readonly recoverRuntime?: (checkpoint: RunCheckpoint) => Promise<AgentServiceRunRuntime>
   readonly createPresentationLifecycle?: (
     route: PresentationRouteV1 | RecoveredLegacyPresentationRoute
@@ -653,29 +657,35 @@ function boundedOptionalContext (
   runtimeFacts: readonly ContextItem[],
   history: readonly ContextItem[],
   groupContext: readonly ContextItem[],
+  memoryContext: readonly ContextItem[],
   budget: ContextBudget
 ): Readonly<{
   runtimeFacts: readonly ContextItem[]
   sessionHistory: readonly ContextItem[]
   groupContext: readonly ContextItem[]
+  memoryContext: readonly ContextItem[]
 }> {
   const historyGroups = [...atomicGroups(history)]
   const groupGroups = [...atomicGroups(groupContext)]
+  const memoryGroups = [...atomicGroups(memoryContext)]
   const current = (): readonly ContextItem[] => Object.freeze([
     ...mandatory,
     ...runtimeFacts,
     ...historyGroups.flat(),
-    ...groupGroups.flat()
+    ...groupGroups.flat(),
+    ...memoryGroups.flat()
   ])
   while ((current().length > budget.maxItems || encodedContextBytes(current()) > budget.maxBytes) &&
-    (groupGroups.length > 0 || historyGroups.length > 0)) {
-    if (groupGroups.length > 0) groupGroups.shift()
+    (memoryGroups.length > 0 || groupGroups.length > 0 || historyGroups.length > 0)) {
+    if (memoryGroups.length > 0) memoryGroups.shift()
+    else if (groupGroups.length > 0) groupGroups.shift()
     else historyGroups.shift()
   }
   return Object.freeze({
     runtimeFacts: Object.freeze([...runtimeFacts]),
     sessionHistory: Object.freeze(historyGroups.flat()),
-    groupContext: Object.freeze(groupGroups.flat())
+    groupContext: Object.freeze(groupGroups.flat()),
+    memoryContext: Object.freeze(memoryGroups.flat())
   })
 }
 
@@ -1207,7 +1217,7 @@ export class AgentService {
         }
       }
       if (linked.signal.aborted) throw new Error('run start was cancelled')
-      const runtime = await this.#createRuntime(request)
+      const runtime = await this.#createRuntime(request, linked.signal)
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       let binding = this.#bindingFor(runId, request, session, runtime)
@@ -1383,11 +1393,15 @@ export class AgentService {
       const groupContext = dropOptional
         ? EMPTY_ITEMS
         : Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)])
+      const memoryContext = dropOptional
+        ? EMPTY_ITEMS
+        : Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)])
       const bounded = boundedOptionalContext(
         Object.freeze([...systemInstructions, currentRequest]),
         runtimeFacts,
         history,
         groupContext,
+        memoryContext,
         request.contextBudget
       )
       return Object.freeze({
@@ -1395,6 +1409,7 @@ export class AgentService {
         runtimeFacts: bounded.runtimeFacts,
         sessionHistory: bounded.sessionHistory,
         groupContext: bounded.groupContext,
+        memoryContext: bounded.memoryContext,
         currentRequest,
         toolMessages: EMPTY_ITEMS
       })

@@ -9,7 +9,6 @@ import {
   parsePresentationTrace
 } from '../../src/agent/contracts/presentation-trace.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
-import { NoopMemoryStore } from '../../src/agent/context/noop-memory-store.js'
 import type {
   ModelAdapter,
   ModelRequest,
@@ -478,8 +477,7 @@ function contractContextEngine (): ContextEngine {
     estimator: {
       estimate: () => 1,
       estimateModelMessage: () => 1
-    },
-    memoryStore: new NoopMemoryStore()
+    }
   })
 }
 
@@ -1513,8 +1511,7 @@ test('AgentService owns context, progress, run execution and terminal session wr
       estimator: {
         estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
         estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
-      },
-      memoryStore: new NoopMemoryStore()
+      }
     }),
     progressPresenter: presenter,
     createEngine: observer => new RunEngine({
@@ -1708,8 +1705,7 @@ test('AgentService retries one runRef collision and fails the second with zero m
         estimator: {
           estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
           estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
-        },
-        memoryStore: new NoopMemoryStore()
+        }
       }),
       progressPresenter: new RunProgressPresenter(),
       createEngine: observer => new RunEngine({
@@ -1792,8 +1788,7 @@ test('AgentService serializes active runs for the same canonical session', async
       estimator: {
         estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
         estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
-      },
-      memoryStore: new NoopMemoryStore()
+      }
     }),
     progressPresenter: new RunProgressPresenter(),
     createEngine: observer => new RunEngine({
@@ -1885,8 +1880,7 @@ test('AgentService cancellation releases a paused run and shutdown waits for app
       estimator: {
         estimate: message => Math.max(1, Math.ceil(JSON.stringify(message.parts).length / 4)),
         estimateModelMessage: message => Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
-      },
-      memoryStore: new NoopMemoryStore()
+      }
     }),
     progressPresenter: new RunProgressPresenter(),
     createEngine: observer => new RunEngine({
