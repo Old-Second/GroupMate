@@ -23,6 +23,7 @@ export const MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2 = Object.freeze({
   languageHintAsciiBytes: 32,
   maxCandidates: 12,
   maxLexicalHits: 24,
+  maxVectorHits: 24,
   maxTokens: 2_400,
   maxBytes: 64 * 1_024,
   maxDurationMs: 500,
@@ -413,7 +414,7 @@ function parseRanking (value: unknown): MemoryRetrievalCandidateV2['ranking'] {
     ),
     vectorRank: nullablePositiveInteger(
       input.vectorRank,
-      MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxCandidates
+      MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxVectorHits
     ),
     rerankRank: nullablePositiveInteger(
       input.rerankRank,

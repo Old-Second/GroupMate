@@ -172,6 +172,7 @@ test('V2 retrieval request freezes query, subject and deadline resource limits',
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.subjects, 4)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxCandidates, 12)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxLexicalHits, 24)
+  assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxVectorHits, 24)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxTokens, 2_400)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxBytes, 64 * 1_024)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxDurationMs, 500)
@@ -191,6 +192,41 @@ test('V2 retrieval request freezes query, subject and deadline resource limits',
       ...invalid
     })), TypeError)
   }
+})
+
+test('V2 retrieval result admits bounded vector over-fetch ranks without widening output', () => {
+  const hybrid = deepFreeze({
+    ...completedResult(),
+    mode: 'hybrid',
+    candidates: completedResult().candidates.map(candidate => ({
+      ...candidate,
+      ranking: {
+        ...candidate.ranking,
+        vectorRank: MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxVectorHits
+      }
+    })),
+    index: {
+      ...completedResult().index,
+      vector: 'stale'
+    }
+  })
+  const parsed = parseMemoryRetrievalResultV2(hybrid)
+  assert.equal(parsed.status, 'completed')
+  if (parsed.status !== 'completed') assert.fail('expected hybrid result')
+  assert.equal(
+    parsed.candidates[0]?.ranking.vectorRank,
+    MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxVectorHits
+  )
+  assert.throws(() => parseMemoryRetrievalResultV2(deepFreeze({
+    ...hybrid,
+    candidates: hybrid.candidates.map(candidate => ({
+      ...candidate,
+      ranking: {
+        ...candidate.ranking,
+        vectorRank: MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxVectorHits + 1
+      }
+    }))
+  })), TypeError)
 })
 
 test('V2 completed result is detached, deeply frozen and carries bounded provenance', () => {
