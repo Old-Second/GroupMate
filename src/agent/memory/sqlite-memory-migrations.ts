@@ -609,7 +609,7 @@ const NEW_SCHEMA_OBJECTS_V2: readonly SqliteSchemaObjectV1[] = Object.freeze([
   namespace_ref TEXT NOT NULL CHECK(${NAMESPACE_REF_CHECK}),
   deletion_ref TEXT NOT NULL CHECK(length(deletion_ref) BETWEEN 1 AND 128),
   deleting_generation INTEGER NOT NULL CHECK(deleting_generation > 0),
-  observed_current_generation INTEGER NOT NULL CHECK(observed_current_generation > deleting_generation),
+  observed_current_generation INTEGER NOT NULL CHECK(observed_current_generation >= deleting_generation),
   canonical_bodies TEXT NOT NULL CHECK(canonical_bodies IN ('verified_absent', 'scrub_pending', 'unverified')),
   payload_deletion TEXT NOT NULL CHECK(payload_deletion IN ('secure_delete_on', 'unverified')),
   wal_checkpoint TEXT NOT NULL CHECK(wal_checkpoint IN ('truncated', 'deferred', 'unverified')),

@@ -28,8 +28,10 @@ import {
 } from '../../src/agent/memory/memory-lifecycle-command.js'
 import {
   MEMORY_RETENTION_POLICY_REF_V1,
+  createMemoryV1ToV2AggregateManifestV1,
   memoryProposalDeadlineV2
 } from '../../src/agent/memory/memory-lifecycle-domain.js'
+import { encodeMemoryV1ToV2AggregateManifestV1 } from '../../src/agent/memory/memory-lifecycle-codec.js'
 import {
   MEMORY_LIFECYCLE_MAINTENANCE_ACTOR_REF_V1,
   createMemoryLifecyclePortV1,
@@ -113,11 +115,13 @@ function harness (t: TestContext) {
 function authorityContext (
   namespace: MemoryNamespaceV1,
   now: string,
-  role: 'personal_subject' | 'group_member' | 'group_admin',
+  role: 'personal_subject' | 'personal_bot_master' | 'group_member' | 'group_admin',
   actions: readonly string[]
 ) {
   const actorUserId = namespace.scope.kind === 'personal'
-    ? namespace.scope.subjectUserId
+    ? role === 'personal_bot_master'
+      ? FIXTURE_IDS.secondUserId
+      : namespace.scope.subjectUserId
     : FIXTURE_IDS.subjectUserId
   const scene = namespace.scope.kind === 'personal'
     ? { kind: 'private' as const, peerUserId: namespace.scope.subjectUserId }
@@ -168,7 +172,8 @@ function actorEnvelope (
   namespace: MemoryNamespaceV1,
   now: string,
   actions: readonly string[],
-  role: 'personal_subject' | 'group_member' | 'group_admin' = 'personal_subject'
+  role: 'personal_subject' | 'personal_bot_master' | 'group_member' | 'group_admin' =
+    'personal_subject'
 ): MemoryLifecycleAuthorizationEnvelopeV1 {
   const auth = authorityContext(namespace, now, role, actions)
   return Object.freeze({
@@ -427,6 +432,50 @@ async function seedDirect (target: ReturnType<typeof harness>, fixture = directF
     fixture.bundle.proposal.proposedAt,
     ['propose_create', 'approve']
   ))
+}
+
+function forgetCommand (
+  fixture: ReturnType<typeof directFixture>,
+  ref: string,
+  occurredAt: string,
+  exact = true,
+  expectedHash = fixture.bundle.revision.revisionHash
+): MemoryLifecycleCommandV1 {
+  return createMemoryLifecycleCommandV1({
+    commandRef: ref,
+    operation: 'record.forget',
+    initiatedByActorRef: ACTOR_REF,
+    namespaceRef: fixture.bundle.record.namespaceRef,
+    expectedNamespaceGeneration: 1,
+    aggregateRef: fixture.bundle.record.memoryId,
+    expectedRevision: exact ? fixture.bundle.revision.revision : null,
+    expectedAggregateHash: exact ? expectedHash : null,
+    occurredAt,
+    newValidUntil: null,
+    newPurgeAt: null,
+    material: null
+  })
+}
+
+function deleteNamespaceCommand (
+  namespace: MemoryNamespaceV1,
+  ref: string,
+  occurredAt: string
+): MemoryLifecycleCommandV1 {
+  return createMemoryLifecycleCommandV1({
+    commandRef: ref,
+    operation: 'namespace.delete',
+    initiatedByActorRef: ACTOR_REF,
+    namespaceRef: memoryNamespaceRefV1(namespace),
+    expectedNamespaceGeneration: 1,
+    aggregateRef: null,
+    expectedRevision: null,
+    expectedAggregateHash: null,
+    occurredAt,
+    newValidUntil: null,
+    newPurgeAt: null,
+    material: null
+  })
 }
 
 test('SQLite lifecycle proposal create is atomic, restart-safe and idempotent', async t => {
@@ -1230,4 +1279,391 @@ test('SQLite lifecycle rejects conservative usage undercounts without partial wr
   `).run()
   await execute('3')
   assert.notEqual(lifecycle.lifecycle_command_records, 0)
+})
+
+test('SQLite lifecycle forget atomically removes body carriers and freezes its receipt', async t => {
+  const target = harness(t)
+  const fixture = directFixture(NOW, commandRef('1'))
+  assert.equal((await seedDirect(target, fixture)).status, 'stored')
+  target.setNow(PLUS_1)
+  const command = forgetCommand(fixture, commandRef('2'), PLUS_1)
+  const envelope = actorEnvelope(command, fixture.namespace, PLUS_1, ['forget'])
+  const forgotten = await target.mutation.execute(envelope)
+  assert.equal(forgotten.status, 'deletion_pending', JSON.stringify(forgotten))
+  if (forgotten.status !== 'deletion_pending') throw new TypeError('unexpected forget result')
+  assert.equal(forgotten.receipt.operation, 'forget')
+  assert.equal(forgotten.receipt.namespaceRef, fixture.bundle.record.namespaceRef)
+  assert.equal(forgotten.receipt.generationBefore, 1)
+  assert.equal(forgotten.receipt.generationAfter, 1)
+  assert.equal(forgotten.receipt.memoryId, fixture.bundle.record.memoryId)
+  assert.equal(forgotten.receipt.deletedRevision, 1)
+  assert.equal(forgotten.receipt.committedAt, PLUS_1)
+  assert.deepEqual(await target.mutation.execute(envelope), forgotten)
+  assert.deepEqual({ ...target.store.database.prepare(`
+    SELECT
+      (SELECT count(*) FROM proposals) AS proposals,
+      (SELECT count(*) FROM consent_evidence) AS consent_evidence,
+      (SELECT count(*) FROM heads) AS heads,
+      (SELECT count(*) FROM revisions) AS revisions,
+      (SELECT count(*) FROM revision_payloads) AS revision_payloads,
+      (SELECT count(*) FROM revision_evidence) AS revision_evidence,
+      (SELECT count(*) FROM tombstones) AS tombstones,
+      (SELECT count(*) FROM outbox) AS outbox,
+      (SELECT count(*) FROM lifecycle_commands) AS commands
+  `).get()! }, {
+    proposals: 0,
+    consent_evidence: 0,
+    heads: 0,
+    revisions: 0,
+    revision_payloads: 0,
+    revision_evidence: 0,
+    tombstones: 1,
+    outbox: 1,
+    commands: 2
+  })
+  assert.deepEqual({ ...target.store.database.prepare(`
+    SELECT active_memory_records, retained_revision_records, tombstone_records,
+      pending_outbox_records FROM usage WHERE namespace_generation = 1
+  `).get()! }, {
+    active_memory_records: 0,
+    retained_revision_records: 0,
+    tombstone_records: 1,
+    pending_outbox_records: 1
+  })
+  assert.deepEqual({ ...target.store.database.prepare(`
+    SELECT active_memory_records, retained_revision_records, tombstone_records,
+      pending_outbox_records FROM global_usage WHERE singleton = 1
+  `).get()! }, {
+    active_memory_records: 0,
+    retained_revision_records: 0,
+    tombstone_records: 1,
+    pending_outbox_records: 1
+  })
+  const tombstone = target.store.database.prepare(`
+    SELECT tombstone_id, receipt_hash FROM tombstones
+  `).get()!
+  assert.equal(tombstone.tombstone_id, forgotten.receipt.tombstoneId)
+  assert.equal(tombstone.receipt_hash, forgotten.receipt.tombstoneReceiptHash)
+
+  const collision = forgetCommand(fixture, commandRef('2'), PLUS_1, true, 'f'.repeat(64))
+  const collided = await target.mutation.execute(actorEnvelope(
+    collision,
+    fixture.namespace,
+    PLUS_1,
+    ['forget']
+  ))
+  assert.deepEqual(collided.status === 'conflict' ? collided.category : null, 'idempotency')
+})
+
+test('SQLite lifecycle forget makes migrated legacy wire carriers unreachable', async t => {
+  const target = harness(t)
+  const fixture = directFixture(NOW, commandRef('0'))
+  assert.equal((await seedDirect(target, fixture)).status, 'stored')
+  const manifest = createMemoryV1ToV2AggregateManifestV1({
+    namespaceRef: fixture.bundle.record.namespaceRef,
+    namespaceGeneration: 1,
+    aggregate: {
+      kind: 'memory',
+      aggregateId: fixture.bundle.record.memoryId,
+      proposalState: 'approved',
+      proposalRevision: 2,
+      currentRevision: 1,
+      legacyProposalWireHashes: ['1'.repeat(64), '2'.repeat(64)],
+      legacyRevisionWires: [{ revision: 1, legacyWireHash: '3'.repeat(64) }]
+    },
+    initiatedByActorRef: ACTOR_REF,
+    plannedMemoryId: fixture.bundle.record.memoryId,
+    intent: { kind: 'create' },
+    consentEvidenceId: fixture.bundle.consentEvidence.evidenceId,
+    consentEvidenceHash: fixture.bundle.consentEvidence.evidenceHash,
+    revisionEvidenceBindings: []
+  })
+  const manifestWire = encodeMemoryV1ToV2AggregateManifestV1(manifest)
+  const manifestBytes = Buffer.byteLength(manifestWire, 'utf8')
+  target.store.database.prepare(`
+    INSERT INTO memory_v1_to_v2_manifests(
+      namespace_ref, namespace_generation, manifest_id, aggregate_kind, aggregate_id,
+      manifest_hash, manifest_wire, manifest_wire_bytes, applied_at_ms
+    ) VALUES (?, 1, ?, 'memory', ?, ?, ?, ?, ?)
+  `).run(
+    fixture.bundle.record.namespaceRef,
+    manifest.manifestId,
+    fixture.bundle.record.memoryId,
+    manifest.manifestHash,
+    manifestWire,
+    manifestBytes,
+    Date.parse(NOW)
+  )
+  target.store.database.prepare(`
+    UPDATE usage SET canonical_logical_bytes = canonical_logical_bytes + ?
+    WHERE namespace_ref = ? AND namespace_generation = 1
+  `).run(manifestBytes, fixture.bundle.record.namespaceRef)
+  target.store.database.prepare(`
+    UPDATE global_usage SET canonical_logical_bytes = canonical_logical_bytes + ?
+    WHERE singleton = 1
+  `).run(manifestBytes)
+  target.setNow(PLUS_1)
+
+  const forgotten = await target.mutation.execute(actorEnvelope(
+    forgetCommand(fixture, commandRef('1'), PLUS_1),
+    fixture.namespace,
+    PLUS_1,
+    ['forget']
+  ))
+  assert.equal(forgotten.status, 'deletion_pending', JSON.stringify(forgotten))
+  assert.deepEqual({ ...target.store.database.prepare(`
+    SELECT
+      (SELECT count(*) FROM memory_v1_to_v2_manifests) AS manifests,
+      (SELECT count(*) FROM proposals) AS proposals,
+      (SELECT count(*) FROM consent_evidence) AS consent_evidence,
+      (SELECT count(*) FROM heads) AS heads,
+      (SELECT count(*) FROM revisions) AS revisions,
+      (SELECT count(*) FROM revision_payloads) AS revision_payloads,
+      (SELECT count(*) FROM revision_evidence) AS revision_evidence,
+      (SELECT count(*) FROM outbox WHERE event_kind IN (
+        'proposal_changed', 'record_upserted'
+      )) AS content_outbox
+  `).get()! }, {
+    manifests: 0,
+    proposals: 0,
+    consent_evidence: 0,
+    heads: 0,
+    revisions: 0,
+    revision_payloads: 0,
+    revision_evidence: 0,
+    content_outbox: 0
+  })
+  const usage = target.store.database.prepare(`
+    SELECT canonical_logical_bytes FROM usage
+    WHERE namespace_ref = ? AND namespace_generation = 1
+  `).get(fixture.bundle.record.namespaceRef)!
+  const global = target.store.database.prepare(`
+    SELECT canonical_logical_bytes FROM global_usage WHERE singleton = 1
+  `).get()!
+  assert.equal(usage.canonical_logical_bytes, global.canonical_logical_bytes)
+})
+
+test('SQLite lifecycle forget separates exact subject and opaque bot-master authority', async t => {
+  const subjectTarget = harness(t)
+  const subjectFixture = directFixture(NOW, commandRef('3'))
+  assert.equal((await seedDirect(subjectTarget, subjectFixture)).status, 'stored')
+  subjectTarget.setNow(PLUS_1)
+  const opaqueSubject = await subjectTarget.mutation.execute(actorEnvelope(
+    forgetCommand(subjectFixture, commandRef('4'), PLUS_1, false),
+    subjectFixture.namespace,
+    PLUS_1,
+    ['forget']
+  ))
+  assert.deepEqual(opaqueSubject.status === 'denied' ? opaqueSubject.category : null, 'authority')
+
+  const masterTarget = harness(t)
+  const masterFixture = directFixture(NOW, commandRef('5'))
+  assert.equal((await seedDirect(masterTarget, masterFixture)).status, 'stored')
+  masterTarget.setNow(PLUS_1)
+  const exactMaster = await masterTarget.mutation.execute(actorEnvelope(
+    forgetCommand(masterFixture, commandRef('6'), PLUS_1),
+    masterFixture.namespace,
+    PLUS_1,
+    ['forget'],
+    'personal_bot_master'
+  ))
+  assert.deepEqual(exactMaster.status === 'denied' ? exactMaster.category : null, 'authority')
+  const opaqueCommand = forgetCommand(masterFixture, commandRef('7'), PLUS_1, false)
+  const opaqueMaster = await masterTarget.mutation.execute(actorEnvelope(
+    opaqueCommand,
+    masterFixture.namespace,
+    PLUS_1,
+    ['forget'],
+    'personal_bot_master'
+  ))
+  assert.equal(opaqueMaster.status, 'deletion_pending', JSON.stringify(opaqueMaster))
+})
+
+test('SQLite lifecycle namespace delete advances generation and leaves old bodies scrub-pending', async t => {
+  const target = harness(t)
+  const fixture = directFixture(NOW, commandRef('8'))
+  assert.equal((await seedDirect(target, fixture)).status, 'stored')
+  target.setNow(PLUS_1)
+  const command = deleteNamespaceCommand(fixture.namespace, commandRef('9'), PLUS_1)
+  const envelope = actorEnvelope(command, fixture.namespace, PLUS_1, ['delete_namespace'])
+  const deleted = await target.mutation.execute(envelope)
+  assert.equal(deleted.status, 'deletion_pending', JSON.stringify(deleted))
+  if (deleted.status !== 'deletion_pending') throw new TypeError('unexpected namespace delete result')
+  assert.equal(deleted.receipt.operation, 'delete_namespace')
+  assert.equal(deleted.receipt.generationBefore, 1)
+  assert.equal(deleted.receipt.generationAfter, 2)
+  assert.equal(deleted.receipt.deletingGeneration, 1)
+  assert.equal(deleted.receipt.memoryId, null)
+  assert.equal(deleted.receipt.deletedRevision, null)
+  assert.deepEqual(await target.mutation.execute(envelope), deleted)
+  assert.deepEqual({ ...target.store.database.prepare(`
+    SELECT
+      (SELECT namespace_generation FROM namespaces) AS generation,
+      (SELECT count(*) FROM proposals WHERE namespace_generation = 1) AS old_proposals,
+      (SELECT count(*) FROM revisions WHERE namespace_generation = 1) AS old_revisions,
+      (SELECT count(*) FROM revision_payloads WHERE namespace_generation = 1) AS old_payloads,
+      (SELECT count(*) FROM heads WHERE namespace_generation = 1) AS old_heads,
+      (SELECT count(*) FROM tombstones WHERE namespace_generation = 2) AS tombstones,
+      (SELECT count(*) FROM namespace_deletion_checkpoints) AS checkpoints,
+      (SELECT count(*) FROM outbox WHERE namespace_generation = 2
+        AND event_kind = 'namespace_deleted') AS delete_events
+  `).get()! }, {
+    generation: 2,
+    old_proposals: 1,
+    old_revisions: 1,
+    old_payloads: 1,
+    old_heads: 1,
+    tombstones: 1,
+    checkpoints: 1,
+    delete_events: 1
+  })
+  const checkpoint = target.store.database.prepare(`
+    SELECT deletion_ref, deleting_generation, observed_current_generation,
+      canonical_bodies, payload_deletion, wal_checkpoint, derived_cleanup, stage
+    FROM namespace_deletion_checkpoints
+  `).get()!
+  assert.deepEqual({ ...checkpoint }, {
+    deletion_ref: deleted.receipt.deletionRef,
+    deleting_generation: 1,
+    observed_current_generation: 2,
+    canonical_bodies: 'scrub_pending',
+    payload_deletion: 'unverified',
+    wal_checkpoint: 'unverified',
+    derived_cleanup: 'queued',
+    stage: 'logical_committed'
+  })
+  const collision = deleteNamespaceCommand(fixture.namespace, commandRef('9'), NOW)
+  const collided = await target.mutation.execute(actorEnvelope(
+    collision,
+    fixture.namespace,
+    PLUS_1,
+    ['delete_namespace']
+  ))
+  assert.deepEqual(collided.status === 'conflict' ? collided.category : null, 'idempotency')
+})
+
+test('SQLite lifecycle namespace deletion uses reserve capacity and rolls late failures back', async t => {
+  const reserveTarget = harness(t)
+  const reserveFixture = directFixture(NOW, commandRef('a'))
+  assert.equal((await seedDirect(reserveTarget, reserveFixture)).status, 'stored')
+  reserveTarget.store.database.prepare(`
+    UPDATE usage SET canonical_logical_bytes = ? WHERE namespace_generation = 1
+  `).run(62 * 1_024 * 1_024 + 1)
+  reserveTarget.store.database.prepare(`
+    UPDATE global_usage SET canonical_logical_bytes = ? WHERE singleton = 1
+  `).run(62 * 1_024 * 1_024 + 1)
+  reserveTarget.setNow(PLUS_1)
+  const reserved = await reserveTarget.mutation.execute(actorEnvelope(
+    deleteNamespaceCommand(reserveFixture.namespace, commandRef('b'), PLUS_1),
+    reserveFixture.namespace,
+    PLUS_1,
+    ['delete_namespace']
+  ))
+  assert.equal(reserved.status, 'deletion_pending', JSON.stringify(reserved))
+
+  const rollbackTarget = harness(t)
+  const rollbackFixture = directFixture(NOW, commandRef('c'))
+  assert.equal((await seedDirect(rollbackTarget, rollbackFixture)).status, 'stored')
+  const baseline = {
+    namespace: { ...rollbackTarget.store.database.prepare(`SELECT * FROM namespaces`).get()! },
+    usage: rollbackTarget.store.database.prepare(`
+      SELECT namespace_generation, active_memory_records, retained_revision_records,
+        tombstone_records, canonical_logical_bytes, pending_outbox_records,
+        lifecycle_command_records, deletion_checkpoint_records
+      FROM usage ORDER BY namespace_generation
+    `).all().map(row => ({ ...row })),
+    global: { ...rollbackTarget.store.database.prepare(`SELECT * FROM global_usage`).get()! }
+  }
+  rollbackTarget.store.database.exec(`
+    CREATE TEMP TRIGGER fail_namespace_deletion_checkpoint
+    BEFORE INSERT ON namespace_deletion_checkpoints
+    BEGIN
+      SELECT RAISE(IGNORE);
+    END
+  `)
+  rollbackTarget.setNow(PLUS_1)
+  const command = deleteNamespaceCommand(rollbackFixture.namespace, commandRef('d'), PLUS_1)
+  const failed = await rollbackTarget.mutation.execute(actorEnvelope(
+    command,
+    rollbackFixture.namespace,
+    PLUS_1,
+    ['delete_namespace']
+  ))
+  assert.deepEqual(failed.status === 'corrupt' ? failed.category : null, 'canonical_data')
+  assert.deepEqual({ ...rollbackTarget.store.database.prepare(`SELECT * FROM namespaces`).get()! },
+    baseline.namespace)
+  assert.deepEqual(rollbackTarget.store.database.prepare(`
+    SELECT namespace_generation, active_memory_records, retained_revision_records,
+      tombstone_records, canonical_logical_bytes, pending_outbox_records,
+      lifecycle_command_records, deletion_checkpoint_records
+    FROM usage ORDER BY namespace_generation
+  `).all().map(row => ({ ...row })), baseline.usage)
+  assert.deepEqual({ ...rollbackTarget.store.database.prepare(`SELECT * FROM global_usage`).get()! },
+    baseline.global)
+  assert.deepEqual({ ...rollbackTarget.store.database.prepare(`
+    SELECT
+      (SELECT count(*) FROM tombstones) AS tombstones,
+      (SELECT count(*) FROM namespace_deletion_checkpoints) AS checkpoints,
+      (SELECT count(*) FROM lifecycle_commands) AS commands,
+      (SELECT count(*) FROM outbox) AS outbox
+  `).get()! }, { tombstones: 0, checkpoints: 0, commands: 1, outbox: 2 })
+  rollbackTarget.store.database.exec('DROP TRIGGER fail_namespace_deletion_checkpoint')
+  assert.equal((await rollbackTarget.mutation.execute(actorEnvelope(
+    command,
+    rollbackFixture.namespace,
+    PLUS_1,
+    ['delete_namespace']
+  ))).status, 'deletion_pending')
+})
+
+test('SQLite lifecycle namespace deletion reports BUSY with zero partial writes', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'groupmate-memory-delete-busy-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const location = join(directory, 'memory.sqlite')
+  let currentNow = NOW
+  const firstStore = openSqliteMemoryDatabaseV2({ location, now: () => currentNow, manifests: [] })
+  const secondStore = openSqliteMemoryDatabaseV2({ location, now: () => currentNow, manifests: [] })
+  try {
+    const fixture = directFixture(NOW, commandRef('e'))
+    const direct = createMemoryLifecyclePortV1({
+      now: () => currentNow,
+      execute: createSqliteMemoryLifecycleProposalAdapterV1({
+        database: firstStore.database,
+        now: () => currentNow
+      }).execute
+    })
+    assert.equal((await direct.execute(actorEnvelope(
+      fixture.command,
+      fixture.namespace,
+      NOW,
+      ['propose_create', 'approve']
+    ))).status, 'stored')
+    currentNow = PLUS_1
+    secondStore.database.exec('PRAGMA busy_timeout = 1')
+    firstStore.database.exec('BEGIN IMMEDIATE')
+    const port = mutationPort(secondStore.database, () => currentNow)
+    const result = await port.execute(actorEnvelope(
+      deleteNamespaceCommand(fixture.namespace, commandRef('f'), PLUS_1),
+      fixture.namespace,
+      PLUS_1,
+      ['delete_namespace']
+    ))
+    assert.deepEqual(result.status === 'unavailable'
+      ? { category: result.category, retryable: result.retryable }
+      : null, { category: 'busy', retryable: true })
+    assert.deepEqual({ ...secondStore.database.prepare(`
+      SELECT
+        (SELECT namespace_generation FROM namespaces) AS generation,
+        (SELECT count(*) FROM tombstones) AS tombstones,
+        (SELECT count(*) FROM namespace_deletion_checkpoints) AS checkpoints,
+        (SELECT count(*) FROM lifecycle_commands) AS commands,
+        (SELECT count(*) FROM outbox) AS outbox
+    `).get()! }, { generation: 1, tombstones: 0, checkpoints: 0, commands: 1, outbox: 2 })
+  } finally {
+    try {
+      firstStore.database.exec('ROLLBACK')
+    } catch {}
+    secondStore.close()
+    firstStore.close()
+  }
 })

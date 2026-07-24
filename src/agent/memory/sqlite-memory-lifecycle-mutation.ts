@@ -18,7 +18,11 @@ import {
 } from './memory-lifecycle-builder.js'
 import {
   decodeMemoryProposalV2,
+  decodeMemoryRevisionEvidenceV1,
   decodeMemoryRevisionV2,
+  decodeMemoryConsentEvidenceV1,
+  decodeMemoryV1ToV2AggregateManifestV1,
+  encodeDeletionStatusV1,
   encodeMemoryConsentEvidenceV1,
   encodeMemoryProposalV2,
   encodeMemoryRevisionEvidenceV1,
@@ -27,6 +31,7 @@ import {
 import {
   decodeMemoryLifecycleCommandWireV1,
   memoryLifecycleCommandHashV1,
+  memoryLifecycleCommandRefHashV1,
   parseMemoryLifecycleCommandV1,
   type MemoryLifecycleCommandOperationV1,
   type MemoryLifecycleCommandWireV1,
@@ -34,7 +39,10 @@ import {
 } from './memory-lifecycle-command.js'
 import {
   memoryLifecycleDomainHashV1,
+  createDeletionMutationReceiptV1,
+  createDeletionStatusV1,
   parseMemoryLifecycleInstantV1,
+  type DeletionMutationReceiptV1,
   type MemoryConsentEvidenceV1,
   type MemoryProposalV2,
   type MemoryRecordV2,
@@ -60,8 +68,12 @@ import {
   type MemoryLifecycleResultV1,
   type MemoryLifecycleStableResultV1
 } from './memory-lifecycle-result.js'
-import { encodeMemoryOutboxEventV1 } from './memory-codec.js'
-import { createMemoryOutboxEventV1 } from './memory-domain.js'
+import {
+  decodeMemoryOutboxEventV1,
+  encodeMemoryOutboxEventV1,
+  encodeMemoryTombstoneV1
+} from './memory-codec.js'
+import { createMemoryOutboxEventV1, createMemoryTombstoneV1 } from './memory-domain.js'
 import {
   memoryNamespaceRefV1,
   memoryNamespaceWireV1,
@@ -93,6 +105,8 @@ type MutationOperationV1 =
   | 'record.correct'
   | 'record.renew'
   | 'record.changeConflict'
+  | 'record.forget'
+  | 'namespace.delete'
 
 interface CoreUsageV1 {
   readonly pendingProposalRecords: number
@@ -121,6 +135,7 @@ interface UsageDeltaV1 {
   readonly pendingProposalRecords: number
   readonly activeMemoryRecords: number
   readonly retainedRevisionRecords: number
+  readonly tombstoneRecords: number
   readonly canonicalLogicalBytes: number
   readonly pendingOutboxRecords: number
   readonly outboxLogicalBytes: number
@@ -134,7 +149,7 @@ interface PreparedEventV1 {
   readonly bytes: number
 }
 
-class CanonicalLifecycleMutationDataErrorV1 extends Error {}
+export class CanonicalLifecycleMutationDataErrorV1 extends Error {}
 
 class LifecycleMutationCapacityErrorV1 extends Error {
   constructor (readonly category: NonNullable<ReturnType<typeof capacityFailure>>) {
@@ -144,7 +159,8 @@ class LifecycleMutationCapacityErrorV1 extends Error {
 
 const SUPPORTED_OPERATIONS = new Set<MemoryLifecycleCommandOperationV1>([
   'proposal.create', 'proposal.approve', 'proposal.reject', 'proposal.withdraw',
-  'proposal.expire', 'record.correct', 'record.renew', 'record.changeConflict'
+  'proposal.expire', 'record.correct', 'record.renew', 'record.changeConflict',
+  'record.forget', 'namespace.delete'
 ])
 const PROPOSAL_DECISION_OPERATIONS = new Set<MutationOperationV1>([
   'proposal.approve', 'proposal.reject', 'proposal.withdraw', 'proposal.expire'
@@ -156,6 +172,8 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/
 const AGGREGATE_REF_HASH_DOMAIN_V1 = 'groupmate.memory.lifecycle-aggregate-ref.v1'
 const MUTATION_RECEIPT_HASH_DOMAIN_V1 = 'groupmate.memory.lifecycle-mutation-receipt.v1'
 const PROPOSAL_RESULT_HASH_DOMAIN_V1 = 'groupmate.memory.lifecycle-proposal-result.v1'
+const DELETION_REPOSITORY_RECEIPT_HASH_DOMAIN_V1 =
+  'groupmate.memory.lifecycle-deletion-repository-receipt.v1'
 const NAMESPACE_CANONICAL_SOFT_BYTES =
   MEMORY_RESOURCE_LIMITS.namespaceCanonicalLogicalBytes - (2 * 1_024 * 1_024)
 const DEPLOYMENT_CANONICAL_SOFT_BYTES =
@@ -262,7 +280,8 @@ function actorAllows (
   envelope: MemoryLifecycleAuthorizationEnvelopeV1,
   wire: MemoryLifecycleCommandWireV1,
   action: 'propose_create' | 'propose_correction' | 'withdraw_own_proposal' |
-  'approve' | 'reject' | 'correct' | 'renew' | 'change_conflict',
+  'approve' | 'reject' | 'correct' | 'renew' | 'change_conflict' | 'forget' |
+  'delete_namespace',
   beforeRequirement: MemoryLifecycleCanonicalAuthorityRequirementV1,
   afterRequirement: MemoryLifecycleCanonicalAuthorityRequirementV1,
   initiatedByActorRef: string | null,
@@ -710,7 +729,10 @@ function validateUsageLowerBounds (
       usage.namespace.retainedRevisionRecords,
       mutationDelta.retainedRevisionRecords
     ),
-    tombstone_records: usage.namespace.tombstoneRecords,
+    tombstone_records: addExact(
+      usage.namespace.tombstoneRecords,
+      mutationDelta.tombstoneRecords
+    ),
     canonical_logical_bytes: addExact(
       usage.namespace.canonicalLogicalBytes,
       mutationDelta.canonicalLogicalBytes
@@ -775,7 +797,7 @@ function validateUsageLowerBounds (
       usage.global.retainedRevisionRecords,
       mutationDelta.retainedRevisionRecords
     ),
-    tombstone_records: usage.global.tombstoneRecords,
+    tombstone_records: addExact(usage.global.tombstoneRecords, mutationDelta.tombstoneRecords),
     canonical_logical_bytes: addExact(
       usage.global.canonicalLogicalBytes,
       mutationDelta.canonicalLogicalBytes
@@ -805,6 +827,14 @@ function addExact (left: number, right: number): number {
   return result
 }
 
+function addDelta (left: number, right: number): number {
+  const result = left + right
+  if (!Number.isSafeInteger(result) || Object.is(result, -0)) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  return result
+}
+
 function projectedUsage (
   usage: UsageStateV1,
   delta: UsageDeltaV1
@@ -813,7 +843,7 @@ function projectedUsage (
     pendingProposalRecords: addExact(value.pendingProposalRecords, delta.pendingProposalRecords),
     activeMemoryRecords: addExact(value.activeMemoryRecords, delta.activeMemoryRecords),
     retainedRevisionRecords: addExact(value.retainedRevisionRecords, delta.retainedRevisionRecords),
-    tombstoneRecords: value.tombstoneRecords,
+    tombstoneRecords: addExact(value.tombstoneRecords, delta.tombstoneRecords),
     canonicalLogicalBytes: addExact(value.canonicalLogicalBytes, delta.canonicalLogicalBytes),
     pendingOutboxRecords: addExact(value.pendingOutboxRecords, delta.pendingOutboxRecords),
     outboxLogicalBytes: addExact(value.outboxLogicalBytes, delta.outboxLogicalBytes)
@@ -837,7 +867,7 @@ function projectedUsage (
   })
 }
 
-function capacityFailure (usage: UsageStateV1):
+function capacityFailure (usage: UsageStateV1, reserveEligible = false):
 'pending_proposals' | 'active_records' | 'retained_revisions' | 'namespaces' |
 'canonical_bytes' | 'outbox_records' | 'outbox_bytes' | 'command_ledger' | null {
   if (usage.global.namespaceRecords > MEMORY_RESOURCE_LIMITS.deploymentNamespaces) return 'namespaces'
@@ -852,12 +882,24 @@ function capacityFailure (usage: UsageStateV1):
       usage.namespace.activeMemoryRecords * MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions) {
     return 'retained_revisions'
   }
-  if (usage.namespace.canonicalLogicalBytes > NAMESPACE_CANONICAL_SOFT_BYTES ||
-    usage.global.canonicalLogicalBytes > DEPLOYMENT_CANONICAL_SOFT_BYTES) {
+  const namespaceCanonicalLimit = reserveEligible
+    ? MEMORY_RESOURCE_LIMITS.namespaceCanonicalLogicalBytes
+    : NAMESPACE_CANONICAL_SOFT_BYTES
+  const deploymentCanonicalLimit = reserveEligible
+    ? MEMORY_RESOURCE_LIMITS.deploymentCanonicalLogicalBytes
+    : DEPLOYMENT_CANONICAL_SOFT_BYTES
+  const outboxRecordLimit = reserveEligible
+    ? MEMORY_RESOURCE_LIMITS.unackedOutboxRecords
+    : OUTBOX_SOFT_RECORDS
+  const outboxByteLimit = reserveEligible
+    ? MEMORY_RESOURCE_LIMITS.unackedOutboxLogicalBytes
+    : OUTBOX_SOFT_BYTES
+  if (usage.namespace.canonicalLogicalBytes > namespaceCanonicalLimit ||
+    usage.global.canonicalLogicalBytes > deploymentCanonicalLimit) {
     return 'canonical_bytes'
   }
-  if (usage.global.pendingOutboxRecords > OUTBOX_SOFT_RECORDS) return 'outbox_records'
-  if (usage.global.outboxLogicalBytes > OUTBOX_SOFT_BYTES) return 'outbox_bytes'
+  if (usage.global.pendingOutboxRecords > outboxRecordLimit) return 'outbox_records'
+  if (usage.global.outboxLogicalBytes > outboxByteLimit) return 'outbox_bytes'
   if (usage.namespaceCommands.records >
       MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleCommandLedgerRecordsPerNamespace ||
     usage.namespaceCommands.bytes >
@@ -880,7 +922,7 @@ function storeUsage (
 ): void {
   requireOneChange(database.prepare(`
     UPDATE usage SET pending_proposal_records = ?, active_memory_records = ?,
-      retained_revision_records = ?, canonical_logical_bytes = ?,
+      retained_revision_records = ?, tombstone_records = ?, canonical_logical_bytes = ?,
       pending_outbox_records = ?, outbox_logical_bytes = ?,
       lifecycle_command_records = ?, lifecycle_command_logical_bytes = ?, updated_at_ms = ?
     WHERE namespace_ref = ? AND namespace_generation = ?
@@ -888,6 +930,7 @@ function storeUsage (
     usage.namespace.pendingProposalRecords,
     usage.namespace.activeMemoryRecords,
     usage.namespace.retainedRevisionRecords,
+    usage.namespace.tombstoneRecords,
     usage.namespace.canonicalLogicalBytes,
     usage.namespace.pendingOutboxRecords,
     usage.namespace.outboxLogicalBytes,
@@ -908,7 +951,8 @@ function storeUsage (
   ).changes)
   requireOneChange(database.prepare(`
     UPDATE global_usage SET namespace_records = ?, pending_proposal_records = ?,
-      active_memory_records = ?, retained_revision_records = ?, canonical_logical_bytes = ?,
+      active_memory_records = ?, retained_revision_records = ?, tombstone_records = ?,
+      canonical_logical_bytes = ?,
       pending_outbox_records = ?, outbox_logical_bytes = ?, lifecycle_command_records = ?,
       lifecycle_command_logical_bytes = ?, updated_at_ms = ? WHERE singleton = 1
   `).run(
@@ -916,6 +960,7 @@ function storeUsage (
     usage.global.pendingProposalRecords,
     usage.global.activeMemoryRecords,
     usage.global.retainedRevisionRecords,
+    usage.global.tombstoneRecords,
     usage.global.canonicalLogicalBytes,
     usage.global.pendingOutboxRecords,
     usage.global.outboxLogicalBytes,
@@ -937,10 +982,11 @@ function prepareEvent (
   sequence: number,
   namespaceRef: string,
   generation: number,
-  aggregate: 'proposal' | 'record',
+  aggregate: 'proposal' | 'record' | 'namespace',
   aggregateId: string,
   revision: number,
-  eventKind: 'proposal_changed' | 'record_upserted',
+  eventKind: 'proposal_changed' | 'record_upserted' | 'record_forgotten' |
+  'namespace_deleted',
   occurredAt: string
 ): PreparedEventV1 {
   const eventId = `event:${domainHash(
@@ -1091,7 +1137,8 @@ function commitStableResult (
   result: MemoryLifecycleStableResultV1,
   baseDelta: Omit<UsageDeltaV1, 'commandRecords' | 'commandBytes'>,
   events: readonly PreparedEventV1[],
-  freshNow: string
+  freshNow: string,
+  reserveEligible = false
 ): MemoryLifecycleResultV1 {
   const resultWire = encodeMemoryLifecycleStableResultWireV1(result)
   const resultBytes = Buffer.byteLength(resultWire, 'utf8')
@@ -1106,14 +1153,14 @@ function commitStableResult (
   const outboxBytes = events.reduce((total, event) => addExact(total, event.bytes), 0)
   const delta: UsageDeltaV1 = Object.freeze({
     ...baseDelta,
-    canonicalLogicalBytes: addExact(baseDelta.canonicalLogicalBytes, resultBytes),
-    pendingOutboxRecords: addExact(baseDelta.pendingOutboxRecords, events.length),
-    outboxLogicalBytes: addExact(baseDelta.outboxLogicalBytes, outboxBytes),
+    canonicalLogicalBytes: addDelta(baseDelta.canonicalLogicalBytes, resultBytes),
+    pendingOutboxRecords: addDelta(baseDelta.pendingOutboxRecords, events.length),
+    outboxLogicalBytes: addDelta(baseDelta.outboxLogicalBytes, outboxBytes),
     commandRecords: 1,
     commandBytes: resultBytes
   })
   const usage = projectedUsage(usageBefore, delta)
-  const capacity = capacityFailure(usage)
+  const capacity = capacityFailure(usage, reserveEligible)
   if (capacity !== null) throw new LifecycleMutationCapacityErrorV1(capacity)
   for (const event of events) insertEvent(database, event)
   requireOneChange(database.prepare(`
@@ -1144,6 +1191,7 @@ const ZERO_DELTA = Object.freeze({
   pendingProposalRecords: 0,
   activeMemoryRecords: 0,
   retainedRevisionRecords: 0,
+  tombstoneRecords: 0,
   canonicalLogicalBytes: 0,
   pendingOutboxRecords: 0,
   outboxLogicalBytes: 0
@@ -1181,6 +1229,464 @@ function recordEvent (
     'record_upserted',
     occurredAt
   )
+}
+
+export interface SqliteDeletedRecordCarriersV1 {
+  readonly proposalIds: readonly string[]
+  readonly manifestIds: readonly string[]
+  readonly revisionCount: number
+  readonly canonicalBytes: number
+  readonly outboxRecords: number
+  readonly outboxBytes: number
+}
+
+function deletionRepositoryReceiptHash (
+  commandHash: string,
+  namespaceRef: string,
+  generationBefore: number,
+  generationAfter: number,
+  memoryId: string | null,
+  deletedRevision: number | null,
+  committedAt: string
+): string {
+  return memoryLifecycleDomainHashV1(
+    DELETION_REPOSITORY_RECEIPT_HASH_DOMAIN_V1,
+    JSON.stringify({
+      commandHash,
+      namespaceRef,
+      generationBefore,
+      generationAfter,
+      memoryId,
+      deletedRevision,
+      committedAt
+    })
+  )
+}
+
+function createDeletionReceiptAndTombstone (
+  wire: MemoryLifecycleCommandWireV1,
+  commandHash: string,
+  freshNow: string,
+  memoryId: string | null,
+  deletedRevision: number | null
+): {
+    readonly receipt: DeletionMutationReceiptV1
+    readonly tombstone: ReturnType<typeof createMemoryTombstoneV1>
+    readonly tombstoneWire: string
+    readonly tombstoneBytes: number
+  } {
+  const namespaceDelete = wire.operation === 'namespace.delete'
+  const generationAfter = namespaceDelete
+    ? addExact(wire.expectedNamespaceGeneration, 1)
+    : wire.expectedNamespaceGeneration
+  const common = {
+    commandRefHash: memoryLifecycleCommandRefHashV1(wire.commandRef),
+    operation: namespaceDelete ? 'delete_namespace' as const : 'forget' as const,
+    repositoryReceiptHash: deletionRepositoryReceiptHash(
+      commandHash,
+      wire.namespaceRef,
+      wire.expectedNamespaceGeneration,
+      generationAfter,
+      memoryId,
+      deletedRevision,
+      freshNow
+    ),
+    namespaceRef: wire.namespaceRef,
+    generationBefore: wire.expectedNamespaceGeneration,
+    generationAfter,
+    deletingGeneration: wire.expectedNamespaceGeneration,
+    memoryId,
+    deletedRevision,
+    committedAt: freshNow
+  }
+  const provisional = createDeletionMutationReceiptV1({
+    ...common,
+    tombstoneReceiptHash: '0'.repeat(64)
+  })
+  const tombstone = createMemoryTombstoneV1({
+    tombstoneId: provisional.tombstoneId,
+    namespaceRef: wire.namespaceRef,
+    namespaceGeneration: generationAfter,
+    memoryId,
+    deletedRevision,
+    deletionKind: namespaceDelete ? 'namespace_deleted' : 'memory_forgotten',
+    deletedAt: freshNow,
+    deletedByActorRef: wire.initiatedByActorRef,
+    reasonCode: namespaceDelete
+      ? 'memory_lifecycle_namespace_delete_v1'
+      : 'memory_lifecycle_forget_v1',
+    expiresAt: provisional.tombstoneExpiresAt
+  })
+  const receipt = createDeletionMutationReceiptV1({
+    ...common,
+    tombstoneReceiptHash: tombstone.receiptHash
+  })
+  if (receipt.deletionRef !== provisional.deletionRef ||
+    receipt.tombstoneId !== provisional.tombstoneId ||
+    receipt.tombstoneExpiresAt !== provisional.tombstoneExpiresAt) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const tombstoneWire = encodeMemoryTombstoneV1(tombstone)
+  return Object.freeze({
+    receipt,
+    tombstone,
+    tombstoneWire,
+    tombstoneBytes: Buffer.byteLength(tombstoneWire, 'utf8')
+  })
+}
+
+function insertDeletionTombstone (
+  database: DatabaseSync,
+  value: ReturnType<typeof createDeletionReceiptAndTombstone>
+): void {
+  const tombstone = value.tombstone
+  requireOneChange(database.prepare(`
+    INSERT INTO tombstones(
+      namespace_ref, namespace_generation, tombstone_id, memory_id,
+      deleted_revision, deletion_kind, deleted_at_ms, expires_at_ms,
+      receipt_hash, tombstone_wire, tombstone_wire_bytes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    tombstone.namespaceRef,
+    tombstone.namespaceGeneration,
+    tombstone.tombstoneId,
+    tombstone.memoryId,
+    tombstone.deletedRevision,
+    tombstone.deletionKind,
+    Date.parse(tombstone.deletedAt),
+    Date.parse(tombstone.expiresAt),
+    tombstone.receiptHash,
+    value.tombstoneWire,
+    value.tombstoneBytes
+  ).changes)
+}
+
+function deletionResult (
+  operation: 'record.forget' | 'namespace.delete',
+  commandHash: string,
+  receipt: DeletionMutationReceiptV1,
+  complete = false
+): MemoryLifecycleStableResultV1 {
+  return stableResult(resultFor(operation, commandHash, {
+    status: complete ? 'deletion_complete' : 'deletion_pending',
+    receipt
+  }))
+}
+
+function loadValidatedRecordCarriers (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number,
+  head: NonNullable<ReturnType<typeof loadHeadRevision>>,
+  freshNow: string
+): SqliteDeletedRecordCarriersV1 {
+  const memoryId = head.revision.memoryId
+  const revisionRows = database.prepare(`
+    SELECT revision FROM revisions
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    ORDER BY revision ASC LIMIT 33
+  `).all(namespaceRef, generation, memoryId)
+  if (revisionRows.length === 0 ||
+    revisionRows.length > MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions ||
+    revisionRows.length !== head.revision.revision) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const revisions = revisionRows.map((row, index) => {
+    const revisionNumber = positiveInteger(rowValue(row, 'revision'))
+    if (revisionNumber !== index + 1) throw new CanonicalLifecycleMutationDataErrorV1()
+    const loaded = loadRevision(database, namespaceRef, generation, memoryId, revisionNumber)
+    if (loaded === null) throw new CanonicalLifecycleMutationDataErrorV1()
+    return loaded
+  })
+  let canonicalBytes = revisions.reduce((total, revision) => addExact(total, revision.bytes), 0)
+
+  const revisionEvidenceRows = database.prepare(`
+    SELECT evidence_id, revision, evidence_hash, evidence_wire, evidence_wire_bytes,
+      changed_at_ms FROM revision_evidence
+    WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    ORDER BY revision ASC LIMIT 32
+  `).all(namespaceRef, generation, memoryId)
+  const expectedRevisionEvidence = revisions.filter(revision =>
+    revision.revision.evidence.kind === 'revision'
+  )
+  if (revisionEvidenceRows.length !== expectedRevisionEvidence.length) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  revisionEvidenceRows.forEach((row, index) => {
+    const loaded = canonicalWire(
+      rowValue(row, 'evidence_wire'),
+      rowValue(row, 'evidence_wire_bytes'),
+      decodeMemoryRevisionEvidenceV1
+    )
+    const revision = expectedRevisionEvidence[index]?.revision
+    if (revision === undefined || loaded.value.evidenceId !== exactString(rowValue(row, 'evidence_id')) ||
+      loaded.value.evidenceHash !== exactString(rowValue(row, 'evidence_hash')) ||
+      loaded.value.revision !== positiveInteger(rowValue(row, 'revision')) ||
+      loaded.value.changedAt !== new Date(exactInteger(rowValue(row, 'changed_at_ms'))).toISOString() ||
+      revision.evidence.evidenceId !== loaded.value.evidenceId ||
+      revision.evidence.evidenceHash !== loaded.value.evidenceHash) {
+      throw new CanonicalLifecycleMutationDataErrorV1()
+    }
+    canonicalBytes = addExact(canonicalBytes, loaded.bytes)
+  })
+
+  const proposalRows = database.prepare(`
+    SELECT proposal_id FROM proposals
+    WHERE namespace_ref = ? AND namespace_generation = ? AND resulting_memory_id = ?
+    ORDER BY proposal_id ASC LIMIT 33
+  `).all(namespaceRef, generation, memoryId)
+  if (proposalRows.length > 32) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const proposalIds: string[] = []
+  for (const row of proposalRows) {
+    const proposalId = exactString(rowValue(row, 'proposal_id'))
+    const proposal = loadProposal(database, namespaceRef, generation, proposalId)
+    if (proposal === null || proposal.proposal.state !== 'approved' ||
+      proposal.proposal.decision?.resultingMemoryId !== memoryId) {
+      throw new CanonicalLifecycleMutationDataErrorV1()
+    }
+    proposalIds.push(proposalId)
+    canonicalBytes = addExact(canonicalBytes, proposal.bytes)
+    const evidenceRows = database.prepare(`
+      SELECT evidence_id, evidence_hash, evidence_wire, evidence_wire_bytes, created_at_ms
+      FROM consent_evidence WHERE namespace_ref = ? AND namespace_generation = ?
+        AND proposal_id = ? ORDER BY evidence_id ASC LIMIT 2
+    `).all(namespaceRef, generation, proposalId)
+    if (evidenceRows.length !== 1) throw new CanonicalLifecycleMutationDataErrorV1()
+    const evidence = canonicalWire(
+      rowValue(evidenceRows[0]!, 'evidence_wire'),
+      rowValue(evidenceRows[0]!, 'evidence_wire_bytes'),
+      decodeMemoryConsentEvidenceV1
+    )
+    if (evidence.value.evidenceId !== exactString(rowValue(evidenceRows[0]!, 'evidence_id')) ||
+      evidence.value.evidenceHash !== exactString(rowValue(evidenceRows[0]!, 'evidence_hash')) ||
+      evidence.value.proposalId !== proposalId ||
+      Date.parse(evidence.value.approvedAt) !==
+        exactInteger(rowValue(evidenceRows[0]!, 'created_at_ms')) ||
+      proposal.proposal.decision?.consentEvidenceId !== evidence.value.evidenceId ||
+      proposal.proposal.decision?.consentEvidenceHash !== evidence.value.evidenceHash) {
+      throw new CanonicalLifecycleMutationDataErrorV1()
+    }
+    canonicalBytes = addExact(canonicalBytes, evidence.bytes)
+  }
+
+  const manifestRows = database.prepare(`
+    SELECT manifest_id, aggregate_kind, aggregate_id, manifest_hash,
+      manifest_wire, manifest_wire_bytes, applied_at_ms
+    FROM memory_v1_to_v2_manifests
+    WHERE namespace_ref = ? AND namespace_generation = ? AND (
+      (aggregate_kind = 'memory' AND aggregate_id = ?) OR
+      (aggregate_kind = 'proposal' AND aggregate_id IN (
+        SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+          AND namespace_generation = ? AND resulting_memory_id = ?
+      ))
+    ) ORDER BY aggregate_kind ASC, aggregate_id ASC LIMIT 34
+  `).all(namespaceRef, generation, memoryId, namespaceRef, generation, memoryId)
+  if (manifestRows.length > proposalIds.length + 1) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const manifestIds = manifestRows.map(row => {
+    const loaded = canonicalWire(
+      rowValue(row, 'manifest_wire'),
+      rowValue(row, 'manifest_wire_bytes'),
+      decodeMemoryV1ToV2AggregateManifestV1
+    )
+    const manifest = loaded.value
+    const aggregateKind = exactString(rowValue(row, 'aggregate_kind'))
+    const aggregateId = exactString(rowValue(row, 'aggregate_id'))
+    const appliedAtMs = exactInteger(rowValue(row, 'applied_at_ms'))
+    if (manifest.manifestId !== exactString(rowValue(row, 'manifest_id')) ||
+      manifest.manifestHash !== exactString(rowValue(row, 'manifest_hash')) ||
+      manifest.namespaceRef !== namespaceRef || manifest.namespaceGeneration !== generation ||
+      manifest.aggregate.kind !== aggregateKind ||
+      manifest.aggregate.aggregateId !== aggregateId ||
+      appliedAtMs < 0 || appliedAtMs > Date.parse(freshNow) ||
+      (aggregateKind === 'memory'
+        ? aggregateId !== memoryId
+        : aggregateKind !== 'proposal' || !proposalIds.includes(aggregateId))) {
+      throw new CanonicalLifecycleMutationDataErrorV1()
+    }
+    canonicalBytes = addExact(canonicalBytes, loaded.bytes)
+    return manifest.manifestId
+  })
+
+  const outboxRows = database.prepare(`
+    SELECT sequence, event_id, aggregate, aggregate_id, revision, event_kind,
+      occurred_at_ms, event_wire, logical_bytes
+    FROM outbox WHERE namespace_ref = ? AND namespace_generation = ? AND (
+      (aggregate = 'record' AND aggregate_id = ?) OR
+      (aggregate = 'proposal' AND aggregate_id IN (
+        SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+          AND namespace_generation = ? AND resulting_memory_id = ?
+      ))
+    ) ORDER BY sequence ASC LIMIT 129
+  `).all(namespaceRef, generation, memoryId, namespaceRef, generation, memoryId)
+  if (outboxRows.length > 128) throw new CanonicalLifecycleMutationDataErrorV1()
+  let outboxBytes = 0
+  for (const row of outboxRows) {
+    const loaded = canonicalWire(
+      rowValue(row, 'event_wire'),
+      rowValue(row, 'logical_bytes'),
+      decodeMemoryOutboxEventV1
+    )
+    const event = loaded.value
+    if (event.sequence !== positiveInteger(rowValue(row, 'sequence')) ||
+      event.eventId !== exactString(rowValue(row, 'event_id')) ||
+      event.namespaceRef !== namespaceRef || event.namespaceGeneration !== generation ||
+      event.aggregate !== exactString(rowValue(row, 'aggregate')) ||
+      event.aggregateId !== exactString(rowValue(row, 'aggregate_id')) ||
+      event.revision !== positiveInteger(rowValue(row, 'revision')) ||
+      event.eventKind !== exactString(rowValue(row, 'event_kind')) ||
+      Date.parse(event.occurredAt) !== exactInteger(rowValue(row, 'occurred_at_ms'))) {
+      throw new CanonicalLifecycleMutationDataErrorV1()
+    }
+    outboxBytes = addExact(outboxBytes, loaded.bytes)
+  }
+  return Object.freeze({
+    proposalIds: Object.freeze(proposalIds),
+    manifestIds: Object.freeze(manifestIds),
+    revisionCount: revisions.length,
+    canonicalBytes,
+    outboxRecords: outboxRows.length,
+    outboxBytes
+  })
+}
+
+export function deleteValidatedSqliteRecordCarriersV1 (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number,
+  memoryId: string,
+  carriers: SqliteDeletedRecordCarriersV1
+): void {
+  const consentDeleted = database.prepare(`
+    DELETE FROM consent_evidence WHERE namespace_ref = ? AND namespace_generation = ?
+      AND proposal_id IN (
+        SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+          AND namespace_generation = ? AND resulting_memory_id = ?
+      )
+  `).run(namespaceRef, generation, namespaceRef, generation, memoryId)
+  if (Number(consentDeleted.changes) !== carriers.proposalIds.length) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const proposalsDeleted = database.prepare(`
+    DELETE FROM proposals WHERE namespace_ref = ? AND namespace_generation = ?
+      AND resulting_memory_id = ?
+  `).run(namespaceRef, generation, memoryId)
+  if (Number(proposalsDeleted.changes) !== carriers.proposalIds.length) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  database.prepare(`
+    DELETE FROM revision_evidence WHERE namespace_ref = ? AND namespace_generation = ?
+      AND memory_id = ?
+  `).run(namespaceRef, generation, memoryId)
+  const manifestsDeleted = database.prepare(`
+    DELETE FROM memory_v1_to_v2_manifests
+    WHERE namespace_ref = ? AND namespace_generation = ? AND (
+      (aggregate_kind = 'memory' AND aggregate_id = ?) OR
+      (aggregate_kind = 'proposal' AND aggregate_id IN (
+        ${carriers.proposalIds.length === 0
+          ? "SELECT '' WHERE 0"
+          : carriers.proposalIds.map(() => '?').join(',')}
+      ))
+    )
+  `).run(namespaceRef, generation, memoryId, ...carriers.proposalIds)
+  if (Number(manifestsDeleted.changes) !== carriers.manifestIds.length) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const revisionsDeleted = database.prepare(`
+    DELETE FROM revisions WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+  `).run(namespaceRef, generation, memoryId)
+  if (Number(revisionsDeleted.changes) !== carriers.revisionCount) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const outboxDeleted = carriers.proposalIds.length === 0
+    ? database.prepare(`
+        DELETE FROM outbox WHERE namespace_ref = ? AND namespace_generation = ?
+          AND aggregate = 'record' AND aggregate_id = ?
+      `).run(namespaceRef, generation, memoryId)
+    : database.prepare(`
+        DELETE FROM outbox WHERE namespace_ref = ? AND namespace_generation = ? AND (
+          (aggregate = 'record' AND aggregate_id = ?) OR
+          (aggregate = 'proposal' AND aggregate_id IN (
+            ${carriers.proposalIds.map(() => '?').join(',')}
+          ))
+        )
+      `).run(namespaceRef, generation, memoryId, ...carriers.proposalIds)
+  if (Number(outboxDeleted.changes) !== carriers.outboxRecords) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const residual = database.prepare(`
+    SELECT 'proposal' AS carrier FROM proposals
+      WHERE namespace_ref = ? AND namespace_generation = ? AND resulting_memory_id = ?
+    UNION ALL
+    SELECT 'head' AS carrier FROM heads
+      WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    UNION ALL
+    SELECT 'revision' AS carrier FROM revisions
+      WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    UNION ALL
+    SELECT 'revision_payload' AS carrier FROM revision_payloads
+      WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    UNION ALL
+    SELECT 'revision' AS carrier FROM revision_evidence
+      WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+    UNION ALL
+    SELECT CASE aggregate_kind WHEN 'proposal' THEN 'proposal' ELSE 'revision' END AS carrier
+      FROM memory_v1_to_v2_manifests
+      WHERE namespace_ref = ? AND namespace_generation = ? AND (
+        (aggregate_kind = 'memory' AND aggregate_id = ?) OR
+        (aggregate_kind = 'proposal' AND aggregate_id IN (
+          ${carriers.proposalIds.length === 0
+            ? "SELECT '' WHERE 0"
+            : carriers.proposalIds.map(() => '?').join(',')}
+        ))
+      )
+    UNION ALL
+    SELECT 'content_outbox' AS carrier FROM outbox
+      WHERE namespace_ref = ? AND namespace_generation = ? AND (
+        (aggregate = 'record' AND aggregate_id = ?) OR
+        (aggregate = 'proposal' AND aggregate_id IN (
+          SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+            AND namespace_generation = ? AND resulting_memory_id = ?
+        ))
+      )
+    LIMIT 1
+  `).get(
+    namespaceRef, generation, memoryId,
+    namespaceRef, generation, memoryId,
+    namespaceRef, generation, memoryId,
+    namespaceRef, generation, memoryId,
+    namespaceRef, generation, memoryId,
+    namespaceRef, generation, memoryId, ...carriers.proposalIds,
+    namespaceRef, generation, memoryId, namespaceRef, generation, memoryId
+  )
+  if (residual !== undefined) throw new CanonicalLifecycleMutationDataErrorV1()
+}
+
+export function loadValidatedSqliteRecordCarriersV1 (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number,
+  memoryId: string,
+  freshNow: string
+): {
+    readonly revision: MemoryRevisionV2
+    readonly carriers: SqliteDeletedRecordCarriersV1
+  } | null {
+  const head = loadHeadRevision(database, namespaceRef, generation, memoryId)
+  if (head === null) return null
+  return Object.freeze({
+    revision: head.revision,
+    carriers: loadValidatedRecordCarriers(
+      database,
+      namespaceRef,
+      generation,
+      head,
+      parseMemoryLifecycleInstantV1(freshNow)
+    )
+  })
 }
 
 function insertRevision (
@@ -1433,7 +1939,8 @@ function executeProposalCreate (
       canonicalLogicalBytes: proposalBytes
     },
     [event],
-    freshNow
+    freshNow,
+    true
   )
   requireOneChange(database.prepare(`
     UPDATE namespaces SET content_epoch = content_epoch + 1, updated_at_ms = ?
@@ -1877,6 +2384,438 @@ function executeRecordMutation (
   return committed
 }
 
+function deletionActorAllows (
+  envelope: MemoryLifecycleAuthorizationEnvelopeV1,
+  wire: MemoryLifecycleCommandWireV1,
+  requirement: MemoryLifecycleCanonicalAuthorityRequirementV1,
+  freshNow: string
+): boolean {
+  if (envelope.authority.kind !== 'actor' || Date.parse(wire.occurredAt) > Date.parse(freshNow)) {
+    return false
+  }
+  const role = memoryLifecycleActorCapabilityRoleV1(envelope.authority.capability)
+  if (wire.operation === 'record.forget') {
+    const exact = wire.expectedRevision !== null && wire.expectedAggregateHash !== null
+    if (role === 'personal_bot_master' ? exact : !exact) return false
+    return decideMemoryLifecycleActorPolicyV1(envelope.authority.capability, {
+      botInstanceId: envelope.access.botInstanceId,
+      accountId: envelope.access.accountId,
+      sceneRef: envelope.access.sceneRef,
+      namespaceRef: wire.namespaceRef,
+      generation: wire.expectedNamespaceGeneration,
+      actorRef: wire.initiatedByActorRef,
+      action: 'forget',
+      beforeRequirement: requirement,
+      afterRequirement: 'none',
+      initiatedByActorRef: null,
+      targetMode: role === 'personal_bot_master'
+        ? 'opaque_delete_only'
+        : 'expected_revision',
+      expectedRevision: role === 'personal_bot_master' ? null : wire.expectedRevision
+    }, freshNow).allowed
+  }
+  return actorAllows(
+    envelope,
+    wire,
+    'delete_namespace',
+    'elevated',
+    'none',
+    null,
+    freshNow
+  )
+}
+
+function executeRecordForget (
+  database: DatabaseSync,
+  envelope: MemoryLifecycleAuthorizationEnvelopeV1,
+  wire: MemoryLifecycleCommandWireV1,
+  commandHash: string,
+  freshNow: string
+): MemoryLifecycleResultV1 {
+  const operation = 'record.forget' as const
+  const memoryId = wire.aggregateRef as string
+  const namespace = loadNamespace(database, wire.namespaceRef)
+  if (namespace === null || namespace.generation !== wire.expectedNamespaceGeneration) {
+    return denial(operation, commandHash, 'authority')
+  }
+  const head = loadHeadRevision(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    memoryId
+  )
+  if (!deletionActorAllows(
+    envelope,
+    wire,
+    head === null ? 'ordinary' : canonicalRequirement(namespace.namespace, head.revision.record),
+    freshNow
+  )) return denial(operation, commandHash, 'authority')
+  const replay = existingLedgerResult(database, wire, commandHash, memoryId)
+  if (replay === 'conflict') {
+    return resultFor(operation, commandHash, { status: 'conflict', category: 'idempotency' })
+  }
+  if (replay !== null) return replay
+  if (head === null) {
+    return commitStableResult(
+      database,
+      wire,
+      commandHash,
+      memoryId,
+      stableResult(resultFor(operation, commandHash, { status: 'not_found' })),
+      ZERO_DELTA,
+      [],
+      freshNow
+    )
+  }
+  if ((wire.expectedRevision !== null && wire.expectedRevision !== head.revision.revision) ||
+    (wire.expectedAggregateHash !== null &&
+      wire.expectedAggregateHash !== head.revision.revisionHash)) {
+    return commitStableResult(
+      database,
+      wire,
+      commandHash,
+      memoryId,
+      stableResult(resultFor(operation, commandHash, {
+        status: 'conflict', category: 'revision'
+      })),
+      ZERO_DELTA,
+      [],
+      freshNow
+    )
+  }
+  const carriers = loadValidatedRecordCarriers(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    head,
+    freshNow
+  )
+  const deletion = createDeletionReceiptAndTombstone(
+    wire,
+    commandHash,
+    freshNow,
+    memoryId,
+    head.revision.revision
+  )
+  deleteValidatedSqliteRecordCarriersV1(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    memoryId,
+    carriers
+  )
+  insertDeletionTombstone(database, deletion)
+  const event = prepareEvent(
+    nextOutboxSequence(database, 1),
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    'record',
+    memoryId,
+    head.revision.revision,
+    'record_forgotten',
+    wire.occurredAt
+  )
+  const committed = commitStableResult(
+    database,
+    wire,
+    commandHash,
+    memoryId,
+    deletionResult(operation, commandHash, deletion.receipt),
+    {
+      ...ZERO_DELTA,
+      activeMemoryRecords: -1,
+      retainedRevisionRecords: -carriers.revisionCount,
+      tombstoneRecords: 1,
+      canonicalLogicalBytes: deletion.tombstoneBytes - carriers.canonicalBytes,
+      pendingOutboxRecords: -carriers.outboxRecords,
+      outboxLogicalBytes: -carriers.outboxBytes
+    },
+    [event],
+    freshNow
+  )
+  requireOneChange(database.prepare(`
+    UPDATE namespaces SET content_epoch = content_epoch + 1, updated_at_ms = ?
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(Date.parse(freshNow), wire.namespaceRef, wire.expectedNamespaceGeneration).changes)
+  return committed
+}
+
+function namespaceDeletionCarrierKinds (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number
+): readonly ('proposal' | 'head' | 'revision' | 'revision_payload' | 'content_outbox')[] {
+  const probes = [
+    [
+      'proposal',
+      "SELECT 1 AS present FROM proposals WHERE namespace_ref = ? AND namespace_generation = ? UNION ALL SELECT 1 AS present FROM consent_evidence WHERE namespace_ref = ? AND namespace_generation = ? UNION ALL SELECT 1 AS present FROM memory_v1_to_v2_manifests WHERE namespace_ref = ? AND namespace_generation = ? AND aggregate_kind = 'proposal' LIMIT 1",
+      3
+    ],
+    [
+      'head',
+      'SELECT 1 AS present FROM heads WHERE namespace_ref = ? AND namespace_generation = ? LIMIT 1',
+      1
+    ],
+    [
+      'revision',
+      "SELECT 1 AS present FROM revisions WHERE namespace_ref = ? AND namespace_generation = ? UNION ALL SELECT 1 AS present FROM revision_evidence WHERE namespace_ref = ? AND namespace_generation = ? UNION ALL SELECT 1 AS present FROM memory_v1_to_v2_manifests WHERE namespace_ref = ? AND namespace_generation = ? AND aggregate_kind = 'memory' LIMIT 1",
+      3
+    ],
+    [
+      'revision_payload',
+      'SELECT 1 AS present FROM revision_payloads WHERE namespace_ref = ? AND namespace_generation = ? LIMIT 1',
+      1
+    ],
+    [
+      'content_outbox',
+      "SELECT 1 AS present FROM outbox WHERE namespace_ref = ? AND namespace_generation = ? AND event_kind IN ('proposal_changed', 'record_upserted') LIMIT 1",
+      1
+    ]
+  ] as const
+  const remaining = probes.filter(([, sql, bindings]) => database.prepare(sql).get(
+    ...Array.from({ length: bindings }, () => [namespaceRef, generation]).flat()
+  ) !== undefined).map(([kind]) => kind)
+  return Object.freeze(remaining)
+}
+
+function executeNamespaceDelete (
+  database: DatabaseSync,
+  envelope: MemoryLifecycleAuthorizationEnvelopeV1,
+  wire: MemoryLifecycleCommandWireV1,
+  commandHash: string,
+  freshNow: string
+): MemoryLifecycleResultV1 {
+  const operation = 'namespace.delete' as const
+  const aggregateRef = wire.namespaceRef
+  if (!deletionActorAllows(envelope, wire, 'elevated', freshNow)) {
+    return denial(operation, commandHash, 'authority')
+  }
+  const replay = existingLedgerResult(database, wire, commandHash, aggregateRef)
+  if (replay === 'conflict') {
+    return resultFor(operation, commandHash, { status: 'conflict', category: 'idempotency' })
+  }
+  if (replay !== null) return replay
+  const namespace = loadNamespace(database, wire.namespaceRef)
+  if (namespace === null || namespace.generation !== wire.expectedNamespaceGeneration) {
+    return denial(operation, commandHash, 'authority')
+  }
+  const usage = loadUsage(database, wire.namespaceRef, wire.expectedNamespaceGeneration)
+  validateUsageLowerBounds(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    usage,
+    ZERO_DELTA
+  )
+  const deletion = createDeletionReceiptAndTombstone(
+    wire,
+    commandHash,
+    freshNow,
+    null,
+    null
+  )
+  const remainingCarrierKinds = namespaceDeletionCarrierKinds(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration
+  )
+  const status = createDeletionStatusV1({
+    deletionRef: deletion.receipt.deletionRef,
+    namespaceRef: wire.namespaceRef,
+    deletingGeneration: wire.expectedNamespaceGeneration,
+    observedCurrentGeneration: deletion.receipt.generationAfter,
+    remainingCarrierKinds,
+    canonicalBodies: remainingCarrierKinds.length === 0 ? 'verified_absent' : 'scrub_pending',
+    payloadDeletion: 'unverified',
+    walCheckpoint: 'unverified',
+    derivedCleanup: 'queued',
+    stage: 'logical_committed',
+    observedAt: freshNow
+  })
+  const checkpointWire = encodeDeletionStatusV1(status)
+  const checkpointBytes = Buffer.byteLength(checkpointWire, 'utf8')
+  const result = deletionResult(operation, commandHash, deletion.receipt)
+  const resultWire = encodeMemoryLifecycleStableResultWireV1(result)
+  const resultBytes = Buffer.byteLength(resultWire, 'utf8')
+  const event = prepareEvent(
+    nextOutboxSequence(database, 1),
+    wire.namespaceRef,
+    deletion.receipt.generationAfter,
+    'namespace',
+    wire.namespaceRef,
+    deletion.receipt.generationAfter,
+    'namespace_deleted',
+    wire.occurredAt
+  )
+  const globalAfter = Object.freeze({
+    ...usage.global,
+    tombstoneRecords: addExact(usage.global.tombstoneRecords, 1),
+    canonicalLogicalBytes: addExact(
+      usage.global.canonicalLogicalBytes,
+      deletion.tombstoneBytes + checkpointBytes + resultBytes
+    ),
+    pendingOutboxRecords: addExact(usage.global.pendingOutboxRecords, 1),
+    outboxLogicalBytes: addExact(usage.global.outboxLogicalBytes, event.bytes),
+    records: addExact(usage.global.records, 1),
+    bytes: addExact(usage.global.bytes, resultBytes)
+  })
+  const oldGenerationAfter = Object.freeze({
+    ...usage.namespace,
+    canonicalLogicalBytes: addExact(
+      usage.namespace.canonicalLogicalBytes - namespace.wireBytes,
+      checkpointBytes + resultBytes
+    )
+  })
+  if (usage.namespace.canonicalLogicalBytes < namespace.wireBytes) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+  const projectedForCapacity: UsageStateV1 = Object.freeze({
+    namespace: oldGenerationAfter,
+    generationCommands: Object.freeze({
+      records: addExact(usage.generationCommands.records, 1),
+      bytes: addExact(usage.generationCommands.bytes, resultBytes)
+    }),
+    namespaceCommands: Object.freeze({
+      records: addExact(usage.namespaceCommands.records, 1),
+      bytes: addExact(usage.namespaceCommands.bytes, resultBytes)
+    }),
+    global: globalAfter
+  })
+  const capacity = capacityFailure(projectedForCapacity, true)
+  if (capacity !== null) throw new LifecycleMutationCapacityErrorV1(capacity)
+  const checkpointUsage = database.prepare(`
+    SELECT n.deletion_checkpoint_records AS namespace_records,
+      g.deletion_checkpoint_records AS global_records,
+      g.deletion_checkpoint_logical_bytes AS global_bytes
+    FROM lifecycle_namespace_usage n CROSS JOIN global_usage g
+    WHERE n.namespace_ref = ? AND g.singleton = 1
+  `).get(wire.namespaceRef) as Row | undefined
+  if (checkpointUsage === undefined) throw new CanonicalLifecycleMutationDataErrorV1()
+  if (exactInteger(rowValue(checkpointUsage, 'namespace_records')) + 1 >
+      MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleDeletionCheckpointsPerNamespace ||
+    exactInteger(rowValue(checkpointUsage, 'global_records')) + 1 >
+      MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleDeletionCheckpointsPerDeployment ||
+    exactInteger(rowValue(checkpointUsage, 'global_bytes')) + checkpointBytes >
+      MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleDeletionCheckpointBytesPerDeployment) {
+    throw new LifecycleMutationCapacityErrorV1('canonical_bytes')
+  }
+
+  requireOneChange(database.prepare(`
+    UPDATE namespaces SET namespace_generation = ?, content_epoch = content_epoch + 1,
+      updated_at_ms = ? WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(
+    deletion.receipt.generationAfter,
+    Date.parse(freshNow),
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration
+  ).changes)
+  requireOneChange(database.prepare(`
+    UPDATE usage SET canonical_logical_bytes = ?, lifecycle_command_records = ?,
+      lifecycle_command_logical_bytes = ?, deletion_checkpoint_records = 1,
+      deletion_checkpoint_logical_bytes = ?, updated_at_ms = ?
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(
+    oldGenerationAfter.canonicalLogicalBytes,
+    projectedForCapacity.generationCommands.records,
+    projectedForCapacity.generationCommands.bytes,
+    checkpointBytes,
+    Date.parse(freshNow),
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration
+  ).changes)
+  requireOneChange(database.prepare(`
+    INSERT INTO usage(
+      namespace_ref, namespace_generation, pending_proposal_records,
+      active_memory_records, retained_revision_records, tombstone_records,
+      canonical_logical_bytes, pending_outbox_records, outbox_logical_bytes,
+      updated_at_ms, lifecycle_audit_records, lifecycle_audit_reserved_records,
+      lifecycle_command_records, deletion_checkpoint_records, export_job_records,
+      lifecycle_audit_logical_bytes, lifecycle_audit_reserved_bytes,
+      lifecycle_command_logical_bytes, deletion_checkpoint_logical_bytes,
+      export_job_logical_bytes
+    ) VALUES (?, ?, 0, 0, 0, 1, ?, 1, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+  `).run(
+    wire.namespaceRef,
+    deletion.receipt.generationAfter,
+    namespace.wireBytes + deletion.tombstoneBytes,
+    event.bytes,
+    Date.parse(freshNow)
+  ).changes)
+  insertDeletionTombstone(database, deletion)
+  insertEvent(database, event)
+  requireOneChange(database.prepare(`
+    INSERT INTO namespace_deletion_checkpoints(
+      namespace_ref, deletion_ref, deleting_generation, observed_current_generation,
+      canonical_bodies, payload_deletion, wal_checkpoint, derived_cleanup, stage,
+      receipt_hash, checkpoint_wire, checkpoint_wire_bytes, updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    wire.namespaceRef,
+    status.deletionRef,
+    status.deletingGeneration,
+    status.observedCurrentGeneration,
+    status.canonicalBodies,
+    status.payloadDeletion,
+    status.walCheckpoint,
+    status.derivedCleanup,
+    status.stage,
+    deletion.receipt.receiptHash,
+    checkpointWire,
+    checkpointBytes,
+    Date.parse(freshNow)
+  ).changes)
+  requireOneChange(database.prepare(`
+    INSERT INTO lifecycle_commands(
+      namespace_ref, namespace_generation, command_ref, command_hash, operation,
+      aggregate_ref_hash, result_wire, result_wire_bytes, result_hash,
+      committed_at_ms, expires_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration,
+    wire.commandRef,
+    commandHash,
+    operation,
+    aggregateRefHash(aggregateRef),
+    resultWire,
+    resultBytes,
+    memoryLifecycleStableResultHashV1(resultWire),
+    Date.parse(freshNow),
+    Date.parse(freshNow) + MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleCommandLedgerTtlMs
+  ).changes)
+  requireOneChange(database.prepare(`
+    UPDATE lifecycle_namespace_usage SET lifecycle_command_records = ?,
+      lifecycle_command_logical_bytes = ?, deletion_checkpoint_records =
+        deletion_checkpoint_records + 1,
+      deletion_checkpoint_logical_bytes = deletion_checkpoint_logical_bytes + ?,
+      updated_at_ms = ? WHERE namespace_ref = ?
+  `).run(
+    projectedForCapacity.namespaceCommands.records,
+    projectedForCapacity.namespaceCommands.bytes,
+    checkpointBytes,
+    Date.parse(freshNow),
+    wire.namespaceRef
+  ).changes)
+  requireOneChange(database.prepare(`
+    UPDATE global_usage SET tombstone_records = ?, canonical_logical_bytes = ?,
+      pending_outbox_records = ?, outbox_logical_bytes = ?, lifecycle_command_records = ?,
+      lifecycle_command_logical_bytes = ?, deletion_checkpoint_records =
+        deletion_checkpoint_records + 1,
+      deletion_checkpoint_logical_bytes = deletion_checkpoint_logical_bytes + ?,
+      updated_at_ms = ? WHERE singleton = 1
+  `).run(
+    globalAfter.tombstoneRecords,
+    globalAfter.canonicalLogicalBytes,
+    globalAfter.pendingOutboxRecords,
+    globalAfter.outboxLogicalBytes,
+    globalAfter.records,
+    globalAfter.bytes,
+    checkpointBytes,
+    Date.parse(freshNow)
+  ).changes)
+  return result
+}
+
 function executeMutation (
   database: DatabaseSync,
   envelope: MemoryLifecycleAuthorizationEnvelopeV1,
@@ -1893,7 +2832,7 @@ function executeMutation (
   const operation = wire.operation as MutationOperationV1
   if (!lockedAccessAllows(envelope, wire, freshNow)) return denial(operation, commandHash, 'access')
   const namespace = loadNamespace(database, wire.namespaceRef)
-  if (wire.operation !== 'proposal.create' && (
+  if (wire.operation !== 'proposal.create' && wire.operation !== 'namespace.delete' && (
     namespace === null || namespace.generation !== wire.expectedNamespaceGeneration
   )) return denial(operation, commandHash, 'authority')
   if (wire.operation === 'proposal.create') {
@@ -1904,6 +2843,12 @@ function executeMutation (
   }
   if (RECORD_OPERATIONS.has(operation)) {
     return executeRecordMutation(database, envelope, wire, commandHash, freshNow)
+  }
+  if (operation === 'record.forget') {
+    return executeRecordForget(database, envelope, wire, commandHash, freshNow)
+  }
+  if (operation === 'namespace.delete') {
+    return executeNamespaceDelete(database, envelope, wire, commandHash, freshNow)
   }
   throw new CanonicalLifecycleMutationDataErrorV1()
 }

@@ -501,6 +501,14 @@ test('sqlite memory v2 schema persists lifecycle bodies, ledgers, checkpoints, e
     assert.deepEqual(tablePrimaryKey(store.database, 'namespace_deletion_checkpoints'), [
       'namespace_ref', 'deletion_ref'
     ])
+    const checkpointSql = String(store.database.prepare(`
+      SELECT sql FROM sqlite_schema
+      WHERE type = 'table' AND name = 'namespace_deletion_checkpoints'
+    `).get()?.sql)
+    assert.match(
+      checkpointSql,
+      /observed_current_generation\s*>\=\s*deleting_generation/i
+    )
     assert.deepEqual(tablePrimaryKey(store.database, 'lifecycle_namespace_usage'), [
       'namespace_ref'
     ])

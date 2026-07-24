@@ -25,16 +25,25 @@ import {
   type MemoryRevisionHeadProofV1
 } from './memory-control-repository.js'
 import {
+  decodeDeletionStatusV1,
   decodeMemoryLifecycleAuditV1,
   decodeMemoryProposalV2,
   decodeMemoryRevisionV2
 } from './memory-lifecycle-codec.js'
 import {
+  MEMORY_DELETION_TOMBSTONE_ID_DOMAIN_V1,
+  createDeletionStatusV1,
+  memoryLifecycleDomainHashV1,
   memoryProposalDeadlineV2,
   parseMemoryLifecycleInstantV1,
   type MemoryProposalV2,
   type MemoryRevisionV2
 } from './memory-lifecycle-domain.js'
+import { memoryLifecycleCommandRefHashV1 } from './memory-lifecycle-command.js'
+import {
+  decodeMemoryLifecycleStableResultWireV1,
+  memoryLifecycleStableResultHashV1
+} from './memory-lifecycle-result.js'
 import {
   decodeMemoryTombstoneV1
 } from './memory-codec.js'
@@ -45,6 +54,7 @@ import {
   parseMemoryNamespaceV1
 } from './memory-namespace.js'
 import {
+  MEMORY_LIFECYCLE_RESOURCE_LIMITS,
   MEMORY_RESOURCE_LIMITS
 } from './memory-resource-limits.js'
 import { MEMORY_CURSOR_HASH_DOMAIN_V1 } from './sqlite-memory-repository.js'
@@ -1037,6 +1047,294 @@ function globalUsage (database: DatabaseSync, snapshotAt: string) {
   })
 }
 
+function deletionTombstoneId (deletionRef: string): string {
+  return `tombstone:${memoryLifecycleDomainHashV1(
+    MEMORY_DELETION_TOMBSTONE_ID_DOMAIN_V1,
+    deletionRef
+  )}`
+}
+
+function loadDeletionTombstone (
+  database: DatabaseSync,
+  namespaceRef: string,
+  deletionRef: string
+) {
+  const row = database.prepare(`
+    SELECT namespace_ref, namespace_generation, tombstone_id, memory_id, deleted_revision,
+      deletion_kind, deleted_at_ms, expires_at_ms, receipt_hash, tombstone_wire,
+      tombstone_wire_bytes
+    FROM tombstones WHERE namespace_ref = ? AND tombstone_id = ?
+  `).get(namespaceRef, deletionTombstoneId(deletionRef)) as Row | undefined
+  if (row === undefined) return null
+  const tombstone = canonicalWire(
+    rowValue(row, 'tombstone_wire'),
+    rowValue(row, 'tombstone_wire_bytes'),
+    value => decodeMemoryTombstoneV1(exactString(value as SQLOutputValue))
+  ).value
+  if (tombstone.namespaceRef !== namespaceRef ||
+    tombstone.namespaceGeneration !== positiveInteger(rowValue(row, 'namespace_generation')) ||
+    tombstone.tombstoneId !== exactString(rowValue(row, 'tombstone_id')) ||
+    tombstone.memoryId !== nullableString(rowValue(row, 'memory_id')) ||
+    tombstone.deletedRevision !== nullableInteger(rowValue(row, 'deleted_revision')) ||
+    tombstone.deletionKind !== exactString(rowValue(row, 'deletion_kind')) ||
+    Date.parse(tombstone.deletedAt) !== exactInteger(rowValue(row, 'deleted_at_ms')) ||
+    Date.parse(tombstone.expiresAt) !== exactInteger(rowValue(row, 'expires_at_ms')) ||
+    tombstone.receiptHash !== exactString(rowValue(row, 'receipt_hash'))) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  return tombstone
+}
+
+function deletionCarrierKinds (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number,
+  memoryId: string | null
+) {
+  const exact = memoryId !== null
+  const args = exact ? [namespaceRef, generation, memoryId] : [namespaceRef, generation]
+  const proposal = exact
+    ? database.prepare(`
+        SELECT 1 AS present FROM proposals
+          WHERE namespace_ref = ? AND namespace_generation = ? AND resulting_memory_id = ?
+        UNION ALL SELECT 1 AS present FROM consent_evidence
+          WHERE namespace_ref = ? AND namespace_generation = ? AND proposal_id IN (
+            SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+              AND namespace_generation = ? AND resulting_memory_id = ?
+          ) LIMIT 1
+      `).get(...args, namespaceRef, generation, namespaceRef, generation, memoryId) !== undefined
+    : database.prepare(`
+        SELECT 1 AS present FROM proposals WHERE namespace_ref = ? AND namespace_generation = ?
+        UNION ALL SELECT 1 AS present FROM consent_evidence
+          WHERE namespace_ref = ? AND namespace_generation = ?
+        UNION ALL SELECT 1 AS present FROM memory_v1_to_v2_manifests
+          WHERE namespace_ref = ? AND namespace_generation = ? AND aggregate_kind = 'proposal'
+        LIMIT 1
+      `).get(...args, ...args, ...args) !== undefined
+  const head = database.prepare(`
+    SELECT 1 AS present FROM heads WHERE namespace_ref = ? AND namespace_generation = ?
+      ${exact ? 'AND memory_id = ?' : ''} LIMIT 1
+  `).get(...args) !== undefined
+  const revision = exact
+    ? database.prepare(`
+        SELECT 1 AS present FROM revisions
+          WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+        UNION ALL SELECT 1 AS present FROM revision_evidence
+          WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ?
+        UNION ALL SELECT 1 AS present FROM memory_v1_to_v2_manifests
+          WHERE namespace_ref = ? AND namespace_generation = ?
+            AND aggregate_kind = 'memory' AND aggregate_id = ? LIMIT 1
+      `).get(...args, ...args, namespaceRef, generation, memoryId) !== undefined
+    : database.prepare(`
+        SELECT 1 AS present FROM revisions WHERE namespace_ref = ? AND namespace_generation = ?
+        UNION ALL SELECT 1 AS present FROM revision_evidence
+          WHERE namespace_ref = ? AND namespace_generation = ?
+        UNION ALL SELECT 1 AS present FROM memory_v1_to_v2_manifests
+          WHERE namespace_ref = ? AND namespace_generation = ? AND aggregate_kind = 'memory'
+        LIMIT 1
+      `).get(...args, ...args, ...args) !== undefined
+  const revisionPayload = database.prepare(`
+    SELECT 1 AS present FROM revision_payloads
+    WHERE namespace_ref = ? AND namespace_generation = ?
+      ${exact ? 'AND memory_id = ?' : ''} LIMIT 1
+  `).get(...args) !== undefined
+  const contentOutbox = database.prepare(`
+    SELECT 1 AS present FROM outbox WHERE namespace_ref = ? AND namespace_generation = ?
+      ${exact ? "AND aggregate = 'record' AND aggregate_id = ? AND event_kind = 'record_upserted'" : "AND event_kind IN ('proposal_changed', 'record_upserted')"}
+    LIMIT 1
+  `).get(...args) !== undefined
+  return Object.freeze([
+    proposal ? 'proposal' as const : null,
+    head ? 'head' as const : null,
+    revision ? 'revision' as const : null,
+    revisionPayload ? 'revision_payload' as const : null,
+    contentOutbox ? 'content_outbox' as const : null
+  ].filter((kind): kind is NonNullable<typeof kind> => kind !== null))
+}
+
+function deletionDerivedCleanup (
+  database: DatabaseSync,
+  namespaceRef: string,
+  currentGeneration: number,
+  deletingGeneration: number,
+  memoryId: string | null
+): 'queued' | 'applied' {
+  const generation = memoryId === null ? currentGeneration : deletingGeneration
+  return database.prepare(`
+    SELECT 1 AS present FROM outbox WHERE namespace_ref = ? AND namespace_generation = ?
+      AND aggregate = ? AND aggregate_id = ? AND event_kind = ? LIMIT 1
+  `).get(
+    namespaceRef,
+    generation,
+    memoryId === null ? 'namespace' : 'record',
+    memoryId ?? namespaceRef,
+    memoryId === null ? 'namespace_deleted' : 'record_forgotten'
+  ) === undefined ? 'applied' : 'queued'
+}
+
+function deletionStatus (
+  database: DatabaseSync,
+  namespaceRef: string,
+  currentGeneration: number,
+  deletionRef: string,
+  snapshotAt: string
+) {
+  const tombstone = loadDeletionTombstone(database, namespaceRef, deletionRef)
+  if (tombstone === null) return null
+  const receiptRows = database.prepare(`
+    SELECT command_ref FROM lifecycle_commands
+    WHERE namespace_ref = ? AND operation IN ('record.forget', 'namespace.delete')
+      AND instr(result_wire, ?) > 0
+    ORDER BY command_ref ASC LIMIT 2
+  `).all(namespaceRef, deletionRef) as Row[]
+  if (receiptRows.length > 1) throw new CanonicalControlDataErrorV1()
+  const canonicalReceipt = receiptRows.length === 0
+    ? null
+    : resolveDeletionReceipt(
+        database,
+        namespaceRef,
+        exactString(rowValue(receiptRows[0]!, 'command_ref')),
+        deletionRef
+      )
+  if (receiptRows.length === 1 && canonicalReceipt === null) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  if (canonicalReceipt !== null && (
+    canonicalReceipt.tombstoneId !== tombstone.tombstoneId ||
+    canonicalReceipt.tombstoneReceiptHash !== tombstone.receiptHash ||
+    canonicalReceipt.generationAfter !== tombstone.namespaceGeneration ||
+    canonicalReceipt.memoryId !== tombstone.memoryId ||
+    canonicalReceipt.deletedRevision !== tombstone.deletedRevision
+  )) throw new CanonicalControlDataErrorV1()
+  const checkpointRow = database.prepare(`
+    SELECT deleting_generation, observed_current_generation, canonical_bodies,
+      payload_deletion, wal_checkpoint, derived_cleanup, stage, receipt_hash,
+      checkpoint_wire, checkpoint_wire_bytes, updated_at_ms
+    FROM namespace_deletion_checkpoints WHERE namespace_ref = ? AND deletion_ref = ?
+  `).get(namespaceRef, deletionRef) as Row | undefined
+  let stored: ReturnType<typeof decodeDeletionStatusV1> | null = null
+  if (checkpointRow !== undefined) {
+    stored = canonicalWire(
+      rowValue(checkpointRow, 'checkpoint_wire'),
+      rowValue(checkpointRow, 'checkpoint_wire_bytes'),
+      decodeDeletionStatusV1
+    ).value
+    if (stored.deletionRef !== deletionRef || stored.namespaceRef !== namespaceRef ||
+      stored.deletingGeneration !==
+        positiveInteger(rowValue(checkpointRow, 'deleting_generation')) ||
+      stored.observedCurrentGeneration !==
+        positiveInteger(rowValue(checkpointRow, 'observed_current_generation')) ||
+      stored.canonicalBodies !== exactString(rowValue(checkpointRow, 'canonical_bodies')) ||
+      stored.payloadDeletion !== exactString(rowValue(checkpointRow, 'payload_deletion')) ||
+      stored.walCheckpoint !== exactString(rowValue(checkpointRow, 'wal_checkpoint')) ||
+      stored.derivedCleanup !== exactString(rowValue(checkpointRow, 'derived_cleanup')) ||
+      stored.stage !== exactString(rowValue(checkpointRow, 'stage')) ||
+      stored.observedAt !==
+        new Date(exactInteger(rowValue(checkpointRow, 'updated_at_ms'))).toISOString() ||
+      !HASH_PATTERN.test(exactString(rowValue(checkpointRow, 'receipt_hash')))) {
+      throw new CanonicalControlDataErrorV1()
+    }
+    if (canonicalReceipt !== null && canonicalReceipt.receiptHash !==
+        exactString(rowValue(checkpointRow, 'receipt_hash'))) {
+      throw new CanonicalControlDataErrorV1()
+    }
+  }
+  const deletingGeneration = stored?.deletingGeneration ??
+    (tombstone.deletionKind === 'namespace_deleted'
+      ? tombstone.namespaceGeneration - 1
+      : tombstone.namespaceGeneration)
+  if (deletingGeneration <= 0 || deletingGeneration > currentGeneration) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  const remaining = deletionCarrierKinds(
+    database,
+    namespaceRef,
+    deletingGeneration,
+    tombstone.memoryId
+  )
+  if (stored?.stage === 'canonical_complete' && remaining.length > 0) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  const derivedCleanup = deletionDerivedCleanup(
+    database,
+    namespaceRef,
+    currentGeneration,
+    deletingGeneration,
+    tombstone.memoryId
+  )
+  const canonicalBodies = remaining.length === 0 ? 'verified_absent' as const
+    : stored === null ? 'unverified' as const : 'scrub_pending' as const
+  const payloadDeletion = stored?.payloadDeletion ?? 'unverified'
+  const walCheckpoint = stored?.walCheckpoint ?? 'unverified'
+  const complete = remaining.length === 0 && payloadDeletion === 'secure_delete_on' &&
+    walCheckpoint === 'truncated'
+  return createDeletionStatusV1({
+    deletionRef,
+    namespaceRef,
+    deletingGeneration,
+    observedCurrentGeneration: currentGeneration,
+    remainingCarrierKinds: remaining,
+    canonicalBodies,
+    payloadDeletion,
+    walCheckpoint,
+    derivedCleanup,
+    stage: complete ? 'canonical_complete' : stored?.stage === 'logical_committed'
+      ? 'logical_committed' : 'verification_pending',
+    observedAt: snapshotAt
+  })
+}
+
+function resolveDeletionReceipt (
+  database: DatabaseSync,
+  namespaceRef: string,
+  commandRef: string,
+  deletionRef: string
+) {
+  const row = database.prepare(`
+    SELECT namespace_generation, command_hash, operation, aggregate_ref_hash,
+      result_wire, result_wire_bytes, result_hash, committed_at_ms, expires_at_ms
+    FROM lifecycle_commands WHERE namespace_ref = ? AND command_ref = ?
+  `).get(namespaceRef, commandRef) as Row | undefined
+  if (row === undefined) return null
+  const operation = exactString(rowValue(row, 'operation'))
+  const loaded = canonicalWire(
+    rowValue(row, 'result_wire'),
+    rowValue(row, 'result_wire_bytes'),
+    decodeMemoryLifecycleStableResultWireV1
+  )
+  if (memoryLifecycleStableResultHashV1(loaded.wire) !==
+      exactString(rowValue(row, 'result_hash'))) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  const result = loaded.value
+  const commandHash = exactString(rowValue(row, 'command_hash'))
+  const committedAt = exactInteger(rowValue(row, 'committed_at_ms'))
+  if (!HASH_PATTERN.test(commandHash) || result.commandHash !== commandHash ||
+    result.operation !== operation ||
+    exactInteger(rowValue(row, 'expires_at_ms')) - committedAt !==
+      MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleCommandLedgerTtlMs) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  if (operation !== 'record.forget' && operation !== 'namespace.delete') return null
+  if (result.status !== 'deletion_pending' && result.status !== 'deletion_complete') return null
+  const receipt = result.receipt
+  if (receipt.deletionRef !== deletionRef) return null
+  const expectedReceiptOperation = operation === 'record.forget' ? 'forget' : 'delete_namespace'
+  const aggregateRef = operation === 'record.forget' ? receipt.memoryId : receipt.namespaceRef
+  if (receipt.namespaceRef !== namespaceRef ||
+    receipt.operation !== expectedReceiptOperation || aggregateRef === null ||
+    receipt.generationBefore !== positiveInteger(rowValue(row, 'namespace_generation')) ||
+    receipt.commandRefHash !== memoryLifecycleCommandRefHashV1(commandRef) ||
+    exactString(rowValue(row, 'aggregate_ref_hash')) !== memoryLifecycleDomainHashV1(
+      'groupmate.memory.lifecycle-aggregate-ref.v1',
+      aggregateRef
+    ) ||
+    receipt.committedAt !== new Date(committedAt).toISOString()) {
+    throw new CanonicalControlDataErrorV1()
+  }
+  return receipt
+}
+
 function executeLocked (
   database: DatabaseSync,
   envelope: MemoryControlRepositoryAdapterEnvelopeV1,
@@ -1110,7 +1408,53 @@ function executeLocked (
     return Object.freeze({ status: 'found', operation: request.operation, snapshotAt,
       value: validateRevisionRow(row), head })
   }
-  return Object.freeze({ status: 'not_found', operation: request.operation, snapshotAt })
+  if (request.operation === 'deletion.getStatus') {
+    const status = deletionStatus(
+      database,
+      request.namespaceRef,
+      request.generation,
+      request.deletionRef,
+      snapshotAt
+    )
+    if (status === null) return Object.freeze({
+      status: 'not_found' as const, operation: request.operation, snapshotAt
+    })
+    return Object.freeze({
+      status: 'found' as const,
+      operation: request.operation,
+      snapshotAt,
+      value: status
+    })
+  }
+  if (request.operation === 'deletion.resolve') {
+    const receipt = resolveDeletionReceipt(
+      database,
+      request.namespaceRef,
+      request.commandRef,
+      request.deletionRef
+    )
+    if (receipt === null) return Object.freeze({
+      status: 'not_found' as const, operation: request.operation, snapshotAt
+    })
+    const status = deletionStatus(
+      database,
+      request.namespaceRef,
+      request.generation,
+      request.deletionRef,
+      snapshotAt
+    )
+    if (status === null || status.deletingGeneration !== receipt.deletingGeneration) {
+      throw new CanonicalControlDataErrorV1()
+    }
+    return Object.freeze({
+      status: 'resolved' as const,
+      operation: request.operation,
+      snapshotAt,
+      receipt,
+      deletionStatus: status
+    })
+  }
+  throw new CanonicalControlDataErrorV1()
 }
 
 function sqliteErrcode (error: unknown): number | null {
