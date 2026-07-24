@@ -2578,6 +2578,26 @@ function namespaceDeletionCarrierKinds (
   return Object.freeze(remaining)
 }
 
+function deletePersonalEnrollmentPolicyIfPresent (
+  database: DatabaseSync,
+  namespaceRef: string,
+  generation: number
+): void {
+  const schema = database.prepare(`
+    SELECT 1 AS present FROM sqlite_schema
+    WHERE type = 'table' AND name = 'personal_memory_policies'
+      AND tbl_name = 'personal_memory_policies'
+  `).get() as Row | undefined
+  if (schema === undefined) return
+  const changes = database.prepare(`
+    DELETE FROM personal_memory_policies
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(namespaceRef, generation).changes
+  if (changes !== 0 && changes !== 0n && changes !== 1 && changes !== 1n) {
+    throw new CanonicalLifecycleMutationDataErrorV1()
+  }
+}
+
 function executeNamespaceDelete (
   database: DatabaseSync,
   envelope: MemoryLifecycleAuthorizationEnvelopeV1,
@@ -2700,6 +2720,11 @@ function executeNamespaceDelete (
     throw new LifecycleMutationCapacityErrorV1('canonical_bytes')
   }
 
+  deletePersonalEnrollmentPolicyIfPresent(
+    database,
+    wire.namespaceRef,
+    wire.expectedNamespaceGeneration
+  )
   requireOneChange(database.prepare(`
     UPDATE namespaces SET namespace_generation = ?, content_epoch = content_epoch + 1,
       updated_at_ms = ? WHERE namespace_ref = ? AND namespace_generation = ?

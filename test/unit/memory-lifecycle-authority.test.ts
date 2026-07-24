@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1,
+  MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1,
   createMemoryLifecycleAuthorityRootV1,
   issueMemoryLifecycleActorCapabilityV1,
   issueMemoryMaintenanceCapabilityV1,
@@ -237,6 +238,48 @@ test('the fixed role matrix permits only bounded action subsets for every role',
     role: 'model',
     actions: ['propose_create']
   }), TypeError)
+})
+
+test('personal enrollment authority is isolated from group and bot-master roles', () => {
+  const personal = namespace({ kind: 'personal', subjectUserId: '20002' })
+  assert.doesNotThrow(() => parseMemoryLifecycleActorAuthorityContextV1({
+    schemaVersion: 1,
+    botInstanceId: personal.botInstanceId,
+    adapter: 'qq',
+    accountId: personal.accountId,
+    sceneRef: SCENE_REF,
+    namespace: personal,
+    namespaceRef: memoryNamespaceRefV1(personal),
+    generation: 1,
+    actorRef: ACTOR_REF,
+    actorUserId: '20002',
+    role: 'personal_subject',
+    roleObservedAt: null,
+    actions: [MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1]
+  }))
+
+  const group = namespace({
+    kind: 'group',
+    groupId: '30003',
+    groupLifecycleId: 'group-30003-generation-1'
+  })
+  for (const role of ['group_admin', 'group_owner', 'group_bot_master']) {
+    assert.throws(() => parseMemoryLifecycleActorAuthorityContextV1({
+      schemaVersion: 1,
+      botInstanceId: group.botInstanceId,
+      adapter: 'qq',
+      accountId: group.accountId,
+      sceneRef: SCENE_REF,
+      namespace: group,
+      namespaceRef: memoryNamespaceRefV1(group),
+      generation: 1,
+      actorRef: ACTOR_REF,
+      actorUserId: '20002',
+      role,
+      roleObservedAt: NOW,
+      actions: [MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1]
+    }), TypeError)
+  }
 })
 
 test('async, throwing and non-boolean trusted verifiers fail closed', async () => {

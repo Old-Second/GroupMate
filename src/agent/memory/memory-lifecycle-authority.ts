@@ -40,8 +40,11 @@ export const MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1 = Object.freeze([
   'claim_export'
 ] as const)
 
+export const MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1 = 'manage_enrollment' as const
+
 export type MemoryLifecycleActorActionV1 =
-  typeof MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1[number]
+  | typeof MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1[number]
+  | typeof MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1
 
 export type MemoryLifecycleActorRoleV1 =
   | 'personal_subject'
@@ -96,8 +99,13 @@ const OLD_GENERATION_MAINTENANCE_OPERATIONS = new Set<MemoryMaintenanceOperation
   'namespace.scrubDeleted', 'namespace.verifyScrubbed'
 ])
 
+const ALL_ACTOR_ACTIONS = Object.freeze([
+  ...MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1,
+  MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1
+] as const)
+
 const PERSONAL_SUBJECT_ACTIONS = new Set<MemoryLifecycleActorActionV1>(
-  MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1
+  ALL_ACTOR_ACTIONS
 )
 const PERSONAL_DELETE_ONLY_ACTIONS = new Set<MemoryLifecycleActorActionV1>([
   'forget', 'delete_namespace', 'resolve_deletion'
@@ -396,7 +404,7 @@ export function parseMemoryLifecycleActorAuthorityContextV1 (
   const actorUserId = parseMemoryQqIdV1(input.actorUserId)
   const actions = parseUniqueEnumArray(
     input.actions,
-    MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1,
+    ALL_ACTOR_ACTIONS,
     MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleActorActions
   )
   const allowedActions = allowedActionsForRole(role)
@@ -759,7 +767,7 @@ export function parseMemoryLifecycleActorCapabilityRequestV1 (
     namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
     generation: positiveInteger(input.generation),
     actorRef: parseActorRef(input.actorRef),
-    action: enumValue(input.action, MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1),
+    action: enumValue(input.action, ALL_ACTOR_ACTIONS),
     requiredAuthority: enumValue(input.requiredAuthority, AUTHORITY_REQUIREMENTS)
   })
 }
