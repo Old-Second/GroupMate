@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto'
 import { types as utilTypes } from 'node:util'
-import { decodeMemoryRecordV1, encodeMemoryRecordV1 } from './memory-codec.js'
-import type { MemoryRecordV1 } from './memory-domain.js'
+import {
+  decodeCanonicalMemoryRecordV1,
+  encodeCanonicalMemoryRecordV1,
+  type CanonicalMemoryRecordV1
+} from './memory-canonical-wire.js'
 import {
   MEMORY_HOT_CACHE_ACCOUNTING_V1,
   createMemoryHotCachePortV1,
@@ -697,8 +700,8 @@ export class RedisMemoryHotCache implements MemoryHotCachePortV1 {
     return await this.#usage()
   }
 
-  async #put (record: MemoryRecordV1): Promise<unknown> {
-    const wire = encodeMemoryRecordV1(record)
+  async #put (record: CanonicalMemoryRecordV1): Promise<unknown> {
+    const wire = encodeCanonicalMemoryRecordV1(record)
     const field = memoryHotCacheRecordFieldV1({
       namespaceRef: record.namespaceRef,
       namespaceGeneration: record.namespaceGeneration,
@@ -744,9 +747,9 @@ export class RedisMemoryHotCache implements MemoryHotCachePortV1 {
       return Object.freeze({ status: 'unavailable' as const })
     }
     const wire = tuple[1]
-    let record: MemoryRecordV1
+    let record: CanonicalMemoryRecordV1
     try {
-      record = decodeMemoryRecordV1(wire)
+      record = decodeCanonicalMemoryRecordV1(wire)
     } catch {
       await this.#deleteCorrupt(field, headField, wire)
       return Object.freeze({ status: 'miss' as const, reason: 'corrupt' as const })

@@ -3,11 +3,11 @@ import {
   memoryAccessCapabilityAllowsV1,
   type MemoryAccessCapabilityV1
 } from './memory-access-gate.js'
-import { encodeMemoryRecordV1 } from './memory-codec.js'
 import {
-  parseMemoryRecordV1,
-  type MemoryRecordV1
-} from './memory-domain.js'
+  encodeCanonicalMemoryRecordV1,
+  parseCanonicalMemoryRecordV1,
+  type CanonicalMemoryRecordV1
+} from './memory-canonical-wire.js'
 import type { MemoryHotCachePortV1 } from './memory-hot-cache.js'
 import {
   inspectMemoryRecord,
@@ -50,7 +50,7 @@ export type MemoryHeadSourceRequestV1 =
 export type MemoryHeadSourceResultV1 =
   | { readonly status: 'found'; readonly namespaceGeneration: number }
   | { readonly status: 'found'; readonly head: MemoryHeadV1 }
-  | { readonly status: 'found'; readonly record: MemoryRecordV1 }
+  | { readonly status: 'found'; readonly record: CanonicalMemoryRecordV1 }
   | { readonly status: 'absent'; readonly namespaceGeneration: number }
   | { readonly status: 'expired'; readonly head: MemoryHeadV1 }
   | { readonly status: 'expired' }
@@ -82,7 +82,7 @@ export type MemoryReadThroughResultV1 =
   | {
       readonly status: 'found'
       readonly source: 'hot' | 'canonical'
-      readonly record: MemoryRecordV1
+      readonly record: CanonicalMemoryRecordV1
     }
   | { readonly status: 'not_found' }
   | { readonly status: 'conflict' }
@@ -248,8 +248,8 @@ function parseSourceResult (
       return Object.freeze({ status, head })
     }
     const input = inspectMemoryRecord(value, ['status', 'record'])
-    const record = parseMemoryRecordV1(input.record)
-    encodeMemoryRecordV1(record)
+    const record = parseCanonicalMemoryRecordV1(input.record)
+    encodeCanonicalMemoryRecordV1(record)
     if (!recordMatchesHead(record, request.head)) return invalidMemoryValue()
     return Object.freeze({ status, record })
   }
@@ -307,7 +307,7 @@ function parseSourceResult (
   return invalidMemoryValue()
 }
 
-function recordMatchesHead (record: MemoryRecordV1, head: MemoryHeadV1): boolean {
+function recordMatchesHead (record: CanonicalMemoryRecordV1, head: MemoryHeadV1): boolean {
   return record.namespaceRef === head.namespaceRef &&
     record.namespaceGeneration === head.namespaceGeneration &&
     record.memoryId === head.memoryId &&
@@ -327,7 +327,7 @@ function foundHeadValue (result: MemoryHeadSourceResultV1): MemoryHeadV1 | null 
   return result.status === 'found' && 'head' in result ? result.head : null
 }
 
-function foundRecordValue (result: MemoryHeadSourceResultV1): MemoryRecordV1 | null {
+function foundRecordValue (result: MemoryHeadSourceResultV1): CanonicalMemoryRecordV1 | null {
   return result.status === 'found' && 'record' in result ? result.record : null
 }
 
@@ -444,7 +444,7 @@ export function createMemoryReadThroughV1 (
         if (signalScope.isAborted()) return ABORTED_RESULT
         if (cached.status === 'aborted') return ABORTED_RESULT
 
-        let record: MemoryRecordV1 | null = null
+        let record: CanonicalMemoryRecordV1 | null = null
         let source: 'hot' | 'canonical' = 'canonical'
         if (cached.status === 'hit') {
           record = cached.record

@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto'
 import { types as utilTypes } from 'node:util'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
-import { decodeMemoryRevisionV1 } from './memory-codec.js'
-import type { MemoryRevisionV1 } from './memory-domain.js'
+import {
+  decodeCanonicalMemoryRevisionV1,
+  type CanonicalMemoryRevisionV1
+} from './memory-canonical-wire.js'
 import {
   createMemoryHeadSourcePortV1,
   type MemoryHeadSourcePortV1,
@@ -287,7 +289,7 @@ function sameHead (left: MemoryHeadV1, right: MemoryHeadV1): boolean {
 }
 
 function revisionMatchesCanonical (
-  revision: MemoryRevisionV1,
+  revision: CanonicalMemoryRevisionV1,
   requestedHead: MemoryHeadV1,
   state: HeadRowV1,
   row: Readonly<Record<string, SQLOutputValue>>,
@@ -382,9 +384,9 @@ function readExactRecord (
     throw new CanonicalMemoryHeadDataErrorV1()
   }
   const wire = exactString(rowValue(row, 'revision_wire'))
-  let revision: MemoryRevisionV1
+  let revision: CanonicalMemoryRevisionV1
   try {
-    revision = decodeMemoryRevisionV1(wire)
+    revision = decodeCanonicalMemoryRevisionV1(wire)
   } catch {
     throw new CanonicalMemoryHeadDataErrorV1()
   }

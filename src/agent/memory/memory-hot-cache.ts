@@ -1,9 +1,9 @@
 import { types as utilTypes } from 'node:util'
-import { encodeMemoryRecordV1 } from './memory-codec.js'
 import {
-  parseMemoryRecordV1,
-  type MemoryRecordV1
-} from './memory-domain.js'
+  encodeCanonicalMemoryRecordV1,
+  parseCanonicalMemoryRecordV1,
+  type CanonicalMemoryRecordV1
+} from './memory-canonical-wire.js'
 import {
   inspectMemoryRecord,
   invalidMemoryValue,
@@ -33,7 +33,7 @@ export type MemoryHotCacheRequestV1 =
   | {
       readonly schemaVersion: 1
       readonly operation: 'record.put'
-      readonly record: MemoryRecordV1
+      readonly record: CanonicalMemoryRecordV1
     }
   | {
       readonly schemaVersion: 1
@@ -68,7 +68,7 @@ export interface MemoryHotCacheUsageV1 {
 }
 
 export type MemoryHotCacheResultV1 =
-  | { readonly status: 'hit'; readonly record: MemoryRecordV1 }
+  | { readonly status: 'hit'; readonly record: CanonicalMemoryRecordV1 }
   | {
       readonly status: 'miss'
       readonly reason: 'not_found' | 'expired' | 'stale' | 'mismatch' | 'corrupt'
@@ -183,8 +183,8 @@ function parseRequest (value: unknown): MemoryHotCacheRequestV1 {
   }
   if (operation === 'record.put') {
     const input = inspectMemoryRecord(value, ['schemaVersion', 'operation', 'record'])
-    const record = parseMemoryRecordV1(input.record)
-    encodeMemoryRecordV1(record)
+    const record = parseCanonicalMemoryRecordV1(input.record)
+    encodeCanonicalMemoryRecordV1(record)
     return Object.freeze({ schemaVersion: 1 as const, operation, record })
   }
   if (operation === 'record.invalidate') {
@@ -228,7 +228,7 @@ function parseRequest (value: unknown): MemoryHotCacheRequestV1 {
   return Object.freeze({ schemaVersion: 1 as const, operation })
 }
 
-function recordMatchesHead (record: MemoryRecordV1, head: MemoryHotCacheHeadV1): boolean {
+function recordMatchesHead (record: CanonicalMemoryRecordV1, head: MemoryHotCacheHeadV1): boolean {
   return record.namespaceRef === head.namespaceRef &&
     record.namespaceGeneration === head.namespaceGeneration &&
     record.memoryId === head.memoryId &&
@@ -310,8 +310,8 @@ function parseResult (
   if (status === 'hit') {
     if (request.operation !== 'record.get') return invalidMemoryValue()
     const input = inspectMemoryRecord(value, ['status', 'record'])
-    const record = parseMemoryRecordV1(input.record)
-    encodeMemoryRecordV1(record)
+    const record = parseCanonicalMemoryRecordV1(input.record)
+    encodeCanonicalMemoryRecordV1(record)
     if (!recordMatchesHead(record, request.head)) return invalidMemoryValue()
     return Object.freeze({ status, record })
   }

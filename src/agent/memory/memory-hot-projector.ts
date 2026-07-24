@@ -1,5 +1,6 @@
 import { types as utilTypes } from 'node:util'
-import type { MemoryOutboxEventV1, MemoryRecordV1 } from './memory-domain.js'
+import type { CanonicalMemoryRecordV1 } from './memory-canonical-wire.js'
+import type { MemoryOutboxEventV1 } from './memory-domain.js'
 import {
   type MemoryHeadSourcePortV1,
   type MemoryHeadSourceResultV1,
@@ -128,7 +129,7 @@ function sameCanonicalState (left: HeadStateV1, right: HeadStateV1): boolean {
   return left.status === right.status && sameHead(left.head, right.head)
 }
 
-function foundRecord (result: MemoryHeadSourceResultV1): MemoryRecordV1 | null {
+function foundRecord (result: MemoryHeadSourceResultV1): CanonicalMemoryRecordV1 | null {
   return result.status === 'found' && 'record' in result ? result.record : null
 }
 
