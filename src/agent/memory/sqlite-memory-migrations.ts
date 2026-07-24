@@ -453,6 +453,12 @@ const PROPOSALS_TABLE_STAGE_SQL_V2 = v1SchemaObject('proposals').sql
     "state IN ('pending', 'approved', 'rejected', 'expired')",
     "state IN ('pending', 'approved', 'rejected', 'expired', 'withdrawn')"
   )
+  .replace(
+    'resulting_revision IS NULL OR resulting_revision = 1',
+    `resulting_revision IS NULL OR (resulting_revision BETWEEN 1 AND ${
+      MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions
+    })`
+  )
 
 const PROPOSALS_TABLE_SQL_V2 = PROPOSALS_TABLE_STAGE_SQL_V2.replace(
   'CREATE TABLE proposals_v2_stage(',

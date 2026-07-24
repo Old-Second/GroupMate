@@ -512,6 +512,7 @@ test('sqlite memory v2 schema persists lifecycle bodies, ledgers, checkpoints, e
       SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'proposals'
     `).get()?.sql)
     assert.match(proposalSql, /'withdrawn'/)
+    assert.match(proposalSql, /resulting_revision\s+BETWEEN\s+1\s+AND\s+32/i)
     const exportColumns = tableColumns(store.database, 'export_jobs')
     for (const column of [
       'artifact_token', 'claim_command_hash', 'delivery_ref_hash',
