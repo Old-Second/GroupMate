@@ -240,11 +240,11 @@ test('Task 6 has one lazy Agent-only isolation source and re-derives recovery fr
   )
   assert.match(
     bridge,
-    /createRuntime:\s*async request[\s\S]*?request\.sessionAddress[\s\S]*?providerRequestMetadata/
+    /createRuntime:\s*async\s*(?:request|\(request,\s*signal\))[\s\S]*?request\.sessionAddress[\s\S]*?providerRequestMetadata/
   )
   assert.match(
     bridge,
-    /recoverRuntime:\s*async checkpoint[\s\S]*?checkpoint\.sessionAddress[\s\S]*?providerRequestMetadata/
+    /recoverRuntime:\s*async\s*(?:checkpoint|\(checkpoint,\s*signal\))[\s\S]*?checkpoint\.sessionAddress[\s\S]*?providerRequestMetadata/
   )
   assert.match(service, /providerRequestMetadata:\s*runtime\.binding\.providerRequestMetadata/)
   assert.match(engine, /metadata:\s*runtime\.providerRequestMetadata/)

@@ -30,6 +30,7 @@ import type {
   PresentationSettingsPort,
   TtsMode
 } from './presentation/presentation-settings.js'
+import type { PresentationResult } from './presentation/presentation-result.js'
 import type { PresentationCompletionCoordinator } from './request-observation-completion.js'
 import type { RunPresentationLifecycle } from './run-presentation-lifecycle.js'
 import type { RuntimePresentationHooks } from './runtime-presentation-hooks.js'
@@ -227,6 +228,14 @@ export interface YunzaiChatControllerOptions {
   readonly presenter: Pick<ReplyPresenter, 'present'>
   readonly completionCoordinator: PresentationCompletionCoordinator
   readonly diagnostics?: ChatDiagnosticsPort
+  readonly postReplyCandidate?: {
+    readonly enqueue: (input: Readonly<{
+      event: YunzaiMessageEvent
+      prepared: ValidatedPreparedChatRequest
+      envelope: FinalChatReplyEnvelope
+      presentation: PresentationResult
+    }>) => Promise<void>
+  }
   readonly now?: () => Date
 }
 
@@ -480,8 +489,8 @@ async function presentFinal (
   profile: Extract<FinalPresentationProfile, { readonly kind: 'ordinary' }>,
   hooks: RuntimePresentationHooks,
   envelope: FinalChatReplyEnvelope
-): Promise<void> {
-  await options.completionCoordinator.complete({
+): Promise<PresentationResult> {
+  return await options.completionCoordinator.complete({
     envelope,
     present: async projection => await options.presenter.present(Object.freeze({
       route: prepared.route,
@@ -640,7 +649,7 @@ async function runOrdinaryChat (
           ? { error: true }
           : {}
     }))
-    await presentFinal(
+    const presentation = await presentFinal(
       options,
       prepared,
       presentationSettings,
@@ -648,6 +657,14 @@ async function runOrdinaryChat (
       hooks,
       envelope
     )
+    if (options.postReplyCandidate !== undefined &&
+      envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
+      presentation.deliveries.some(delivery => delivery.kind === 'sent')) {
+      const candidateInput = Object.freeze({ event, prepared, envelope, presentation })
+      void Promise.resolve()
+        .then(async () => await options.postReplyCandidate!.enqueue(candidateInput))
+        .catch(() => undefined)
+    }
   } catch (error) {
     const presentation = getChatErrorPresentation(error)
     if (!requestDiagnosticRecorded && prepared !== undefined) {

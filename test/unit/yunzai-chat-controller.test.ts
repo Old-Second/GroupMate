@@ -74,6 +74,21 @@ const presentationResult: PresentationResult = Object.freeze({
   deliveries: Object.freeze([])
 })
 
+const sentPresentationResult: PresentationResult = Object.freeze({
+  schemaVersion: 1,
+  outcome: 'complete',
+  deliveries: Object.freeze([Object.freeze({
+    kind: 'sent' as const,
+    media: 'text' as const,
+    attempt: 1 as const,
+    receipt: Object.freeze({
+      schemaVersion: 1 as const,
+      media: 'text' as const,
+      messageId: 'reply-1'
+    }) as never
+  })])
+})
+
 function event (overrides: Record<string, unknown> = {}) {
   return {
     isGroup: true,
@@ -167,6 +182,8 @@ function fixture (input: Readonly<{
   envelope?: ChatReplyEnvelope
   agentError?: unknown
   settings?: PresentationSettings
+  presentationResult?: PresentationResult
+  candidateEnqueue?: (input: unknown) => Promise<void>
 }> = {}) {
   const calls: string[] = []
   const commandReplies: Array<{ message: string, quote: boolean }> = []
@@ -175,6 +192,7 @@ function fixture (input: Readonly<{
   const agentInputs: unknown[] = []
   const presentationInputs: PresentationInput[] = []
   const preferencePatches: Array<Readonly<Partial<ChatPreferences>>> = []
+  const candidateInputs: unknown[] = []
   let completionCalls = 0
   let ocrCalls = 0
   let preparationCalls = 0
@@ -310,7 +328,7 @@ function fixture (input: Readonly<{
       present: async presentationInput => {
         calls.push('present')
         presentationInputs.push(presentationInput)
-        return presentationResult
+        return input.presentationResult ?? presentationResult
       }
     },
     completionCoordinator: {
@@ -328,6 +346,16 @@ function fixture (input: Readonly<{
         assert.equal(JSON.stringify(entry).includes('你好呀'), false)
       }
     },
+    ...(input.candidateEnqueue === undefined
+      ? {}
+      : {
+          postReplyCandidate: {
+            enqueue: async (value: unknown) => {
+              candidateInputs.push(value)
+              await input.candidateEnqueue!(value)
+            }
+          }
+        }),
     now: () => new Date('2026-07-17T12:00:00.000Z')
   }
   return {
@@ -339,6 +367,7 @@ function fixture (input: Readonly<{
     requestInputs,
     agentInputs,
     presentationInputs,
+    candidateInputs,
     preferencePatches,
     completionCalls: () => completionCalls,
     ocrCalls: () => ocrCalls,
@@ -483,6 +512,93 @@ test('ordinary terminal results enter the Presenter exactly once while paused do
   assert.equal(paused.lifecycleCalls(), 1)
   assert.equal(paused.completionCalls(), 0)
   assert.equal(paused.presentationInputs.length, 0)
+})
+
+test('post-reply candidate extraction starts only after a definite sent delivery', async () => {
+  const current = fixture({
+    presentationResult: sentPresentationResult,
+    candidateEnqueue: async () => undefined
+  })
+  const activeEvent = event()
+
+  assert.equal(await current.controller.chatgpt1(activeEvent), true)
+  assert.equal(current.candidateInputs.length, 1)
+  const candidateInput = current.candidateInputs[0] as Record<string, unknown>
+  assert.equal(candidateInput.event, activeEvent)
+  assert.equal((candidateInput.envelope as { kind: string }).kind, 'completed')
+  assert.equal(
+    (candidateInput.envelope as { completion: { text: string } }).completion.text,
+    '你好呀'
+  )
+  assert.equal(candidateInput.presentation, sentPresentationResult)
+  assert.equal(
+    (candidateInput.prepared as { evidence: PreparedYunzaiMessageEvidenceV1 }).evidence.prompt,
+    '你好'
+  )
+})
+
+test('post-reply candidate enqueue is fire-and-forget and cannot delay the QQ reply path', async () => {
+  let enqueueStarted = false
+  const neverSettles = new Promise<void>(() => undefined)
+  const current = fixture({
+    presentationResult: sentPresentationResult,
+    candidateEnqueue: async () => {
+      enqueueStarted = true
+      await neverSettles
+    }
+  })
+
+  assert.equal(await current.controller.chatgpt1(event()), true)
+  assert.equal(enqueueStarted, true)
+  assert.equal(current.candidateInputs.length, 1)
+})
+
+test('post-reply candidate extraction rejects unresolved and non-visible presentation outcomes', async () => {
+  const outcomes: readonly PresentationResult[] = Object.freeze([
+    presentationResult,
+    Object.freeze({
+      schemaVersion: 1,
+      outcome: 'failed',
+      deliveries: Object.freeze([Object.freeze({
+        kind: 'failed_definite' as const,
+        media: 'text' as const,
+        attempt: 1 as const,
+        code: 'host_rejected' as const
+      })])
+    }),
+    Object.freeze({
+      schemaVersion: 1,
+      outcome: 'unknown',
+      deliveries: Object.freeze([Object.freeze({
+        kind: 'outcome_unknown' as const,
+        media: 'text' as const,
+        attempt: 1 as const,
+        code: 'unknown_host_result' as const
+      })])
+    }),
+    Object.freeze({
+      schemaVersion: 1,
+      outcome: 'skipped',
+      skipReason: 'allowed_silence',
+      deliveries: Object.freeze([])
+    })
+  ])
+  for (const outcome of outcomes) {
+    const current = fixture({
+      presentationResult: outcome,
+      candidateEnqueue: async () => undefined
+    })
+    await current.controller.chatgpt1(event())
+    assert.equal(current.candidateInputs.length, 0, outcome.outcome)
+  }
+
+  const paused = fixture({
+    envelope: pausedEnvelope(),
+    presentationResult: sentPresentationResult,
+    candidateEnqueue: async () => undefined
+  })
+  await paused.controller.chatgpt1(event())
+  assert.equal(paused.candidateInputs.length, 0)
 })
 
 test('all conversation mode TTS role and billing entry methods preserve compatibility', async () => {
