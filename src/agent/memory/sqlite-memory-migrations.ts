@@ -18,6 +18,7 @@ import {
   parseMemoryNamespaceV1
 } from './memory-namespace.js'
 import {
+  MEMORY_DERIVATIVE_RESOURCE_LIMITS,
   MEMORY_LIFECYCLE_RESOURCE_LIMITS,
   MEMORY_RESOURCE_LIMITS
 } from './memory-resource-limits.js'
@@ -25,6 +26,7 @@ import {
 export const MEMORY_SQLITE_APPLICATION_ID_V1 = 0x474d454d
 export const MEMORY_SQLITE_SCHEMA_VERSION_V1 = 1
 export const MEMORY_SQLITE_SCHEMA_VERSION_V2 = 2
+export const MEMORY_SQLITE_SCHEMA_VERSION_V3 = 3
 export const MEMORY_SQLITE_SCHEMA_FINGERPRINT_DOMAIN_V1 =
   'groupmate.memory.sqlite-schema.v1'
 
@@ -51,6 +53,8 @@ export interface RunSqliteMemoryMigrationV2OptionsV1 {
   readonly appliedAt: string
   readonly manifests: readonly MemoryV1ToV2AggregateManifestV1[]
 }
+
+export type RunSqliteMemoryMigrationV3OptionsV1 = RunSqliteMemoryMigrationV2OptionsV1
 
 export class MemorySqliteMigrationErrorV2 extends TypeError {
   readonly code:
@@ -939,6 +943,196 @@ export const MEMORY_SQLITE_MIGRATION_V2: MemorySqliteMigrationV1 = Object.freeze
 
 export const MEMORY_SQLITE_MIGRATIONS_V2: readonly MemorySqliteMigrationV1[] =
   Object.freeze([MEMORY_SQLITE_MIGRATION_V1, MEMORY_SQLITE_MIGRATION_V2])
+
+const NEW_SCHEMA_OBJECTS_V3: readonly SqliteSchemaObjectV1[] = Object.freeze([
+  Object.freeze({
+    type: 'table' as const,
+    name: 'personal_memory_policies',
+    tableName: 'personal_memory_policies',
+    sql: `CREATE TABLE personal_memory_policies(
+  namespace_ref TEXT PRIMARY KEY CHECK(${NAMESPACE_REF_CHECK}),
+  namespace_generation INTEGER NOT NULL CHECK(namespace_generation > 0),
+  state TEXT NOT NULL CHECK(state IN ('opted_out', 'opted_in')),
+  candidate_mode TEXT NOT NULL CHECK(candidate_mode IN ('off', 'shadow', 'policy_approved')),
+  policy_generation INTEGER NOT NULL CHECK(policy_generation > 0),
+  decided_by_actor_ref_hash TEXT NOT NULL CHECK(${HASH_CHECK('decided_by_actor_ref_hash')}),
+  decision_source_ref_hash TEXT NOT NULL CHECK(${HASH_CHECK('decision_source_ref_hash')}),
+  policy_hash TEXT NOT NULL CHECK(${HASH_CHECK('policy_hash')}),
+  policy_wire TEXT NOT NULL CHECK(length(policy_wire) > 0),
+  policy_wire_bytes INTEGER NOT NULL CHECK(
+    policy_wire_bytes BETWEEN 1 AND ${MEMORY_DERIVATIVE_RESOURCE_LIMITS.personalPolicyWireBytes}
+  ),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+  CHECK(policy_wire_bytes = length(CAST(policy_wire AS BLOB))),
+  CHECK(state = 'opted_in' OR candidate_mode = 'off'),
+  FOREIGN KEY(namespace_ref, namespace_generation)
+    REFERENCES namespaces(namespace_ref, namespace_generation) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`
+  }),
+  Object.freeze({
+    type: 'table' as const,
+    name: 'memory_derivative_jobs',
+    tableName: 'memory_derivative_jobs',
+    sql: `CREATE TABLE memory_derivative_jobs(
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL CHECK(length(job_id) BETWEEN 1 AND 128),
+  namespace_ref TEXT NOT NULL CHECK(${NAMESPACE_REF_CHECK}),
+  namespace_generation INTEGER NOT NULL CHECK(namespace_generation > 0),
+  aggregate_kind TEXT NOT NULL CHECK(aggregate_kind IN ('record', 'namespace')),
+  aggregate_id TEXT NOT NULL CHECK(length(aggregate_id) BETWEEN 1 AND 128),
+  event_kind TEXT NOT NULL CHECK(event_kind IN (
+    'record_upserted', 'record_forgotten', 'namespace_deleted', 'rebuild_requested'
+  )),
+  memory_revision INTEGER CHECK(memory_revision IS NULL OR memory_revision > 0),
+  revision_hash TEXT CHECK(revision_hash IS NULL OR (${HASH_CHECK('revision_hash')})),
+  content_epoch INTEGER NOT NULL CHECK(content_epoch >= 0),
+  occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms >= 0),
+  logical_bytes INTEGER NOT NULL CHECK(
+    logical_bytes BETWEEN 1 AND ${MEMORY_DERIVATIVE_RESOURCE_LIMITS.derivativeJobLogicalBytes}
+  ),
+  CHECK(
+    (event_kind = 'record_upserted' AND aggregate_kind = 'record' AND
+      memory_revision IS NOT NULL AND revision_hash IS NOT NULL) OR
+    (event_kind = 'record_forgotten' AND aggregate_kind = 'record' AND
+      ((memory_revision IS NULL AND revision_hash IS NULL) OR
+       (memory_revision IS NOT NULL AND revision_hash IS NOT NULL))) OR
+    (event_kind IN ('namespace_deleted', 'rebuild_requested') AND
+      aggregate_kind = 'namespace' AND memory_revision IS NULL AND revision_hash IS NULL)
+  )
+) STRICT`
+  }),
+  Object.freeze({
+    type: 'table' as const,
+    name: 'memory_derivative_projectors',
+    tableName: 'memory_derivative_projectors',
+    sql: `CREATE TABLE memory_derivative_projectors(
+  projector_kind TEXT PRIMARY KEY CHECK(projector_kind IN ('lexical', 'vector')),
+  status TEXT NOT NULL CHECK(status IN ('disabled', 'rebuild_required', 'rebuilding', 'ready')),
+  projection_generation INTEGER NOT NULL CHECK(projection_generation >= 0),
+  index_fingerprint TEXT CHECK(index_fingerprint IS NULL OR (${HASH_CHECK('index_fingerprint')})),
+  last_applied_sequence INTEGER NOT NULL CHECK(last_applied_sequence >= 0),
+  rebuild_after_sequence INTEGER NOT NULL CHECK(rebuild_after_sequence >= 0),
+  scan_namespace_ref TEXT CHECK(scan_namespace_ref IS NULL OR (${NAMESPACE_REF_CHECK.replaceAll('namespace_ref', 'scan_namespace_ref')})),
+  scan_memory_id TEXT CHECK(scan_memory_id IS NULL OR length(scan_memory_id) BETWEEN 1 AND 128),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+  CHECK((scan_namespace_ref IS NULL) = (scan_memory_id IS NULL)),
+  CHECK(
+    (status IN ('disabled', 'rebuild_required') AND projection_generation = 0 AND
+      index_fingerprint IS NULL AND scan_namespace_ref IS NULL) OR
+    (status = 'rebuilding' AND projection_generation > 0 AND index_fingerprint IS NOT NULL) OR
+    (status = 'ready' AND projection_generation > 0 AND index_fingerprint IS NOT NULL AND
+      scan_namespace_ref IS NULL AND last_applied_sequence >= rebuild_after_sequence)
+  )
+) STRICT, WITHOUT ROWID`
+  }),
+  Object.freeze({
+    type: 'table' as const,
+    name: 'memory_derivative_usage',
+    tableName: 'memory_derivative_usage',
+    sql: `CREATE TABLE memory_derivative_usage(
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  queued_records INTEGER NOT NULL CHECK(
+    queued_records BETWEEN 0 AND ${MEMORY_DERIVATIVE_RESOURCE_LIMITS.derivativeJobRecords}
+  ),
+  queued_logical_bytes INTEGER NOT NULL CHECK(
+    queued_logical_bytes BETWEEN 0 AND ${MEMORY_DERIVATIVE_RESOURCE_LIMITS.derivativeJobLogicalBytesTotal}
+  ),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT, WITHOUT ROWID`
+  }),
+  Object.freeze({
+    type: 'index' as const,
+    name: 'memory_namespaces_generation_v3',
+    tableName: 'namespaces',
+    sql: `CREATE UNIQUE INDEX memory_namespaces_generation_v3
+ON namespaces(namespace_ref ASC, namespace_generation ASC)`
+  }),
+  Object.freeze({
+    type: 'index' as const,
+    name: 'memory_derivative_jobs_id_v3',
+    tableName: 'memory_derivative_jobs',
+    sql: `CREATE UNIQUE INDEX memory_derivative_jobs_id_v3
+ON memory_derivative_jobs(job_id ASC)`
+  }),
+  Object.freeze({
+    type: 'index' as const,
+    name: 'memory_derivative_jobs_namespace_v3',
+    tableName: 'memory_derivative_jobs',
+    sql: `CREATE INDEX memory_derivative_jobs_namespace_v3
+ON memory_derivative_jobs(namespace_ref ASC, namespace_generation ASC, sequence ASC)`
+  }),
+  Object.freeze({
+    type: 'trigger' as const,
+    name: 'memory_derivative_jobs_ai_v3',
+    tableName: 'memory_derivative_jobs',
+    sql: `CREATE TRIGGER memory_derivative_jobs_ai_v3
+AFTER INSERT ON memory_derivative_jobs BEGIN
+  UPDATE memory_derivative_usage
+  SET queued_records = queued_records + 1,
+    queued_logical_bytes = queued_logical_bytes + new.logical_bytes,
+    updated_at_ms = max(updated_at_ms, new.occurred_at_ms)
+  WHERE singleton = 1;
+  SELECT CASE WHEN changes() != 1
+    THEN raise(ABORT, 'memory derivative usage unavailable') END;
+END`
+  }),
+  Object.freeze({
+    type: 'trigger' as const,
+    name: 'memory_derivative_jobs_ad_v3',
+    tableName: 'memory_derivative_jobs',
+    sql: `CREATE TRIGGER memory_derivative_jobs_ad_v3
+AFTER DELETE ON memory_derivative_jobs BEGIN
+  UPDATE memory_derivative_usage
+  SET queued_records = queued_records - 1,
+    queued_logical_bytes = queued_logical_bytes - old.logical_bytes
+  WHERE singleton = 1;
+  SELECT CASE WHEN changes() != 1
+    THEN raise(ABORT, 'memory derivative usage unavailable') END;
+END`
+  })
+])
+
+const SCHEMA_OBJECTS_V3: readonly SqliteSchemaObjectV1[] = Object.freeze([
+  ...SCHEMA_OBJECTS_V2,
+  ...NEW_SCHEMA_OBJECTS_V3
+])
+
+export const MEMORY_SQLITE_SCHEMA_FINGERPRINT_V3 = fingerprintRows(SCHEMA_OBJECTS_V3)
+
+const INITIAL_DATA_SQL_V3 = Object.freeze([
+  `INSERT INTO memory_derivative_usage(
+  singleton, queued_records, queued_logical_bytes, updated_at_ms
+) VALUES (1, 0, 0, 0)`,
+  `INSERT INTO memory_derivative_projectors(
+  projector_kind, status, projection_generation, index_fingerprint,
+  last_applied_sequence, rebuild_after_sequence,
+  scan_namespace_ref, scan_memory_id, updated_at_ms
+) VALUES ('lexical', 'rebuild_required', 0, NULL, 0, 0, NULL, NULL, 0)`,
+  `INSERT INTO memory_derivative_projectors(
+  projector_kind, status, projection_generation, index_fingerprint,
+  last_applied_sequence, rebuild_after_sequence,
+  scan_namespace_ref, scan_memory_id, updated_at_ms
+) VALUES ('vector', 'disabled', 0, NULL, 0, 0, NULL, NULL, 0)`
+])
+
+const MIGRATION_SQL_V3 = `${[
+  ...NEW_SCHEMA_OBJECTS_V3.map(value => value.sql),
+  ...INITIAL_DATA_SQL_V3
+].map(value => `${value};`).join('\n')}\n`
+
+export const MEMORY_SQLITE_MIGRATION_V3: MemorySqliteMigrationV1 = Object.freeze({
+  version: 3,
+  sql: MIGRATION_SQL_V3,
+  checksum: sha256(MIGRATION_SQL_V3),
+  schemaFingerprint: MEMORY_SQLITE_SCHEMA_FINGERPRINT_V3
+})
+
+export const MEMORY_SQLITE_MIGRATIONS_V3: readonly MemorySqliteMigrationV1[] =
+  Object.freeze([
+    MEMORY_SQLITE_MIGRATION_V1,
+    MEMORY_SQLITE_MIGRATION_V2,
+    MEMORY_SQLITE_MIGRATION_V3
+  ])
 
 function schemaRowsFromDatabase (database: DatabaseSync): readonly SqliteSchemaObjectV1[] {
   const rows = database.prepare(`
@@ -1881,9 +2075,34 @@ export function assertSqliteMemoryMigrationV2Ready (
   return invalidMemoryValue()
 }
 
-export function runSqliteMemoryMigrationV2 (
+export function assertSqliteMemoryMigrationV3Ready (
   database: DatabaseSync,
-  optionsValue: RunSqliteMemoryMigrationV2OptionsV1
+  manifestsValue: unknown
+): readonly MemoryV1ToV2AggregateManifestV1[] {
+  const manifests = parseMigrationManifestsV2(manifestsValue)
+  const version = pragmaNumber(database, 'user_version')
+  if (version === MEMORY_SQLITE_SCHEMA_VERSION_V1) {
+    validateAppliedMigrations(database, 1, MEMORY_SQLITE_MIGRATIONS_V3)
+    if (sqliteMemorySchemaFingerprintV1(database) !== MEMORY_SQLITE_SCHEMA_FINGERPRINT_V1) {
+      return invalidMemoryValue()
+    }
+    validateV1MigrationManifestsV2(database, manifests)
+    return manifests
+  }
+  if (version === MEMORY_SQLITE_SCHEMA_VERSION_V2 ||
+    version === MEMORY_SQLITE_SCHEMA_VERSION_V3) {
+    if (manifests.length !== 0) {
+      throw new MemorySqliteMigrationErrorV2('memory_migration_manifest_invalid')
+    }
+    return manifests
+  }
+  return invalidMemoryValue()
+}
+
+function runSqliteMemoryMigrationTargetV2 (
+  database: DatabaseSync,
+  optionsValue: RunSqliteMemoryMigrationV2OptionsV1,
+  migrations: readonly MemorySqliteMigrationV1[]
 ): void {
   const options = exactObject(optionsValue, ['appliedAt', 'manifests'])
   const appliedAt = canonicalInstant(options.appliedAt)
@@ -1892,7 +2111,7 @@ export function runSqliteMemoryMigrationV2 (
   let trustedTimeHighWaterMs = appliedAtMs
   runParsedMigrationSequenceV1(
     database,
-    MEMORY_SQLITE_MIGRATIONS_V2,
+    migrations,
     appliedAt,
     {
       onCurrent: currentVersion => {
@@ -1908,20 +2127,47 @@ export function runSqliteMemoryMigrationV2 (
         } else if (currentVersion === MEMORY_SQLITE_SCHEMA_VERSION_V2 &&
           manifests.length !== 0) {
           throw new MemorySqliteMigrationErrorV2('memory_migration_manifest_invalid')
+        } else if (currentVersion === MEMORY_SQLITE_SCHEMA_VERSION_V3 &&
+          manifests.length !== 0) {
+          throw new MemorySqliteMigrationErrorV2('memory_migration_manifest_invalid')
         }
       },
       afterApply: (_currentVersion, migration) => {
-        if (migration.version !== MEMORY_SQLITE_SCHEMA_VERSION_V2) return
-        backfillGlobalAggregateUsageV2(database)
-        persistV1MigrationManifestsV2(database, manifests, appliedAtMs)
-        initializeLifecycleNamespaceUsageV2(database, appliedAtMs)
-        const updated = database.prepare(`
-          UPDATE lifecycle_deployment_state
-          SET trusted_time_high_water_ms = ?
-          WHERE singleton = 1 AND trusted_time_high_water_ms = 0
-        `).run(trustedTimeHighWaterMs)
-        if (updated.changes !== 1) return invalidMemoryValue()
+        if (migration.version === MEMORY_SQLITE_SCHEMA_VERSION_V2) {
+          backfillGlobalAggregateUsageV2(database)
+          persistV1MigrationManifestsV2(database, manifests, appliedAtMs)
+          initializeLifecycleNamespaceUsageV2(database, appliedAtMs)
+          const updated = database.prepare(`
+            UPDATE lifecycle_deployment_state
+            SET trusted_time_high_water_ms = ?
+            WHERE singleton = 1 AND trusted_time_high_water_ms = 0
+          `).run(trustedTimeHighWaterMs)
+          if (updated.changes !== 1) return invalidMemoryValue()
+        } else if (migration.version === MEMORY_SQLITE_SCHEMA_VERSION_V3) {
+          const usage = database.prepare(`
+            UPDATE memory_derivative_usage
+            SET updated_at_ms = ? WHERE singleton = 1
+          `).run(appliedAtMs)
+          const projectors = database.prepare(`
+            UPDATE memory_derivative_projectors SET updated_at_ms = ?
+          `).run(appliedAtMs)
+          if (usage.changes !== 1 || projectors.changes !== 2) return invalidMemoryValue()
+        }
       }
     }
   )
+}
+
+export function runSqliteMemoryMigrationV2 (
+  database: DatabaseSync,
+  optionsValue: RunSqliteMemoryMigrationV2OptionsV1
+): void {
+  runSqliteMemoryMigrationTargetV2(database, optionsValue, MEMORY_SQLITE_MIGRATIONS_V2)
+}
+
+export function runSqliteMemoryMigrationV3 (
+  database: DatabaseSync,
+  optionsValue: RunSqliteMemoryMigrationV3OptionsV1
+): void {
+  runSqliteMemoryMigrationTargetV2(database, optionsValue, MEMORY_SQLITE_MIGRATIONS_V3)
 }
