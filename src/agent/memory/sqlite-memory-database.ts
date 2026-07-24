@@ -15,17 +15,25 @@ import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js'
 import { MEMORY_RESOURCE_LIMITS } from './memory-resource-limits.js'
 import {
+  assertSqliteMemoryMigrationV2Ready,
+  MemorySqliteMigrationErrorV2,
   MEMORY_SQLITE_APPLICATION_ID_V1,
   MEMORY_SQLITE_MIGRATION_V1,
+  MEMORY_SQLITE_MIGRATIONS_V2,
   MEMORY_SQLITE_SCHEMA_VERSION_V1,
+  MEMORY_SQLITE_SCHEMA_VERSION_V2,
   MEMORY_SQLITE_SCHEMA_FINGERPRINT_V1,
+  MEMORY_SQLITE_SCHEMA_FINGERPRINT_V2,
+  runSqliteMemoryMigrationV2,
   runSqliteMemoryMigrationSequenceV1,
   sqliteMemorySchemaFingerprintV1
 } from './sqlite-memory-migrations.js'
+import type { MemoryV1ToV2AggregateManifestV1 } from './memory-lifecycle-domain.js'
 
 export {
   MEMORY_SQLITE_APPLICATION_ID_V1,
-  MEMORY_SQLITE_SCHEMA_VERSION_V1
+  MEMORY_SQLITE_SCHEMA_VERSION_V1,
+  MEMORY_SQLITE_SCHEMA_VERSION_V2
 } from './sqlite-memory-migrations.js'
 
 export type SqliteMemoryDatabaseErrorCodeV1 =
@@ -50,6 +58,12 @@ export interface SqliteMemoryDatabaseV1 {
 interface OpenSqliteMemoryDatabaseOptionsV1 {
   readonly location: string
   readonly now: () => string
+}
+
+export interface OpenSqliteMemoryDatabaseOptionsV2 {
+  readonly location: string
+  readonly now: () => string
+  readonly manifests: readonly MemoryV1ToV2AggregateManifestV1[]
 }
 
 interface FileIdentityV1 {
@@ -103,6 +117,22 @@ function parseOptions (value: OpenSqliteMemoryDatabaseOptionsV1): OpenSqliteMemo
   return Object.freeze({
     location: input.location,
     now: input.now as () => string
+  })
+}
+
+function parseOptionsV2 (
+  value: OpenSqliteMemoryDatabaseOptionsV2
+): OpenSqliteMemoryDatabaseOptionsV2 {
+  const input = inspectMemoryRecord(value, ['location', 'now', 'manifests'])
+  if (typeof input.location !== 'string' || input.location.length === 0 ||
+    input.location.length > 4_096 || input.location.includes('\0') ||
+    typeof input.now !== 'function' || !Array.isArray(input.manifests)) {
+    return invalidMemoryValue()
+  }
+  return Object.freeze({
+    location: input.location,
+    now: input.now as () => string,
+    manifests: input.manifests as readonly MemoryV1ToV2AggregateManifestV1[]
   })
 }
 
@@ -181,6 +211,29 @@ function exactMigrationMetadata (database: DatabaseSync): void {
   }
 }
 
+function exactMigrationMetadataV2 (database: DatabaseSync): void {
+  const rows = database.prepare(`
+    SELECT version, checksum, schema_fingerprint, applied_at
+    FROM schema_migrations
+    ORDER BY version ASC
+    LIMIT 3
+  `).all()
+  if (rows.length !== MEMORY_SQLITE_MIGRATIONS_V2.length) return schemaUnsupported()
+  rows.forEach((row, index) => {
+    const migration = MEMORY_SQLITE_MIGRATIONS_V2[index]
+    if (migration === undefined || row.version !== migration.version ||
+      row.checksum !== migration.checksum ||
+      row.schema_fingerprint !== migration.schemaFingerprint) {
+      return schemaUnsupported()
+    }
+    try {
+      canonicalInstant(row.applied_at)
+    } catch {
+      return schemaUnsupported()
+    }
+  })
+}
+
 function validateDatabaseIdentity (database: DatabaseSync): void {
   requirePragmaValue(database, 'application_id', MEMORY_SQLITE_APPLICATION_ID_V1)
   requirePragmaValue(database, 'user_version', MEMORY_SQLITE_SCHEMA_VERSION_V1)
@@ -189,6 +242,36 @@ function validateDatabaseIdentity (database: DatabaseSync): void {
     return schemaUnsupported()
   }
   exactMigrationMetadata(database)
+}
+
+function validateDatabaseIdentityV2 (database: DatabaseSync): void {
+  requirePragmaValue(database, 'application_id', MEMORY_SQLITE_APPLICATION_ID_V1)
+  requirePragmaValue(database, 'user_version', MEMORY_SQLITE_SCHEMA_VERSION_V2)
+  requirePragmaValue(database, 'foreign_keys', 1)
+  if (sqliteMemorySchemaFingerprintV1(database) !== MEMORY_SQLITE_SCHEMA_FINGERPRINT_V2) {
+    return schemaUnsupported()
+  }
+  exactMigrationMetadataV2(database)
+  const state = database.prepare(`
+    SELECT trusted_time_high_water_ms, export_fencing_counter,
+      export_lease_owner_id, export_lease_token, export_leased_until_ms
+    FROM lifecycle_deployment_state WHERE singleton = 1
+  `).get()
+  if (state === undefined || typeof state.trusted_time_high_water_ms !== 'number' ||
+    !Number.isSafeInteger(state.trusted_time_high_water_ms) ||
+    state.trusted_time_high_water_ms < 0 ||
+    typeof state.export_fencing_counter !== 'number' ||
+    !Number.isSafeInteger(state.export_fencing_counter) ||
+    state.export_fencing_counter < 0) return schemaUnsupported()
+}
+
+function validateDatabaseIdentityForVersion (
+  database: DatabaseSync,
+  version: number
+): void {
+  if (version === MEMORY_SQLITE_SCHEMA_VERSION_V1) return validateDatabaseIdentity(database)
+  if (version === MEMORY_SQLITE_SCHEMA_VERSION_V2) return validateDatabaseIdentityV2(database)
+  return schemaUnsupported()
 }
 
 function validateDatabaseIdentityTransaction (
@@ -214,7 +297,38 @@ function validateDatabaseIdentityTransaction (
   }
 }
 
-function readHeader (location: string): { readonly identity: FileIdentityV1; readonly header: Buffer } {
+function validateDatabaseIdentityTransactionForVersion (
+  database: DatabaseSync,
+  immediate: boolean,
+  version: number
+): void {
+  let transactionStarted = false
+  try {
+    database.exec(immediate ? 'BEGIN IMMEDIATE' : 'BEGIN')
+    transactionStarted = true
+    validateDatabaseIdentityForVersion(database, version)
+    database.exec('COMMIT')
+    transactionStarted = false
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        database.exec('ROLLBACK')
+      } catch {
+        // The fixed validation failure remains authoritative.
+      }
+    }
+    throw error
+  }
+}
+
+function readHeader (
+  location: string,
+  acceptedVersions: readonly number[] = [MEMORY_SQLITE_SCHEMA_VERSION_V1]
+): {
+    readonly identity: FileIdentityV1
+    readonly header: Buffer
+    readonly schemaVersion: number
+  } {
   let stat: ReturnType<typeof lstatSync>
   try {
     stat = lstatSync(location, { bigint: true })
@@ -246,16 +360,18 @@ function readHeader (location: string): { readonly identity: FileIdentityV1; rea
   if (!header.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) {
     return sqliteUnavailable()
   }
+  const schemaVersion = header.readUInt32BE(SQLITE_USER_VERSION_OFFSET)
   if (header.readUInt16BE(16) !== 4_096 ||
     header.readUInt32BE(SQLITE_SCHEMA_FORMAT_OFFSET) !== 4 ||
     header.readUInt32BE(SQLITE_TEXT_ENCODING_OFFSET) !== 1 ||
-    header.readUInt32BE(SQLITE_USER_VERSION_OFFSET) !== MEMORY_SQLITE_SCHEMA_VERSION_V1 ||
+    !acceptedVersions.includes(schemaVersion) ||
     header.readUInt32BE(SQLITE_APPLICATION_ID_OFFSET) !== MEMORY_SQLITE_APPLICATION_ID_V1) {
     return schemaUnsupported()
   }
   return Object.freeze({
     identity: Object.freeze({ device: stat.dev, inode: stat.ino }),
-    header
+    header,
+    schemaVersion
   })
 }
 
@@ -298,6 +414,30 @@ function preflightExistingDatabase (location: string): FileIdentityV1 {
   }
   sameFileIdentity(location, identity)
   return identity
+}
+
+function preflightExistingDatabaseV2 (
+  location: string,
+  manifests: readonly MemoryV1ToV2AggregateManifestV1[]
+): { readonly identity: FileIdentityV1; readonly schemaVersion: number } {
+  const { identity, schemaVersion } = readHeader(location, [
+    MEMORY_SQLITE_SCHEMA_VERSION_V1,
+    MEMORY_SQLITE_SCHEMA_VERSION_V2
+  ])
+  validateSidecarBudget(location)
+  const database = openDatabase(location, true)
+  try {
+    validateDatabaseIdentityTransactionForVersion(database, false, schemaVersion)
+    assertSqliteMemoryMigrationV2Ready(database, manifests)
+  } catch (error) {
+    if (error instanceof SqliteMemoryDatabaseErrorV1 ||
+      error instanceof MemorySqliteMigrationErrorV2) throw error
+    return schemaUnsupported()
+  } finally {
+    database.close()
+  }
+  sameFileIdentity(location, identity)
+  return Object.freeze({ identity, schemaVersion })
 }
 
 function configureRuntime (database: DatabaseSync, inMemory: boolean): void {
@@ -423,6 +563,66 @@ function bootstrapFileDatabase (
   preflightExistingDatabase(location)
 }
 
+function bootstrapFileDatabaseV2 (
+  location: string,
+  now: () => string,
+  manifests: readonly MemoryV1ToV2AggregateManifestV1[]
+): void {
+  const directory = path.dirname(location)
+  const temporary = path.join(
+    directory,
+    `.${path.basename(location)}.bootstrap-v2-${process.pid}-${randomUUID()}`
+  )
+  let descriptor: number | undefined
+  let database: DatabaseSync | undefined
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600)
+    closeSync(descriptor)
+    descriptor = undefined
+    database = openDatabase(temporary, false)
+    configureRuntime(database, false)
+    runSqliteMemoryMigrationV2(database, {
+      manifests,
+      appliedAt: canonicalInstant(Reflect.apply(now, undefined, []))
+    })
+    validateDatabaseIdentityV2(database)
+    checkpointForPublication(database)
+    database.close()
+    database = undefined
+    removeOwnedPath(`${temporary}-wal`)
+    removeOwnedPath(`${temporary}-shm`)
+    removeOwnedPath(`${temporary}-journal`)
+    fsyncPath(temporary)
+    try {
+      linkSync(temporary, location)
+      fsyncPath(directory)
+      removeOwnedPath(temporary)
+      fsyncPath(directory)
+    } catch (error) {
+      if (!isErrno(error, 'EEXIST')) throw error
+      cleanupOwnedBootstrap(temporary)
+    }
+  } catch (error) {
+    if (database !== undefined) {
+      try {
+        database.close()
+      } catch {
+        // Cleanup remains best-effort; the fixed public error is authoritative.
+      }
+    }
+    if (descriptor !== undefined) closeSync(descriptor)
+    try {
+      cleanupOwnedBootstrap(temporary)
+    } catch {
+      // Never replace the fixed public error with a cleanup path or SQLite message.
+    }
+    if (error instanceof SqliteMemoryDatabaseErrorV1 ||
+      error instanceof MemorySqliteMigrationErrorV2) throw error
+    return sqliteUnavailable()
+  }
+  preflightExistingDatabaseV2(location, manifests)
+}
+
 function openWritableDatabase (
   location: string,
   expectedIdentity: FileIdentityV1
@@ -446,6 +646,44 @@ function openWritableDatabase (
   return Object.freeze({ database, close })
 }
 
+function openWritableDatabaseV2 (
+  location: string,
+  expectedIdentity: FileIdentityV1,
+  schemaVersion: number,
+  now: () => string,
+  manifests: readonly MemoryV1ToV2AggregateManifestV1[]
+): SqliteMemoryDatabaseV1 {
+  const database = openDatabase(location, false)
+  try {
+    sameFileIdentity(location, expectedIdentity)
+    if (schemaVersion === MEMORY_SQLITE_SCHEMA_VERSION_V1) {
+      configureRuntime(database, false)
+      runSqliteMemoryMigrationV2(database, {
+        manifests,
+        appliedAt: canonicalInstant(Reflect.apply(now, undefined, []))
+      })
+    }
+    validateDatabaseIdentityTransactionForVersion(
+      database,
+      true,
+      MEMORY_SQLITE_SCHEMA_VERSION_V2
+    )
+    configureRuntime(database, false)
+  } catch (error) {
+    database.close()
+    if (error instanceof SqliteMemoryDatabaseErrorV1 ||
+      error instanceof MemorySqliteMigrationErrorV2) throw error
+    return sqliteUnavailable()
+  }
+  let closed = false
+  const close = (): void => {
+    if (closed) return
+    database.close()
+    closed = true
+  }
+  return Object.freeze({ database, close })
+}
+
 function openInMemoryDatabase (now: () => string): SqliteMemoryDatabaseV1 {
   const database = openDatabase(':memory:', false)
   try {
@@ -458,6 +696,33 @@ function openInMemoryDatabase (now: () => string): SqliteMemoryDatabaseV1 {
   } catch (error) {
     database.close()
     if (error instanceof SqliteMemoryDatabaseErrorV1) throw error
+    return sqliteUnavailable()
+  }
+  let closed = false
+  const close = (): void => {
+    if (closed) return
+    database.close()
+    closed = true
+  }
+  return Object.freeze({ database, close })
+}
+
+function openInMemoryDatabaseV2 (
+  now: () => string,
+  manifests: readonly MemoryV1ToV2AggregateManifestV1[]
+): SqliteMemoryDatabaseV1 {
+  const database = openDatabase(':memory:', false)
+  try {
+    configureRuntime(database, true)
+    runSqliteMemoryMigrationV2(database, {
+      manifests,
+      appliedAt: canonicalInstant(Reflect.apply(now, undefined, []))
+    })
+    validateDatabaseIdentityV2(database)
+  } catch (error) {
+    database.close()
+    if (error instanceof SqliteMemoryDatabaseErrorV1 ||
+      error instanceof MemorySqliteMigrationErrorV2) throw error
     return sqliteUnavailable()
   }
   let closed = false
@@ -493,6 +758,33 @@ export function openSqliteMemoryDatabaseV1 (
     return openWritableDatabase(options.location, identity)
   } catch (error) {
     if (error instanceof SqliteMemoryDatabaseErrorV1) throw error
+    return sqliteUnavailable()
+  }
+}
+
+export function openSqliteMemoryDatabaseV2 (
+  optionsValue: OpenSqliteMemoryDatabaseOptionsV2
+): SqliteMemoryDatabaseV1 {
+  const options = parseOptionsV2(optionsValue)
+  databaseConstructor()
+  if (options.location === ':memory:') {
+    return openInMemoryDatabaseV2(options.now, options.manifests)
+  }
+  try {
+    if (!locationExists(options.location)) {
+      bootstrapFileDatabaseV2(options.location, options.now, options.manifests)
+    }
+    const preflight = preflightExistingDatabaseV2(options.location, options.manifests)
+    return openWritableDatabaseV2(
+      options.location,
+      preflight.identity,
+      preflight.schemaVersion,
+      options.now,
+      options.manifests
+    )
+  } catch (error) {
+    if (error instanceof SqliteMemoryDatabaseErrorV1 ||
+      error instanceof MemorySqliteMigrationErrorV2) throw error
     return sqliteUnavailable()
   }
 }
