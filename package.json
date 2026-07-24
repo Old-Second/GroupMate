@@ -25,6 +25,7 @@
     "test:resources:phase7": "pnpm run build && node scripts/measure-phase-7-resources.mjs",
     "verify:phase7": "pnpm run build && node scripts/verify-phase-7.mjs",
     "verify:phase7b": "pnpm run build && pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7b.mjs",
+    "verify:phase7c": "pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7c.mjs",
     "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
   "dependencies": {
