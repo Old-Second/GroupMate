@@ -15,6 +15,7 @@ import {
 } from '../../src/agent/memory/memory-lifecycle-builder.js'
 import {
   createMemoryControlRepositoryPortV1,
+  memoryProposalListCursorV1,
   memoryRevisionHistoryCursorV1,
   type MemoryControlRepositoryRequestV1
 } from '../../src/agent/memory/memory-control-repository.js'
@@ -353,6 +354,18 @@ function pageWireBytes (
 test('control repository authorizes and normalizes an oldest-first safe proposal page', async () => {
   let dispatched: unknown
   const records = [proposalSummary()]
+  const nextCursorAnchor = {
+    schemaVersion: 1 as const,
+    proposedAt: records[0]!.proposedAt,
+    proposalId: records[0]!.proposalId
+  }
+  const nextCursor = memoryProposalListCursorV1({
+    schemaVersion: 1,
+    namespaceRef: memoryNamespaceRefV1(personalMemoryNamespaceFixture()),
+    namespaceGeneration: 1,
+    states: ['pending'],
+    anchor: nextCursorAnchor
+  })
   const repository = createMemoryControlRepositoryPortV1({
     now: () => NOW,
     execute: async envelope => {
@@ -362,8 +375,9 @@ test('control repository authorizes and normalizes an oldest-first safe proposal
         operation: 'proposal.list',
         snapshotAt: NOW,
         records,
-        nextCursor: CURSOR,
-        wireBytes: pageWireBytes(records, []),
+        nextCursor,
+        nextCursorAnchor,
+        wireBytes: pageWireBytes(records, [], { nextCursorAnchor }),
         corruptRecords: 0,
         corruptRefs: []
       }
@@ -376,6 +390,7 @@ test('control repository authorizes and normalizes an oldest-first safe proposal
     ),
     states: ['pending'],
     cursor: null,
+    cursorAnchor: null,
     limit: 16,
     maxWireBytes: MEMORY_RESOURCE_LIMITS.listPageWireBytes
   }
@@ -393,6 +408,7 @@ test('control repository authorizes and normalizes an oldest-first safe proposal
     generation: 1,
     states: ['pending'],
     cursor: null,
+    cursorAnchor: null,
     limit: 16,
     maxWireBytes: MEMORY_RESOURCE_LIMITS.listPageWireBytes
   })
@@ -660,16 +676,35 @@ test('proposal pages require legal progress, unique refs, bounded bytes and olde
     maxWireBytes: MEMORY_RESOURCE_LIMITS.listPageWireBytes
   }
   const result = (records: readonly unknown[], corruptRefs: readonly string[] = [],
-    nextCursor: string | null = null) => ({
+    nextCursorAnchor: { readonly proposedAt: string; readonly proposalId: string } | null = null) => {
+    const anchor = nextCursorAnchor === null
+      ? null
+      : { schemaVersion: 1 as const, ...nextCursorAnchor }
+    const nextCursor = anchor === null
+      ? null
+      : memoryProposalListCursorV1({
+          schemaVersion: 1,
+          namespaceRef: first.namespaceRef,
+          namespaceGeneration: first.namespaceGeneration,
+          states: request.states,
+          anchor
+        })
+    return ({
     status: 'page',
     operation: 'proposal.list',
     snapshotAt: NOW,
     records,
     nextCursor,
-    wireBytes: pageWireBytes(records, corruptRefs),
+    wireBytes: pageWireBytes(
+      records,
+      corruptRefs,
+      anchor === null ? {} : { nextCursorAnchor: anchor }
+    ),
     corruptRecords: corruptRefs.length,
-    corruptRefs
+    corruptRefs,
+    ...(anchor === null ? {} : { nextCursorAnchor: anchor })
   })
+  }
 
   adapterResult = result([{
     ...first,
@@ -687,16 +722,28 @@ test('proposal pages require legal progress, unique refs, bounded bytes and olde
   })
   adapterResult = result([first, first])
   assert.equal((await repository.execute(request)).status, 'corrupt')
-  adapterResult = result([], [], CURSOR)
+  adapterResult = result([], [], {
+    proposedAt: first.proposedAt,
+    proposalId: `proposal:${'e'.repeat(64)}`
+  })
   assert.equal((await repository.execute(request)).status, 'corrupt')
-  adapterResult = result([], [`proposal:${'e'.repeat(64)}`], CURSOR)
+  adapterResult = result([], [`proposal:${'e'.repeat(64)}`], {
+    proposedAt: first.proposedAt,
+    proposalId: `proposal:${'e'.repeat(64)}`
+  })
   assert.equal((await repository.execute(request)).status, 'page')
   adapterResult = result([], [
     `proposal:${'e'.repeat(64)}`,
     `proposal:${'e'.repeat(64)}`
-  ], CURSOR)
+  ], {
+    proposedAt: first.proposedAt,
+    proposalId: `proposal:${'e'.repeat(64)}`
+  })
   assert.equal((await repository.execute(request)).status, 'corrupt')
-  adapterResult = result([first], [], CURSOR)
+  adapterResult = result([first], [], {
+    proposedAt: first.proposedAt,
+    proposalId: first.proposalId
+  })
   ;(adapterResult as { wireBytes: number }).wireBytes = 1
   assert.equal((await repository.execute(request)).status, 'corrupt')
   await assert.rejects(repository.execute({ ...request, limit: 65 }), TypeError)

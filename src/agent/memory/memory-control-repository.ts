@@ -113,6 +113,12 @@ export interface MemoryRevisionHistoryCursorAnchorV1 {
   readonly revisionHash: string
 }
 
+export interface MemoryProposalListCursorAnchorV1 {
+  readonly schemaVersion: 1
+  readonly proposedAt: string
+  readonly proposalId: string
+}
+
 export interface MemoryRevisionHistoryCursorInputV1 {
   readonly schemaVersion: 1
   readonly namespaceRef: MemoryNamespaceRefV1
@@ -204,6 +210,7 @@ export type MemoryControlRepositoryRequestV1 =
   | MemoryControlRequestBaseV1 & MemoryControlPageRequestV1 & {
       readonly operation: 'proposal.list'
       readonly states?: readonly MemoryProposalStateV2[]
+      readonly cursorAnchor?: MemoryProposalListCursorAnchorV1 | null
     }
   | MemoryControlRequestBaseV1 & {
       readonly operation: 'proposal.inspect'
@@ -260,6 +267,7 @@ export type MemoryControlRepositoryAdapterRequestV1 =
   | MemoryControlAdapterBaseV1 & MemoryControlPageRequestV1 & {
       readonly operation: 'proposal.list'
       readonly states: readonly MemoryProposalStateV2[]
+      readonly cursorAnchor: MemoryProposalListCursorAnchorV1 | null
     }
   | MemoryControlAdapterBaseV1 & {
       readonly operation: 'proposal.inspect'
@@ -346,7 +354,9 @@ type MemoryControlListOperationV1 =
   | 'audit.list'
 
 export type MemoryControlRepositoryResultV1 =
-  | MemoryControlPageResultBaseV1<'proposal.list', MemoryProposalSafeProjectionV1>
+  | MemoryControlPageResultBaseV1<'proposal.list', MemoryProposalSafeProjectionV1> & {
+      readonly nextCursorAnchor?: MemoryProposalListCursorAnchorV1
+    }
   | MemoryControlPageResultBaseV1<'record.listSafe', MemoryRecordSafeProjectionV1>
   | MemoryControlPageResultBaseV1<'record.inspectList', MemoryRecordControlProjectionV1>
   | MemoryControlPageResultBaseV1<'revision.list', MemoryRevisionV2> & {
@@ -476,6 +486,8 @@ const RESULT_FIELDS = Object.freeze([
 const CURSOR_PATTERN = /^memory-control-cursor:v1:[0-9a-f]{64}$/
 const SCENE_REF_PATTERN = /^[0-9a-f]{64}$/
 const REVISION_CURSOR_HASH_DOMAIN_V1 = 'groupmate.memory.control-revision-cursor.v1'
+const PROPOSAL_CURSOR_HASH_DOMAIN_V1 = 'groupmate.memory.control-proposal-cursor.v1'
+const MIN_LIST_PAGE_WIRE_BYTES = 1_024
 const ABORTED_RESULT = Object.freeze({ status: 'aborted' as const })
 const DENIED_ACCESS_RESULT = Object.freeze({ status: 'denied' as const, category: 'access' as const })
 const DENIED_AUTHORITY_RESULT = Object.freeze({
@@ -572,6 +584,60 @@ export function memoryRevisionHistoryCursorV1 (
   return `memory-control-cursor:v1:${digest}`
 }
 
+function parseProposalCursorAnchor (value: unknown): MemoryProposalListCursorAnchorV1 {
+  const input = inspectMemoryRecord(value, ['schemaVersion', 'proposedAt', 'proposalId'])
+  if (input.schemaVersion !== 1) return invalidMemoryValue()
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    proposedAt: parseMemoryLifecycleInstantV1(input.proposedAt),
+    proposalId: proposalRef(input.proposalId)
+  })
+}
+
+export function memoryProposalListCursorV1 (value: unknown): string {
+  const input = inspectMemoryRecord(value, [
+    'schemaVersion', 'namespaceRef', 'namespaceGeneration', 'states', 'anchor'
+  ])
+  if (input.schemaVersion !== 1) return invalidMemoryValue()
+  const states = parseProposalStates(input.states)
+  const canonical = Object.freeze({
+    schemaVersion: 1 as const,
+    namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
+    namespaceGeneration: positiveInteger(input.namespaceGeneration),
+    states,
+    anchor: parseProposalCursorAnchor(input.anchor)
+  })
+  const digest = createHash('sha256')
+    .update(PROPOSAL_CURSOR_HASH_DOMAIN_V1, 'utf8')
+    .update('\0')
+    .update(JSON.stringify(canonical), 'utf8')
+    .digest('hex')
+  return `memory-control-cursor:v1:${digest}`
+}
+
+function parseProposalCursorBinding (
+  cursorValue: string | null,
+  anchorValue: unknown,
+  namespaceRef: MemoryNamespaceRefV1,
+  namespaceGeneration: number,
+  states: readonly MemoryProposalStateV2[]
+): MemoryProposalListCursorAnchorV1 | null {
+  if (cursorValue === null) {
+    if (anchorValue !== undefined && anchorValue !== null) return invalidMemoryValue()
+    return null
+  }
+  if (anchorValue === undefined || anchorValue === null) return invalidMemoryValue()
+  const anchor = parseProposalCursorAnchor(anchorValue)
+  if (memoryProposalListCursorV1({
+    schemaVersion: 1,
+    namespaceRef,
+    namespaceGeneration,
+    states,
+    anchor
+  }) !== cursorValue) return invalidMemoryValue()
+  return anchor
+}
+
 function parseRevisionCursorBinding (
   cursorValue: string | null,
   anchorValue: unknown,
@@ -599,10 +665,15 @@ function parsePageFields (
   input: Readonly<Record<string, unknown>>,
   maximumRecords: number = MEMORY_RESOURCE_LIMITS.listPageRecords
 ): MemoryControlPageRequestV1 {
+  const maxWireBytes = positiveInteger(
+    input.maxWireBytes,
+    MEMORY_RESOURCE_LIMITS.listPageWireBytes
+  )
+  if (maxWireBytes < MIN_LIST_PAGE_WIRE_BYTES) return invalidMemoryValue()
   return Object.freeze({
     cursor: cursor(input.cursor),
     limit: positiveInteger(input.limit, maximumRecords),
-    maxWireBytes: positiveInteger(input.maxWireBytes, MEMORY_RESOURCE_LIMITS.listPageWireBytes)
+    maxWireBytes
   })
 }
 
@@ -653,9 +724,22 @@ function parseRequest (value: unknown): ParsedControlRequestV1 {
     input = inspectMemoryRecord(
       value,
       [...common, 'cursor', 'limit', 'maxWireBytes'],
-      ['states']
+      ['states', 'cursorAnchor']
     )
-    operationFields = { ...parsePageFields(input), states: parseProposalStates(input.states) }
+    const authorization = parseAuthorization(input)
+    const page = parsePageFields(input)
+    const states = parseProposalStates(input.states)
+    operationFields = {
+      ...page,
+      states,
+      cursorAnchor: parseProposalCursorBinding(
+        page.cursor,
+        input.cursorAnchor,
+        authorization.namespaceRef,
+        authorization.generation,
+        states
+      )
+    }
   } else if (operation === 'proposal.inspect') {
     input = inspectMemoryRecord(value, [...common, 'proposalId'])
     operationFields = { proposalId: proposalRef(input.proposalId) }
@@ -1117,7 +1201,9 @@ function parseCommonPage (
   ]
   const input = request.operation === 'revision.list'
     ? inspectMemoryRecord(value, [...fields, 'head', 'nextCursorAnchor'])
-    : inspectMemoryRecord(value, fields)
+    : request.operation === 'proposal.list'
+      ? inspectMemoryRecord(value, fields, ['nextCursorAnchor'])
+      : inspectMemoryRecord(value, fields)
   if (input.status !== 'page' || input.operation !== request.operation) {
     return invalidMemoryValue()
   }
@@ -1150,10 +1236,44 @@ function parsePageResult (
     lifecycleState: 'current' | 'expired'
   }> | undefined
   let nextCursorAnchor: MemoryRevisionHistoryCursorAnchorV1 | null | undefined
+  let proposalNextCursorAnchor: MemoryProposalListCursorAnchorV1 | undefined
   if (request.operation === 'proposal.list') {
     const parsed = inspectMemoryArray(common.input.records, request.limit)
       .map(item => parseProposalSafeProjection(item, common.snapshotAt, request))
     assertProposalOldestFirst(parsed)
+    if (request.cursorAnchor !== null) {
+      const first = parsed.at(0)
+      if (first !== undefined && (
+        first.proposedAt < request.cursorAnchor.proposedAt ||
+        (first.proposedAt === request.cursorAnchor.proposedAt &&
+          first.proposalId <= request.cursorAnchor.proposalId)
+      )) return invalidMemoryValue()
+    }
+    if (common.nextCursor === null) {
+      if (common.input.nextCursorAnchor !== undefined &&
+        common.input.nextCursorAnchor !== null) return invalidMemoryValue()
+    } else {
+      if (common.input.nextCursorAnchor === undefined ||
+        common.input.nextCursorAnchor === null) return invalidMemoryValue()
+      proposalNextCursorAnchor = parseProposalCursorAnchor(common.input.nextCursorAnchor)
+      if (common.nextCursor !== memoryProposalListCursorV1({
+        schemaVersion: 1,
+        namespaceRef: request.namespaceRef,
+        namespaceGeneration: request.generation,
+        states: request.states,
+        anchor: proposalNextCursorAnchor
+      })) return invalidMemoryValue()
+      const lastRecord = parsed.at(-1)
+      if (lastRecord !== undefined && (
+        proposalNextCursorAnchor.proposedAt < lastRecord.proposedAt ||
+        (proposalNextCursorAnchor.proposedAt === lastRecord.proposedAt &&
+          proposalNextCursorAnchor.proposalId < lastRecord.proposalId)
+      )) return invalidMemoryValue()
+      if (!parsed.some(item => item.proposalId === proposalNextCursorAnchor?.proposalId) &&
+        !common.corruptRefs.includes(proposalNextCursorAnchor.proposalId)) {
+        return invalidMemoryValue()
+      }
+    }
     records = Object.freeze(parsed)
   } else if (request.operation === 'record.listSafe') {
     const parsed = inspectMemoryArray(common.input.records, request.limit)
@@ -1284,10 +1404,12 @@ function parsePageResult (
     return invalidMemoryValue()
   }
   const wireBytes = positiveInteger(common.input.wireBytes)
-  const revisionMetadata = revisionHead === undefined
-    ? {}
-    : { head: revisionHead, nextCursorAnchor }
-  const actualBytes = canonicalPageBytes(records, common.corruptRefs, revisionMetadata)
+  const pageMetadata = revisionHead !== undefined
+    ? { head: revisionHead, nextCursorAnchor }
+    : proposalNextCursorAnchor === undefined
+      ? {}
+      : { nextCursorAnchor: proposalNextCursorAnchor }
+  const actualBytes = canonicalPageBytes(records, common.corruptRefs, pageMetadata)
   if (wireBytes !== actualBytes || wireBytes > request.maxWireBytes ||
     wireBytes > MEMORY_RESOURCE_LIMITS.listPageWireBytes) return invalidMemoryValue()
   return deepFreeze({
@@ -1299,7 +1421,7 @@ function parsePageResult (
     wireBytes,
     corruptRecords: common.corruptRecords,
     corruptRefs: common.corruptRefs,
-    ...revisionMetadata
+    ...pageMetadata
   }) as MemoryControlRepositoryResultV1
 }
 
