@@ -1,6 +1,5 @@
 import { types as utilTypes } from 'node:util';
-import { encodeMemoryRecordV1 } from './memory-codec.js';
-import { parseMemoryRecordV1 } from './memory-domain.js';
+import { encodeCanonicalMemoryRecordV1, parseCanonicalMemoryRecordV1 } from './memory-canonical-wire.js';
 import { inspectMemoryRecord, invalidMemoryValue, parseMemoryNamespaceRefV1 } from './memory-namespace.js';
 import { createMemoryPortSignalScopeV1 } from './memory-port-signal.js';
 import { MEMORY_RESOURCE_LIMITS, memoryAsciiWithinLimit } from './memory-resource-limits.js';
@@ -85,8 +84,8 @@ function parseRequest(value) {
     }
     if (operation === 'record.put') {
         const input = inspectMemoryRecord(value, ['schemaVersion', 'operation', 'record']);
-        const record = parseMemoryRecordV1(input.record);
-        encodeMemoryRecordV1(record);
+        const record = parseCanonicalMemoryRecordV1(input.record);
+        encodeCanonicalMemoryRecordV1(record);
         return Object.freeze({ schemaVersion: 1, operation, record });
     }
     if (operation === 'record.invalidate') {
@@ -188,8 +187,8 @@ function parseResult(value, request, signalAborted) {
         if (request.operation !== 'record.get')
             return invalidMemoryValue();
         const input = inspectMemoryRecord(value, ['status', 'record']);
-        const record = parseMemoryRecordV1(input.record);
-        encodeMemoryRecordV1(record);
+        const record = parseCanonicalMemoryRecordV1(input.record);
+        encodeCanonicalMemoryRecordV1(record);
         if (!recordMatchesHead(record, request.head))
             return invalidMemoryValue();
         return Object.freeze({ status, record });

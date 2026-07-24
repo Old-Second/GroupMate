@@ -320,21 +320,23 @@ test('Phase 7C verification composes resources, production-off and security gate
   assert.equal(failedSecurity.passed, false)
 })
 
-test('Phase 7C verification entry remains on temporary test output until Task 11', async () => {
+test('Phase 7C verification entry runs the built Task 11 artifact', async () => {
   const script = await readFile(path.join(PROJECT_ROOT, 'scripts/verify-phase-7c.mjs'), 'utf8')
   assert.equal(script,
-    "import { main } from '../.test-dist/src/verification/phase-7c-memory-report.js'\n" +
+    "import { main } from '../dist/verification/phase-7c-memory-report.js'\n" +
     'await main()\n')
   const pkg = JSON.parse(await readFile(path.join(PROJECT_ROOT, 'package.json'), 'utf8')) as {
     readonly scripts?: Readonly<Record<string, string>>
   }
   assert.equal(pkg.scripts?.['verify:phase7c'],
-    'pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 ' +
+    'pnpm run build && pnpm exec tsc -p tsconfig.test.json && ' +
+    'node --test --test-concurrency=1 ' +
     '.test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7c.mjs')
-  assert.equal(pkg.scripts?.['verify:phase7c']?.includes('pnpm run build'), false)
+  assert.equal(pkg.scripts?.['verify:phase7c']?.includes('pnpm run build'), true)
   const report = await readFile(path.join(
     PROJECT_ROOT,
     'src/verification/phase-7c-memory-report.ts'
   ), 'utf8')
-  assert.match(report, /skipSourceDistCheck: true/)
+  assert.doesNotMatch(report, /skipSourceDistCheck/)
+  assert.match(report, /auditPhase7SecurityBoundaries\)\(root\)/)
 })

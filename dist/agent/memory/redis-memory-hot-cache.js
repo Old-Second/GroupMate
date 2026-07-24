@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
-import { decodeMemoryRecordV1, encodeMemoryRecordV1 } from './memory-codec.js';
+import { decodeCanonicalMemoryRecordV1, encodeCanonicalMemoryRecordV1 } from './memory-canonical-wire.js';
 import { MEMORY_HOT_CACHE_ACCOUNTING_V1, createMemoryHotCachePortV1 } from './memory-hot-cache.js';
 import { inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js';
 import { MEMORY_RESOURCE_LIMITS, memoryAsciiWithinLimit } from './memory-resource-limits.js';
@@ -653,7 +653,7 @@ export class RedisMemoryHotCache {
         return await this.#usage();
     }
     async #put(record) {
-        const wire = encodeMemoryRecordV1(record);
+        const wire = encodeCanonicalMemoryRecordV1(record);
         const field = memoryHotCacheRecordFieldV1({
             namespaceRef: record.namespaceRef,
             namespaceGeneration: record.namespaceGeneration,
@@ -702,7 +702,7 @@ export class RedisMemoryHotCache {
         const wire = tuple[1];
         let record;
         try {
-            record = decodeMemoryRecordV1(wire);
+            record = decodeCanonicalMemoryRecordV1(wire);
         }
         catch {
             await this.#deleteCorrupt(field, headField, wire);

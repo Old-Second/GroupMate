@@ -1,7 +1,6 @@
 import { types as utilTypes } from 'node:util';
 import { memoryAccessCapabilityAllowsV1 } from './memory-access-gate.js';
-import { encodeMemoryRecordV1 } from './memory-codec.js';
-import { parseMemoryRecordV1 } from './memory-domain.js';
+import { encodeCanonicalMemoryRecordV1, parseCanonicalMemoryRecordV1 } from './memory-canonical-wire.js';
 import { inspectMemoryRecord, invalidMemoryValue, parseMemoryNamespaceRefV1 } from './memory-namespace.js';
 import { createMemoryPortSignalScopeV1 } from './memory-port-signal.js';
 import { MEMORY_RESOURCE_LIMITS, memoryAsciiWithinLimit } from './memory-resource-limits.js';
@@ -121,8 +120,8 @@ function parseSourceResult(value, request, signalAborted) {
             return Object.freeze({ status, head });
         }
         const input = inspectMemoryRecord(value, ['status', 'record']);
-        const record = parseMemoryRecordV1(input.record);
-        encodeMemoryRecordV1(record);
+        const record = parseCanonicalMemoryRecordV1(input.record);
+        encodeCanonicalMemoryRecordV1(record);
         if (!recordMatchesHead(record, request.head))
             return invalidMemoryValue();
         return Object.freeze({ status, record });

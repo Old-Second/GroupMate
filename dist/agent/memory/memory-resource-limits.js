@@ -43,6 +43,37 @@ export const MEMORY_RESOURCE_LIMITS = Object.freeze({
     accessNamespaces: 64,
     trustedMemberUserIds: 4_096
 });
+export const MEMORY_LIFECYCLE_RESOURCE_LIMITS = Object.freeze({
+    lifecycleCapabilityAbsoluteTtlMs: 60_000,
+    lifecycleActorActions: 15,
+    lifecyclePolicyValues: 16,
+    lifecycleCommandWireBytes: 4 * 1_024,
+    lifecycleCommandResultWireBytes: 4 * 1_024,
+    lifecycleCommandMaterialWireBytes: 64 * 1_024,
+    lifecycleCommandLedgerRecordsPerNamespace: 8_192,
+    lifecycleCommandLedgerBytesPerNamespace: 8 * 1_024 * 1_024,
+    lifecycleCommandLedgerRecordsPerDeployment: 65_536,
+    lifecycleCommandLedgerBytesPerDeployment: 64 * 1_024 * 1_024,
+    lifecycleCommandLedgerTtlMs: 365 * 24 * 60 * 60 * 1_000,
+    lifecycleEvidenceWireBytes: 4 * 1_024,
+    lifecycleMigrationManifestWireBytes: 16 * 1_024,
+    lifecycleMigrationRevisionBindings: 32,
+    lifecycleDeletionCheckpointsPerNamespace: 32,
+    lifecycleDeletionCheckpointWireBytes: 4 * 1_024,
+    lifecycleDeletionReceiptWireBytes: 4 * 1_024,
+    lifecycleDeletionStatusWireBytes: 4 * 1_024,
+    lifecycleDeletionCheckpointsPerDeployment: 4_096,
+    lifecycleDeletionCheckpointBytesPerDeployment: 16 * 1_024 * 1_024,
+    lifecycleExportJobsPerNamespace: 64,
+    lifecycleExportJobBytesPerNamespace: 512 * 1_024,
+    lifecycleExportJobsPerDeployment: 512,
+    lifecycleExportJobBytesPerDeployment: 4 * 1_024 * 1_024,
+    lifecycleExportJobWireBytes: 8 * 1_024,
+    lifecycleExportTerminalTtlMs: 30 * 60 * 1_000,
+    lifecycleAuditTtlMs: 365 * 24 * 60 * 60 * 1_000,
+    lifecycleAuditWireBytes: 2 * 1_024,
+    lifecycleAuditReservationWireBytes: 2 * 1_024
+});
 function hasLoneSurrogate(value) {
     for (let index = 0; index < value.length; index += 1) {
         const code = value.charCodeAt(index);

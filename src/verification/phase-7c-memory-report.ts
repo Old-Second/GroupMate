@@ -15,7 +15,6 @@ import {
 } from '../agent/memory/sqlite-memory-export.js'
 import {
   auditPhase7SecurityBoundaries,
-  type Phase7SecurityAuditOptions,
   type Phase7SecurityAuditResult
 } from './phase-7-security-audit.js'
 import {
@@ -167,10 +166,7 @@ readonly Phase7cMemoryProcessSample[]
 interface VerifyPhase7cMemoryOptions {
   readonly samples?: unknown
   readonly productionAudit?: (projectRoot: string) => Promise<Phase7bMemoryWiringAudit>
-  readonly securityAudit?: (
-    projectRoot: string,
-    options?: Phase7SecurityAuditOptions
-  ) => Promise<Phase7SecurityAuditResult>
+  readonly securityAudit?: (projectRoot: string) => Promise<Phase7SecurityAuditResult>
   readonly lifecycleAudit?: (projectRoot: string) => Promise<Phase7cLifecycleSurfaceAudit>
 }
 
@@ -572,9 +568,7 @@ export async function verifyPhase7cMemory (
   const lifecycle = await (options.lifecycleAudit ?? auditPhase7cLifecycleSurfaces)(root)
   let phase7: Phase7SecurityAuditResult | null = null
   try {
-    phase7 = await (options.securityAudit ?? auditPhase7SecurityBoundaries)(root, {
-      skipSourceDistCheck: true
-    })
+    phase7 = await (options.securityAudit ?? auditPhase7SecurityBoundaries)(root)
   } catch {
     phase7 = null
   }

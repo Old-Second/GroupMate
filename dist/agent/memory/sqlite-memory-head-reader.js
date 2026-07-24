@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
-import { decodeMemoryRevisionV1 } from './memory-codec.js';
+import { decodeCanonicalMemoryRevisionV1 } from './memory-canonical-wire.js';
 import { createMemoryHeadSourcePortV1 } from './memory-head-reader.js';
 import { inspectMemoryRecord, invalidMemoryValue, memoryNamespaceRefV1, memoryNamespaceWireV1, parseMemoryNamespaceV1 } from './memory-namespace.js';
 import { MEMORY_CURSOR_HASH_DOMAIN_V1 } from './sqlite-memory-repository.js';
@@ -319,7 +319,7 @@ function readExactRecord(database, request, nowMs) {
     const wire = exactString(rowValue(row, 'revision_wire'));
     let revision;
     try {
-        revision = decodeMemoryRevisionV1(wire);
+        revision = decodeCanonicalMemoryRevisionV1(wire);
     }
     catch {
         throw new CanonicalMemoryHeadDataErrorV1();

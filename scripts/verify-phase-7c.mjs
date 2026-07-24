@@ -1,2 +1,2 @@
-import { main } from '../.test-dist/src/verification/phase-7c-memory-report.js'
+import { main } from '../dist/verification/phase-7c-memory-report.js'
 await main()
