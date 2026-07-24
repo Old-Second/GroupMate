@@ -171,6 +171,7 @@ test('V2 retrieval request requires an issued capability for every exact namespa
 test('V2 retrieval request freezes query, subject and deadline resource limits', () => {
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.subjects, 4)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxCandidates, 12)
+  assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxLexicalHits, 24)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxTokens, 2_400)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxBytes, 64 * 1_024)
   assert.equal(MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxDurationMs, 500)

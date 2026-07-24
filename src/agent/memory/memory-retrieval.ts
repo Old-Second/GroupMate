@@ -22,6 +22,7 @@ export const MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2 = Object.freeze({
   queryTextCodePoints: 2_000,
   languageHintAsciiBytes: 32,
   maxCandidates: 12,
+  maxLexicalHits: 24,
   maxTokens: 2_400,
   maxBytes: 64 * 1_024,
   maxDurationMs: 500,
@@ -408,7 +409,7 @@ function parseRanking (value: unknown): MemoryRetrievalCandidateV2['ranking'] {
     exactMatch: input.exactMatch,
     lexicalRank: nullablePositiveInteger(
       input.lexicalRank,
-      MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxCandidates
+      MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.maxLexicalHits
     ),
     vectorRank: nullablePositiveInteger(
       input.vectorRank,
