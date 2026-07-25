@@ -26,6 +26,7 @@
     "verify:phase7": "pnpm run build && node scripts/verify-phase-7.mjs",
     "verify:phase7b": "pnpm run build && pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7b.mjs",
     "verify:phase7c": "pnpm run build && pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js && node scripts/verify-phase-7c.mjs",
+    "verify:phase7d": "pnpm run build && pnpm exec tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*memory*.test.js .test-dist/test/unit/context-engine.test.js .test-dist/test/unit/context-planner.test.js .test-dist/test/unit/run-context-planner.test.js .test-dist/test/unit/run-engine.test.js .test-dist/test/unit/run-usage.test.js .test-dist/test/unit/model-cost.test.js .test-dist/test/unit/presentation-trace.test.js && node scripts/verify-phase-7d.mjs",
     "test:online:openai": "node scripts/smoke-openai-compatible.mjs"
   },
   "dependencies": {
