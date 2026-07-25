@@ -59,6 +59,15 @@ import {
   initializeProductionYunzaiAgent
 } from './dist/runtime/production-yunzai-agent.js'
 import {
+  initializeProductionPersonalMemoryRuntimeV1
+} from './dist/runtime/production-personal-memory-loader.js'
+import {
+  configureProductionPersonalMemoryOperationsPortV1
+} from './dist/runtime/personal-memory-operations.js'
+import {
+  configureProductionPersonalMemoryCommandPortV1
+} from './dist/runtime/personal-memory-command.js'
+import {
   resolveYunzaiGroupHistoryCursor
 } from './dist/runtime/agent-service-bridge.js'
 import {
@@ -1387,6 +1396,30 @@ configureTranslationService({
   fetch: newFetch,
   logger: runtimeLogger
 })
+let personalMemoryRuntime = null
+try {
+  personalMemoryRuntime = await initializeProductionPersonalMemoryRuntimeV1({
+    botInstanceId: 'groupmate-production-v1',
+    storageDirectory: resolvePluginPath('data', 'memory'),
+    deploymentMode: () => Config.personalMemoryMode,
+    groupAllowlist: () => Config.personalMemoryGroupAllowlist,
+    recallMaxItems: () => Config.personalMemoryRecallMaxItems,
+    recallMaxTokens: () => Config.personalMemoryRecallMaxTokens,
+    recallTimeoutMs: () => Config.personalMemoryRecallTimeoutMs
+  })
+  if (personalMemoryRuntime !== null) {
+    configureProductionPersonalMemoryOperationsPortV1(personalMemoryRuntime.operations)
+    configureProductionPersonalMemoryCommandPortV1(personalMemoryRuntime.commands)
+  }
+} catch {
+  const failedRuntime = personalMemoryRuntime
+  personalMemoryRuntime = null
+  await failedRuntime?.close().catch(() => undefined)
+  runtimeLogger.error(Object.freeze({
+    event: 'groupmate.personal_memory.initialization_failure',
+    code: 'construction_failed'
+  }))
+}
 initializeProductionYunzaiAgent({
   bridge: Object.freeze({
     config: Config,
@@ -1421,7 +1454,8 @@ initializeProductionYunzaiAgent({
   buttonPolicy,
   pictureRenderer,
   tts,
-  modelFactory: () => modelPort
+  modelFactory: () => modelPort,
+  ...(personalMemoryRuntime === null ? {} : { personalMemoryRuntime })
 })
 
 const files = fs.readdirSync(resolvePluginPath('apps')).filter(file => file.endsWith('.js'))

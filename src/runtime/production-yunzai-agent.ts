@@ -7,6 +7,7 @@ import {
   bindYunzaiShutdownSignals,
   createYunzaiAgentServiceBridge,
   type YunzaiAgentServiceBridge,
+  type YunzaiAgentServiceBridgeDependencies,
   type YunzaiAgentServiceBridgeOptions,
   type YunzaiMessageEvent,
   type YunzaiBotPicker
@@ -204,6 +205,12 @@ export interface ProductionYunzaiAgentOptions {
   readonly pictureRenderer: GroupMatePictureRenderer
   readonly tts: TtsReplyPort
   readonly modelFactory: () => ProductionModelPort
+  readonly personalMemoryRuntime?: Readonly<{
+    readonly recallSource: NonNullable<
+    YunzaiAgentServiceBridgeDependencies['personalMemoryRecallSource']
+    >
+    readonly close: () => Promise<void>
+  }>
   readonly providerIsolationIdSourceFactory?: ProviderIsolationIdSourceFactory
   readonly random?: () => number
   readonly now?: () => Date
@@ -780,6 +787,9 @@ export function createProductionYunzaiAgent (
     progressPresenter,
     modelAdapter: model,
     providerIsolationIdSourceFactory,
+    ...(options.personalMemoryRuntime === undefined
+      ? {}
+      : { personalMemoryRecallSource: options.personalMemoryRuntime.recallSource }),
     runStore,
     admission,
     ...(contentJournal === undefined ? {} : { contentJournal }),
@@ -1005,6 +1015,9 @@ export function createProductionYunzaiAgent (
         } finally {
           try {
             await contentJournal?.drain()
+          } catch {}
+          try {
+            await options.personalMemoryRuntime?.close()
           } catch {}
         }
       })().finally(() => {

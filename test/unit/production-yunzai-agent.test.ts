@@ -889,3 +889,27 @@ test('journal drain cannot replace the original bridge shutdown rejection', asyn
   )
   assert.equal(drainCalls, 1)
 })
+
+test('production personal memory runtime closes exactly once with the agent graph', async () => {
+  let closeCalls = 0
+  const baseOptions = options(() => undefined)
+  const graph = createProductionYunzaiAgent({
+    ...baseOptions,
+    personalMemoryRuntime: Object.freeze({
+      recallSource: Object.freeze({
+        recall: async () => Object.freeze({
+          schemaVersion: 2,
+          status: 'completed',
+          mode: 'lexical',
+          candidates: Object.freeze([]),
+          index: Object.freeze({ lexical: 'fresh', vector: 'disabled', watermark: '0' })
+        })
+      }),
+      close: async () => { closeCalls += 1 }
+    })
+  })
+
+  assert.equal(await graph.shutdown('unit_test'), 0)
+  assert.equal(await graph.shutdown('ignored'), 0)
+  assert.equal(closeCalls, 1)
+})

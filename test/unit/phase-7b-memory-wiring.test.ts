@@ -79,7 +79,7 @@ const EXPECTED_TOOL_NAMES = Object.freeze([
   'imageCaption'
 ])
 
-test('Phase 7B production wiring remains explicitly memory-disabled', async () => {
+test('Phase 7B production boundary remains default-off with one reviewed recall seam', async () => {
   const audit = await auditPhase7bMemoryWiring(PROJECT_ROOT)
 
   assert.equal(audit.schemaVersion, 1)
@@ -255,6 +255,32 @@ test('runtime memory seam and telemetry edges reject shorthand and comment bypas
     ].join('\n')
   }
   assert.equal(phase7bRuntimeMemoryRecallSeamIsExact(exact), true)
+
+  const production = [
+    'interface O { readonly personalMemoryRuntime?: Readonly<{',
+    '  readonly recallSource: NonNullable<D[\'personalMemoryRecallSource\']>',
+    '  readonly close: () => Promise<void>',
+    '}> }',
+    'const dependencies = options.personalMemoryRuntime === undefined',
+    '  ? {}',
+    '  : { personalMemoryRecallSource: options.personalMemoryRuntime.recallSource }',
+    'await options.personalMemoryRuntime?.close()'
+  ].join('\n')
+  assert.equal(phase7bRuntimeMemoryRecallSeamIsExact({
+    ...exact,
+    'src/runtime/production-yunzai-agent.ts': production
+  }), true)
+  for (const mutation of [
+    production.replace('options.personalMemoryRuntime === undefined', 'false'),
+    production.replace(
+      'personalMemoryRecallSource: options.personalMemoryRuntime.recallSource',
+      'personalMemoryRecallSource: other.recallSource'
+    ),
+    production.replace('await options.personalMemoryRuntime?.close()', '')
+  ]) assert.equal(phase7bRuntimeMemoryRecallSeamIsExact({
+    ...exact,
+    'src/runtime/production-yunzai-agent.ts': mutation
+  }), false)
   for (const source of [
     'interface D { readonly personalMemoryRecallSource: Source }\nconst value = dependencies.personalMemoryRecallSource\n',
     'interface D { readonly personalMemoryRecallSource?: Source }\n',

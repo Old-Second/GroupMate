@@ -966,6 +966,14 @@ export function phase7bRuntimeMemoryRecallSeamIsExact (value: unknown): boolean 
   const paths = Object.keys(input).sort()
   if (paths.length === 0 || paths.length > 512) return false
   let exactSeams = 0
+  const productionPath = 'src/runtime/production-yunzai-agent.ts'
+  const production = input[productionPath]
+  if (production !== undefined && (typeof production !== 'string' ||
+    matchCount(production, /\bpersonalMemoryRuntime\b/g) !== 4 ||
+    matchCount(production, /\bpersonalMemoryRecallSource\b/g) !== 2 ||
+    !/options\.personalMemoryRuntime === undefined/.test(production) ||
+    !/personalMemoryRecallSource: options\.personalMemoryRuntime\.recallSource/.test(production) ||
+    !/await options\.personalMemoryRuntime\?\.close\(\)/.test(production))) return false
   for (const relativePath of paths) {
     const source = input[relativePath]
     if (!/^src\/runtime\/(?:[a-z0-9._-]+\/)*[a-z0-9._-]+\.ts$/i.test(relativePath) ||
@@ -984,13 +992,18 @@ export function phase7bRuntimeMemoryRecallSeamIsExact (value: unknown): boolean 
       if (!closed) return
       if (ts.isIdentifier(node) && node.text === 'personalMemoryRecallSource') {
         const parent = node.parent
-        if (relativePath !== 'src/runtime/agent-service-bridge.ts') {
-          closed = false
-        } else if (ts.isPropertySignature(parent) && parent.name === node &&
+        if (relativePath === 'src/runtime/agent-service-bridge.ts' &&
+          ts.isPropertySignature(parent) && parent.name === node &&
           parent.questionToken !== undefined) {
           exactSeams += 1
-        } else if (ts.isPropertyAccessExpression(parent) && parent.name === node &&
+        } else if (relativePath === 'src/runtime/agent-service-bridge.ts' &&
+          ts.isPropertyAccessExpression(parent) && parent.name === node &&
           ts.isIdentifier(parent.expression) && parent.expression.text === 'dependencies') {
+          exactSeams += 1
+        } else if (relativePath === productionPath &&
+          ts.isPropertyAssignment(parent) && parent.name === node &&
+          ts.isPropertyAccessExpression(parent.initializer) &&
+          parent.initializer.name.text === 'recallSource') {
           exactSeams += 1
         } else {
           closed = false
@@ -1001,7 +1014,7 @@ export function phase7bRuntimeMemoryRecallSeamIsExact (value: unknown): boolean 
     visit(sourceFile)
     if (!closed) return false
   }
-  return exactSeams === 2
+  return exactSeams === (production === undefined ? 2 : 3)
 }
 
 interface ExactInterfaceProperty {

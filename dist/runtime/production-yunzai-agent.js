@@ -540,6 +540,9 @@ export function createProductionYunzaiAgent(options) {
         progressPresenter,
         modelAdapter: model,
         providerIsolationIdSourceFactory,
+        ...(options.personalMemoryRuntime === undefined
+            ? {}
+            : { personalMemoryRecallSource: options.personalMemoryRuntime.recallSource }),
         runStore,
         admission,
         ...(contentJournal === undefined ? {} : { contentJournal }),
@@ -730,6 +733,10 @@ export function createProductionYunzaiAgent(options) {
                 finally {
                     try {
                         await contentJournal?.drain();
+                    }
+                    catch { }
+                    try {
+                        await options.personalMemoryRuntime?.close();
                     }
                     catch { }
                 }
