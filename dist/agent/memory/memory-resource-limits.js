@@ -43,6 +43,23 @@ export const MEMORY_RESOURCE_LIMITS = Object.freeze({
     accessNamespaces: 64,
     trustedMemberUserIds: 4_096
 });
+export const MEMORY_DERIVATIVE_RESOURCE_LIMITS = Object.freeze({
+    personalPolicyWireBytes: 4 * 1_024,
+    derivativeJobLogicalBytes: 1 * 1_024,
+    derivativeJobRecords: 8_192,
+    derivativeJobLogicalBytesTotal: 8 * 1_024 * 1_024,
+    extractionJobWireBytes: 8 * 1_024,
+    extractionQueueRecords: 1_024,
+    extractionQueueLogicalBytes: 8 * 1_024 * 1_024,
+    extractionWorkerBatchRecords: 2,
+    extractionWorkerMaximumAttempts: 5,
+    extractionLeaseDurationMs: 30_000,
+    extractionJobMaximumAgeMs: 24 * 60 * 60 * 1_000,
+    candidateAuditRecords: 8_192,
+    lexicalIndexRecords: 32_768,
+    lexicalIndexLogicalBytes: 128 * 1_024 * 1_024,
+    lexicalSqliteMainFileBytes: 256 * 1_024 * 1_024
+});
 export const MEMORY_LIFECYCLE_RESOURCE_LIMITS = Object.freeze({
     lifecycleCapabilityAbsoluteTtlMs: 60_000,
     lifecycleActorActions: 15,

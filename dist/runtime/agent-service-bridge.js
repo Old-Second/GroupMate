@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ContextEngine } from '../agent/context/context-engine.js';
-import { NoopMemoryStore } from '../agent/context/noop-memory-store.js';
+import { projectMemoryRetrievalContextOutcomeV2 } from '../agent/memory/memory-context-projection.js';
 import { RedisContextArtifactStore } from '../agent/context/redis-context-artifact-store.js';
 import { ModelProviderError, parseProviderRequestMetadata } from '../agent/model/model-adapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
@@ -108,6 +108,7 @@ function groupHistoryReadKey(options, event) {
     return botId === null || groupId === null ? null : `${botId}\0${groupId}`;
 }
 const GROUP_HISTORY_DIAGNOSTIC_EVENT = 'groupmate.group_history.fail_open';
+const PERSONAL_MEMORY_DIAGNOSTIC_EVENT = 'groupmate.personal_memory.recall';
 function reportGroupHistoryDiagnostic(options, code) {
     try {
         options.logger?.info?.(Object.freeze({
@@ -117,6 +118,86 @@ function reportGroupHistoryDiagnostic(options, code) {
     }
     catch {
         // Diagnostics must not alter group history fail-open behavior.
+    }
+}
+function reportPersonalMemoryDiagnostic(options, code) {
+    try {
+        options.logger?.info?.(Object.freeze({
+            event: PERSONAL_MEMORY_DIAGNOSTIC_EVENT,
+            code
+        }));
+    }
+    catch {
+        // Memory diagnostics cannot alter ordinary reply fail-open behavior.
+    }
+}
+function personalMemoryQueryText(evidence) {
+    if (!evidence.hasReply)
+        return evidence.prompt;
+    const separator = evidence.prompt.indexOf('\n');
+    if (separator < 0)
+        return evidence.prompt;
+    try {
+        const payload = JSON.parse(evidence.prompt.slice(separator + 1));
+        if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+            return evidence.prompt;
+        }
+        const current = payload.currentRequest;
+        if (current === null || typeof current !== 'object' || Array.isArray(current)) {
+            return evidence.prompt;
+        }
+        const content = current.content;
+        return typeof content === 'string' && content.trim() !== '' ? content : evidence.prompt;
+    }
+    catch {
+        return evidence.prompt;
+    }
+}
+async function loadPersonalMemoryContext(source, options, request, runtime, signal) {
+    return await resolveYunzaiPersonalMemoryContextV1(Object.freeze({
+        source,
+        recallInput: Object.freeze({
+            request,
+            event: runtime.event,
+            messageEvidence: runtime.messageEvidence,
+            queryText: personalMemoryQueryText(runtime.messageEvidence)
+        }),
+        onDiagnostic: code => { reportPersonalMemoryDiagnostic(options, code); }
+    }), signal);
+}
+export async function resolveYunzaiPersonalMemoryContextV1(input, signal) {
+    if (signal.aborted)
+        throw new DOMException('operation was aborted', 'AbortError');
+    if (input.source === undefined)
+        return Object.freeze([]);
+    const diagnose = (code) => {
+        try {
+            input.onDiagnostic?.(code);
+        }
+        catch { }
+    };
+    let raw;
+    try {
+        raw = await input.source.recall(input.recallInput, signal);
+    }
+    catch {
+        if (signal.aborted)
+            throw new DOMException('operation was aborted', 'AbortError');
+        diagnose('source_unavailable');
+        return Object.freeze([]);
+    }
+    if (signal.aborted)
+        throw new DOMException('operation was aborted', 'AbortError');
+    try {
+        const projection = projectMemoryRetrievalContextOutcomeV2(raw);
+        if (projection.result.status !== 'completed') {
+            diagnose(`${projection.result.status}_${projection.result.reason}`);
+        }
+        return projection.items;
+    }
+    catch {
+        diagnose('result_invalid');
+        return Object.freeze([]);
     }
 }
 function configInteger(config, key, fallback, minimum, maximum) {
@@ -794,6 +875,8 @@ export class YunzaiAgentServiceBridge {
                 run: toolRun,
                 runtimeFacts: Object.freeze([runtimeIdentityItem(request, event)]),
                 groupContext,
+                event,
+                messageEvidence,
                 ...(options.progress === undefined ? {} : { progress: options.progress })
             }));
         }
@@ -1156,8 +1239,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             estimator: {
                 estimate: message => Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(message), 'utf8') / 4)),
                 estimateModelMessage: message => Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(message), 'utf8') / 4))
-            },
-            memoryStore: new NoopMemoryStore()
+            }
         }),
         contextArtifactStore,
         ...(modelCapabilityOverride === undefined ? {} : { modelCapabilityOverride }),
@@ -1192,7 +1274,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 }
             }
         }),
-        createRuntime: async (request) => {
+        createRuntime: async (request, signal) => {
             const providerRequestMetadata = await providerMetadataFor(request.sessionAddress);
             const runtime = prepared.get(request.requestId);
             if (runtime === undefined) {
@@ -1201,6 +1283,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                     userMessage: '运行环境已失效，请重新发起。'
                 });
             }
+            const memoryContext = await loadPersonalMemoryContext(dependencies.personalMemoryRecallSource, options, request, runtime, signal);
             const value = Object.freeze({
                 binding: Object.freeze({
                     ...runtime.run.binding,
@@ -1208,6 +1291,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 }),
                 runtimeFacts: runtime.runtimeFacts,
                 groupContext: runtime.groupContext,
+                memoryContext,
                 ...(runtime.progress === undefined ? {} : { progress: runtime.progress })
             });
             return value;

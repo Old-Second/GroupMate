@@ -223,7 +223,7 @@ async function safeSuggestions(port, enabled, prompt, envelope) {
     }
 }
 async function presentFinal(options, prepared, settings, profile, hooks, envelope) {
-    await options.completionCoordinator.complete({
+    return await options.completionCoordinator.complete({
         envelope,
         present: async (projection) => await options.presenter.present(Object.freeze({
             route: prepared.route,
@@ -361,7 +361,15 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
                     ? { error: true }
                     : {}
         }));
-        await presentFinal(options, prepared, presentationSettings, profile, hooks, envelope);
+        const presentation = await presentFinal(options, prepared, presentationSettings, profile, hooks, envelope);
+        if (options.postReplyCandidate !== undefined &&
+            envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
+            presentation.deliveries.some(delivery => delivery.kind === 'sent')) {
+            const candidateInput = Object.freeze({ event, prepared, envelope, presentation });
+            void Promise.resolve()
+                .then(async () => await options.postReplyCandidate.enqueue(candidateInput))
+                .catch(() => undefined);
+        }
     }
     catch (error) {
         const presentation = getChatErrorPresentation(error);

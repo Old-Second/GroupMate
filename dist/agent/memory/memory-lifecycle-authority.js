@@ -18,6 +18,7 @@ export const MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1 = Object.freeze([
     'resolve_deletion',
     'claim_export'
 ]);
+export const MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1 = 'manage_enrollment';
 export const MEMORY_MAINTENANCE_OPERATIONS_V1 = Object.freeze([
     'proposal.expireDue',
     'proposal.purgeDecided',
@@ -52,7 +53,11 @@ const MAX_CANONICAL_INSTANT_MS = 8_640_000_000_000_000;
 const OLD_GENERATION_MAINTENANCE_OPERATIONS = new Set([
     'namespace.scrubDeleted', 'namespace.verifyScrubbed'
 ]);
-const PERSONAL_SUBJECT_ACTIONS = new Set(MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1);
+const ALL_ACTOR_ACTIONS = Object.freeze([
+    ...MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1,
+    MEMORY_PERSONAL_ENROLLMENT_ACTOR_ACTION_V1
+]);
+const PERSONAL_SUBJECT_ACTIONS = new Set(ALL_ACTOR_ACTIONS);
 const PERSONAL_DELETE_ONLY_ACTIONS = new Set([
     'forget', 'delete_namespace', 'resolve_deletion'
 ]);
@@ -175,7 +180,7 @@ export function parseMemoryLifecycleActorAuthorityContextV1(value) {
     const role = enumValue(input.role, ACTOR_ROLES);
     const actorRef = parseActorRef(input.actorRef);
     const actorUserId = parseMemoryQqIdV1(input.actorUserId);
-    const actions = parseUniqueEnumArray(input.actions, MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1, MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleActorActions);
+    const actions = parseUniqueEnumArray(input.actions, ALL_ACTOR_ACTIONS, MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleActorActions);
     const allowedActions = allowedActionsForRole(role);
     if (actions.length === 0 || actions.some(action => !allowedActions.has(action))) {
         return invalidMemoryValue();
@@ -480,7 +485,7 @@ export function parseMemoryLifecycleActorCapabilityRequestV1(value) {
         namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
         generation: positiveInteger(input.generation),
         actorRef: parseActorRef(input.actorRef),
-        action: enumValue(input.action, MEMORY_LIFECYCLE_ACTOR_ACTIONS_V1),
+        action: enumValue(input.action, ALL_ACTOR_ACTIONS),
         requiredAuthority: enumValue(input.requiredAuthority, AUTHORITY_REQUIREMENTS)
     });
 }

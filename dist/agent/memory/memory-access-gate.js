@@ -131,7 +131,8 @@ function evaluateMemoryAccessV1(contextValue, requestedNamespacesValue) {
 export function decideMemoryAccessV1(contextValue, requestedNamespacesValue) {
     return evaluateMemoryAccessV1(contextValue, requestedNamespacesValue).decision;
 }
-function memoryAccessSceneRefV1(scene) {
+export function memoryAccessSceneRefV1(sceneValue) {
+    const scene = parseMemoryAccessSceneV1(sceneValue);
     const wire = scene.kind === 'private'
         ? `{"kind":"private","peerUserId":${JSON.stringify(scene.peerUserId)}}`
         : `{"kind":"group","groupId":${JSON.stringify(scene.groupId)},"groupLifecycleId":${JSON.stringify(scene.groupLifecycleId)}}`;

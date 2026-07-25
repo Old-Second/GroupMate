@@ -1,7 +1,7 @@
 import { AgentError } from '../contracts/error.js';
 import { createContextSpanV1, domainSeparatedContextHash, MAX_CONTEXT_SPANS } from './context-span.js';
 import { MAX_CONTEXT_PLANNER_INPUT_BYTES, planModelTurn } from './context-planner.js';
-import { asciiContextCompare, canonicalizeContextJsonValue, canonicalizeModelMessages, CONTEXT_TOKEN_ESTIMATOR_VERSION, inspectContextArray, inspectContextRecord, normalizeContextString, requireContextAscii } from './context-token-estimator.js';
+import { asciiContextCompare, canonicalizeModelMessages, CONTEXT_TOKEN_ESTIMATOR_VERSION } from './context-token-estimator.js';
 const optionalPriority = {
     system_instruction: 0,
     runtime_fact: 5,
@@ -71,12 +71,14 @@ function invalidContextInput(reason) {
     });
 }
 function validateInputContainers(input) {
-    const valid = input.systemInstructions.every(item => item.source === 'system_instruction') &&
-        input.runtimeFacts.every(item => item.source === 'runtime_fact') &&
-        input.sessionHistory.every(item => item.source === 'session_history') &&
-        input.groupContext.every(item => item.source === 'group_context') &&
-        input.currentRequest.source === 'current_request' &&
-        input.toolMessages.every(item => item.source === 'tool_chain');
+    const ordinary = (item, source) => (item.source === source && item.memoryRecord === undefined);
+    const valid = input.systemInstructions.every(item => ordinary(item, 'system_instruction')) &&
+        input.runtimeFacts.every(item => ordinary(item, 'runtime_fact')) &&
+        input.sessionHistory.every(item => ordinary(item, 'session_history')) &&
+        input.groupContext.every(item => ordinary(item, 'group_context')) &&
+        input.memoryContext.every(item => item.source === 'memory' && item.memoryRecord !== undefined) &&
+        ordinary(input.currentRequest, 'current_request') &&
+        input.toolMessages.every(item => ordinary(item, 'tool_chain'));
     if (!valid)
         return invalidContextInput('source_container_mismatch');
 }
@@ -155,127 +157,6 @@ function messageText(message) {
     const text = message.parts.map(partText).filter(value => value.length > 0).join('\n');
     return text.length === 0 ? '[空消息]' : text;
 }
-function contextText(value, allowEmpty = false) {
-    const text = normalizeContextString(value);
-    if (!allowEmpty && text.length === 0)
-        return invalidContextInput('memory_candidate_invalid');
-    return text;
-}
-function memoryPartText(value) {
-    const base = inspectContextRecord(value, ['type'], [
-        'text', 'resourceType', 'resourceId', 'mimeType', 'expiresAt', 'userId', 'displayName',
-        'toolCallId', 'name', 'arguments', 'status', 'content'
-    ]);
-    switch (base.type) {
-        case 'text': {
-            const input = inspectContextRecord(value, ['type', 'text']);
-            return contextText(input.text, true);
-        }
-        case 'mention': {
-            const input = inspectContextRecord(value, ['type', 'userId'], ['displayName']);
-            const userId = contextText(input.userId);
-            const displayName = input.displayName === undefined ? undefined : contextText(input.displayName);
-            return `@${displayName ?? userId}`;
-        }
-        case 'resource_ref': {
-            const input = inspectContextRecord(value, ['type', 'resourceType', 'resourceId'], ['mimeType', 'expiresAt']);
-            if (input.resourceType !== 'image' && input.resourceType !== 'audio' && input.resourceType !== 'file') {
-                return invalidContextInput('memory_candidate_invalid');
-            }
-            if (input.mimeType !== undefined)
-                contextText(input.mimeType);
-            if (input.expiresAt !== undefined)
-                contextText(input.expiresAt);
-            return `[${input.resourceType}: ${contextText(input.resourceId)}]`;
-        }
-        case 'tool_call': {
-            const input = inspectContextRecord(value, ['type', 'toolCallId', 'name', 'arguments']);
-            contextText(input.toolCallId);
-            canonicalizeContextJsonValue(input.arguments);
-            return `[工具调用: ${contextText(input.name)}]`;
-        }
-        case 'tool_result': {
-            const input = inspectContextRecord(value, ['type', 'toolCallId', 'status', 'content']);
-            contextText(input.toolCallId);
-            if (input.status !== 'ok' && input.status !== 'error' && input.status !== 'denied' &&
-                input.status !== 'indeterminate')
-                return invalidContextInput('memory_candidate_invalid');
-            return `[工具结果: ${input.status}] ${contextText(input.content, true)}`;
-        }
-        default:
-            return invalidContextInput('memory_candidate_invalid');
-    }
-}
-function validateMemoryProvenance(value) {
-    const input = inspectContextRecord(value, [
-        'source', 'trust', 'sensitivity', 'sourceId', 'createdAt'
-    ]);
-    contextText(input.source);
-    if (input.trust !== 'trusted' && input.trust !== 'untrusted') {
-        return invalidContextInput('memory_candidate_invalid');
-    }
-    if (input.sensitivity !== 'public' && input.sensitivity !== 'group' &&
-        input.sensitivity !== 'private' && input.sensitivity !== 'sensitive') {
-        return invalidContextInput('memory_candidate_invalid');
-    }
-    contextText(input.sourceId);
-    contextText(input.createdAt);
-}
-function validateMemoryQuote(value) {
-    const input = inspectContextRecord(value, ['messageId', 'sender', 'parts']);
-    contextText(input.messageId);
-    const sender = inspectContextRecord(input.sender, ['userId'], ['displayName']);
-    contextText(sender.userId);
-    if (sender.displayName !== undefined)
-        contextText(sender.displayName);
-    inspectContextArray(input.parts, MAX_CONTEXT_SPANS).forEach(memoryPartText);
-}
-function memoryMessageProjection(value) {
-    const input = inspectContextRecord(value, [
-        'id', 'role', 'parts', 'createdAt', 'provenance'
-    ], ['replyTo']);
-    contextText(input.id);
-    if (input.role !== 'system' && input.role !== 'user' && input.role !== 'assistant' && input.role !== 'tool') {
-        return invalidContextInput('memory_candidate_invalid');
-    }
-    const parts = inspectContextArray(input.parts, MAX_CONTEXT_SPANS).map(memoryPartText);
-    const createdAt = contextText(input.createdAt);
-    validateMemoryProvenance(input.provenance);
-    if (input.replyTo !== undefined)
-        validateMemoryQuote(input.replyTo);
-    const text = parts.filter(part => part.length > 0).join('\n');
-    return Object.freeze({ text: text.length === 0 ? '[空消息]' : text, createdAt });
-}
-function memoryItem(value) {
-    const candidate = inspectContextRecord(value, [
-        'memoryId', 'message', 'createdAt', 'confidence', 'sensitivity', 'conflict'
-    ]);
-    const memoryId = requireContextAscii(candidate.memoryId);
-    contextText(candidate.createdAt);
-    if (typeof candidate.confidence !== 'number' || !Number.isFinite(candidate.confidence) ||
-        candidate.confidence < 0 || candidate.confidence > 1 ||
-        (candidate.sensitivity !== 'public' && candidate.sensitivity !== 'group' &&
-            candidate.sensitivity !== 'private' && candidate.sensitivity !== 'sensitive') ||
-        (candidate.conflict !== 'none' && candidate.conflict !== 'possible' && candidate.conflict !== 'confirmed')) {
-        return invalidContextInput('memory_candidate_invalid');
-    }
-    const projected = memoryMessageProjection(candidate.message);
-    const id = `memory:${memoryId}`;
-    const message = Object.freeze({
-        id: legacyRef('memory-message', memoryId),
-        role: 'user',
-        parts: Object.freeze([Object.freeze({ type: 'text', text: projected.text })]),
-        createdAt: projected.createdAt,
-        provenance: Object.freeze({
-            source: 'memory',
-            trust: 'untrusted',
-            sensitivity: candidate.sensitivity,
-            sourceId: legacyRef('memory-record', memoryId),
-            createdAt: projected.createdAt
-        })
-    });
-    return Object.freeze({ id, source: 'memory', message });
-}
 function canonicalLegacyMessages(items) {
     try {
         return canonicalizeModelMessages(Object.freeze(items.map(item => {
@@ -337,11 +218,12 @@ function safeOrdinaryItem(item, source, trust, modelMessage) {
         id: item.id,
         source,
         message,
+        ...(item.memoryRecord === undefined ? {} : { memoryRecord: item.memoryRecord }),
         ...(item.atomicGroupId === undefined ? {} : { atomicGroupId: item.atomicGroupId }),
         modelMessage
     });
 }
-function sourceAnchors(item, query) {
+function sourceAnchors(item) {
     const itemRef = item.source === 'memory'
         ? item.message.provenance.sourceId
         : legacyRef('item', item.id);
@@ -349,13 +231,15 @@ function sourceAnchors(item, query) {
             ref: itemRef,
             contentHash: legacyHash('item-content', messageText(item.message))
         })];
-    if (item.source === 'memory' && query !== undefined) {
-        const scene = query.namespace.kind === 'group'
-            ? legacyRef('scene', `group:${query.namespace.groupId}`)
-            : legacyRef('scene', `personal:${query.botId}:${query.namespace.userId}`);
-        const participant = legacyRef('participant', query.requester.userId);
-        refs.push(Object.freeze({ ref: scene, contentHash: legacyHash('anchor', scene) }));
-        refs.push(Object.freeze({ ref: participant, contentHash: legacyHash('anchor', participant) }));
+    if (item.source === 'memory' && item.memoryRecord !== undefined) {
+        refs.push(Object.freeze({
+            ref: legacyRef('memory-id', item.memoryRecord.memoryId),
+            contentHash: item.memoryRecord.revisionHash
+        }));
+        refs.push(Object.freeze({
+            ref: legacyRef('memory-namespace', item.memoryRecord.namespaceRef),
+            contentHash: legacyHash('memory-namespace-anchor', item.memoryRecord.namespaceRef)
+        }));
     }
     return Object.freeze(refs);
 }
@@ -370,13 +254,15 @@ function provenanceKind(source) {
         return 'tool_ledger';
     return 'run';
 }
-function ordinaryProjection(item, namespaceRef, semanticOrder, query) {
-    return ordinaryGroupProjection(Object.freeze([item]), namespaceRef, semanticOrder, query);
+function ordinaryProjection(item, namespaceRef, semanticOrder) {
+    return ordinaryGroupProjection(Object.freeze([item]), namespaceRef, semanticOrder);
 }
-function ordinaryGroupProjection(items, namespaceRef, semanticOrder, query) {
+function ordinaryGroupProjection(items, namespaceRef, semanticOrder) {
     const first = items[0];
     if (first === undefined || items.some(item => item.source !== first.source) ||
-        (first.source === 'current_request' && items.length !== 1)) {
+        (first.source === 'current_request' && items.length !== 1) ||
+        (first.source === 'memory' && (items.length !== 1 || first.memoryRecord === undefined ||
+            first.message.provenance.sourceId !== `memory:${first.memoryRecord.revisionHash}`))) {
         throw new AgentError({
             code: 'invalid_request', stage: 'context.atomic_group', retryable: false,
             userMessage: '上下文原子组无效。', details: { reason: 'atomic_group_invalid' }
@@ -407,7 +293,7 @@ function ordinaryGroupProjection(items, namespaceRef, semanticOrder, query) {
         : legacyRef('item-group', groupKey);
     const refs = new Map();
     for (const item of items) {
-        for (const sourceRef of sourceAnchors(item, query)) {
+        for (const sourceRef of sourceAnchors(item)) {
             if (!refs.has(sourceRef.ref))
                 refs.set(sourceRef.ref, sourceRef);
         }
@@ -425,12 +311,13 @@ function ordinaryGroupProjection(items, namespaceRef, semanticOrder, query) {
             : 'optional',
         priority: sourcePriority(first.source),
         semanticOrder,
-        originGeneration: 0,
+        originGeneration: first.memoryRecord?.revision ?? 0,
         provenance: Object.freeze({
             kind: provenanceKind(strictSource),
             ref,
-            revision: null,
-            contentHash: legacyHash('provenance-group', items.map(item => messageText(item.message)).join('\0'))
+            revision: first.memoryRecord?.revision ?? null,
+            contentHash: first.memoryRecord?.revisionHash ??
+                legacyHash('provenance-group', items.map(item => messageText(item.message)).join('\0'))
         }),
         supersedes: null,
         messages,
@@ -511,7 +398,7 @@ function protocolProjection(items, namespaceRef, semanticOrder) {
     }));
     return Object.freeze({ span, items: canonicalItems });
 }
-function strictProjections(items, namespaceRef, query) {
+function strictProjections(items, namespaceRef) {
     const protocolGroups = new Map();
     const atomicGroups = new Map();
     const protocolLastIndex = new Map();
@@ -559,7 +446,7 @@ function strictProjections(items, namespaceRef, query) {
                 group.push(item);
             continue;
         }
-        projections.push({ order: index, value: ordinaryProjection(item, namespaceRef, index + 1, query) });
+        projections.push({ order: index, value: ordinaryProjection(item, namespaceRef, index + 1) });
     }
     for (const [spanId, group] of protocolGroups) {
         const order = items.findIndex(item => item.protocolSpanId === spanId);
@@ -572,17 +459,17 @@ function strictProjections(items, namespaceRef, query) {
         const order = items.findIndex(item => item.atomicGroupId === groupId);
         projections.push({
             order,
-            value: ordinaryGroupProjection(Object.freeze(group), namespaceRef, order + 1, query)
+            value: ordinaryGroupProjection(Object.freeze(group), namespaceRef, order + 1)
         });
     }
     return Object.freeze(projections.sort((left, right) => left.order - right.order).map(entry => entry.value));
 }
-function strictPlannerGate(items, currentRequestId, query, maxMessages) {
+function strictPlannerGate(items, currentRequestId, maxMessages) {
     let projections;
     let result;
     try {
         const namespaceRef = legacyRef('namespace', currentRequestId);
-        projections = strictProjections(items, namespaceRef, query);
+        projections = strictProjections(items, namespaceRef);
         const capabilityHash = legacyHash('capability', 'context-engine-v1');
         result = planModelTurn(Object.freeze({
             schemaVersion: 1,
@@ -649,22 +536,18 @@ function strictPlannerGate(items, currentRequestId, query, maxMessages) {
 }
 export class ContextEngine {
     estimator;
-    memoryStore;
     constructor(options) {
         this.estimator = options.estimator;
-        this.memoryStore = options.memoryStore;
     }
     projectSourceSpans(input, namespaceRef, signal) {
         assertNotAborted(signal);
         validateInputContainers(input);
-        if (input.memoryQuery !== undefined) {
-            return invalidContextInput('memory_query_requires_prepare');
-        }
         const semanticItems = Object.freeze([
             ...input.systemInstructions,
             ...input.runtimeFacts,
             ...input.sessionHistory,
             ...input.groupContext,
+            ...input.memoryContext,
             input.currentRequest,
             ...input.toolMessages
         ]);
@@ -694,7 +577,7 @@ export class ContextEngine {
             }
         }
         assertNotAborted(signal);
-        return Object.freeze(strictProjections(Object.freeze(unique), namespaceRef, undefined).map(projection => projection.span));
+        return Object.freeze(strictProjections(Object.freeze(unique), namespaceRef).map(projection => projection.span));
     }
     async prepare(input, budget, signal) {
         assertNotAborted(signal);
@@ -702,42 +585,12 @@ export class ContextEngine {
         const availableInputTokens = availableTokens(budget);
         const hardMaxItems = Math.min(budget.maxItems, MAX_CONTEXT_SPANS);
         const hardMaxBytes = Math.min(budget.maxBytes, MAX_CONTEXT_PLANNER_INPUT_BYTES);
-        let memoryItems = Object.freeze([]);
-        if (input.memoryQuery !== undefined) {
-            if (!Number.isSafeInteger(input.memoryQuery.limit) || input.memoryQuery.limit < 0) {
-                return invalidContextInput('memory_query_invalid');
-            }
-            let memories;
-            try {
-                memories = await this.memoryStore.retrieve(input.memoryQuery, signal);
-            }
-            catch {
-                assertNotAborted(signal);
-                throw new AgentError({
-                    code: 'storage_unavailable',
-                    stage: 'context.memory.retrieve',
-                    retryable: true,
-                    userMessage: '上下文记忆暂时不可用。'
-                });
-            }
-            assertNotAborted(signal);
-            try {
-                const values = inspectContextArray(memories, Math.min(input.memoryQuery.limit, hardMaxItems));
-                memoryItems = Object.freeze(values.map(memoryItem));
-            }
-            catch (error) {
-                if (error instanceof AgentError)
-                    throw error;
-                return invalidContextInput('memory_candidate_invalid');
-            }
-        }
-        assertNotAborted(signal);
         const semanticItems = [
             ...input.systemInstructions,
             ...input.runtimeFacts,
             ...input.sessionHistory,
             ...input.groupContext,
-            ...memoryItems,
+            ...input.memoryContext,
             input.currentRequest,
             ...input.toolMessages
         ];
@@ -809,7 +662,7 @@ export class ContextEngine {
             .filter(value => !selectedIds.has(value.item.id))
             .sort((left, right) => left.semanticIndex - right.semanticIndex)
             .map(value => Object.freeze({ id: value.item.id, reason: 'budget' }));
-        const strict = strictPlannerGate(legacyItems, input.currentRequest.id, input.memoryQuery, budget.maxItems);
+        const strict = strictPlannerGate(legacyItems, input.currentRequest.id, budget.maxItems);
         const strictOmitted = strict.omittedIds.map(id => Object.freeze({
             id,
             reason: 'budget'

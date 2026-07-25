@@ -419,18 +419,22 @@ function encodedContextBytes(items) {
         modelMessage: item.modelMessage
     }))), 'utf8');
 }
-function boundedOptionalContext(mandatory, runtimeFacts, history, groupContext, budget) {
+function boundedOptionalContext(mandatory, runtimeFacts, history, groupContext, memoryContext, budget) {
     const historyGroups = [...atomicGroups(history)];
     const groupGroups = [...atomicGroups(groupContext)];
+    const memoryGroups = [...atomicGroups(memoryContext)];
     const current = () => Object.freeze([
         ...mandatory,
         ...runtimeFacts,
         ...historyGroups.flat(),
-        ...groupGroups.flat()
+        ...groupGroups.flat(),
+        ...memoryGroups.flat()
     ]);
     while ((current().length > budget.maxItems || encodedContextBytes(current()) > budget.maxBytes) &&
-        (groupGroups.length > 0 || historyGroups.length > 0)) {
-        if (groupGroups.length > 0)
+        (memoryGroups.length > 0 || groupGroups.length > 0 || historyGroups.length > 0)) {
+        if (memoryGroups.length > 0)
+            memoryGroups.shift();
+        else if (groupGroups.length > 0)
             groupGroups.shift();
         else
             historyGroups.shift();
@@ -438,7 +442,8 @@ function boundedOptionalContext(mandatory, runtimeFacts, history, groupContext, 
     return Object.freeze({
         runtimeFacts: Object.freeze([...runtimeFacts]),
         sessionHistory: Object.freeze(historyGroups.flat()),
-        groupContext: Object.freeze(groupGroups.flat())
+        groupContext: Object.freeze(groupGroups.flat()),
+        memoryContext: Object.freeze(memoryGroups.flat())
     });
 }
 function freshSession(request, sessionId, timestamp) {
@@ -852,7 +857,7 @@ export class AgentService {
             }
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
-            const runtime = await this.#createRuntime(request);
+            const runtime = await this.#createRuntime(request, linked.signal);
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
@@ -1010,12 +1015,16 @@ export class AgentService {
             const groupContext = dropOptional
                 ? EMPTY_ITEMS
                 : Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]);
-            const bounded = boundedOptionalContext(Object.freeze([...systemInstructions, currentRequest]), runtimeFacts, history, groupContext, request.contextBudget);
+            const memoryContext = dropOptional
+                ? EMPTY_ITEMS
+                : Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)]);
+            const bounded = boundedOptionalContext(Object.freeze([...systemInstructions, currentRequest]), runtimeFacts, history, groupContext, memoryContext, request.contextBudget);
             return Object.freeze({
                 systemInstructions,
                 runtimeFacts: bounded.runtimeFacts,
                 sessionHistory: bounded.sessionHistory,
                 groupContext: bounded.groupContext,
+                memoryContext: bounded.memoryContext,
                 currentRequest,
                 toolMessages: EMPTY_ITEMS
             });

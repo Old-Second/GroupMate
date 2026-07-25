@@ -1642,6 +1642,22 @@ function namespaceDeletionCarrierKinds(database, namespaceRef, generation) {
     const remaining = probes.filter(([, sql, bindings]) => database.prepare(sql).get(...Array.from({ length: bindings }, () => [namespaceRef, generation]).flat()) !== undefined).map(([kind]) => kind);
     return Object.freeze(remaining);
 }
+function deletePersonalEnrollmentPolicyIfPresent(database, namespaceRef, generation) {
+    const schema = database.prepare(`
+    SELECT 1 AS present FROM sqlite_schema
+    WHERE type = 'table' AND name = 'personal_memory_policies'
+      AND tbl_name = 'personal_memory_policies'
+  `).get();
+    if (schema === undefined)
+        return;
+    const changes = database.prepare(`
+    DELETE FROM personal_memory_policies
+    WHERE namespace_ref = ? AND namespace_generation = ?
+  `).run(namespaceRef, generation).changes;
+    if (changes !== 0 && changes !== 0n && changes !== 1 && changes !== 1n) {
+        throw new CanonicalLifecycleMutationDataErrorV1();
+    }
+}
 function executeNamespaceDelete(database, envelope, wire, commandHash, freshNow) {
     const operation = 'namespace.delete';
     const aggregateRef = wire.namespaceRef;
@@ -1729,6 +1745,7 @@ function executeNamespaceDelete(database, envelope, wire, commandHash, freshNow)
             MEMORY_LIFECYCLE_RESOURCE_LIMITS.lifecycleDeletionCheckpointBytesPerDeployment) {
         throw new LifecycleMutationCapacityErrorV1('canonical_bytes');
     }
+    deletePersonalEnrollmentPolicyIfPresent(database, wire.namespaceRef, wire.expectedNamespaceGeneration);
     requireOneChange(database.prepare(`
     UPDATE namespaces SET namespace_generation = ?, content_epoch = content_epoch + 1,
       updated_at_ms = ? WHERE namespace_ref = ? AND namespace_generation = ?

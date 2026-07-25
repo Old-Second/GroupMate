@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 import { createManagementToolDefinitions, createQueryToolRuntime, createVisibleToolDefinitions } from '../runtime/tools/tool-runtime-factory.js';
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js';
@@ -175,6 +176,30 @@ export function phase7bMemoryControlFieldIsForbidden(value) {
         return true;
     const normalized = value.replace(/[_-]/g, '').toLowerCase();
     return normalized.includes('memory') || normalized.includes('qdrant');
+}
+const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
+    personalMemoryMode: 'off',
+    personalMemoryGroupAllowlist: Object.freeze([]),
+    personalMemoryRecallMaxItems: 6,
+    personalMemoryRecallMaxTokens: 1_200,
+    personalMemoryRecallTimeoutMs: 150
+});
+const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([
+    ...Object.keys(PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS),
+    'personalMemoryOperationsStatus',
+    'personalMemoryMaintenanceAction'
+]);
+export function phase7bPersonalMemoryConfigIsDefaultOff(value) {
+    let input;
+    try {
+        input = exactRecord(value, 'personal memory config');
+    }
+    catch {
+        return false;
+    }
+    const memoryFields = Object.keys(input).filter(phase7bMemoryControlFieldIsForbidden).sort();
+    const expected = Object.keys(PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS).sort();
+    return sameStrings(memoryFields, expected) && expected.every(field => (isDeepStrictEqual(input[field], PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS[field])));
 }
 export function collectPhase7bProductionToolNames() {
     const unavailable = async () => {
@@ -568,7 +593,11 @@ function sourceImportSpecifiers(relativePath, source) {
         if (!complete)
             return;
         if (ts.isImportDeclaration(node)) {
-            acceptLiteral(node.moduleSpecifier);
+            const bindings = node.importClause?.namedBindings;
+            const typeOnly = node.importClause?.isTypeOnly === true || (bindings !== undefined && ts.isNamedImports(bindings) &&
+                bindings.elements.length > 0 && bindings.elements.every(element => element.isTypeOnly));
+            if (!typeOnly)
+                acceptLiteral(node.moduleSpecifier);
         }
         else if (ts.isExportDeclaration(node)) {
             if (node.moduleSpecifier !== undefined)
@@ -669,11 +698,18 @@ export function auditPhase7bProductionReachability(value) {
     return Object.freeze({
         complete,
         reachableFiles: reachable.length,
-        forbiddenMemoryModules: reachable.filter(relativePath => (relativePath.startsWith('src/agent/memory/'))).length,
+        forbiddenMemoryModules: reachable.filter(relativePath => (relativePath.startsWith('src/agent/memory/') && ![
+            'src/agent/memory/memory-access-gate.ts',
+            'src/agent/memory/memory-context-projection.ts',
+            'src/agent/memory/memory-domain.ts',
+            'src/agent/memory/memory-namespace.ts',
+            'src/agent/memory/memory-resource-limits.ts',
+            'src/agent/memory/memory-retrieval.ts'
+        ].includes(relativePath))).length,
         forbiddenContextSourceModules: reachable.filter(relativePath => (relativePath === 'src/agent/context/context-source.ts')).length
     });
 }
-export function phase7bRuntimeMemoryStoreSeamIsClosed(value) {
+export function phase7bRuntimeMemoryRecallSeamIsExact(value) {
     let input;
     try {
         input = exactRecord(value, 'Phase 7B runtime source graph');
@@ -694,29 +730,26 @@ export function phase7bRuntimeMemoryStoreSeamIsClosed(value) {
         const sourceFile = ts.createSourceFile(relativePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
         if (sourceHasParseDiagnostics(sourceFile))
             return false;
-        let closed = true;
+        let closed = !/\b(?:NoopMemoryStore|MemoryStore|memoryStore)\b/.test(source);
         const visit = (node) => {
             if (!closed)
                 return;
-            if ((ts.isStringLiteralLike(node) && node.text === 'memoryStore') ||
-                (ts.isPrivateIdentifier(node) && node.text === '#memoryStore')) {
-                closed = false;
-                return;
-            }
-            if (ts.isIdentifier(node) && node.text === 'memoryStore') {
+            if (ts.isIdentifier(node) && node.text === 'personalMemoryRecallSource') {
                 const parent = node.parent;
-                const initializer = ts.isPropertyAssignment(parent) && parent.name === node
-                    ? parent.initializer
-                    : undefined;
-                if (initializer === undefined || !ts.isNewExpression(initializer) ||
-                    !ts.isIdentifier(initializer.expression) ||
-                    initializer.expression.text !== 'NoopMemoryStore' ||
-                    (initializer.arguments?.length ?? 0) !== 0 ||
-                    (initializer.typeArguments?.length ?? 0) !== 0) {
+                if (relativePath !== 'src/runtime/agent-service-bridge.ts') {
                     closed = false;
-                    return;
                 }
-                exactSeams += 1;
+                else if (ts.isPropertySignature(parent) && parent.name === node &&
+                    parent.questionToken !== undefined) {
+                    exactSeams += 1;
+                }
+                else if (ts.isPropertyAccessExpression(parent) && parent.name === node &&
+                    ts.isIdentifier(parent.expression) && parent.expression.text === 'dependencies') {
+                    exactSeams += 1;
+                }
+                else {
+                    closed = false;
+                }
             }
             ts.forEachChild(node, visit);
         };
@@ -724,7 +757,7 @@ export function phase7bRuntimeMemoryStoreSeamIsClosed(value) {
         if (!closed)
             return false;
     }
-    return exactSeams === 1;
+    return exactSeams === 2;
 }
 const PHASE_7B_EXPECTED_BRIDGE_DEPENDENCIES = Object.freeze([
     { name: 'progressPresenter', optional: false, type: 'RunProgressPresenter' },
@@ -737,6 +770,11 @@ const PHASE_7B_EXPECTED_BRIDGE_DEPENDENCIES = Object.freeze([
         name: 'providerIsolationIdSourceFactory',
         optional: true,
         type: 'ProviderIsolationIdSourceFactory'
+    },
+    {
+        name: 'personalMemoryRecallSource',
+        optional: true,
+        type: 'YunzaiPersonalMemoryRecallSourceV1'
     },
     {
         name: 'observations',
@@ -795,44 +833,34 @@ export function phase7bBridgeDependenciesAreClosed(value) {
     }
     return exactInterfaceProperties(value, 'YunzaiAgentServiceBridgeDependencies', PHASE_7B_EXPECTED_BRIDGE_DEPENDENCIES);
 }
-export function phase7bBridgeNoopMemoryStoreIsExact(value) {
+export function phase7bBridgeMemoryDefaultOffIsExact(value) {
     if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_AUDIT_FILE_BYTES) {
         return false;
     }
     const sourceFile = ts.createSourceFile('src/runtime/agent-service-bridge.ts', value, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     if (sourceHasParseDiagnostics(sourceFile))
         return false;
-    const imports = sourceFile.statements.filter((node) => (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier) &&
-        node.moduleSpecifier.text === '../agent/context/noop-memory-store.js'));
-    if (imports.length !== 1)
-        return false;
-    const importClause = imports[0].importClause;
-    if (importClause === undefined || importClause.isTypeOnly || importClause.name !== undefined ||
-        importClause.namedBindings === undefined || !ts.isNamedImports(importClause.namedBindings) ||
-        importClause.namedBindings.elements.length !== 1)
-        return false;
-    const imported = importClause.namedBindings.elements[0];
-    if (imported === undefined || imported.isTypeOnly || imported.propertyName !== undefined ||
-        imported.name.text !== 'NoopMemoryStore')
-        return false;
     let identifierCount = 0;
-    let exactConstructionCount = 0;
+    let optionalPropertyCount = 0;
+    let dependencyReadCount = 0;
     const visit = (node) => {
-        if (ts.isIdentifier(node) && node.text === 'NoopMemoryStore')
+        if (ts.isIdentifier(node) && node.text === 'personalMemoryRecallSource') {
             identifierCount += 1;
-        if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) &&
-            node.expression.text === 'NoopMemoryStore') {
             const parent = node.parent;
-            if (ts.isPropertyAssignment(parent) && parent.initializer === node &&
-                ts.isIdentifier(parent.name) && parent.name.text === 'memoryStore' &&
-                (node.arguments?.length ?? 0) === 0 && (node.typeArguments?.length ?? 0) === 0) {
-                exactConstructionCount += 1;
+            if (ts.isPropertySignature(parent) && parent.name === node &&
+                parent.questionToken !== undefined)
+                optionalPropertyCount += 1;
+            if (ts.isPropertyAccessExpression(parent) && parent.name === node &&
+                ts.isIdentifier(parent.expression) && parent.expression.text === 'dependencies') {
+                dependencyReadCount += 1;
             }
         }
         ts.forEachChild(node, visit);
     };
     visit(sourceFile);
-    return identifierCount === 2 && exactConstructionCount === 1;
+    return identifierCount === 2 && optionalPropertyCount === 1 && dependencyReadCount === 1 &&
+        /if \(input\.source === undefined\) return Object\.freeze\(\[\]\)/.test(value) &&
+        !/\bnew\s+[A-Za-z0-9_$]*(?:Memory|Qdrant|Vector)[A-Za-z0-9_$]*\s*\(/.test(value);
 }
 function matchCount(source, pattern) {
     return [...source.matchAll(pattern)].length;
@@ -1059,7 +1087,7 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
     const bridge = sources.bridge ?? '';
     const toolSource = sources.tools ?? '';
     const guobaSource = `${sources.guoba ?? ''}\n${sources.guobaSupport ?? ''}`;
-    const runtimeMemoryImports = matchCount(runtimeSource, /(?:from\s+|import\s*\(\s*)['"][^'"]*agent\/memory\/[^'"]+['"]/g);
+    const runtimeMemoryImports = matchCount(bridge, /(?:from\s+|import\s*\(\s*)['"][^'"]*agent\/memory\/[^'"]+['"]/g);
     const runtimeMemoryQueries = matchCount(runtimeSource, /\bmemoryQuery\b/g);
     const runtimeMemoryProposals = matchCount(runtimeSource, /\bmemoryProposal\b/g);
     const runtimeContextSourceImports = matchCount(runtimeSource, /(?:from\s+|import\s*\(\s*)['"][^'"]*agent\/context\/context-source(?:\.js)?['"]/g);
@@ -1077,44 +1105,43 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
     }
     const forbiddenMemoryToolNames = productionToolNames.filter(name => (/Memory|Remember|Forget|Qdrant/i.test(name))).length;
     const productionToolNamesExact = sameStrings(productionToolNames, PHASE_7B_PRODUCTION_TOOL_NAMES);
-    let guobaMemoryEnableFields = 1;
+    let guobaMemoryControlFieldsExact = false;
     try {
         const fields = buildGuobaSchemas({
             vitsRoleOptions: [],
             voicevoxRoleOptions: [],
             azureRoleOptions: []
         }).flatMap(schema => schema.field === undefined ? [] : [schema.field]);
-        guobaMemoryEnableFields = fields.filter(phase7bMemoryControlFieldIsForbidden).length +
-            matchCount(guobaSource, /长期记忆(?:已启用|启用|开关)/g);
+        guobaMemoryControlFieldsExact = sameStrings(fields.filter(phase7bMemoryControlFieldIsForbidden).sort(), [...PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS].sort()) && matchCount(guobaSource, /长期记忆(?:已启用|启用|开关)/g) === 0;
     }
     catch {
-        guobaMemoryEnableFields = 1;
+        guobaMemoryControlFieldsExact = false;
     }
-    let configMemoryEnableFields = 1;
+    let configMemoryDefaultsOff = false;
     if (sources.config !== null) {
         try {
             const config = exactRecord(JSON.parse(sources.config), 'example config');
-            configMemoryEnableFields = Object.keys(config)
-                .filter(phase7bMemoryControlFieldIsForbidden).length;
+            configMemoryDefaultsOff = phase7bPersonalMemoryConfigIsDefaultOff(config);
         }
         catch {
-            configMemoryEnableFields = 1;
+            configMemoryDefaultsOff = false;
         }
     }
-    const productionNoopStore = phase7bBridgeNoopMemoryStoreIsExact(bridge);
+    const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge) &&
+        configMemoryDefaultsOff;
     const bridgeDependenciesClosed = phase7bBridgeDependenciesAreClosed(bridge);
-    const memoryStoreSeamExact = phase7bRuntimeMemoryStoreSeamIsClosed(runtimeSourceGraph);
+    const memoryRecallSeamExact = phase7bRuntimeMemoryRecallSeamIsExact(runtimeSourceGraph);
     const service = sources.service ?? '';
     const sourceInputStart = service.indexOf('const sourceInput = (dropOptional: boolean): ContextInput => {');
     const sourceInputEnd = service.indexOf('\n    const initialInput = sourceInput(false)', sourceInputStart);
     const sourceInput = sourceInputStart >= 0 && sourceInputEnd > sourceInputStart
         ? service.slice(sourceInputStart, sourceInputEnd)
         : '';
-    const exactProductionContextInput = /return Object\.freeze\(\{\s*systemInstructions,\s*runtimeFacts:\s*bounded\.runtimeFacts,\s*sessionHistory:\s*bounded\.sessionHistory,\s*groupContext:\s*bounded\.groupContext,\s*currentRequest,\s*toolMessages:\s*EMPTY_ITEMS\s*\}\)/.test(sourceInput) && !/\bmemoryQuery\b|\.\.\./.test(sourceInput.slice(sourceInput.lastIndexOf('return Object.freeze({')));
+    const exactProductionContextInput = /return Object\.freeze\(\{\s*systemInstructions,\s*runtimeFacts:\s*bounded\.runtimeFacts,\s*sessionHistory:\s*bounded\.sessionHistory,\s*groupContext:\s*bounded\.groupContext,\s*memoryContext:\s*bounded\.memoryContext,\s*currentRequest,\s*toolMessages:\s*EMPTY_ITEMS\s*\}\)/.test(sourceInput) && !/\bmemoryQuery\b|\.\.\./.test(sourceInput.slice(sourceInput.lastIndexOf('return Object.freeze({')));
     const dangerousConstructionCount = matchCount(runtimeSource, /\b(?:openSqliteMemoryDatabaseV1|createSqliteMemoryRepositoryV1|RedisMemoryHotCache|createMemoryHotProjectorV1|createSqliteMemoryHeadSourceV1|createSqliteMemoryOutboxV1)\b/g);
-    const productionDependenciesClosed = requiredSourcesPresent && productionNoopStore &&
-        bridgeDependenciesClosed && memoryStoreSeamExact &&
-        runtimeMemoryImports === 0 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
+    const productionDependenciesClosed = requiredSourcesPresent && productionMemoryDefaultOff &&
+        bridgeDependenciesClosed && memoryRecallSeamExact &&
+        runtimeMemoryImports === 1 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
         runtimeContextSourceImports === 0 && dangerousConstructionCount === 0 &&
         reachability.forbiddenMemoryModules === 0 &&
         reachability.forbiddenContextSourceModules === 0 &&
@@ -1123,9 +1150,9 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
     const coldImport = await runColdImportAudit(root);
     const result = Object.freeze({
         schemaVersion: 1,
-        productionNoopStore,
+        productionMemoryDefaultOff,
         productionDependenciesClosed,
-        memoryStoreSeamExact,
+        memoryRecallSeamExact,
         runtimeMemoryImports,
         runtimeMemoryQueries,
         runtimeMemoryProposals,
@@ -1136,18 +1163,18 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
         forbiddenMemoryToolFactories,
         forbiddenMemoryToolNames,
         productionToolNamesExact,
-        guobaMemoryEnableFields,
-        configMemoryEnableFields,
+        guobaMemoryControlFieldsExact,
+        configMemoryDefaultsOff,
         memoryTelemetryEdges: telemetryEdges,
         coldImport,
-        passed: productionNoopStore && productionDependenciesClosed &&
-            runtimeMemoryImports === 0 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
+        passed: productionMemoryDefaultOff && productionDependenciesClosed &&
+            runtimeMemoryImports === 1 && runtimeMemoryQueries === 0 && runtimeMemoryProposals === 0 &&
             runtimeContextSourceImports === 0 && reachability.complete &&
             reachability.forbiddenMemoryModules === 0 &&
             reachability.forbiddenContextSourceModules === 0 &&
             forbiddenMemoryToolFactories === 0 && forbiddenMemoryToolNames === 0 &&
             productionToolNamesExact &&
-            guobaMemoryEnableFields === 0 && configMemoryEnableFields === 0 &&
+            guobaMemoryControlFieldsExact && configMemoryDefaultsOff &&
             telemetryEdges === 0 && coldImport.passed
     });
     return result;
