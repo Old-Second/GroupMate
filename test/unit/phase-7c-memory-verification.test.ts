@@ -114,8 +114,8 @@ function passingProductionAudit (): Phase7bMemoryWiringAudit {
     forbiddenMemoryToolFactories: 0,
     forbiddenMemoryToolNames: 0,
     productionToolNamesExact: true,
-    guobaMemoryEnableFields: 0,
-    configMemoryEnableFields: 0,
+    guobaMemoryControlFieldsExact: true,
+    configMemoryDefaultsOff: true,
     memoryTelemetryEdges: 0,
     coldImport: { passed: true, timerCalls: 0, redisEvalCalls: 0, createdFiles: 0 },
     passed: true

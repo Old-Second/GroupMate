@@ -144,6 +144,28 @@ export function buildGuobaSchemas ({
     field('bymFuckRecall', '自动撤回反击回复', '开启后只撤回随机参与产生的反击回复，不撤回用户消息或普通错误提示。', 'Switch'),
     field('bymFuckRecallTime', '反击回复撤回秒数', '反击回复成功发送后等待多少秒撤回。', 'InputNumber', { min: 1, max: 3600 }),
 
+    divider('长期记忆'),
+    field('personalMemoryMode', '个人长期记忆模式', '默认关闭。显式模式只允许用户主动管理记忆；影子模式额外记录待评估候选但不用于回答；自动模式只自动批准严格白名单候选。所有模式仍要求每位用户独立 opt-in，修改后需重启。', 'Select', {
+      options: [
+        { label: '完全关闭', value: 'off' },
+        { label: '仅显式管理', value: 'explicit' },
+        { label: '影子候选', value: 'shadow' },
+        { label: '策略自动批准', value: 'automatic' }
+      ]
+    }),
+    field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入已 opt-in 用户的个人记忆；空列表表示群聊全部不允许，私聊仍受用户独立 opt-in 控制。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
+    field('personalMemoryRecallMaxItems', '单次召回条数上限', '每次请求最多注入的个人记忆条数，范围 1 到 12；默认 6。修改后需重启。', 'InputNumber', { min: 1, max: 12, step: 1 }),
+    field('personalMemoryRecallMaxTokens', '单次召回 Token 上限', '每次请求中个人记忆正文的独立 Token 预算，范围 1 到 2400；默认 1200，仍受总上下文预算约束。修改后需重启。', 'InputNumber', { min: 1, max: 2_400, step: 1 }),
+    field('personalMemoryRecallTimeoutMs', '单次召回超时毫秒', '个人记忆召回总超时，范围 1 到 500 毫秒；默认 150，超时会无记忆继续普通回复。修改后需重启。', 'InputNumber', { min: 1, max: 500, step: 1 }),
+    field('personalMemoryOperationsStatus', '长期记忆运行状态', '只读取当前已装配实例的有界计数，不会初始化 SQLite、Redis、worker、timer 或外部服务，也不会显示记忆正文和查询内容。', 'InputTextArea', { disabled: true }),
+    field('personalMemoryMaintenanceAction', '长期记忆维护动作', '保存时可执行完整性校验或重建可派生的词法索引；动作不会删除 canonical 记忆，关闭模式下不会初始化存储或执行维护。', 'Select', {
+      options: [
+        { label: '不执行', value: 'none' },
+        { label: '校验完整性', value: 'verify' },
+        { label: '重建词法索引', value: 'rebuild_lexical' }
+      ]
+    }),
+
     divider('工具与搜索'),
     field('smartMode', '开启工具调用', '允许模型使用搜索、图片、语音和授权群管理工具，会增加请求次数；权限仍由运行时校验。', 'Switch'),
     field('toolPolicyProfile', '工具权限策略', '兼容模式在通过运行时权限校验后执行；安全与严格模式中需要审批的操作会拒绝执行，不会生成旧口令；新的风险分级审批将在新运行引擎接入后启用。', 'Select', {

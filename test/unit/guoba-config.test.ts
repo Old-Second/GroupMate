@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  buildGuobaConfigPatch,
   guobaConfigSaveMessage,
-  normalizeGuobaConfigValue
+  normalizeGuobaConfigValue,
+  PERSONAL_MEMORY_CONFIG_DEFAULTS
 } from '../../src/runtime/guoba-config.js'
 
 test('normalizes editable Guoba list fields into unique trimmed values', () => {
@@ -15,9 +17,134 @@ test('normalizes editable Guoba list fields into unique trimmed values', () => {
     ['123456', '654321']
   )
   assert.deepEqual(
+    normalizeGuobaConfigValue(
+      'personalMemoryGroupAllowlist',
+      ['123456', ' 654321 ', '123456', 'invalid']
+    ),
+    ['123456', '654321']
+  )
+  assert.deepEqual(
     normalizeGuobaConfigValue('blockWords', 'bad phrase, second phrase'),
     ['bad phrase', 'second phrase']
   )
+})
+
+test('normalizes the bounded personal memory pilot configuration fail closed', () => {
+  assert.deepEqual(PERSONAL_MEMORY_CONFIG_DEFAULTS, {
+    personalMemoryMode: 'off',
+    personalMemoryGroupAllowlist: [],
+    personalMemoryRecallMaxItems: 6,
+    personalMemoryRecallMaxTokens: 1_200,
+    personalMemoryRecallTimeoutMs: 150
+  })
+
+  for (const mode of ['off', 'explicit', 'shadow', 'automatic']) {
+    assert.equal(normalizeGuobaConfigValue('personalMemoryMode', mode), mode)
+  }
+  for (const value of ['enabled', 'auto', '', 1]) {
+    assert.throws(
+      () => normalizeGuobaConfigValue('personalMemoryMode', value),
+      /长期记忆模式配置无效/
+    )
+  }
+
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallMaxItems', 1), 1)
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallMaxItems', 12), 12)
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallMaxTokens', 1), 1)
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallMaxTokens', 2_400), 2_400)
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallTimeoutMs', 1), 1)
+  assert.equal(normalizeGuobaConfigValue('personalMemoryRecallTimeoutMs', 500), 500)
+  for (const [field, values] of [
+    ['personalMemoryRecallMaxItems', [0, 13, 1.5, '6']],
+    ['personalMemoryRecallMaxTokens', [0, 2_401, 1.5, '1200']],
+    ['personalMemoryRecallTimeoutMs', [0, 501, 1.5, '150']]
+  ] as const) {
+    for (const value of values) {
+      assert.throws(
+        () => normalizeGuobaConfigValue(field, value),
+        /长期记忆召回预算配置无效/
+      )
+    }
+  }
+})
+
+test('Guoba patch keeps masked secrets, saves ordinary empty values and ignores unknown fields', () => {
+  const current = {
+    apiKey: 'existing-secret',
+    model: 'deepseek-chat',
+    personalMemoryMode: 'off',
+    legacyUnknown: 'must-survive-outside-the-form'
+  }
+  assert.deepEqual(buildGuobaConfigPatch({
+    apiKey: '',
+    model: '',
+    personalMemoryMode: 'explicit',
+    unknownSubmittedField: 'drop-me'
+  }, {
+    current,
+    supportedKeys: ['apiKey', 'model', 'personalMemoryMode']
+  }), {
+    model: '',
+    personalMemoryMode: 'explicit'
+  })
+  assert.deepEqual(buildGuobaConfigPatch({}, {
+    current,
+    supportedKeys: ['apiKey', 'model']
+  }), {})
+  assert.deepEqual(buildGuobaConfigPatch({ apiKey: 'replacement-secret' }, {
+    current,
+    supportedKeys: ['apiKey']
+  }), { apiKey: 'replacement-secret' })
+  assert.deepEqual(buildGuobaConfigPatch({
+    personalMemoryOperationsStatus: 'hostile-status',
+    personalMemoryMaintenanceAction: 'verify'
+  }, {
+    current,
+    supportedKeys: [],
+    virtualKeys: ['personalMemoryMaintenanceAction']
+  }), { personalMemoryMaintenanceAction: 'verify' })
+})
+
+test('Guoba patch rejects accessors without invoking them', () => {
+  let reads = 0
+  const hostile = Object.create(null) as Record<string, unknown>
+  Object.defineProperty(hostile, 'apiKey', {
+    enumerable: true,
+    get () {
+      reads += 1
+      return 'leaked'
+    }
+  })
+  assert.throws(() => buildGuobaConfigPatch(hostile, {
+    current: { apiKey: 'existing-secret' },
+    supportedKeys: ['apiKey']
+  }), /Guoba 配置数据无效/)
+  assert.equal(reads, 0)
+  assert.throws(() => buildGuobaConfigPatch(new Proxy({ apiKey: 'leaked' }, {}), {
+    current: { apiKey: 'existing-secret' },
+    supportedKeys: ['apiKey']
+  }), /Guoba 配置数据无效/)
+})
+
+test('Guoba patch accepts only bounded plain strings for masked secrets', () => {
+  let serialized = 0
+  const hostile = {
+    toJSON () {
+      serialized += 1
+      return 'leaked'
+    }
+  }
+  for (const value of [1, true, hostile, 'a\0b', 'a'.repeat(16 * 1_024 + 1)]) {
+    assert.throws(() => buildGuobaConfigPatch({ apiKey: value }, {
+      current: { apiKey: 'existing-secret' },
+      supportedKeys: ['apiKey']
+    }), /Guoba 密钥配置无效/)
+  }
+  assert.equal(serialized, 0)
+  assert.deepEqual(buildGuobaConfigPatch({ apiKey: 'a'.repeat(16 * 1_024) }, {
+    current: { apiKey: 'existing-secret' },
+    supportedKeys: ['apiKey']
+  }), { apiKey: 'a'.repeat(16 * 1_024) })
 })
 
 test('validates QQ scope and BYM exception identifiers', () => {
@@ -106,6 +233,10 @@ test('disk log saves require restart while ordinary live fields keep the normal 
   )
   assert.equal(
     guobaConfigSaveMessage(['apiContextWindowTokens']),
+    '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
+  )
+  assert.equal(
+    guobaConfigSaveMessage(['personalMemoryMode']),
     '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
   )
 })

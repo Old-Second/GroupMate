@@ -13,6 +13,7 @@ import {
   phase7bBridgeMemoryDefaultOffIsExact,
   phase7bComputedImportBoundaryIsClosed,
   phase7bMemoryControlFieldIsForbidden,
+  phase7bPersonalMemoryConfigIsDefaultOff,
   phase7bMemoryTelemetrySourceFindings,
   phase7bOutboxSurfaceIsBodyFree,
   phase7bRuntimeMemoryRecallSeamIsExact
@@ -95,8 +96,8 @@ test('Phase 7B production wiring remains explicitly memory-disabled', async () =
   assert.equal(audit.forbiddenMemoryToolFactories, 0)
   assert.equal(audit.forbiddenMemoryToolNames, 0)
   assert.equal(audit.productionToolNamesExact, true)
-  assert.equal(audit.guobaMemoryEnableFields, 0)
-  assert.equal(audit.configMemoryEnableFields, 0)
+  assert.equal(audit.guobaMemoryControlFieldsExact, true)
+  assert.equal(audit.configMemoryDefaultsOff, true)
   assert.equal(audit.memoryTelemetryEdges, 0)
   assert.deepEqual(audit.coldImport, {
     passed: true,
@@ -285,7 +286,7 @@ test('runtime memory seam and telemetry edges reject shorthand and comment bypas
   ), 0)
 })
 
-test('Guoba and example config expose no long-term memory enable surface', async () => {
+test('Guoba and example config expose only the reviewed default-off personal memory surface', async () => {
   const fields = buildGuobaSchemas({
     vitsRoleOptions: [],
     voicevoxRoleOptions: [],
@@ -295,17 +296,24 @@ test('Guoba and example config expose no long-term memory enable surface', async
     PROJECT_ROOT,
     'config/config.example.json'
   ), 'utf8')) as Record<string, unknown>
-  const forbidden = new Set([
-    'memoryEnabled',
-    'longTermMemoryEnabled',
-    'memoryReadEnabled',
-    'memoryWriteEnabled',
-    'memoryQuery',
-    'memoryProposal',
-    'qdrantEnabled'
+  assert.deepEqual(fields.filter(phase7bMemoryControlFieldIsForbidden).sort(), [
+    'personalMemoryGroupAllowlist',
+    'personalMemoryMaintenanceAction',
+    'personalMemoryMode',
+    'personalMemoryOperationsStatus',
+    'personalMemoryRecallMaxItems',
+    'personalMemoryRecallMaxTokens',
+    'personalMemoryRecallTimeoutMs'
   ])
-  assert.deepEqual(fields.filter(field => forbidden.has(field)), [])
-  assert.deepEqual(Object.keys(config).filter(field => forbidden.has(field)), [])
+  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff(config), true)
+  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff({
+    ...config,
+    personalMemoryMode: 'explicit'
+  }), false)
+  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff({
+    ...config,
+    qdrantEnabled: false
+  }), false)
 })
 
 test('Phase 7B verification entry runs the built Task 11 artifact', async () => {

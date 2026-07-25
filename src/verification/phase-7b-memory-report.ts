@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import ts from 'typescript'
 import {
   createManagementToolDefinitions,
@@ -258,8 +259,8 @@ export interface Phase7bMemoryWiringAudit {
   readonly forbiddenMemoryToolFactories: number
   readonly forbiddenMemoryToolNames: number
   readonly productionToolNamesExact: boolean
-  readonly guobaMemoryEnableFields: number
-  readonly configMemoryEnableFields: number
+  readonly guobaMemoryControlFieldsExact: boolean
+  readonly configMemoryDefaultsOff: boolean
   readonly memoryTelemetryEdges: number
   readonly coldImport: Phase7bMemoryColdImportAudit
   readonly passed: boolean
@@ -362,6 +363,36 @@ export function phase7bMemoryControlFieldIsForbidden (value: unknown): boolean {
   if (typeof value !== 'string') return true
   const normalized = value.replace(/[_-]/g, '').toLowerCase()
   return normalized.includes('memory') || normalized.includes('qdrant')
+}
+
+const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
+  personalMemoryMode: 'off',
+  personalMemoryGroupAllowlist: Object.freeze([]) as readonly string[],
+  personalMemoryRecallMaxItems: 6,
+  personalMemoryRecallMaxTokens: 1_200,
+  personalMemoryRecallTimeoutMs: 150
+})
+
+const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([
+  ...Object.keys(PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS),
+  'personalMemoryOperationsStatus',
+  'personalMemoryMaintenanceAction'
+])
+
+export function phase7bPersonalMemoryConfigIsDefaultOff (value: unknown): boolean {
+  let input: Record<string, unknown>
+  try {
+    input = exactRecord(value, 'personal memory config')
+  } catch {
+    return false
+  }
+  const memoryFields = Object.keys(input).filter(phase7bMemoryControlFieldIsForbidden).sort()
+  const expected = Object.keys(PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS).sort()
+  return sameStrings(memoryFields, expected) && expected.every(field => (
+    isDeepStrictEqual(input[field], PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS[
+      field as keyof typeof PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS
+    ])
+  ))
 }
 
 export function collectPhase7bProductionToolNames (): readonly string[] {
@@ -1396,29 +1427,31 @@ export async function auditPhase7bMemoryWiring (
     productionToolNames,
     PHASE_7B_PRODUCTION_TOOL_NAMES
   )
-  let guobaMemoryEnableFields = 1
+  let guobaMemoryControlFieldsExact = false
   try {
     const fields = buildGuobaSchemas({
       vitsRoleOptions: [],
       voicevoxRoleOptions: [],
       azureRoleOptions: []
     }).flatMap(schema => schema.field === undefined ? [] : [schema.field])
-    guobaMemoryEnableFields = fields.filter(phase7bMemoryControlFieldIsForbidden).length +
-      matchCount(guobaSource, /长期记忆(?:已启用|启用|开关)/g)
+    guobaMemoryControlFieldsExact = sameStrings(
+      fields.filter(phase7bMemoryControlFieldIsForbidden).sort(),
+      [...PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS].sort()
+    ) && matchCount(guobaSource, /长期记忆(?:已启用|启用|开关)/g) === 0
   } catch {
-    guobaMemoryEnableFields = 1
+    guobaMemoryControlFieldsExact = false
   }
-  let configMemoryEnableFields = 1
+  let configMemoryDefaultsOff = false
   if (sources.config !== null) {
     try {
       const config = exactRecord(JSON.parse(sources.config) as unknown, 'example config')
-      configMemoryEnableFields = Object.keys(config)
-        .filter(phase7bMemoryControlFieldIsForbidden).length
+      configMemoryDefaultsOff = phase7bPersonalMemoryConfigIsDefaultOff(config)
     } catch {
-      configMemoryEnableFields = 1
+      configMemoryDefaultsOff = false
     }
   }
-  const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge)
+  const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge) &&
+    configMemoryDefaultsOff
   const bridgeDependenciesClosed = phase7bBridgeDependenciesAreClosed(bridge)
   const memoryRecallSeamExact = phase7bRuntimeMemoryRecallSeamIsExact(runtimeSourceGraph)
   const service = sources.service ?? ''
@@ -1462,8 +1495,8 @@ export async function auditPhase7bMemoryWiring (
     forbiddenMemoryToolFactories,
     forbiddenMemoryToolNames,
     productionToolNamesExact,
-    guobaMemoryEnableFields,
-    configMemoryEnableFields,
+    guobaMemoryControlFieldsExact,
+    configMemoryDefaultsOff,
     memoryTelemetryEdges: telemetryEdges,
     coldImport,
     passed: productionMemoryDefaultOff && productionDependenciesClosed &&
@@ -1473,7 +1506,7 @@ export async function auditPhase7bMemoryWiring (
       reachability.forbiddenContextSourceModules === 0 &&
       forbiddenMemoryToolFactories === 0 && forbiddenMemoryToolNames === 0 &&
       productionToolNamesExact &&
-      guobaMemoryEnableFields === 0 && configMemoryEnableFields === 0 &&
+      guobaMemoryControlFieldsExact && configMemoryDefaultsOff &&
       telemetryEdges === 0 && coldImport.passed
   })
   return result

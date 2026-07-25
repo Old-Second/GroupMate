@@ -154,6 +154,11 @@ const defaultConfig = {
   apiMaxToken: 4096,
   // 0 使用模型 Profile/安全默认值，正整数仅对重启后创建的新任务生效。
   apiContextWindowTokens: 0,
+  personalMemoryMode: 'off',
+  personalMemoryGroupAllowlist: [],
+  personalMemoryRecallMaxItems: 6,
+  personalMemoryRecallMaxTokens: 1200,
+  personalMemoryRecallTimeoutMs: 150,
   toolPrivateSendPolicy: 'master', // 工具发起私聊：disabled/master/everyone。
   toolCrossGroupSendPolicy: 'disabled', // 工具跨群发送：disabled/master/everyone。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。

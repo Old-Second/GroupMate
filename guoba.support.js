@@ -1,17 +1,35 @@
-import { Config } from './utils/config.js'
+import { Config, supportedConfigKeys } from './utils/config.js'
 import { speakers } from './utils/tts.js'
 import { supportConfigurations as azureRoleList } from './utils/tts/microsoft-azure.js'
 import { supportConfigurations as voxRoleList } from './utils/tts/voicevox.js'
 import {
-  guobaConfigSaveMessage,
-  normalizeGuobaConfigValue
+  buildGuobaConfigPatch,
+  guobaConfigSaveMessage
 } from './dist/runtime/guoba-config.js'
 import { buildGuobaSchemas } from './dist/runtime/guoba-schema.js'
+import {
+  formatPersonalMemoryOperationsStatusV1,
+  productionPersonalMemoryOperationsGatewayV1
+} from './dist/runtime/personal-memory-operations.js'
 import { createPendingIndicatorConfigPort } from './dist/runtime/presentation/pending-indicator-config.js'
 import { pluginId, repositoryUrl } from './dist/runtime/plugin-context.js'
 import { updateProductionObservabilityLevel } from './dist/runtime/production-yunzai-agent.js'
 
 const pendingIndicatorConfig = createPendingIndicatorConfigPort(redis)
+const personalMemoryOperations = productionPersonalMemoryOperationsGatewayV1(
+  () => Config.personalMemoryMode
+)
+
+function personalMemoryOperationMessage (result) {
+  if (result.status === 'completed') {
+    return `保存成功；长期记忆维护已完成，共处理 ${result.affectedRecords} 条派生记录。`
+  }
+  if (result.status === 'disabled') {
+    return '配置已保存；长期记忆当前关闭，未初始化存储或执行维护。'
+  }
+  return '配置已保存；当前运行实例未提供长期记忆维护端口，请重启后重试。'
+}
+
 function roleOption (name) {
   return { label: name, value: name }
 }
@@ -46,17 +64,23 @@ export function supportGuoba () {
       async getConfigData () {
         return {
           ...Config,
-          turnConfirm: await pendingIndicatorConfig.getEnabled()
+          turnConfirm: await pendingIndicatorConfig.getEnabled(),
+          personalMemoryOperationsStatus: formatPersonalMemoryOperationsStatusV1(
+            await personalMemoryOperations.inspect()
+          ),
+          personalMemoryMaintenanceAction: 'none'
         }
       },
       async setConfigData (data, { Result }) {
         // 先完成全部校验，避免无效枚举导致配置只保存一半。
-        const normalized = Object.entries(data).map(([keyPath, rawValue]) => [
-          keyPath,
-          normalizeGuobaConfigValue(keyPath, rawValue)
-        ])
+        const normalized = Object.entries(buildGuobaConfigPatch(data, {
+          current: Config,
+          supportedKeys: supportedConfigKeys,
+          virtualKeys: ['turnConfirm', 'personalMemoryMaintenanceAction']
+        }))
         const changedFields = []
         let observabilityResult = null
+        let personalMemoryOperationResult = null
         for (const [keyPath, value] of normalized) {
           if (keyPath === 'turnConfirm') {
             await pendingIndicatorConfig.setEnabled(value)
@@ -71,6 +95,12 @@ export function supportGuoba () {
               if (observabilityResult.kind === 'applied') {
                 Config.observabilityLevel = value
               }
+            }
+            continue
+          }
+          if (keyPath === 'personalMemoryMaintenanceAction') {
+            if (value !== 'none') {
+              personalMemoryOperationResult = await personalMemoryOperations.execute(value)
             }
             continue
           }
@@ -91,7 +121,12 @@ export function supportGuoba () {
           : observabilityResult?.kind === 'barrier_failed'
             ? '可观测性已保持关闭；轨迹清理失败，请再次保存“完全关闭”后重试。'
             : null
-        return Result.ok({}, guobaConfigSaveMessage(changedFields, observabilityMessage))
+        const priorityMessage = observabilityMessage ?? (
+          personalMemoryOperationResult === null
+            ? null
+            : personalMemoryOperationMessage(personalMemoryOperationResult)
+        )
+        return Result.ok({}, guobaConfigSaveMessage(changedFields, priorityMessage))
       }
     }
   }

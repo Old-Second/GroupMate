@@ -9,6 +9,10 @@ const IDENTIFIER_LIST_FIELDS = new Set([
   'bymDisableGroup'
 ])
 
+const GROUP_IDENTIFIER_LIST_FIELDS = new Set([
+  'personalMemoryGroupAllowlist'
+])
+
 const QQ_SCOPE_FIELDS = new Set([
   'whitelist',
   'blacklist'
@@ -22,6 +26,30 @@ const TOOL_POLICY_PROFILES = new Set(['compatible', 'safe', 'strict'])
 const CROSS_CHANNEL_POLICIES = new Set(['disabled', 'master', 'everyone'])
 const OPENAI_COMPATIBILITY_PROFILES = new Set(['standard', 'deepseek'])
 const OBSERVABILITY_LEVELS = new Set(['off', 'basic', 'diagnostic'])
+const PERSONAL_MEMORY_MODES = new Set(['off', 'explicit', 'shadow', 'automatic'])
+const PERSONAL_MEMORY_MAINTENANCE_ACTIONS = new Set(['none', 'verify', 'rebuild_lexical'])
+const GUOBA_SECRET_MAXIMUM_UTF8_BYTES = 16 * 1_024
+
+export const PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
+  personalMemoryMode: 'off',
+  personalMemoryGroupAllowlist: Object.freeze([]) as readonly string[],
+  personalMemoryRecallMaxItems: 6,
+  personalMemoryRecallMaxTokens: 1_200,
+  personalMemoryRecallTimeoutMs: 150
+})
+
+export const GUOBA_MASKED_SECRET_FIELDS = Object.freeze([
+  'apiKey',
+  'tavilyApiKey',
+  'azSerpKey',
+  'braveSearchApiKey',
+  'amapKey',
+  'githubAPIKey',
+  'azureTTSKey',
+  'sunoSessToken',
+  'sunoClientToken'
+] as const)
+const GUOBA_MASKED_SECRET_FIELD_SET = new Set<string>(GUOBA_MASKED_SECRET_FIELDS)
 
 export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
   'toggleMode',
@@ -32,7 +60,12 @@ export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
   'proxy',
   'headless',
   'chromePath',
-  'diskLogEnabled'
+  'diskLogEnabled',
+  'personalMemoryMode',
+  'personalMemoryGroupAllowlist',
+  'personalMemoryRecallMaxItems',
+  'personalMemoryRecallMaxTokens',
+  'personalMemoryRecallTimeoutMs'
 ])
 
 const SAVED_MESSAGE = '保存成功~'
@@ -63,7 +96,86 @@ function splitList (value: unknown, separator: RegExp): string[] {
   }, [])
 }
 
+function boundedPersonalMemoryInteger (value: unknown, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 ||
+    value > maximum || Object.is(value, -0)) {
+    throw new TypeError('长期记忆召回预算配置无效。')
+  }
+  return value
+}
+
+interface BuildGuobaConfigPatchOptions {
+  readonly current: Readonly<Record<string, unknown>>
+  readonly supportedKeys: readonly string[]
+  readonly virtualKeys?: readonly string[]
+}
+
+function exactDataEntries (value: unknown): readonly (readonly [string, unknown])[] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    utilTypes.isProxy(value)) {
+    throw new TypeError('Guoba 配置数据无效。')
+  }
+  const entries: Array<readonly [string, unknown]> = []
+  for (const key of Object.keys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      throw new TypeError('Guoba 配置数据无效。')
+    }
+    entries.push(Object.freeze([key, descriptor.value] as const))
+  }
+  return Object.freeze(entries)
+}
+
+export function buildGuobaConfigPatch (
+  value: unknown,
+  options: BuildGuobaConfigPatchOptions
+): Readonly<Record<string, unknown>> {
+  if (options.current === null || typeof options.current !== 'object' ||
+    Array.isArray(options.current)) throw new TypeError('Guoba 配置数据无效。')
+  const supported = new Set(options.supportedKeys)
+  const virtual = new Set(options.virtualKeys ?? [])
+  const patch: Record<string, unknown> = {}
+  for (const [key, raw] of exactDataEntries(value)) {
+    if (!supported.has(key) && !virtual.has(key)) continue
+    if (GUOBA_MASKED_SECRET_FIELD_SET.has(key)) {
+      if (raw === '' || raw === null || raw === undefined) continue
+      if (typeof raw !== 'string' || raw.includes('\0') ||
+        Buffer.byteLength(raw, 'utf8') > GUOBA_SECRET_MAXIMUM_UTF8_BYTES) {
+        throw new TypeError('Guoba 密钥配置无效。')
+      }
+    }
+    patch[key] = normalizeGuobaConfigValue(key, raw)
+  }
+  return Object.freeze(patch)
+}
+
 export function normalizeGuobaConfigValue (key: string, value: unknown): unknown {
+  if (key === 'personalMemoryMode') {
+    if (typeof value !== 'string' || !PERSONAL_MEMORY_MODES.has(value)) {
+      throw new TypeError('长期记忆模式配置无效。')
+    }
+    return value
+  }
+
+  if (key === 'personalMemoryMaintenanceAction') {
+    if (typeof value !== 'string' || !PERSONAL_MEMORY_MAINTENANCE_ACTIONS.has(value)) {
+      throw new TypeError('长期记忆维护动作无效。')
+    }
+    return value
+  }
+
+  if (key === 'personalMemoryRecallMaxItems') {
+    return boundedPersonalMemoryInteger(value, 12)
+  }
+
+  if (key === 'personalMemoryRecallMaxTokens') {
+    return boundedPersonalMemoryInteger(value, 2_400)
+  }
+
+  if (key === 'personalMemoryRecallTimeoutMs') {
+    return boundedPersonalMemoryInteger(value, 500)
+  }
+
   if (key === 'apiContextWindowTokens') {
     if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
       value < 0 || value > 1_000_000) {
@@ -121,6 +233,11 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
     return splitList(value, /[,，;；|\s]/)
   }
 
+  if (GROUP_IDENTIFIER_LIST_FIELDS.has(key)) {
+    return splitList(value, /[,，;；|\s]/)
+      .filter(item => /^[1-9]\d{5,9}$/.test(item))
+  }
+
   if (QQ_SCOPE_FIELDS.has(key)) {
     return splitList(value, /[,，;；|\s]/)
       .filter(item => /^\^?[1-9]\d{5,9}(\^[1-9]\d{5,9})?$/.test(item))
@@ -133,3 +250,4 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
 
   return value
 }
+import { types as utilTypes } from 'node:util'

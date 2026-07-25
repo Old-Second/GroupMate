@@ -7,7 +7,10 @@ import {
   selectImportableConfig,
   selectPersistedConfig
 } from '../../src/runtime/config-persistence.js'
-import { normalizeGuobaConfigValue } from '../../src/runtime/guoba-config.js'
+import {
+  GUOBA_MASKED_SECRET_FIELDS,
+  normalizeGuobaConfigValue
+} from '../../src/runtime/guoba-config.js'
 import { buildGuobaSchemas } from '../../src/runtime/guoba-schema.js'
 
 const root = process.cwd()
@@ -139,6 +142,13 @@ const requiredGuobaFields = [
   'groupContextLength',
   'groupMerge',
   'conversationPreserveTime',
+  'personalMemoryMode',
+  'personalMemoryGroupAllowlist',
+  'personalMemoryRecallMaxItems',
+  'personalMemoryRecallMaxTokens',
+  'personalMemoryRecallTimeoutMs',
+  'personalMemoryOperationsStatus',
+  'personalMemoryMaintenanceAction',
   'toolPrivateSendPolicy',
   'toolCrossGroupSendPolicy',
   'enableToolVideoDownload',
@@ -252,6 +262,15 @@ const expectedGuobaGroups = [
     ]
   },
   {
+    label: '长期记忆',
+    fields: [
+      'personalMemoryMode', 'personalMemoryGroupAllowlist',
+      'personalMemoryRecallMaxItems', 'personalMemoryRecallMaxTokens',
+      'personalMemoryRecallTimeoutMs', 'personalMemoryOperationsStatus',
+      'personalMemoryMaintenanceAction'
+    ]
+  },
+  {
     label: '工具与搜索',
     fields: [
       'smartMode', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
@@ -356,12 +375,17 @@ test('Guoba exposes every supported user-facing configuration with an explanatio
 
   for (const field of requiredGuobaFields) {
     assert.equal(fields.has(field), true, `${field} must be configurable in Guoba`)
-    if (field === 'turnConfirm') continue
+    if (field === 'turnConfirm' || field === 'personalMemoryOperationsStatus' ||
+      field === 'personalMemoryMaintenanceAction') continue
     assert.match(configSource, new RegExp(`^  ${field}:`, 'm'), `${field} must have a runtime default`)
     assert.equal(Object.hasOwn(configExample, field), true, `${field} must have a safe example value`)
   }
   assert.doesNotMatch(configSource, /^  turnConfirm:/m)
   assert.equal(Object.hasOwn(configExample, 'turnConfirm'), false)
+  for (const field of ['personalMemoryOperationsStatus', 'personalMemoryMaintenanceAction']) {
+    assert.doesNotMatch(configSource, new RegExp(`^  ${field}:`, 'm'))
+    assert.equal(Object.hasOwn(configExample, field), false)
+  }
 
   for (const [field, schema] of fields) {
     assert.equal(
@@ -557,7 +581,7 @@ test('Guoba external service fields provide actionable setup references', () => 
   assert.match(serpOptions.find(option => option.value === 'azure')?.label ?? '', /退役/)
 })
 
-test('Guoba groups supported settings into nine functional sections', () => {
+test('Guoba groups supported settings into ten functional sections', () => {
   const schemas = buildGuobaSchemas({
     vitsRoleOptions: [],
     voicevoxRoleOptions: [],
@@ -583,6 +607,79 @@ test('Guoba groups supported settings into nine functional sections', () => {
     [...requiredGuobaFields].sort(),
     'the layout must preserve the complete supported field set'
   )
+})
+
+test('long-term memory pilot is default-off, bounded and operationally explicit', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const fields = new Map(schemas.flatMap(schema => (
+    schema.field ? [[schema.field, schema] as const] : []
+  )))
+  const source = await readSource('utils/config.js')
+  const example = JSON.parse(
+    await readSource('config/config.example.json')
+  ) as Record<string, unknown>
+
+  assert.deepEqual(
+    (fields.get('personalMemoryMode')?.componentProps?.options as Array<{ value: string }>)
+      .map(option => option.value),
+    ['off', 'explicit', 'shadow', 'automatic']
+  )
+  assert.equal(example.personalMemoryMode, 'off')
+  assert.match(source, /^  personalMemoryMode: 'off',/m)
+  assert.deepEqual(example.personalMemoryGroupAllowlist, [])
+  assert.deepEqual(fields.get('personalMemoryGroupAllowlist')?.componentProps, {
+    allowAdd: true,
+    closable: true
+  })
+  assert.deepEqual(fields.get('personalMemoryRecallMaxItems')?.componentProps, {
+    min: 1, max: 12, step: 1
+  })
+  assert.deepEqual(fields.get('personalMemoryRecallMaxTokens')?.componentProps, {
+    min: 1, max: 2_400, step: 1
+  })
+  assert.deepEqual(fields.get('personalMemoryRecallTimeoutMs')?.componentProps, {
+    min: 1, max: 500, step: 1
+  })
+  assert.equal(example.personalMemoryRecallMaxItems, 6)
+  assert.equal(example.personalMemoryRecallMaxTokens, 1_200)
+  assert.equal(example.personalMemoryRecallTimeoutMs, 150)
+  assert.equal(fields.get('personalMemoryOperationsStatus')?.componentProps?.disabled, true)
+  assert.deepEqual(
+    (fields.get('personalMemoryMaintenanceAction')?.componentProps?.options as Array<{
+      value: string
+    }>).map(option => option.value),
+    ['none', 'verify', 'rebuild_lexical']
+  )
+
+  for (const field of [
+    'personalMemoryMode', 'personalMemoryGroupAllowlist', 'personalMemoryRecallMaxItems',
+    'personalMemoryRecallMaxTokens', 'personalMemoryRecallTimeoutMs'
+  ]) assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
+  assert.match(fields.get('personalMemoryMode')?.bottomHelpMessage ?? '', /用户.*独立.*加入|opt-in/)
+  assert.match(fields.get('personalMemoryGroupAllowlist')?.bottomHelpMessage ?? '', /空.*群聊.*不允许/)
+  assert.match(fields.get('personalMemoryOperationsStatus')?.bottomHelpMessage ?? '', /不会.*初始化/)
+  assert.match(fields.get('personalMemoryMaintenanceAction')?.bottomHelpMessage ?? '', /不会.*删除/)
+
+  const all = `${source}\n${JSON.stringify(example)}\n${JSON.stringify(schemas)}`
+  assert.doesNotMatch(all, /personalMemory(?:Embedding|Vector|Rerank).*(?:true|enabled)/i)
+})
+
+test('Guoba masks every password field and routes saves through the reviewed patch boundary', async () => {
+  const schemas = buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  })
+  const passwordFields = schemas.flatMap(schema => (
+    schema.component === 'InputPassword' && schema.field !== undefined ? [schema.field] : []
+  )).sort()
+  assert.deepEqual(passwordFields, [...GUOBA_MASKED_SECRET_FIELDS].sort())
+
+  const support = await readSource('guoba.support.js')
+  assert.match(support, /buildGuobaConfigPatch\(data, \{/)
+  assert.match(support, /supportedKeys: supportedConfigKeys/)
+  assert.match(support, /virtualKeys: \['turnConfirm', 'personalMemoryMaintenanceAction'\]/)
+  assert.doesNotMatch(support, /Object\.entries\(data\)/)
 })
 
 test('management and help no longer advertise removed providers', async () => {
