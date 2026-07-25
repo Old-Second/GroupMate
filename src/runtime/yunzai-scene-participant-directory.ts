@@ -258,8 +258,10 @@ YunzaiSceneParticipantDirectoryInputV1
       const accountId = qqId(input.accountId)
       const currentUserId = qqId(event.sender?.user_id ?? event.user_id)
       if (accountId === null || currentUserId === null) return null
-      if (event.isGroup !== true && event.isGroup !== false) return null
-      if (event.isGroup === false) {
+      const hasGroupIdentity = event.group_id !== undefined && event.group_id !== null &&
+        String(event.group_id).trim() !== ''
+      if (event.isGroup !== true && event.isGroup !== false && hasGroupIdentity) return null
+      if (event.isGroup !== true) {
         const current = createSceneParticipantV1(Object.freeze({
           identity: Object.freeze({
             userId: currentUserId,

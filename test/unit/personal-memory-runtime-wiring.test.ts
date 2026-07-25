@@ -597,6 +597,25 @@ test('private directory proves only the current counterpart without member I/O',
   assert.deepEqual(snapshot?.references, [])
 })
 
+test('private directory accepts a host private event without an isGroup discriminator', async () => {
+  let calls = 0
+  const directory = createYunzaiSceneParticipantDirectoryV1()
+  const snapshot = await directory.resolve({
+    event: {
+      user_id: CURRENT_USER_ID,
+      sender: { user_id: CURRENT_USER_ID, nickname: '宿主私聊用户' },
+      bot: { sendApi: async () => { calls += 1; return null } }
+    },
+    messageEvidence: evidence(),
+    accountId: ACCOUNT_ID,
+    observedAt: NOW
+  }, new AbortController().signal)
+  assert.equal(calls, 0)
+  assert.equal(snapshot?.scene.kind, 'private')
+  assert.equal(snapshot?.current.identity.displayName, '宿主私聊用户')
+  assert.deepEqual(snapshot?.references, [])
+})
+
 test('Yunzai directory fails closed on an ambiguous group discriminator', async () => {
   let calls = 0
   const directory = createYunzaiSceneParticipantDirectoryV1()
