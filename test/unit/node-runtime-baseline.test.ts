@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 const root = process.cwd()
 
-test('package declares the deployed Node 22.14 runtime as its exact baseline', async () => {
+test('package declares the deployed Node 22.23.1 runtime as its exact baseline', async () => {
   const packageJson = JSON.parse(
     await readFile(path.join(root, 'package.json'), 'utf8')
   ) as {
@@ -14,7 +14,7 @@ test('package declares the deployed Node 22.14 runtime as its exact baseline', a
     devDependencies?: Record<string, string>
   }
 
-  assert.equal(packageJson.engines?.node, '>=22.14.0')
+  assert.equal(packageJson.engines?.node, '>=22.23.1')
   assert.equal(packageJson.devDependencies?.['@types/node'], '22.14.0')
 })
 
@@ -26,13 +26,13 @@ test('pnpm lockfile pins the same Node type baseline', async () => {
   assert.doesNotMatch(lockfile, /@types\/node@18\.19\.130/)
 })
 
-test('the declared runtime baseline exposes the node:sqlite API used by memory storage', () => {
+test('the declared runtime baseline exposes node:sqlite with FTS5 search', () => {
   const database = new DatabaseSync(':memory:')
   try {
-    database.exec('CREATE TABLE probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT')
+    database.exec('CREATE VIRTUAL TABLE probe USING fts5(value)')
     database.prepare('INSERT INTO probe(value) VALUES (?)').run('ready')
-    const row = database.prepare('SELECT id, value FROM probe').get()
-    assert.equal(row?.id, 1)
+    const row = database.prepare('SELECT rowid, value FROM probe WHERE probe MATCH ?').get('ready')
+    assert.equal(row?.rowid, 1)
     assert.equal(row?.value, 'ready')
   } finally {
     database.close()

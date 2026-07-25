@@ -21,7 +21,7 @@ GroupMate 是一个运行在 Yunzai 体系中的 QQ 群原生交互项目。它�
 
 ## 环境要求
 
-- Node.js 18.18 或更高版本
+- Node.js 22.23.1 或更高版本（需要内置 SQLite 的 FTS5 支持）
 - pnpm 10
 - 可加载 Yunzai 插件的运行环境，例如 TRSS-Yunzai
 
