@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import { findProjectRoot } from '../helpers/project-root.js'
 
 const projectRoot = findProjectRoot(import.meta.url)
-const runtimeRoots = ['apps', 'client', 'model', 'server', 'utils']
+const runtimeRoots = ['apps', 'client', 'server', 'src', 'utils']
 
 async function collectRuntimeSources (directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true })
