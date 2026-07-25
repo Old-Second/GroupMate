@@ -123,7 +123,6 @@ function linkedTimeoutSignal(callerSignal, durationMs) {
     const timer = setTimeout(() => {
         controller.abort(new DOMException('completion timed out', 'TimeoutError'));
     }, durationMs);
-    timer.unref?.();
     return Object.freeze({
         signal: controller.signal,
         dispose: () => {

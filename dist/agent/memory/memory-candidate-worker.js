@@ -282,7 +282,6 @@ async function withTimeout(operation, callerSignal) {
             controller.abort(new CandidateTimeoutErrorV1());
             reject(new CandidateTimeoutErrorV1());
         }, MEMORY_CANDIDATE_EXTRACTION_TIMEOUT_MS_V1);
-        timeout.unref?.();
     });
     const operationPromise = Promise.resolve().then(async () => await operation(controller.signal));
     void operationPromise.catch(() => undefined);

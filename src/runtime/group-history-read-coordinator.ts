@@ -248,7 +248,6 @@ export class GroupHistoryReadCoordinator {
     try {
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(GROUP_HISTORY_TIMEOUT), this.#timeoutMs)
-        timer.unref?.()
       })
       return await Promise.race([operation, timeout])
     } catch (error) {
