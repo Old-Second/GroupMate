@@ -38,6 +38,49 @@ test('the context estimator is versioned and uses canonical UTF-8 message JSON',
   assert.equal(Object.isFrozen(canonical[0]), true)
 })
 
+test('canonical model messages preserve valid user image URLs and omit empty image lists', () => {
+  const messages = deepFreeze([
+    {
+      role: 'user' as const,
+      content: '请描述图片',
+      imageUrls: ['https://cdn.example.test/image.png']
+    },
+    {
+      role: 'user' as const,
+      content: '没有图片',
+      imageUrls: []
+    }
+  ])
+  const canonical = canonicalizeModelMessages(messages)
+
+  assert.deepEqual(canonical, [
+    {
+      role: 'user',
+      content: '请描述图片',
+      imageUrls: ['https://cdn.example.test/image.png']
+    },
+    { role: 'user', content: '没有图片' }
+  ])
+  assert.equal(
+    serializeModelMessages(messages),
+    '[{"role":"user","content":"请描述图片","imageUrls":["https://cdn.example.test/image.png"]},{"role":"user","content":"没有图片"}]'
+  )
+})
+
+test('canonical model messages reject non-public or invalid image URLs', () => {
+  const invalidMessages = [
+    [{ role: 'user', content: 'question', imageUrls: ['data:image/png;base64,AAAA'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['ftp://cdn.example.test/image.jpg'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://user:pass@cdn.example.test/image.jpg'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://cdn.example.test/image.jpg#fragment'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://cdn.example.test/image.jpg', 'https://cdn.example.test/image.jpg'] }]
+  ] as const
+
+  for (const messages of invalidMessages) {
+    assert.throws(() => canonicalizeModelMessages(deepFreeze(messages)), TypeError)
+  }
+})
+
 test('canonical message bytes accept exactly 512 KiB and reject one byte more', () => {
   const empty = deepFreeze([{ role: 'user' as const, content: '' }])
   const overhead = serializedModelMessagesBytes(empty)

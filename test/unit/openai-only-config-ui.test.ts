@@ -337,7 +337,7 @@ test('default and example configuration expose only the supported provider', asy
   }
   assert.doesNotMatch(source, /getGeminiKey|pureSydneyInstruction|defaultChatGPTAPI|officialChatGPTAPI/)
   assert.match(source, /^  openAiCompatibilityProfile: 'standard',/m)
-  assert.equal(example.openAiCompatibilityProfile, 'standard')
+  assert.equal(example.openAiCompatibilityProfile, 'deepseek')
 })
 
 test('Guoba and legacy settings view expose supported API, TTS and tool fields only', async () => {

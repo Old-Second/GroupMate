@@ -1,4 +1,5 @@
 import { types as utilTypes } from 'node:util';
+import { MAX_MODEL_IMAGE_URLS, publicModelImageUrl } from '../model/model-adapter.js';
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js';
 export const CONTEXT_TOKEN_ESTIMATOR_VERSION = 'context-byte-quarter-v1';
 export const MAX_CONTEXT_CANONICAL_MESSAGE_BYTES = 512 * 1_024;
@@ -295,13 +296,33 @@ function parseProviderState(value, state) {
     });
 }
 function parseModelMessage(value, state) {
-    const base = inspectContextRecord(value, ['role'], ['content', 'toolCalls', 'providerState', 'toolCallId']);
+    const base = inspectContextRecord(value, ['role'], ['content', 'toolCalls', 'providerState', 'toolCallId', 'imageUrls']);
     switch (base.role) {
         case 'system':
         case 'developer':
         case 'user': {
-            const input = inspectContextRecord(value, ['role', 'content']);
-            return Object.freeze({ role: base.role, content: normalizeContextString(input.content) });
+            const input = inspectContextRecord(value, ['role', 'content'], base.role === 'user' ? ['imageUrls'] : []);
+            if (base.role !== 'user' || input.imageUrls === undefined) {
+                return Object.freeze({ role: base.role, content: normalizeContextString(input.content) });
+            }
+            let imageUrls;
+            try {
+                imageUrls = inspectContextArray(input.imageUrls, MAX_MODEL_IMAGE_URLS)
+                    .map(value => publicModelImageUrl(value));
+            }
+            catch {
+                return invalidContextValue();
+            }
+            if (imageUrls.length !== new Set(imageUrls).size)
+                return invalidContextValue();
+            if (imageUrls.length === 0) {
+                return Object.freeze({ role: base.role, content: normalizeContextString(input.content) });
+            }
+            return Object.freeze({
+                role: 'user',
+                content: normalizeContextString(input.content),
+                imageUrls: Object.freeze(imageUrls)
+            });
         }
         case 'assistant': {
             const input = inspectContextRecord(value, ['role', 'content'], ['toolCalls', 'providerState']);
@@ -366,7 +387,9 @@ function modelMessageJson(message) {
         case 'system':
         case 'developer':
         case 'user':
-            return `{"role":${JSON.stringify(message.role)},"content":${JSON.stringify(message.content)}}`;
+            return `{"role":${JSON.stringify(message.role)},"content":${JSON.stringify(message.content)}${message.role === 'user' && message.imageUrls !== undefined
+                ? `,"imageUrls":[${message.imageUrls.map(url => JSON.stringify(url)).join(',')}]`
+                : ''}}`;
         case 'assistant': {
             const fields = [
                 `"role":"assistant"`,

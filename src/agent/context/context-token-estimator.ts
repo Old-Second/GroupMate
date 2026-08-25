@@ -4,6 +4,10 @@ import type {
   ModelAssistantToolCall,
   ModelMessage
 } from '../model/model-adapter.js'
+import {
+  MAX_MODEL_IMAGE_URLS,
+  publicModelImageUrl
+} from '../model/model-adapter.js'
 import type { ProviderTurnState } from '../run/provider-state.js'
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 
@@ -315,13 +319,39 @@ function parseProviderState (value: unknown, state: WalkState): ProviderTurnStat
 }
 
 function parseModelMessage (value: unknown, state: WalkState): ModelMessage {
-  const base = inspectContextRecord(value, ['role'], ['content', 'toolCalls', 'providerState', 'toolCallId'])
+  const base = inspectContextRecord(
+    value,
+    ['role'],
+    ['content', 'toolCalls', 'providerState', 'toolCallId', 'imageUrls']
+  )
   switch (base.role) {
     case 'system':
     case 'developer':
     case 'user': {
-      const input = inspectContextRecord(value, ['role', 'content'])
-      return Object.freeze({ role: base.role, content: normalizeContextString(input.content) })
+      const input = inspectContextRecord(
+        value,
+        ['role', 'content'],
+        base.role === 'user' ? ['imageUrls'] : []
+      )
+      if (base.role !== 'user' || input.imageUrls === undefined) {
+        return Object.freeze({ role: base.role, content: normalizeContextString(input.content) })
+      }
+      let imageUrls: string[]
+      try {
+        imageUrls = inspectContextArray(input.imageUrls, MAX_MODEL_IMAGE_URLS)
+          .map(value => publicModelImageUrl(value))
+      } catch {
+        return invalidContextValue()
+      }
+      if (imageUrls.length !== new Set(imageUrls).size) return invalidContextValue()
+      if (imageUrls.length === 0) {
+        return Object.freeze({ role: base.role, content: normalizeContextString(input.content) })
+      }
+      return Object.freeze({
+        role: 'user' as const,
+        content: normalizeContextString(input.content),
+        imageUrls: Object.freeze(imageUrls)
+      })
     }
     case 'assistant': {
       const input = inspectContextRecord(value, ['role', 'content'], ['toolCalls', 'providerState'])
@@ -384,7 +414,11 @@ function modelMessageJson (message: ModelMessage): string {
     case 'system':
     case 'developer':
     case 'user':
-      return `{"role":${JSON.stringify(message.role)},"content":${JSON.stringify(message.content)}}`
+      return `{"role":${JSON.stringify(message.role)},"content":${JSON.stringify(message.content)}${
+        message.role === 'user' && message.imageUrls !== undefined
+          ? `,"imageUrls":[${message.imageUrls.map(url => JSON.stringify(url)).join(',')}]`
+          : ''
+      }}`
     case 'assistant': {
       const fields = [
         `"role":"assistant"`,

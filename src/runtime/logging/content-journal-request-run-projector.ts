@@ -161,8 +161,18 @@ function projectRequest (
 function parseModelMessage (value: JsonValue): void {
   const input = jsonObject(value, 'model message') as UnknownRecord
   if (input.role === 'system' || input.role === 'developer' || input.role === 'user') {
-    exactKeys(input, ['role', 'content'], ['role', 'content'], 'model message')
+    exactKeys(
+      input,
+      input.role === 'user' ? ['role', 'content', 'imageUrls'] : ['role', 'content'],
+      ['role', 'content'],
+      'model message'
+    )
     text(input.content, 'model message content', true)
+    if (input.role === 'user' && input.imageUrls !== undefined) {
+      for (const imageUrl of jsonArray(input.imageUrls, 8, 'model image URLs')) {
+        text(imageUrl, 'model image URL')
+      }
+    }
     return
   }
   if (input.role === 'tool') {

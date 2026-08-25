@@ -146,6 +146,73 @@ test('standard profile disables tools without mutating input', async () => {
   })
 })
 
+test('vision messages keep text content as a string when no image is present', () => {
+  const body = buildImmutableChatRequest(
+    frozenRequest(),
+    deepSeekCompatibilityProfile
+  )
+  const messages = body.messages as Array<Record<string, unknown>>
+  assert.equal(messages[1]?.role, 'user')
+  assert.equal(messages[1]?.content, 'fixture question')
+})
+
+test('vision messages encode external image URLs as OpenAI-compatible content blocks', () => {
+  const body = buildImmutableChatRequest(
+    frozenRequest({
+      messages: [
+        { role: 'system', content: 'fixture system' },
+        {
+          role: 'user',
+          content: '这张图里有什么？',
+          imageUrls: [
+            'https://cdn.example.test/one.jpg',
+            'http://cdn.example.test/two.webp'
+          ]
+        }
+      ]
+    }),
+    deepSeekCompatibilityProfile
+  )
+  const messages = body.messages as Array<Record<string, unknown>>
+  const content = messages[1]?.content as Array<Record<string, unknown>>
+  assert.deepEqual(content, [
+    { type: 'text', text: '这张图里有什么？' },
+    {
+      type: 'image_url',
+      image_url: { url: 'https://cdn.example.test/one.jpg' }
+    },
+    {
+      type: 'image_url',
+      image_url: { url: 'http://cdn.example.test/two.webp' }
+    }
+  ])
+})
+
+test('vision messages reject unsafe, duplicated, oversized and excessive image URLs', () => {
+  const invalidMessages = [
+    [{ role: 'user', content: 'question', imageUrls: ['ftp://cdn.example.test/image.jpg'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://user:pass@cdn.example.test/image.jpg'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://cdn.example.test/image.jpg#fragment'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://cdn.example.test/image.jpg', 'https://cdn.example.test/image.jpg'] }],
+    [{ role: 'user', content: 'question', imageUrls: ['https://cdn.example.test/'.padEnd(8_193, 'x')] }],
+    [{
+      role: 'user',
+      content: 'question',
+      imageUrls: Array.from({ length: 9 }, (_, index) => `https://cdn.example.test/${index}.jpg`)
+    }]
+  ] as const
+
+  for (const messages of invalidMessages) {
+    assert.throws(
+      () => buildImmutableChatRequest(
+        frozenRequest({ messages }),
+        deepSeekCompatibilityProfile
+      ),
+      isProviderError('provider_invalid_request', false)
+    )
+  }
+})
+
 test('standard metadata is wire-neutral while DeepSeek emits one exact top-level user_id', async () => {
   const metadata: ProviderRequestMetadata = Object.freeze({
     cacheIsolationId: CACHE_ISOLATION_ID

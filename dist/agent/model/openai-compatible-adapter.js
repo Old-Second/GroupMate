@@ -1,6 +1,6 @@
 import { createParser } from 'eventsource-parser';
 import { jsonByteLength, parseJsonValue } from './json-value.js';
-import { ModelProviderError, modelProtocolError, modelRequestError, parseProviderRequestMetadata } from './model-adapter.js';
+import { ModelProviderError, modelProtocolError, modelRequestError, parseProviderRequestMetadata, MAX_MODEL_IMAGE_URLS, publicModelImageUrl } from './model-adapter.js';
 import { asWireRecord, iterateResponseBytes, readBoundedResponseText, readBoundedWireError } from './openai-wire.js';
 import { normalizeCompleteToolCalls, SseToolCallAccumulator } from './sse-tool-call-accumulator.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
@@ -133,13 +133,36 @@ function wireToolCall(call) {
     });
 }
 function wireMessage(message, profile) {
-    if (message.role === 'system' || message.role === 'developer' || message.role === 'user') {
+    if (message.role === 'system' || message.role === 'developer') {
         const role = message.role === 'developer' && !profile.capabilities.supportsDeveloperRole
             ? 'system'
             : message.role;
         return Object.freeze({
             role,
             content: assertString(message.content, 'invalid_model_message_content', RUN_RESOURCE_LIMITS.requestBytes)
+        });
+    }
+    if (message.role === 'user') {
+        const content = assertString(message.content, 'invalid_model_message_content', RUN_RESOURCE_LIMITS.requestBytes);
+        const imageUrls = message.imageUrls ?? [];
+        if (!Array.isArray(imageUrls) || imageUrls.length > MAX_MODEL_IMAGE_URLS) {
+            throw modelRequestError('invalid_model_image_urls');
+        }
+        const uniqueImageUrls = [...new Set(imageUrls.map(publicModelImageUrl))];
+        if (uniqueImageUrls.length !== imageUrls.length) {
+            throw modelRequestError('invalid_model_image_urls');
+        }
+        if (uniqueImageUrls.length === 0)
+            return Object.freeze({ role: 'user', content });
+        return Object.freeze({
+            role: 'user',
+            content: Object.freeze([
+                Object.freeze({ type: 'text', text: content }),
+                ...uniqueImageUrls.map(url => Object.freeze({
+                    type: 'image_url',
+                    image_url: Object.freeze({ url })
+                }))
+            ])
         });
     }
     if (message.role === 'tool') {

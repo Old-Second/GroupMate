@@ -1,6 +1,27 @@
 import { types as utilTypes } from 'node:util';
 import { AgentError } from '../contracts/error.js';
 const CACHE_ISOLATION_ID = /^gm_[gu]_[A-Za-z0-9_-]{43}$/;
+export const MAX_MODEL_IMAGE_URLS = 8;
+export const MAX_MODEL_IMAGE_URL_LENGTH = 8_192;
+const PUBLIC_IMAGE_URL = /^https?:$/i;
+export function publicModelImageUrl(value) {
+    if (typeof value !== 'string' || value.length === 0 ||
+        value.length > MAX_MODEL_IMAGE_URL_LENGTH) {
+        throw modelRequestError('invalid_model_image_url');
+    }
+    let url;
+    try {
+        url = new URL(value);
+    }
+    catch {
+        throw modelRequestError('invalid_model_image_url');
+    }
+    if (!PUBLIC_IMAGE_URL.test(url.protocol) || url.username !== '' ||
+        url.password !== '' || url.hash !== '') {
+        throw modelRequestError('invalid_model_image_url');
+    }
+    return value;
+}
 export function parseProviderRequestMetadata(value) {
     if (value === null || typeof value !== 'object' || utilTypes.isProxy(value) ||
         Array.isArray(value)) {

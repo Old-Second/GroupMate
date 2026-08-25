@@ -18,7 +18,9 @@ import {
   type ModelRequest,
   type ModelTurn,
   type ModelUsage,
-  type NormalizedToolCall
+  type NormalizedToolCall,
+  MAX_MODEL_IMAGE_URLS,
+  publicModelImageUrl
 } from './model-adapter.js'
 import type {
   ModelErrorOverride,
@@ -194,13 +196,39 @@ function wireMessage (
   message: ModelMessage,
   profile: OpenAICompatibleProfile
 ): JsonObject {
-  if (message.role === 'system' || message.role === 'developer' || message.role === 'user') {
+  if (message.role === 'system' || message.role === 'developer') {
     const role = message.role === 'developer' && !profile.capabilities.supportsDeveloperRole
       ? 'system'
       : message.role
     return Object.freeze({
       role,
       content: assertString(message.content, 'invalid_model_message_content', RUN_RESOURCE_LIMITS.requestBytes)
+    })
+  }
+  if (message.role === 'user') {
+    const content = assertString(
+      message.content,
+      'invalid_model_message_content',
+      RUN_RESOURCE_LIMITS.requestBytes
+    )
+    const imageUrls = message.imageUrls ?? []
+    if (!Array.isArray(imageUrls) || imageUrls.length > MAX_MODEL_IMAGE_URLS) {
+      throw modelRequestError('invalid_model_image_urls')
+    }
+    const uniqueImageUrls = [...new Set(imageUrls.map(publicModelImageUrl))]
+    if (uniqueImageUrls.length !== imageUrls.length) {
+      throw modelRequestError('invalid_model_image_urls')
+    }
+    if (uniqueImageUrls.length === 0) return Object.freeze({ role: 'user', content })
+    return Object.freeze({
+      role: 'user',
+      content: Object.freeze([
+        Object.freeze({ type: 'text', text: content }),
+        ...uniqueImageUrls.map(url => Object.freeze({
+          type: 'image_url',
+          image_url: Object.freeze({ url })
+        }))
+      ])
     })
   }
   if (message.role === 'tool') {

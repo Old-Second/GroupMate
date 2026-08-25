@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { parseRunAdvanceResult } from '../agent/contracts/result.js';
+import { publicModelImageUrl } from '../agent/model/model-adapter.js';
 import { recoveredLegacyRoute } from '../agent/contracts/interaction.js';
 import { RunAdmissionRejectionError } from '../agent/run/run-admission.js';
 import { RunReferenceConflictError } from '../agent/run/run-store.js';
@@ -279,8 +280,22 @@ function modelMessageFor(item) {
     const content = messageText(item.message);
     if (item.message.role === 'system')
         return Object.freeze({ role: 'system', content });
-    if (item.message.role === 'user')
-        return Object.freeze({ role: 'user', content });
+    if (item.message.role === 'user') {
+        const imageUrls = Object.freeze(item.message.parts
+            .filter((part) => (part.type === 'resource_ref' && part.resourceType === 'image'))
+            .map(part => {
+            try {
+                return publicModelImageUrl(part.resourceId);
+            }
+            catch {
+                return null;
+            }
+        })
+            .filter((value) => value !== null));
+        return imageUrls.length === 0
+            ? Object.freeze({ role: 'user', content })
+            : Object.freeze({ role: 'user', content, imageUrls });
+    }
     if (item.message.role === 'assistant')
         return Object.freeze({ role: 'assistant', content });
     throw new AgentError({
@@ -321,9 +336,16 @@ function coalesceModelMessages(messages) {
         const previous = result.at(-1);
         if (role !== null && previous !== undefined &&
             mergeableTextRole(previous) === role) {
+            const imageUrls = role === 'user'
+                ? Object.freeze([...new Set([
+                        ...(previous.role === 'user' ? previous.imageUrls ?? [] : []),
+                        ...(message.role === 'user' ? message.imageUrls ?? [] : [])
+                    ])])
+                : undefined;
             result[result.length - 1] = Object.freeze({
                 role,
-                content: `${previous.content ?? ''}\n\n${message.content ?? ''}`
+                content: `${previous.content ?? ''}\n\n${message.content ?? ''}`,
+                ...(imageUrls === undefined || imageUrls.length === 0 ? {} : { imageUrls })
             });
         }
         else {

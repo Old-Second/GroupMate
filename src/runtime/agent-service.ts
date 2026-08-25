@@ -20,6 +20,7 @@ import type {
   ModelMessage,
   ModelProviderError
 } from '../agent/model/model-adapter.js'
+import { publicModelImageUrl } from '../agent/model/model-adapter.js'
 import type { ModelCapabilityOverride } from '../agent/model/model-capability.js'
 import type {
   PresentationRouteV1,
@@ -496,7 +497,23 @@ function modelMessageFor (item: ContextItem): ModelMessage {
   if (item.modelMessage !== undefined) return item.modelMessage
   const content = messageText(item.message)
   if (item.message.role === 'system') return Object.freeze({ role: 'system', content })
-  if (item.message.role === 'user') return Object.freeze({ role: 'user', content })
+  if (item.message.role === 'user') {
+    const imageUrls = Object.freeze(item.message.parts
+      .filter((part): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
+        part.type === 'resource_ref' && part.resourceType === 'image'
+      ))
+      .map(part => {
+        try {
+          return publicModelImageUrl(part.resourceId)
+        } catch {
+          return null
+        }
+      })
+      .filter((value): value is string => value !== null))
+    return imageUrls.length === 0
+      ? Object.freeze({ role: 'user', content })
+      : Object.freeze({ role: 'user', content, imageUrls })
+  }
   if (item.message.role === 'assistant') return Object.freeze({ role: 'assistant', content })
   throw new AgentError({
     code: 'invalid_session',
@@ -539,9 +556,16 @@ function coalesceModelMessages (
     const previous = result.at(-1)
     if (role !== null && previous !== undefined &&
       mergeableTextRole(previous) === role) {
+      const imageUrls = role === 'user'
+        ? Object.freeze([...new Set([
+            ...(previous.role === 'user' ? previous.imageUrls ?? [] : []),
+            ...(message.role === 'user' ? message.imageUrls ?? [] : [])
+          ])])
+        : undefined
       result[result.length - 1] = Object.freeze({
         role,
-        content: `${previous.content ?? ''}\n\n${message.content ?? ''}`
+        content: `${previous.content ?? ''}\n\n${message.content ?? ''}`,
+        ...(imageUrls === undefined || imageUrls.length === 0 ? {} : { imageUrls })
       }) as ModelMessage
     } else {
       result.push(message)

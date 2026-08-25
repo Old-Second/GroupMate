@@ -15,6 +15,7 @@ import {
 import type { AgentEvent } from '../contracts/event.js'
 import { parseAgentEvent } from '../contracts/event.js'
 import type { ModelMessage, ModelReasoningOptions } from '../model/model-adapter.js'
+import { publicModelImageUrl, MAX_MODEL_IMAGE_URLS } from '../model/model-adapter.js'
 import {
   modelCapabilityStableHash,
   parseModelCapabilitySnapshot,
@@ -435,8 +436,27 @@ function validateModelMessages (
   for (const raw of value) {
     const message = record(raw, 'run model message')
     if (['system', 'developer', 'user'].includes(String(message.role))) {
-      exactKeys(message, ['role', 'content'], ['role', 'content'], 'model message')
+      exactKeys(
+        message,
+        message.role === 'user' ? ['role', 'content', 'imageUrls'] : ['role', 'content'],
+        ['role', 'content'],
+        'model message'
+      )
       boundedString(message.content, 'model message content')
+      if (message.role === 'user' && message.imageUrls !== undefined) {
+        if (!Array.isArray(message.imageUrls) || message.imageUrls.length > MAX_MODEL_IMAGE_URLS) {
+          throw new TypeError('model message image URLs are invalid')
+        }
+        let imageUrls: string[]
+        try {
+          imageUrls = message.imageUrls.map(publicModelImageUrl)
+        } catch {
+          throw new TypeError('model message image URLs are invalid')
+        }
+        if (imageUrls.length !== new Set(imageUrls).size) {
+          throw new TypeError('model message image URLs are duplicated')
+        }
+      }
       continue
     }
     if (message.role === 'tool') {
