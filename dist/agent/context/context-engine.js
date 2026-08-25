@@ -1,4 +1,5 @@
 import { AgentError } from '../contracts/error.js';
+import { publicModelImageUrl } from '../model/model-adapter.js';
 import { createContextSpanV1, domainSeparatedContextHash, MAX_CONTEXT_SPANS } from './context-span.js';
 import { MAX_CONTEXT_PLANNER_INPUT_BYTES, planModelTurn } from './context-planner.js';
 import { asciiContextCompare, canonicalizeModelMessages, CONTEXT_TOKEN_ESTIMATOR_VERSION } from './context-token-estimator.js';
@@ -184,6 +185,23 @@ function sourcePriority(source) {
         return 'normal';
     return 'low';
 }
+function modelImageUrls(message) {
+    if (message.role !== 'user')
+        return Object.freeze([]);
+    const imageUrls = [];
+    for (const part of message.parts) {
+        if (part.type !== 'resource_ref' || part.resourceType !== 'image')
+            continue;
+        try {
+            const imageUrl = publicModelImageUrl(part.resourceId);
+            imageUrls.push(imageUrl);
+        }
+        catch {
+            // Invalid or non-public resources remain represented by the text projection only.
+        }
+    }
+    return Object.freeze(imageUrls);
+}
 function ordinaryModelMessage(item) {
     const content = messageText(item.message);
     if (item.source === 'system_instruction') {
@@ -192,7 +210,10 @@ function ordinaryModelMessage(item) {
     if (item.source === 'session_history' && item.message.role === 'assistant') {
         return Object.freeze({ role: 'assistant', content });
     }
-    return Object.freeze({ role: 'user', content });
+    const imageUrls = modelImageUrls(item.message);
+    return imageUrls.length === 0
+        ? Object.freeze({ role: 'user', content })
+        : Object.freeze({ role: 'user', content, imageUrls });
 }
 function safeOrdinaryItem(item, source, trust, modelMessage) {
     if (modelMessage.role === 'tool') {

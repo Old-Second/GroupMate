@@ -1,6 +1,9 @@
 import { AgentError } from '../contracts/error.js'
 import type { AgentContentPart, AgentMessage } from '../contracts/content.js'
-import type { ModelMessage } from '../model/model-adapter.js'
+import {
+  publicModelImageUrl,
+  type ModelMessage
+} from '../model/model-adapter.js'
 import type { ContextBudget, ContextSnapshot } from './context-budget.js'
 import type {
   ContextInput,
@@ -241,6 +244,21 @@ function sourcePriority (source: ContextSource): ContextSpanPriority {
   return 'low'
 }
 
+function modelImageUrls (message: AgentMessage): readonly string[] {
+  if (message.role !== 'user') return Object.freeze([])
+  const imageUrls: string[] = []
+  for (const part of message.parts) {
+    if (part.type !== 'resource_ref' || part.resourceType !== 'image') continue
+    try {
+      const imageUrl = publicModelImageUrl(part.resourceId)
+      imageUrls.push(imageUrl)
+    } catch {
+      // Invalid or non-public resources remain represented by the text projection only.
+    }
+  }
+  return Object.freeze(imageUrls)
+}
+
 function ordinaryModelMessage (item: ContextItem): ModelMessage {
   const content = messageText(item.message)
   if (item.source === 'system_instruction') {
@@ -249,7 +267,10 @@ function ordinaryModelMessage (item: ContextItem): ModelMessage {
   if (item.source === 'session_history' && item.message.role === 'assistant') {
     return Object.freeze({ role: 'assistant' as const, content })
   }
-  return Object.freeze({ role: 'user' as const, content })
+  const imageUrls = modelImageUrls(item.message)
+  return imageUrls.length === 0
+    ? Object.freeze({ role: 'user' as const, content })
+    : Object.freeze({ role: 'user' as const, content, imageUrls })
 }
 
 function safeOrdinaryItem (

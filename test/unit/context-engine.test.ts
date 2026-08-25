@@ -379,6 +379,44 @@ test('ordinary compatibility mapping preserves source order and safe session ass
   ])
 })
 
+test('ordinary current requests preserve public user image resources in prepared model messages', async () => {
+  const imageUrl = 'https://cdn.example.test/current.png'
+  const current = item('current', 'current_request', '请描述图片')
+  const currentWithImage = Object.freeze({
+    ...current,
+    message: Object.freeze({
+      ...current.message,
+      parts: Object.freeze([
+        ...current.message.parts,
+        Object.freeze({
+          type: 'resource_ref' as const,
+          resourceType: 'image' as const,
+          resourceId: imageUrl
+        })
+      ])
+    })
+  })
+  const contextInput = input({ currentRequest: currentWithImage })
+  const engine = new ContextEngine({ estimator })
+  const snapshot = await engine.prepare(contextInput, budget(100))
+  const projected = snapshot.items.find(value => value.id === 'current')
+  const currentMessage = projected?.modelMessage
+
+  assert.deepEqual(currentMessage, {
+    role: 'user',
+    content: `请描述图片\n[image: ${imageUrl}]`,
+    imageUrls: [imageUrl]
+  })
+  assert.equal(Object.isFrozen(currentMessage), true)
+  if (currentMessage?.role === 'user') {
+    assert.equal(Object.isFrozen(currentMessage.imageUrls), true)
+  }
+
+  const currentSpan = engine.projectSourceSpans(contextInput, 'run:image-projection')
+    .find(span => span.source === 'current_request')
+  assert.deepEqual(currentSpan?.messages[0], currentMessage)
+})
+
 test('strict planner pressure never splits a selected legacy atomic group', async () => {
   const atomic = [1, 2, 3].map(index => item(
     `atomic-${index}`,
