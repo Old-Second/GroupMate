@@ -130,7 +130,8 @@ if (module) {
     if (Config.cloudTranscode) {
       logger.warn('未安装node-silk，将尝试使用云转码服务进行合成')
     } else {
-      Config.debug && logger.error('groupmate.tts.silk_module_unavailable')
+      // 语音仍可走 ffmpeg 或云转码，这里只是能力缺失提示，不是运行故障
+      Config.debug && logger.warn('groupmate.tts.silk_module_unavailable')
       logger.warn('未安装node-silk，如ffmpeg不支持amr编码请安装node-silk以支持语音模式')
     }
   }
