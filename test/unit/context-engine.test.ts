@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import type { AgentContentPart, AgentMessage } from '../../src/agent/contracts/content.js'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
+import { resourceReferenceLabel } from '../../src/agent/contracts/content-projection.js'
 import type {
   ContextInput,
   ContextItem,
@@ -404,7 +405,7 @@ test('ordinary current requests preserve public user image resources in prepared
 
   assert.deepEqual(currentMessage, {
     role: 'user',
-    content: `请描述图片\n[image: ${imageUrl}]`,
+    content: `请描述图片\n[image: #${resourceReferenceLabel('message-current', 1)}]`,
     imageUrls: [imageUrl]
   })
   assert.equal(Object.isFrozen(currentMessage), true)
@@ -475,12 +476,12 @@ test('a declared resource expiry drops the image input and keeps the text', asyn
 
   assert.deepEqual(projected('live'), {
     role: 'user',
-    content: `看这张\n[image: ${liveUrl}]`,
+    content: `看这张\n[image: #${resourceReferenceLabel('message-live', 1)}]`,
     imageUrls: [liveUrl]
   })
   assert.deepEqual(projected('expired'), {
     role: 'user',
-    content: `还有这张\n[image: ${expiredUrl}]`
+    content: `还有这张\n[image: #${resourceReferenceLabel('message-expired', 1)}]`
   })
 })
 
@@ -509,7 +510,7 @@ test('an image input without a declared expiry is replayed as captured', async (
 
   assert.deepEqual(snapshot.items.find(value => value.id === 'old')?.modelMessage, {
     role: 'user',
-    content: `看这张\n[image: ${imageUrl}]`,
+    content: `看这张\n[image: #${resourceReferenceLabel('message-old', 1)}]`,
     imageUrls: [imageUrl]
   })
 })
@@ -536,9 +537,84 @@ test('image inputs survive when the message instant cannot be parsed', async () 
 
   assert.deepEqual(snapshot.items.find(value => value.id === 'current')?.modelMessage, {
     role: 'user',
-    content: `这是什么\n[image: ${imageUrl}]`,
+    content: `这是什么\n[image: #${resourceReferenceLabel('message-current', 1)}]`,
     imageUrls: [imageUrl]
   })
+})
+
+test('a rotated host signature leaves the replayed text projection byte-identical', async () => {
+  // What the host serves once its scene key rotates: same file, new signature.
+  const signedUrl = (key: string): string => (
+    'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE-A&rkey=' + key
+  )
+  const withImages = (id: string, urls: readonly string[]): ContextItem => {
+    const base = item(id, 'session_history', '看这两张', undefined, '2026-07-13T00:00:00.000Z')
+    return deepFreeze({
+      ...base,
+      message: {
+        ...base.message,
+        parts: [
+          ...base.message.parts,
+          ...urls.map(resourceId => ({
+            type: 'resource_ref' as const,
+            resourceType: 'image' as const,
+            resourceId
+          }))
+        ]
+      }
+    })
+  }
+  const secondUrl = (key: string): string => (
+    'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=FILE-B&rkey=' + key
+  )
+  const prepared = async (key: string) => {
+    const contextInput = input({
+      sessionHistory: [withImages('history', [signedUrl(key), secondUrl(key)])],
+      currentRequest: item('current', 'current_request', '继续说', undefined, '2026-07-13T00:10:00.000Z')
+    })
+    const engine = new ContextEngine({ estimator })
+    const snapshot = await engine.prepare(contextInput, budget(100))
+    return {
+      modelMessage: snapshot.items.find(value => value.id === 'history')?.modelMessage,
+      contentHash: engine.projectSourceSpans(contextInput, 'run:rotation')
+        .find(span => span.source === 'session_history')?.sourceRefs[0]?.contentHash
+    }
+  }
+  const before = await prepared('CAPTURED_KEY_0000')
+  const after = await prepared('ROTATED_KEY_1111')
+  const beforeMessage = before.modelMessage
+  const afterMessage = after.modelMessage
+
+  assert.equal(typeof beforeMessage?.content, 'string')
+  assert.equal(afterMessage?.content, beforeMessage?.content)
+  assert.equal(
+    afterMessage?.content,
+    '看这两张' +
+      `\n[image: #${resourceReferenceLabel('message-history', 1)}]` +
+      `\n[image: #${resourceReferenceLabel('message-history', 2)}]`
+  )
+  // Two images in one message stay distinguishable.
+  assert.notEqual(
+    resourceReferenceLabel('message-history', 1),
+    resourceReferenceLabel('message-history', 2)
+  )
+  // The signature never reaches the text, and the images still reach the request.
+  for (const message of [beforeMessage, afterMessage]) {
+    assert.equal(String(message?.content).includes('rkey'), false)
+    assert.equal(String(message?.content).includes('KEY'), false)
+  }
+  if (beforeMessage?.role !== 'user' || afterMessage?.role !== 'user') {
+    throw new Error('replayed history must project as a user message')
+  }
+  assert.deepEqual(beforeMessage.imageUrls, [
+    signedUrl('CAPTURED_KEY_0000'), secondUrl('CAPTURED_KEY_0000')
+  ])
+  assert.deepEqual(afterMessage.imageUrls, [
+    signedUrl('ROTATED_KEY_1111'), secondUrl('ROTATED_KEY_1111')
+  ])
+  // The legacy span content hash rides on the same projection, so it is stable too.
+  assert.equal(typeof before.contentHash, 'string')
+  assert.equal(after.contentHash, before.contentHash)
 })
 
 test('strict planner pressure never splits a selected legacy atomic group', async () => {

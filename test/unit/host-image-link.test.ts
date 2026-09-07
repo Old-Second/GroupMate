@@ -543,7 +543,8 @@ class UnusedToolRuntime implements ToolRuntime {
 
 function replayService (
   liveness: HostImageLinkLiveness,
-  requests: ModelRequest[]
+  requests: ModelRequest[],
+  groupKey: () => string = () => GROUP_KEY
 ): AgentService {
   const redis = new FakeRedis(() => Date.parse(requestedAt))
   const runStore = new InMemoryRunStore()
@@ -605,6 +606,7 @@ function replayService (
     hostImageLinks: new HostImageLinkService({
       keySource: {
         keys: async () => keys({
+          group: groupKey(),
           refreshedAtMs: Date.parse(requestedAt),
           expiresAtMs: Date.parse(requestedAt) + 3_420_000
         })
@@ -642,6 +644,45 @@ test('a history image reaches the provider with the current host key', async () 
     )),
     [groupLink()]
   )
+  await service.shutdown('process_shutdown')
+})
+
+test('a rotated host key leaves the replayed text projection byte-identical', async () => {
+  const requests: ModelRequest[] = []
+  let hostKey = GROUP_KEY
+  const service = replayService('alive', requests, () => hostKey)
+
+  await service.handle(imageRequest('rotate-1', '看这张', groupLink(), capturedAt))
+  hostKey = 'ROTATEDONEaaaaaaaaaaaaaaaa'
+  assert.equal((await service.handle(imageRequest('rotate-2', '刚才那张是什么'))).kind, 'completed')
+  hostKey = 'ROTATEDTWObbbbbbbbbbbbbbbb'
+  assert.equal((await service.handle(imageRequest('rotate-3', '再说一次'))).kind, 'completed')
+
+  const replayedText = (request: ModelRequest | undefined): readonly string[] => (
+    (request?.messages ?? [])
+      .map(message => (typeof message.content === 'string' ? message.content : ''))
+      .filter(content => content.includes('看这张'))
+  )
+  const replayedImages = (request: ModelRequest | undefined): readonly string[] => (
+    (request?.messages ?? []).flatMap(message => (
+      message.role === 'user' ? [...message.imageUrls ?? []] : []
+    ))
+  )
+  // The image-bearing turn is replayed twice across two key rotations.
+  assert.equal(replayedText(requests[1]).length, 1)
+  assert.deepEqual(replayedText(requests[2]), replayedText(requests[1]))
+  // Only the image reference carries the rotated signature.
+  assert.deepEqual(replayedImages(requests[1]), [groupLink('file-1', 'ROTATEDONEaaaaaaaaaaaaaaaa')])
+  assert.deepEqual(replayedImages(requests[2]), [groupLink('file-1', 'ROTATEDTWObbbbbbbbbbbbbbbb')])
+  // No request text ever carries a host signature.
+  for (const request of requests) {
+    for (const message of request.messages) {
+      if (typeof message.content !== 'string') continue
+      assert.equal(message.content.includes('rkey'), false)
+      assert.equal(message.content.includes(GROUP_KEY), false)
+      assert.equal(message.content.includes(CAPTURED_KEY), false)
+    }
+  }
   await service.shutdown('process_shutdown')
 })
 

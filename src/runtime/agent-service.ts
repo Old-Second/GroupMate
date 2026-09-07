@@ -5,6 +5,7 @@ import {
 } from '../agent/contracts/error.js'
 import type { AgentEvent } from '../agent/contracts/event.js'
 import type { AgentContentPart, AgentMessage } from '../agent/contracts/content.js'
+import { agentMessageText } from '../agent/contracts/content-projection.js'
 import type { SessionPersistenceOutcome } from '../agent/contracts/completion.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import {
@@ -566,24 +567,9 @@ function linkedAbortSignal (
   })
 }
 
-function contentPartText (part: AgentContentPart): string {
-  switch (part.type) {
-    case 'text': return part.text
-    case 'resource_ref': return `[${part.resourceType}: ${part.resourceId}]`
-    case 'mention': return `@${part.displayName ?? part.userId}`
-    case 'tool_call': return `[工具调用: ${part.name}]`
-    case 'tool_result': return `[工具结果: ${part.status}] ${part.content}`
-  }
-}
-
-function messageText (message: AgentMessage): string {
-  const text = message.parts.map(contentPartText).filter(value => value.length > 0).join('\n')
-  return text.length === 0 ? '[空消息]' : text
-}
-
 function modelMessageFor (item: ContextItem, referenceAtMs: number): ModelMessage {
   if (item.modelMessage !== undefined) return item.modelMessage
-  const content = messageText(item.message)
+  const content = agentMessageText(item.message)
   if (item.message.role === 'system') return Object.freeze({ role: 'system', content })
   if (item.message.role === 'user') {
     const imageUrls = Object.freeze(item.message.parts

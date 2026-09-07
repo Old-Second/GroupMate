@@ -1,5 +1,6 @@
 import { AgentError } from '../contracts/error.js'
-import type { AgentContentPart, AgentMessage } from '../contracts/content.js'
+import type { AgentMessage } from '../contracts/content.js'
+import { agentMessageText } from '../contracts/content-projection.js'
 import {
   publicModelImageUrl,
   type ModelMessage
@@ -205,21 +206,6 @@ function legacyRef (kind: string, value: string): string {
   return `${kind}:${legacyHash(kind, value)}`
 }
 
-function partText (part: AgentContentPart): string {
-  switch (part.type) {
-    case 'text': return part.text
-    case 'mention': return `@${part.displayName ?? part.userId}`
-    case 'resource_ref': return `[${part.resourceType}: ${part.resourceId}]`
-    case 'tool_call': return `[工具调用: ${part.name}]`
-    case 'tool_result': return `[工具结果: ${part.status}] ${part.content}`
-  }
-}
-
-function messageText (message: AgentMessage): string {
-  const text = message.parts.map(partText).filter(value => value.length > 0).join('\n')
-  return text.length === 0 ? '[空消息]' : text
-}
-
 function canonicalLegacyMessages (items: readonly ContextItem[]): readonly ModelMessage[] {
   try {
     return canonicalizeModelMessages(Object.freeze(items.map(item => {
@@ -291,7 +277,7 @@ function modelImageUrls (message: AgentMessage, referenceAtMs: number): readonly
 }
 
 function ordinaryModelMessage (item: ContextItem, referenceAtMs: number): ModelMessage {
-  const content = messageText(item.message)
+  const content = agentMessageText(item.message)
   if (item.source === 'system_instruction') {
     return Object.freeze({ role: 'system' as const, content })
   }
@@ -347,7 +333,7 @@ function sourceAnchors (
     : legacyRef('item', item.id)
   const refs = [Object.freeze({
     ref: itemRef,
-    contentHash: legacyHash('item-content', messageText(item.message))
+    contentHash: legacyHash('item-content', agentMessageText(item.message))
   })]
   if (item.source === 'memory' && item.memoryRecord !== undefined) {
     refs.push(Object.freeze({
@@ -455,7 +441,7 @@ function ordinaryGroupProjection (
       ref,
       revision: first.memoryRecord?.revision ?? null,
       contentHash: first.memoryRecord?.revisionHash ??
-        legacyHash('provenance-group', items.map(item => messageText(item.message)).join('\0'))
+        legacyHash('provenance-group', items.map(item => agentMessageText(item.message)).join('\0'))
     }),
     supersedes: null,
     messages,
