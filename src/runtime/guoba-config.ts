@@ -65,7 +65,9 @@ export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
   'personalMemoryGroupAllowlist',
   'personalMemoryRecallMaxItems',
   'personalMemoryRecallMaxTokens',
-  'personalMemoryRecallTimeoutMs'
+  'personalMemoryRecallTimeoutMs',
+  'hostImageLinkRefresh',
+  'hostImageLinkProbeBudgetMs'
 ])
 
 const SAVED_MESSAGE = '保存成功~'
@@ -174,6 +176,21 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
 
   if (key === 'personalMemoryRecallTimeoutMs') {
     return boundedPersonalMemoryInteger(value, 500)
+  }
+
+  if (key === 'hostImageLinkRefresh') {
+    if (typeof value !== 'boolean') {
+      throw new TypeError('历史图片链接续签配置无效。')
+    }
+    return value
+  }
+
+  if (key === 'hostImageLinkProbeBudgetMs') {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+      value < 0 || value > 3_000) {
+      throw new TypeError('历史图片链接探测预算配置无效。')
+    }
+    return value
   }
 
   if (key === 'apiContextWindowTokens') {

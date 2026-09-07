@@ -21,6 +21,11 @@ import {
 } from '../agent/context/context-engine.js'
 import type { ContextInput, ContextItem } from '../agent/context/context-item.js'
 import type {
+  HostImageLinkCandidate,
+  HostImageLinkDecision,
+  HostImageLinkResolveContext
+} from './host-image-link-service.js'
+import type {
   ModelMessage,
   ModelProviderError
 } from '../agent/model/model-adapter.js'
@@ -255,6 +260,22 @@ export interface AgentServiceOptions {
   readonly onObserverFailure?: (entry: Readonly<{
     event: 'agent.observer_failed'
   }>) => void
+  /**
+   * Keeps replayed host media links usable.
+   *
+   * Host image links are signed with a key that rotates, so a link stored in
+   * conversation history has to be re-signed before it is replayed. Leaving the
+   * port out keeps the previous behaviour: links replay exactly as captured.
+   */
+  readonly hostImageLinks?: HostImageLinkPort
+}
+
+export interface HostImageLinkPort {
+  resolve (
+    candidates: readonly HostImageLinkCandidate[],
+    context: HostImageLinkResolveContext,
+    signal?: AbortSignal
+  ): Promise<ReadonlyMap<string, HostImageLinkDecision>>
 }
 
 interface PendingRun {
@@ -281,7 +302,69 @@ function isApprovalRecoveryDeferred (
 }
 
 const EMPTY_ITEMS: readonly ContextItem[] = Object.freeze([])
-const EMPTY_IMAGE_URLS: readonly string[] = Object.freeze([])
+const EMPTY_HOST_IMAGE_LINKS: ReadonlyMap<string, HostImageLinkDecision> =
+  Object.freeze(new Map<string, HostImageLinkDecision>())
+
+function imageResourceParts (
+  message: AgentMessage
+): readonly Extract<AgentContentPart, { type: 'resource_ref' }>[] {
+  return message.parts.filter((
+    part
+  ): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
+    part.type === 'resource_ref' && part.resourceType === 'image'
+  ))
+}
+
+function hostImageLinkCandidates (
+  items: readonly ContextItem[]
+): readonly HostImageLinkCandidate[] {
+  const candidates: HostImageLinkCandidate[] = []
+  for (const item of items) {
+    if (item.message.role !== 'user') continue
+    const createdAtMs = Date.parse(item.message.createdAt)
+    for (const part of imageResourceParts(item.message)) {
+      candidates.push(Object.freeze({
+        resourceId: part.resourceId,
+        capturedAtMs: Number.isFinite(createdAtMs) ? createdAtMs : null
+      }))
+    }
+  }
+  return Object.freeze(candidates)
+}
+
+/**
+ * Applies host link decisions to the replayed context.
+ *
+ * A re-signed link replaces the captured one, and a link the host no longer
+ * serves keeps its text projection while its declared expiry leaves the image
+ * reference out of the model request.
+ */
+function withHostImageLinks (
+  items: readonly ContextItem[],
+  decisions: ReadonlyMap<string, HostImageLinkDecision>
+): readonly ContextItem[] {
+  if (decisions.size === 0) return items
+  return Object.freeze(items.map(item => {
+    if (item.message.role !== 'user') return item
+    if (!imageResourceParts(item.message).some(part => decisions.has(part.resourceId))) {
+      return item
+    }
+    const parts = item.message.parts.map(part => {
+      if (part.type !== 'resource_ref' || part.resourceType !== 'image') return part
+      const decision = decisions.get(part.resourceId)
+      if (decision === undefined) return part
+      return Object.freeze({
+        ...part,
+        resourceId: decision.link,
+        expiresAt: decision.expiresAt
+      })
+    })
+    return Object.freeze({
+      ...item,
+      message: Object.freeze({ ...item.message, parts: Object.freeze(parts) })
+    })
+  }))
+}
 
 function callbackPresentationLifecycle (
   route: PresentationRouteV1 | RecoveredLegacyPresentationRoute,
@@ -503,20 +586,19 @@ function modelMessageFor (item: ContextItem, referenceAtMs: number): ModelMessag
   const content = messageText(item.message)
   if (item.message.role === 'system') return Object.freeze({ role: 'system', content })
   if (item.message.role === 'user') {
-    const imageUrls = imageInputExpired(item.message, referenceAtMs)
-      ? EMPTY_IMAGE_URLS
-      : Object.freeze(item.message.parts
-        .filter((part): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
-          part.type === 'resource_ref' && part.resourceType === 'image'
-        ))
-        .map(part => {
-          try {
-            return publicModelImageUrl(part.resourceId)
-          } catch {
-            return null
-          }
-        })
-        .filter((value): value is string => value !== null))
+    const imageUrls = Object.freeze(item.message.parts
+      .filter((part): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
+        part.type === 'resource_ref' && part.resourceType === 'image' &&
+        !imageInputExpired(part, referenceAtMs)
+      ))
+      .map(part => {
+        try {
+          return publicModelImageUrl(part.resourceId)
+        } catch {
+          return null
+        }
+      })
+      .filter((value): value is string => value !== null))
     return imageUrls.length === 0
       ? Object.freeze({ role: 'user', content })
       : Object.freeze({ role: 'user', content, imageUrls })
@@ -869,6 +951,7 @@ export class AgentService {
   readonly #onTerminalSnapshot?: AgentServiceOptions['onTerminalSnapshot']
   readonly #onTerminalCommitReceipt?: AgentServiceOptions['onTerminalCommitReceipt']
   readonly #onObserverFailure?: AgentServiceOptions['onObserverFailure']
+  readonly #hostImageLinks?: HostImageLinkPort
   readonly #engine: RunEngine
   readonly #pending = new Map<string, PendingRun>()
   readonly #runOperations = new Map<string, RunOperationState>()
@@ -903,6 +986,7 @@ export class AgentService {
     this.#onTerminalSnapshot = options.onTerminalSnapshot
     this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt
     this.#onObserverFailure = options.onObserverFailure
+    this.#hostImageLinks = options.hostImageLinks
     this.#engine = options.createEngine(event => {
       try {
         this.#progressPresenter.handle(event)
@@ -1251,7 +1335,13 @@ export class AgentService {
       const runtime = await this.#createRuntime(request, linked.signal)
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
-      let binding = this.#bindingFor(runId, request, session, runtime)
+      const hostImageLinks = await this.#resolveHostImageLinks(
+        request,
+        session,
+        runtime,
+        linked.signal
+      )
+      let binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks)
       const presentationLifecycle = options.presentationLifecycle ??
         await this.#lifecycleFor(request.presentationRoute, runtime.progress)
       let presentationStarted = false
@@ -1290,7 +1380,7 @@ export class AgentService {
             if (!(error instanceof RunReferenceConflictError) || attempt !== 0) throw error
             runRef = this.#createRunRef()
             request = freezeRequest(draft, runRef)
-            binding = this.#bindingFor(runId, request, session, runtime)
+            binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks)
           }
         }
       } finally {
@@ -1402,11 +1492,42 @@ export class AgentService {
     return lifecycle
   }
 
+  async #resolveHostImageLinks (
+    request: YunzaiAgentRequest,
+    session: SessionRecord<AgentSessionState> | null,
+    runtime: AgentServiceRunRuntime,
+    signal: AbortSignal
+  ): Promise<ReadonlyMap<string, HostImageLinkDecision>> {
+    const port = this.#hostImageLinks
+    if (port === undefined) return EMPTY_HOST_IMAGE_LINKS
+    const replayed = Object.freeze([
+      ...(session === null ? EMPTY_ITEMS : sessionItems(session.state.messages)),
+      ...(runtime.groupContext ?? EMPTY_ITEMS),
+      ...(runtime.memoryContext ?? EMPTY_ITEMS)
+    ])
+    const candidates = hostImageLinkCandidates(replayed)
+    if (candidates.length === 0) return EMPTY_HOST_IMAGE_LINKS
+    const requestedAtMs = Date.parse(request.createdAt)
+    try {
+      return await port.resolve(candidates, Object.freeze({
+        botId: request.sessionAddress.botId,
+        referenceAtMs: Number.isFinite(requestedAtMs)
+          ? requestedAtMs
+          : this.#now().getTime()
+      }), signal)
+    } catch {
+      // A replayed link that cannot be re-signed still reaches the provider as
+      // captured, exactly as it did before this port existed.
+      return EMPTY_HOST_IMAGE_LINKS
+    }
+  }
+
   #bindingFor (
     runId: string,
     request: YunzaiAgentRequest,
     session: SessionRecord<AgentSessionState> | null,
-    runtime: AgentServiceRunRuntime
+    runtime: AgentServiceRunRuntime,
+    hostImageLinks: ReadonlyMap<string, HostImageLinkDecision> = EMPTY_HOST_IMAGE_LINKS
   ): RunRuntimeBinding {
     const sourceInput = (dropOptional: boolean): ContextInput => {
       const systemInstructions = Object.freeze(request.systemInstructions.map((value, index) => (
@@ -1420,13 +1541,19 @@ export class AgentService {
       const runtimeFacts = Object.freeze([...(runtime.runtimeFacts ?? EMPTY_ITEMS)])
       const history = dropOptional || session === null
         ? EMPTY_ITEMS
-        : sessionItems(session.state.messages)
+        : withHostImageLinks(sessionItems(session.state.messages), hostImageLinks)
       const groupContext = dropOptional
         ? EMPTY_ITEMS
-        : Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)])
+        : withHostImageLinks(
+          Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]),
+          hostImageLinks
+        )
       const memoryContext = dropOptional
         ? EMPTY_ITEMS
-        : Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)])
+        : withHostImageLinks(
+          Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)]),
+          hostImageLinks
+        )
       const bounded = boundedOptionalContext(
         Object.freeze([...systemInstructions, currentRequest]),
         runtimeFacts,

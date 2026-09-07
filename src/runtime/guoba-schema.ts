@@ -119,6 +119,8 @@ export function buildGuobaSchemas ({
     field('groupContextLength', '群聊上下文条数', '最多读取的近期群消息数量；越大越消耗 Token。', 'InputNumber', { min: 0 }),
     field('groupContextTip', '群聊上下文提示词', '读取群聊记录时附加给模型的说明，用于强调身份区分和上下文使用方式。', 'InputTextArea'),
     field('groupMerge', '群会话合并', '开启后同一群成员共享模型会话；关闭后按群和用户隔离。', 'Switch'),
+    field('hostImageLinkRefresh', '历史图片链接续签', '重放会话历史里的图片时，用宿主当前的签名参数换掉捕获时那一份。QQ 图片链接的签名约 57 分钟轮换一次，不续签会让整条请求被模型服务判为格式错误。关闭后历史图片按捕获时的链接原样重放，超过 10 分钟的会只保留文字。修改后需重启。', 'Switch'),
+    field('hostImageLinkProbeBudgetMs', '历史图片存活探测预算', '续签后仍可能遇到宿主已经删除的图片文件，这类链接会一直让请求失败。这里是每次请求用于确认历史图片是否还在的总时间预算，范围 0 到 3000 毫秒；默认 500，0 表示不探测。超出预算就按可用处理，不影响回复。修改后需重启。', 'InputNumber', { min: 0, max: 3_000, step: 50 }),
     field('conversationPreserveTime', '会话保留秒数', 'Redis 会话过期时间；大于 0 时按秒过期，0 表示不设置自动过期。', 'InputNumber', { min: 0 }),
 
     divider('群聊参与'),

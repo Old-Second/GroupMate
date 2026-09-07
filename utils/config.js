@@ -23,6 +23,10 @@ const defaultConfig = {
   conversationPreserveTime: 0,
   toggleMode: 'at',
   groupMerge: false,
+  // 重放历史图片时用宿主当前的签名参数换掉捕获时那一份。
+  hostImageLinkRefresh: true,
+  // 每次请求用于确认历史图片是否仍被宿主保留的总预算，0 表示不探测。
+  hostImageLinkProbeBudgetMs: 500,
   quoteReply: true,
   showQRCode: true,
   apiKey: '',

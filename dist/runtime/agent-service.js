@@ -93,7 +93,59 @@ function isApprovalRecoveryDeferred(value) {
     return 'kind' in value && value.kind === 'approval_deferred';
 }
 const EMPTY_ITEMS = Object.freeze([]);
-const EMPTY_IMAGE_URLS = Object.freeze([]);
+const EMPTY_HOST_IMAGE_LINKS = Object.freeze(new Map());
+function imageResourceParts(message) {
+    return message.parts.filter((part) => (part.type === 'resource_ref' && part.resourceType === 'image'));
+}
+function hostImageLinkCandidates(items) {
+    const candidates = [];
+    for (const item of items) {
+        if (item.message.role !== 'user')
+            continue;
+        const createdAtMs = Date.parse(item.message.createdAt);
+        for (const part of imageResourceParts(item.message)) {
+            candidates.push(Object.freeze({
+                resourceId: part.resourceId,
+                capturedAtMs: Number.isFinite(createdAtMs) ? createdAtMs : null
+            }));
+        }
+    }
+    return Object.freeze(candidates);
+}
+/**
+ * Applies host link decisions to the replayed context.
+ *
+ * A re-signed link replaces the captured one, and a link the host no longer
+ * serves keeps its text projection while its declared expiry leaves the image
+ * reference out of the model request.
+ */
+function withHostImageLinks(items, decisions) {
+    if (decisions.size === 0)
+        return items;
+    return Object.freeze(items.map(item => {
+        if (item.message.role !== 'user')
+            return item;
+        if (!imageResourceParts(item.message).some(part => decisions.has(part.resourceId))) {
+            return item;
+        }
+        const parts = item.message.parts.map(part => {
+            if (part.type !== 'resource_ref' || part.resourceType !== 'image')
+                return part;
+            const decision = decisions.get(part.resourceId);
+            if (decision === undefined)
+                return part;
+            return Object.freeze({
+                ...part,
+                resourceId: decision.link,
+                expiresAt: decision.expiresAt
+            });
+        });
+        return Object.freeze({
+            ...item,
+            message: Object.freeze({ ...item.message, parts: Object.freeze(parts) })
+        });
+    }));
+}
 function callbackPresentationLifecycle(route, progress, delivery) {
     let started = false;
     let settled;
@@ -283,19 +335,18 @@ function modelMessageFor(item, referenceAtMs) {
     if (item.message.role === 'system')
         return Object.freeze({ role: 'system', content });
     if (item.message.role === 'user') {
-        const imageUrls = imageInputExpired(item.message, referenceAtMs)
-            ? EMPTY_IMAGE_URLS
-            : Object.freeze(item.message.parts
-                .filter((part) => (part.type === 'resource_ref' && part.resourceType === 'image'))
-                .map(part => {
-                try {
-                    return publicModelImageUrl(part.resourceId);
-                }
-                catch {
-                    return null;
-                }
-            })
-                .filter((value) => value !== null));
+        const imageUrls = Object.freeze(item.message.parts
+            .filter((part) => (part.type === 'resource_ref' && part.resourceType === 'image' &&
+            !imageInputExpired(part, referenceAtMs)))
+            .map(part => {
+            try {
+                return publicModelImageUrl(part.resourceId);
+            }
+            catch {
+                return null;
+            }
+        })
+            .filter((value) => value !== null));
         return imageUrls.length === 0
             ? Object.freeze({ role: 'user', content })
             : Object.freeze({ role: 'user', content, imageUrls });
@@ -591,6 +642,7 @@ export class AgentService {
     #onTerminalSnapshot;
     #onTerminalCommitReceipt;
     #onObserverFailure;
+    #hostImageLinks;
     #engine;
     #pending = new Map();
     #runOperations = new Map();
@@ -624,6 +676,7 @@ export class AgentService {
         this.#onTerminalSnapshot = options.onTerminalSnapshot;
         this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt;
         this.#onObserverFailure = options.onObserverFailure;
+        this.#hostImageLinks = options.hostImageLinks;
         this.#engine = options.createEngine(event => {
             try {
                 this.#progressPresenter.handle(event);
@@ -887,7 +940,8 @@ export class AgentService {
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
-            let binding = this.#bindingFor(runId, request, session, runtime);
+            const hostImageLinks = await this.#resolveHostImageLinks(request, session, runtime, linked.signal);
+            let binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks);
             const presentationLifecycle = options.presentationLifecycle ??
                 await this.#lifecycleFor(request.presentationRoute, runtime.progress);
             let presentationStarted = false;
@@ -928,7 +982,7 @@ export class AgentService {
                             throw error;
                         runRef = this.#createRunRef();
                         request = freezeRequest(draft, runRef);
-                        binding = this.#bindingFor(runId, request, session, runtime);
+                        binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks);
                     }
                 }
             }
@@ -1026,7 +1080,34 @@ export class AgentService {
         }
         return lifecycle;
     }
-    #bindingFor(runId, request, session, runtime) {
+    async #resolveHostImageLinks(request, session, runtime, signal) {
+        const port = this.#hostImageLinks;
+        if (port === undefined)
+            return EMPTY_HOST_IMAGE_LINKS;
+        const replayed = Object.freeze([
+            ...(session === null ? EMPTY_ITEMS : sessionItems(session.state.messages)),
+            ...(runtime.groupContext ?? EMPTY_ITEMS),
+            ...(runtime.memoryContext ?? EMPTY_ITEMS)
+        ]);
+        const candidates = hostImageLinkCandidates(replayed);
+        if (candidates.length === 0)
+            return EMPTY_HOST_IMAGE_LINKS;
+        const requestedAtMs = Date.parse(request.createdAt);
+        try {
+            return await port.resolve(candidates, Object.freeze({
+                botId: request.sessionAddress.botId,
+                referenceAtMs: Number.isFinite(requestedAtMs)
+                    ? requestedAtMs
+                    : this.#now().getTime()
+            }), signal);
+        }
+        catch {
+            // A replayed link that cannot be re-signed still reaches the provider as
+            // captured, exactly as it did before this port existed.
+            return EMPTY_HOST_IMAGE_LINKS;
+        }
+    }
+    #bindingFor(runId, request, session, runtime, hostImageLinks = EMPTY_HOST_IMAGE_LINKS) {
         const sourceInput = (dropOptional) => {
             const systemInstructions = Object.freeze(request.systemInstructions.map((value, index) => (systemItem(runId, value, index, request.createdAt))));
             const currentRequest = Object.freeze({
@@ -1037,13 +1118,13 @@ export class AgentService {
             const runtimeFacts = Object.freeze([...(runtime.runtimeFacts ?? EMPTY_ITEMS)]);
             const history = dropOptional || session === null
                 ? EMPTY_ITEMS
-                : sessionItems(session.state.messages);
+                : withHostImageLinks(sessionItems(session.state.messages), hostImageLinks);
             const groupContext = dropOptional
                 ? EMPTY_ITEMS
-                : Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]);
+                : withHostImageLinks(Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]), hostImageLinks);
             const memoryContext = dropOptional
                 ? EMPTY_ITEMS
-                : Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)]);
+                : withHostImageLinks(Object.freeze([...(runtime.memoryContext ?? EMPTY_ITEMS)]), hostImageLinks);
             const bounded = boundedOptionalContext(Object.freeze([...systemInstructions, currentRequest]), runtimeFacts, history, groupContext, memoryContext, request.contextBudget);
             return Object.freeze({
                 systemInstructions,

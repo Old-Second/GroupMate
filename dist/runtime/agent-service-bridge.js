@@ -14,6 +14,8 @@ import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { ToolScheduler } from '../agent/run/tool-scheduler.js';
 import { RedisAgentSessionStore } from '../agent/session/redis-agent-session-store.js';
 import { AgentService } from './agent-service.js';
+import { HostImageLinkService } from './host-image-link-service.js';
+import { HostImageLinkFetchProbe, YunzaiHostImageLinkKeySource } from './yunzai-host-image-link-adapter.js';
 import { beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
 import { GroupHistoryReadCoordinator } from './group-history-read-coordinator.js';
 import { createAgentRunLog } from './safe-chat-logging.js';
@@ -1231,6 +1233,13 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 contentJournal.recordRunEvent(event);
             }
         });
+    const hostImageLinks = configBoolean(options.config, 'hostImageLinkRefresh', true)
+        ? new HostImageLinkService({
+            keySource: new YunzaiHostImageLinkKeySource(),
+            probe: new HostImageLinkFetchProbe(),
+            probeBudgetMs: configInteger(options.config, 'hostImageLinkProbeBudgetMs', 500, 0, 3_000)
+        })
+        : undefined;
     const service = new AgentService({
         sessions,
         runStore,
@@ -1243,6 +1252,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         }),
         contextArtifactStore,
         ...(modelCapabilityOverride === undefined ? {} : { modelCapabilityOverride }),
+        ...(hostImageLinks === undefined ? {} : { hostImageLinks }),
         progressPresenter,
         createEngine: observer => new RunEngine({
             adapter: dependencies.modelAdapter,

@@ -141,6 +141,8 @@ const requiredGuobaFields = [
   'groupContextTip',
   'groupContextLength',
   'groupMerge',
+  'hostImageLinkRefresh',
+  'hostImageLinkProbeBudgetMs',
   'conversationPreserveTime',
   'personalMemoryMode',
   'personalMemoryGroupAllowlist',
@@ -249,6 +251,7 @@ const expectedGuobaGroups = [
       'apiStream', 'apiMaxToken', 'apiContextWindowTokens', 'apiThinkingMode', 'apiReasoningEffort',
       'forwardReasoning', 'forwardToolDetails', 'openAiForceUseReverse', 'enableGroupContext',
       'groupContextLength', 'groupContextTip', 'groupMerge',
+      'hostImageLinkRefresh', 'hostImageLinkProbeBudgetMs',
       'conversationPreserveTime'
     ]
   },

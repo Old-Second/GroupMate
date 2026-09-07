@@ -417,16 +417,17 @@ test('ordinary current requests preserve public user image resources in prepared
   assert.deepEqual(currentSpan?.messages[0], currentMessage)
 })
 
-test('recent history keeps its image input while an expired link is dropped', async () => {
+test('a declared resource expiry drops the image input and keeps the text', async () => {
   const currentAt = '2026-07-13T01:00:00.000Z'
-  const recentUrl = 'https://cdn.example.test/recent.png'
+  const liveUrl = 'https://cdn.example.test/live.png'
   const expiredUrl = 'https://cdn.example.test/expired.png'
   const withImage = (
     id: string,
     source: ContextSource,
     text: string,
     createdAt: string,
-    imageUrl: string
+    imageUrl: string,
+    expiresAt?: string
   ): ContextItem => {
     const base = item(id, source, text, undefined, createdAt)
     return Object.freeze({
@@ -438,7 +439,8 @@ test('recent history keeps its image input while an expired link is dropped', as
           Object.freeze({
             type: 'resource_ref' as const,
             resourceType: 'image' as const,
-            resourceId: imageUrl
+            resourceId: imageUrl,
+            ...(expiresAt === undefined ? {} : { expiresAt })
           })
         ])
       })
@@ -446,10 +448,24 @@ test('recent history keeps its image input while an expired link is dropped', as
   }
   const contextInput = input({
     sessionHistory: [
-      // 9 minutes before the current request: still inside the window.
-      withImage('recent', 'session_history', '看这张', '2026-07-13T00:51:00.000Z', recentUrl),
-      // 11 minutes before the current request: the host link is assumed expired.
-      withImage('expired', 'session_history', '还有这张', '2026-07-13T00:49:00.000Z', expiredUrl)
+      // Captured hours ago, but re-signed: the declared expiry is still ahead.
+      withImage(
+        'live',
+        'session_history',
+        '看这张',
+        '2026-07-12T21:00:00.000Z',
+        liveUrl,
+        '2026-07-13T01:30:00.000Z'
+      ),
+      // Recent, yet the host no longer serves it.
+      withImage(
+        'expired',
+        'session_history',
+        '还有这张',
+        '2026-07-13T00:59:00.000Z',
+        expiredUrl,
+        '2026-07-13T00:59:30.000Z'
+      )
     ],
     currentRequest: item('current', 'current_request', '继续说', undefined, currentAt)
   })
@@ -457,14 +473,44 @@ test('recent history keeps its image input while an expired link is dropped', as
   const snapshot = await engine.prepare(contextInput, budget(100))
   const projected = (id: string) => snapshot.items.find(value => value.id === id)?.modelMessage
 
-  assert.deepEqual(projected('recent'), {
+  assert.deepEqual(projected('live'), {
     role: 'user',
-    content: `看这张\n[image: ${recentUrl}]`,
-    imageUrls: [recentUrl]
+    content: `看这张\n[image: ${liveUrl}]`,
+    imageUrls: [liveUrl]
   })
   assert.deepEqual(projected('expired'), {
     role: 'user',
     content: `还有这张\n[image: ${expiredUrl}]`
+  })
+})
+
+test('an image input without a declared expiry is replayed as captured', async () => {
+  const imageUrl = 'https://cdn.example.test/undeclared.png'
+  const base = item('old', 'session_history', '看这张', undefined, '2026-07-12T00:00:00.000Z')
+  const history = Object.freeze({
+    ...base,
+    message: Object.freeze({
+      ...base.message,
+      parts: Object.freeze([
+        ...base.message.parts,
+        Object.freeze({
+          type: 'resource_ref' as const,
+          resourceType: 'image' as const,
+          resourceId: imageUrl
+        })
+      ])
+    })
+  })
+  const engine = new ContextEngine({ estimator })
+  const snapshot = await engine.prepare(input({
+    sessionHistory: [history],
+    currentRequest: item('current', 'current_request', '继续说', undefined, '2026-07-13T01:00:00.000Z')
+  }), budget(100))
+
+  assert.deepEqual(snapshot.items.find(value => value.id === 'old')?.modelMessage, {
+    role: 'user',
+    content: `看这张\n[image: ${imageUrl}]`,
+    imageUrls: [imageUrl]
   })
 })
 

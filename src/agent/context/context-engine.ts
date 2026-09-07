@@ -244,15 +244,6 @@ function sourcePriority (source: ContextSource): ContextSpanPriority {
   return 'low'
 }
 
-/**
- * How long a replayed image input stays attached to a context message.
- *
- * Host image links are signed and expire, so an old history image makes the
- * provider reject the whole request instead of answering it. Past the window the
- * message keeps its text projection and only loses the image reference.
- */
-const CONTEXT_IMAGE_INPUT_MAX_AGE_MS = 10 * 60 * 1_000
-
 export function referenceInstantMs (items: readonly ContextItem[]): number {
   const current = items.find(item => item.source === 'current_request')
   const currentAt = Date.parse(current?.message.createdAt ?? '')
@@ -265,20 +256,30 @@ export function referenceInstantMs (items: readonly ContextItem[]): number {
   return newest
 }
 
-export function imageInputExpired (message: AgentMessage, referenceAtMs: number): boolean {
-  if (!Number.isFinite(referenceAtMs)) return false
-  const createdAtMs = Date.parse(message.createdAt)
-  // Only a provable age drops an image reference.
-  if (!Number.isFinite(createdAtMs)) return false
-  return referenceAtMs - createdAtMs > CONTEXT_IMAGE_INPUT_MAX_AGE_MS
+/**
+ * Whether a replayed resource reference has outlived the host that serves it.
+ *
+ * Host media links are signed and the signature expires, so the capturing side
+ * declares how long the reference stays usable. Past that instant the message
+ * keeps its text projection and only loses the image reference; a reference
+ * without a declared expiry is never dropped here.
+ */
+export function imageInputExpired (
+  part: Readonly<{ readonly expiresAt?: string }>,
+  referenceAtMs: number
+): boolean {
+  if (!Number.isFinite(referenceAtMs) || part.expiresAt === undefined) return false
+  const expiresAtMs = Date.parse(part.expiresAt)
+  if (!Number.isFinite(expiresAtMs)) return false
+  return expiresAtMs <= referenceAtMs
 }
 
 function modelImageUrls (message: AgentMessage, referenceAtMs: number): readonly string[] {
   if (message.role !== 'user') return Object.freeze([])
-  if (imageInputExpired(message, referenceAtMs)) return Object.freeze([])
   const imageUrls: string[] = []
   for (const part of message.parts) {
     if (part.type !== 'resource_ref' || part.resourceType !== 'image') continue
+    if (imageInputExpired(part, referenceAtMs)) continue
     try {
       const imageUrl = publicModelImageUrl(part.resourceId)
       imageUrls.push(imageUrl)
