@@ -663,12 +663,22 @@ async function classifyBoundedResponse(response, profile, signal) {
     const wireError = await readBoundedWireError(response, signal, RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes);
     const classification = profile.classifyError(wireError) ??
         baseWireErrorClassification(wireError);
+    // Provider bodies stay unlogged; the two short codes are what makes a rejected
+    // request attributable in the journal after the fact.
     return new ModelProviderError({
         code: classification.code,
         stage: 'model.response',
         retryable: classification.retryable,
         userMessage: classification.userMessage,
-        details: { status: wireError.status },
+        details: Object.freeze({
+            status: wireError.status,
+            ...(wireError.providerCode === undefined
+                ? {}
+                : { providerCode: wireError.providerCode }),
+            ...(classification.profileCode === undefined
+                ? {}
+                : { profileCode: classification.profileCode })
+        }),
         statusCode: wireError.status,
         providerCode: wireError.providerCode,
         profileCode: classification.profileCode

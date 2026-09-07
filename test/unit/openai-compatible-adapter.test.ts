@@ -958,8 +958,42 @@ test('bounds error bodies and classifies stable HTTP failures without retrying',
   }
 })
 
-test('classifies a timeout abort without starting a second request', async () => {
-  let attempts = 0
+test('records the reported and classified failure codes without the provider body', async () => {
+  const errorFixture = await loadText('standard-error.json')
+  let observed: unknown
+  try {
+    await adapterWithFetch(async () => fixtureResponse(errorFixture, { status: 400 }))
+      .complete(frozenRequest(), new AbortController().signal)
+  } catch (error) {
+    observed = error
+  }
+  assert.equal(isProviderError('provider_invalid_request', false)(observed), true)
+  assert.deepEqual((observed as ModelProviderError).details, {
+    status: 400,
+    providerCode: 'fixture_invalid_request'
+  })
+
+  let profiled: unknown
+  try {
+    await adapterWithFetch(
+      async () => fixtureResponse(errorFixture, { status: 402 }),
+      deepSeekCompatibilityProfile
+    ).complete(frozenRequest({
+      metadata: Object.freeze({ cacheIsolationId: CACHE_ISOLATION_ID })
+    }), new AbortController().signal)
+  } catch (error) {
+    profiled = error
+  }
+  assert.equal(isProviderError('provider_invalid_request', false)(profiled), true)
+  assert.deepEqual((profiled as ModelProviderError).details, {
+    status: 402,
+    providerCode: 'fixture_invalid_request',
+    profileCode: 'deepseek_balance_insufficient'
+  })
+  assert.doesNotMatch(JSON.stringify(profiled), /fixture invalid request/)
+})
+
+test('classifies a timeout abort without starting a second request', async () => {  let attempts = 0
   const controller = new AbortController()
   const adapter = adapterWithFetch(async (_url, init) => {
     attempts += 1
