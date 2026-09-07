@@ -1,3 +1,4 @@
+import { expiredImageInputRecoveryHint } from './openai-compatible-profile.js';
 const EMPTY_OBJECT = Object.freeze({});
 export const standardOpenAIProfile = Object.freeze({
     id: 'standard',
@@ -27,5 +28,5 @@ export const standardOpenAIProfile = Object.freeze({
         throw new TypeError('standard profile does not accept provider state');
     },
     classifyError: () => undefined,
-    recoveryHint: () => 'none'
+    recoveryHint: expiredImageInputRecoveryHint
 });

@@ -1054,3 +1054,72 @@ test('classifies a timeout abort without starting a second request', async () =>
   await assert.rejects(completion, isProviderError('provider_timeout', true))
   assert.equal(attempts, 1)
 })
+
+test('marks a rejected request that replayed an image input', async () => {
+  const errorFixture = await loadText('standard-error.json')
+  const cases = [
+    {
+      messages: [
+        { role: 'system', content: 'fixture system' },
+        { role: 'user', content: 'fixture history', imageUrls: ['https://example.test/a.png'] },
+        { role: 'user', content: 'fixture question' }
+      ],
+      expected: true
+    },
+    {
+      messages: [
+        { role: 'system', content: 'fixture system' },
+        { role: 'user', content: 'fixture question' }
+      ],
+      expected: false
+    }
+  ] as const
+  for (const { messages, expected } of cases) {
+    let observed: unknown
+    try {
+      await adapterWithFetch(async () => fixtureResponse(errorFixture, { status: 400 }))
+        .complete(
+          frozenRequest({ messages: messages as unknown as ModelRequest['messages'] }),
+          new AbortController().signal
+        )
+    } catch (error) {
+      observed = error
+    }
+    assert.equal(isProviderError('provider_invalid_request', false)(observed), true)
+    assert.equal((observed as ModelProviderError).requestImageInputs, expected)
+    // The recovery signal stays off the checkpoint-bound error fields.
+    assert.deepEqual((observed as ModelProviderError).details, {
+      status: 400,
+      providerCode: 'fixture_invalid_request'
+    })
+    assert.equal(
+      standardOpenAIProfile.recoveryHint(observed as ModelProviderError),
+      expected ? 'drop_optional_context_once' : 'none'
+    )
+    assert.equal(
+      deepSeekCompatibilityProfile.recoveryHint(observed as ModelProviderError),
+      expected ? 'drop_optional_context_once' : 'none'
+    )
+  }
+})
+
+test('keeps an image-carrying failure unrecoverable outside a rejected request', async () => {
+  const errorFixture = await loadText('standard-error.json')
+  const imageRequest = frozenRequest({
+    messages: [
+      { role: 'system', content: 'fixture system' },
+      { role: 'user', content: 'fixture question', imageUrls: ['https://example.test/a.png'] }
+    ] as unknown as ModelRequest['messages']
+  })
+  for (const status of [429, 500] as const) {
+    let observed: unknown
+    try {
+      await adapterWithFetch(async () => fixtureResponse(errorFixture, { status }))
+        .complete(imageRequest, new AbortController().signal)
+    } catch (error) {
+      observed = error
+    }
+    assert.equal((observed as ModelProviderError).requestImageInputs, true)
+    assert.equal(standardOpenAIProfile.recoveryHint(observed as ModelProviderError), 'none')
+  }
+})

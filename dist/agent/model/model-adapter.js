@@ -93,6 +93,14 @@ export class ModelProviderError extends AgentError {
     providerCode;
     profileCode;
     providerBody;
+    /**
+     * Whether the rejected request carried image inputs.
+     *
+     * Host image links are signed and expire, so a replayed image is the most
+     * common reason a provider refuses an otherwise well-formed request. The flag
+     * stays off `details` because it is a recovery signal, not an error field.
+     */
+    requestImageInputs;
     constructor(options) {
         super({
             code: options.code,
@@ -103,6 +111,7 @@ export class ModelProviderError extends AgentError {
         });
         this.name = 'ModelProviderError';
         this.statusCode = options.statusCode ?? null;
+        this.requestImageInputs = options.requestImageInputs === true;
         this.providerCode = options.providerCode && SAFE_CODE.test(options.providerCode)
             ? options.providerCode
             : undefined;

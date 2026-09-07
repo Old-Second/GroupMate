@@ -14,7 +14,11 @@ import {
 import type { AbortOptions, ListOptions, SaveOptions } from '../agent/contracts/storage.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
 import type { ContextArtifactStore } from '../agent/context/context-artifact-store.js'
-import { ContextEngine } from '../agent/context/context-engine.js'
+import {
+  ContextEngine,
+  imageInputExpired,
+  referenceInstantMs
+} from '../agent/context/context-engine.js'
 import type { ContextInput, ContextItem } from '../agent/context/context-item.js'
 import type {
   ModelMessage,
@@ -277,6 +281,7 @@ function isApprovalRecoveryDeferred (
 }
 
 const EMPTY_ITEMS: readonly ContextItem[] = Object.freeze([])
+const EMPTY_IMAGE_URLS: readonly string[] = Object.freeze([])
 
 function callbackPresentationLifecycle (
   route: PresentationRouteV1 | RecoveredLegacyPresentationRoute,
@@ -493,23 +498,25 @@ function messageText (message: AgentMessage): string {
   return text.length === 0 ? '[空消息]' : text
 }
 
-function modelMessageFor (item: ContextItem): ModelMessage {
+function modelMessageFor (item: ContextItem, referenceAtMs: number): ModelMessage {
   if (item.modelMessage !== undefined) return item.modelMessage
   const content = messageText(item.message)
   if (item.message.role === 'system') return Object.freeze({ role: 'system', content })
   if (item.message.role === 'user') {
-    const imageUrls = Object.freeze(item.message.parts
-      .filter((part): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
-        part.type === 'resource_ref' && part.resourceType === 'image'
-      ))
-      .map(part => {
-        try {
-          return publicModelImageUrl(part.resourceId)
-        } catch {
-          return null
-        }
-      })
-      .filter((value): value is string => value !== null))
+    const imageUrls = imageInputExpired(item.message, referenceAtMs)
+      ? EMPTY_IMAGE_URLS
+      : Object.freeze(item.message.parts
+        .filter((part): part is Extract<AgentContentPart, { type: 'resource_ref' }> => (
+          part.type === 'resource_ref' && part.resourceType === 'image'
+        ))
+        .map(part => {
+          try {
+            return publicModelImageUrl(part.resourceId)
+          } catch {
+            return null
+          }
+        })
+        .filter((value): value is string => value !== null))
     return imageUrls.length === 0
       ? Object.freeze({ role: 'user', content })
       : Object.freeze({ role: 'user', content, imageUrls })
@@ -1452,9 +1459,11 @@ export class AgentService {
         request.contextBudget,
         signal
       )
+      const items = currentRunItemOrder(snapshot.items)
+      const referenceAtMs = referenceInstantMs(snapshot.items)
       return Object.freeze({
         messages: coalesceModelMessages(
-          currentRunItemOrder(snapshot.items).map(modelMessageFor)
+          items.map(item => modelMessageFor(item, referenceAtMs))
         ),
         estimatedInputTokens: snapshot.estimatedInputTokens
       })

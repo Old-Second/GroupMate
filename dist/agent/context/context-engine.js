@@ -193,7 +193,7 @@ function sourcePriority(source) {
  * message keeps its text projection and only loses the image reference.
  */
 const CONTEXT_IMAGE_INPUT_MAX_AGE_MS = 10 * 60 * 1_000;
-function referenceInstantMs(items) {
+export function referenceInstantMs(items) {
     const current = items.find(item => item.source === 'current_request');
     const currentAt = Date.parse(current?.message.createdAt ?? '');
     if (Number.isFinite(currentAt))
@@ -206,7 +206,7 @@ function referenceInstantMs(items) {
     }
     return newest;
 }
-function imageInputExpired(message, referenceAtMs) {
+export function imageInputExpired(message, referenceAtMs) {
     if (!Number.isFinite(referenceAtMs))
         return false;
     const createdAtMs = Date.parse(message.createdAt);

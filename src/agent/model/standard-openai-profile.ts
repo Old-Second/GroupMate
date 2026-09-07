@@ -1,7 +1,8 @@
 import type { JsonObject } from './json-value.js'
-import type {
-  OpenAICompatibleProfile,
-  ToolControlInput
+import {
+  expiredImageInputRecoveryHint,
+  type OpenAICompatibleProfile,
+  type ToolControlInput
 } from './openai-compatible-profile.js'
 
 const EMPTY_OBJECT: Readonly<JsonObject> = Object.freeze({})
@@ -34,5 +35,5 @@ export const standardOpenAIProfile: OpenAICompatibleProfile = Object.freeze({
     throw new TypeError('standard profile does not accept provider state')
   },
   classifyError: () => undefined,
-  recoveryHint: () => 'none'
+  recoveryHint: expiredImageInputRecoveryHint
 })

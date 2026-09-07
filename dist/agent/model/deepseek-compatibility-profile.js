@@ -1,6 +1,7 @@
 import { parseJsonValue } from './json-value.js';
 import { DEEPSEEK_CNY_CATALOG_VERSION, resolveModelPriceSnapshot } from './model-price-catalog.js';
 import { normalizeModelReasoningTrace } from './model-adapter.js';
+import { expiredImageInputRecoveryHint } from './openai-compatible-profile.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 const PROFILE_ID = 'deepseek';
 const PROFILE_VERSION = 1;
@@ -169,12 +170,13 @@ function classifyDeepSeekError(error) {
     return undefined;
 }
 function deepSeekRecoveryHint(error) {
-    return error.code === 'provider_invalid_request' &&
+    if (error.code === 'provider_invalid_request' &&
         error.stage === 'model.response' &&
         error.statusCode === 400 &&
-        error.profileCode === LEGACY_CONTEXT_PROFILE_CODE
-        ? 'drop_optional_context_once'
-        : 'none';
+        error.profileCode === LEGACY_CONTEXT_PROFILE_CODE) {
+        return 'drop_optional_context_once';
+    }
+    return expiredImageInputRecoveryHint(error);
 }
 export const deepSeekCompatibilityProfile = Object.freeze({
     id: PROFILE_ID,

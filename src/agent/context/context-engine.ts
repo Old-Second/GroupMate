@@ -253,7 +253,7 @@ function sourcePriority (source: ContextSource): ContextSpanPriority {
  */
 const CONTEXT_IMAGE_INPUT_MAX_AGE_MS = 10 * 60 * 1_000
 
-function referenceInstantMs (items: readonly ContextItem[]): number {
+export function referenceInstantMs (items: readonly ContextItem[]): number {
   const current = items.find(item => item.source === 'current_request')
   const currentAt = Date.parse(current?.message.createdAt ?? '')
   if (Number.isFinite(currentAt)) return currentAt
@@ -265,7 +265,7 @@ function referenceInstantMs (items: readonly ContextItem[]): number {
   return newest
 }
 
-function imageInputExpired (message: AgentMessage, referenceAtMs: number): boolean {
+export function imageInputExpired (message: AgentMessage, referenceAtMs: number): boolean {
   if (!Number.isFinite(referenceAtMs)) return false
   const createdAtMs = Date.parse(message.createdAt)
   // Only a provable age drops an image reference.

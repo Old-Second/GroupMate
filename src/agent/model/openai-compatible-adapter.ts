@@ -766,10 +766,24 @@ function baseWireErrorClassification (error: BoundedOpenAIWireError): ModelError
   }
 }
 
+/**
+ * Whether the outgoing request replays any image input.
+ *
+ * Host image links are signed and expire, so an image is the likeliest reason a
+ * provider refuses an otherwise well-formed request. The answer only feeds the
+ * recovery hint; it never reaches the provider or the checkpoint.
+ */
+function requestCarriesImageInputs (request: ModelRequest): boolean {
+  return request.messages.some(message => (
+    message.role === 'user' && (message.imageUrls?.length ?? 0) > 0
+  ))
+}
+
 async function classifyBoundedResponse (
   response: OpenAIResponseLike,
   profile: OpenAICompatibleProfile,
-  signal: AbortSignal
+  signal: AbortSignal,
+  requestImageInputs: boolean
 ): Promise<ModelProviderError> {
   const wireError = await readBoundedWireError(
     response,
@@ -797,7 +811,8 @@ async function classifyBoundedResponse (
     statusCode: wireError.status,
     providerCode: wireError.providerCode,
     profileCode: classification.profileCode,
-    providerBody: wireError.body
+    providerBody: wireError.body,
+    requestImageInputs
   })
 }
 
@@ -882,7 +897,14 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (error instanceof ModelProviderError) throw error
       throw classifyTransportFailure(error, signal)
     }
-    if (!response.ok) throw await classifyBoundedResponse(response, this.#profile, signal)
+    if (!response.ok) {
+      throw await classifyBoundedResponse(
+        response,
+        this.#profile,
+        signal,
+        requestCarriesImageInputs(request)
+      )
+    }
     try {
       return request.streaming
         ? await readBoundedEventStream(response, this.#profile, signal)

@@ -659,7 +659,17 @@ function baseWireErrorClassification(error) {
         userMessage: '请求格式不正确，请联系机器人主人。'
     };
 }
-async function classifyBoundedResponse(response, profile, signal) {
+/**
+ * Whether the outgoing request replays any image input.
+ *
+ * Host image links are signed and expire, so an image is the likeliest reason a
+ * provider refuses an otherwise well-formed request. The answer only feeds the
+ * recovery hint; it never reaches the provider or the checkpoint.
+ */
+function requestCarriesImageInputs(request) {
+    return request.messages.some(message => (message.role === 'user' && (message.imageUrls?.length ?? 0) > 0));
+}
+async function classifyBoundedResponse(response, profile, signal, requestImageInputs) {
     const wireError = await readBoundedWireError(response, signal, RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes);
     const classification = profile.classifyError(wireError) ??
         baseWireErrorClassification(wireError);
@@ -682,7 +692,8 @@ async function classifyBoundedResponse(response, profile, signal) {
         statusCode: wireError.status,
         providerCode: wireError.providerCode,
         profileCode: classification.profileCode,
-        providerBody: wireError.body
+        providerBody: wireError.body,
+        requestImageInputs
     });
 }
 function classifyTransportFailure(error, signal) {
@@ -765,8 +776,9 @@ export class OpenAICompatibleAdapter {
                 throw error;
             throw classifyTransportFailure(error, signal);
         }
-        if (!response.ok)
-            throw await classifyBoundedResponse(response, this.#profile, signal);
+        if (!response.ok) {
+            throw await classifyBoundedResponse(response, this.#profile, signal, requestCarriesImageInputs(request));
+        }
         try {
             return request.streaming
                 ? await readBoundedEventStream(response, this.#profile, signal)

@@ -180,6 +180,7 @@ export interface ModelProviderErrorOptions {
   readonly providerCode?: string
   readonly profileCode?: string
   readonly providerBody?: string
+  readonly requestImageInputs?: boolean
 }
 
 const SAFE_CODE = /^[a-z0-9_.:-]{1,128}$/i
@@ -218,6 +219,14 @@ export class ModelProviderError extends AgentError {
   readonly providerCode?: string
   readonly profileCode?: string
   readonly providerBody?: string
+  /**
+   * Whether the rejected request carried image inputs.
+   *
+   * Host image links are signed and expire, so a replayed image is the most
+   * common reason a provider refuses an otherwise well-formed request. The flag
+   * stays off `details` because it is a recovery signal, not an error field.
+   */
+  readonly requestImageInputs: boolean
 
   constructor (options: ModelProviderErrorOptions) {
     super({
@@ -229,6 +238,7 @@ export class ModelProviderError extends AgentError {
     })
     this.name = 'ModelProviderError'
     this.statusCode = options.statusCode ?? null
+    this.requestImageInputs = options.requestImageInputs === true
     this.providerCode = options.providerCode && SAFE_CODE.test(options.providerCode)
       ? options.providerCode
       : undefined

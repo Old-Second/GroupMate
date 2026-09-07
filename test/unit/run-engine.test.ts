@@ -1865,6 +1865,54 @@ test('RunEngine excludes wire failures from usage and records only retry or reco
   })
 })
 
+test('RunEngine recovers once from an image-carrying provider rejection', async () => {
+  const rejection = (requestImageInputs: boolean) => new ModelProviderError({
+    code: 'provider_invalid_request',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。',
+    statusCode: 400,
+    requestImageInputs
+  })
+
+  const recoveredStore = new TerminalCaptureStore()
+  const recovered = harness([rejection(true), modelText('recovery success')], {
+    store: recoveredStore,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简上下文' }]),
+      estimatedInputTokens: 4
+    })
+  })
+  assert.equal((await recovered.engine.start(recovered.input)).kind, 'completed')
+  assert.equal(recovered.adapter.requests.length, 2)
+  assert.equal(recoveredStore.terminalCheckpoint?.recoveryUsed, true)
+
+  // A rejection with no replayed image keeps failing closed on the first attempt.
+  const plainStore = new TerminalCaptureStore()
+  const plain = harness([rejection(false), modelText('never reached')], {
+    store: plainStore,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简上下文' }]),
+      estimatedInputTokens: 4
+    })
+  })
+  assert.equal((await plain.engine.start(plain.input)).kind, 'failed')
+  assert.equal(plain.adapter.requests.length, 1)
+  assert.equal(plainStore.terminalCheckpoint?.recoveryUsed, false)
+
+  // The single recovery budget still bounds a provider that rejects both attempts.
+  const exhaustedStore = new TerminalCaptureStore()
+  const exhausted = harness([rejection(true), rejection(true)], {
+    store: exhaustedStore,
+    recoverContext: async () => Object.freeze({
+      messages: Object.freeze([{ role: 'user' as const, content: '精简上下文' }]),
+      estimatedInputTokens: 4
+    })
+  })
+  assert.equal((await exhausted.engine.start(exhausted.input)).kind, 'failed')
+  assert.equal(exhausted.adapter.requests.length, 2)
+})
+
 test('RunEngine records trusted refusal and invalid tool protocol usage before failing closed', async () => {
   const turns: readonly ModelTurn[] = [
     Object.freeze({

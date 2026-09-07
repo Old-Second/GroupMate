@@ -12,10 +12,11 @@ import type {
   ModelReasoningOptions
 } from './model-adapter.js'
 import { normalizeModelReasoningTrace } from './model-adapter.js'
-import type {
-  ModelErrorOverride,
-  OpenAICompatibleProfile,
-  ToolControlInput
+import {
+  expiredImageInputRecoveryHint,
+  type ModelErrorOverride,
+  type OpenAICompatibleProfile,
+  type ToolControlInput
 } from './openai-compatible-profile.js'
 import type { BoundedOpenAIWireError } from './openai-wire.js'
 import {
@@ -216,12 +217,13 @@ function classifyDeepSeekError (
 function deepSeekRecoveryHint (
   error: ModelProviderError
 ): 'none' | 'drop_optional_context_once' {
-  return error.code === 'provider_invalid_request' &&
+  if (error.code === 'provider_invalid_request' &&
     error.stage === 'model.response' &&
     error.statusCode === 400 &&
-    error.profileCode === LEGACY_CONTEXT_PROFILE_CODE
-    ? 'drop_optional_context_once'
-    : 'none'
+    error.profileCode === LEGACY_CONTEXT_PROFILE_CODE) {
+    return 'drop_optional_context_once'
+  }
+  return expiredImageInputRecoveryHint(error)
 }
 
 export const deepSeekCompatibilityProfile: OpenAICompatibleProfile = Object.freeze({
