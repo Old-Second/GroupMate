@@ -223,8 +223,13 @@ function boundedUtf8(value, maxBytes) {
     }
     return pieces.join('');
 }
-function providerFailureJournalEvent(fields, error) {
-    return Object.freeze({ type: 'provider.failure', ...fields, error });
+function providerFailureJournalEvent(fields, error, providerBody) {
+    return Object.freeze({
+        type: 'provider.failure',
+        ...fields,
+        error,
+        ...(providerBody === undefined ? {} : { providerBody })
+    });
 }
 function serializedAgentError(error, stage, userMessage, details) {
     return Object.freeze({
@@ -304,12 +309,22 @@ function canonicalProviderCallError(error, aborted, journalFields) {
         : error instanceof ModelProviderError
             ? error
             : internalError(error);
-    const serialized = boundedSerializedAgentError(classified, journalFields === null
+    const fits = journalFields === null
         ? undefined
-        : candidate => Buffer.byteLength(JSON.stringify(providerFailureJournalEvent(journalFields, candidate)), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes);
+        : (candidate) => Buffer.byteLength(JSON.stringify(providerFailureJournalEvent(journalFields, candidate)), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes;
+    const serialized = boundedSerializedAgentError(classified, fits);
+    // The body is the last thing to claim the envelope budget: a long provider message
+    // must never push the codes that make the failure attributable out of the record.
+    const providerBody = journalFields === null || !(classified instanceof ModelProviderError)
+        ? undefined
+        : classified.providerBody;
+    const boundedBody = providerBody === undefined
+        ? undefined
+        : longestFittingPrefix(providerBody, prefix => Buffer.byteLength(JSON.stringify(providerFailureJournalEvent(journalFields, serialized, prefix)), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes);
     return Object.freeze({
         error: new AgentError({ ...serialized, cause: error }),
-        serialized
+        serialized,
+        ...(boundedBody === undefined || boundedBody === '' ? {} : { providerBody: boundedBody })
     });
 }
 function checkpointConflict(cause) {
@@ -1702,7 +1717,7 @@ export class RunEngine {
                         if (journalFields === null) {
                             throw new TypeError('provider failure journal identity is unavailable');
                         }
-                        return providerFailureJournalEvent(journalFields, classified.serialized);
+                        return providerFailureJournalEvent(journalFields, classified.serialized, classified.providerBody);
                     });
                     const failedAttemptDraft = Object.freeze({
                         type: 'model.attempted',

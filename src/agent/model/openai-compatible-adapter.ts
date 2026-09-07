@@ -778,8 +778,8 @@ async function classifyBoundedResponse (
   )
   const classification = profile.classifyError(wireError) ??
     baseWireErrorClassification(wireError)
-  // Provider bodies stay unlogged; the two short codes are what makes a rejected
-  // request attributable in the journal after the fact.
+  // The short codes stay on `details`, which reaches the checkpoint; the provider's
+  // own wording rides `providerBody`, which only the content journal may keep.
   return new ModelProviderError({
     code: classification.code,
     stage: 'model.response',
@@ -796,7 +796,8 @@ async function classifyBoundedResponse (
     }),
     statusCode: wireError.status,
     providerCode: wireError.providerCode,
-    profileCode: classification.profileCode
+    profileCode: classification.profileCode,
+    providerBody: wireError.body
   })
 }
 

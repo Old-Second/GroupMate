@@ -9,6 +9,7 @@ import { AgentError, serializeAgentError } from '../../src/agent/contracts/error
 import { parseJsonValue } from '../../src/agent/model/json-value.js'
 import type { JsonObject } from '../../src/agent/model/json-value.js'
 import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import { PROVIDER_BODY_MAX_LENGTH } from '../../src/agent/model/model-adapter.js'
 import { createDefaultRunBudget } from '../../src/agent/run/run-budget.js'
 import {
   createInitialRunCheckpoint,
@@ -645,6 +646,54 @@ test('projects complete provider response failure and committed terminal content
         ...common, checkpoint: terminal.checkpoint, receipt: terminal.receipt
       }
     }
+  ])
+})
+
+test('projects the sanitized provider failure body and rejects an unusable one', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const terminal = terminalJournalFixture()
+  const common = Object.freeze({
+    type: 'provider.failure' as const,
+    occurredAt: '2026-07-17T08:03:00.000Z',
+    runRef: terminal.checkpoint.runRef,
+    requestRef: terminal.checkpoint.requestRef,
+    ordinal: 1,
+    attemptKind: 'primary' as const,
+    error: Object.freeze({
+      code: 'provider_invalid_request' as const,
+      stage: 'model.response',
+      retryable: false,
+      userMessage: '请求格式不正确，请联系机器人主人。',
+      details: Object.freeze({ status: 400, providerCode: 'invalid_image_url' })
+    })
+  })
+  const providerBody = '{"error":{"message":"failed to download image"}}'
+
+  journal.recordRunEvent(Object.freeze({ ...common, providerBody }))
+  for (const invalid of [42, '', '界'.repeat(PROVIDER_BODY_MAX_LENGTH)]) {
+    journal.recordRunEvent(Object.freeze({
+      ...common,
+      providerBody: invalid
+    }) as unknown as RunContentJournalEvent)
+  }
+
+  assert.deepEqual(events, [
+    {
+      type: 'provider.failure',
+      payload: {
+        occurredAt: common.occurredAt,
+        runRef: common.runRef,
+        requestRef: common.requestRef,
+        ordinal: 1,
+        attemptKind: 'primary',
+        error: common.error,
+        providerBody
+      }
+    },
+    ...[42, '', '界'.repeat(PROVIDER_BODY_MAX_LENGTH)].map(() => ({
+      type: 'groupmate.content_journal.projection_failure',
+      payload: { operation: 'run_event', code: 'invalid_content' }
+    }))
   ])
 })
 

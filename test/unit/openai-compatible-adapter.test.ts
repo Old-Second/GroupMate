@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import {
   ModelProviderError,
+  PROVIDER_BODY_MAX_LENGTH,
   type ModelRequest,
   type ProviderRequestMetadata
 } from '../../src/agent/model/model-adapter.js'
@@ -954,11 +955,14 @@ test('bounds error bodies and classifies stable HTTP failures without retrying',
     }
     assert.equal(isProviderError(code, retryable)(observed), true)
     assert.equal(attempts, 1)
-    assert.doesNotMatch(JSON.stringify(observed), /private-error-body|fixture invalid request/)
+    assert.doesNotMatch(
+      JSON.stringify((observed as ModelProviderError).details),
+      /private-error-body|fixture invalid request/
+    )
   }
 })
 
-test('records the reported and classified failure codes without the provider body', async () => {
+test('records the reported and classified failure codes with a journal-only body', async () => {
   const errorFixture = await loadText('standard-error.json')
   let observed: unknown
   try {
@@ -990,10 +994,52 @@ test('records the reported and classified failure codes without the provider bod
     providerCode: 'fixture_invalid_request',
     profileCode: 'deepseek_balance_insufficient'
   })
-  assert.doesNotMatch(JSON.stringify(profiled), /fixture invalid request/)
+  assert.doesNotMatch(
+    JSON.stringify((profiled as ModelProviderError).details),
+    /fixture invalid request/
+  )
+  assert.match(
+    (profiled as ModelProviderError).providerBody ?? '',
+    /fixture invalid request/
+  )
 })
 
-test('classifies a timeout abort without starting a second request', async () => {  let attempts = 0
+test('redacts credentials and bounds the provider body kept for the journal', async () => {
+  const secretBody = JSON.stringify({
+    error: {
+      message: 'rejected Authorization: Bearer abcdef123456 for sk-live-abcdef ' +
+        'while fetching https://example.invalid/image.png',
+      code: 'fixture_invalid_request'
+    }
+  })
+  let observed: unknown
+  try {
+    await adapterWithFetch(async () => fixtureResponse(secretBody, { status: 400 }))
+      .complete(frozenRequest(), new AbortController().signal)
+  } catch (error) {
+    observed = error
+  }
+  const body = (observed as ModelProviderError).providerBody ?? ''
+  assert.match(body, /Bearer \[redacted\]/)
+  assert.match(body, /sk-\[redacted\]/)
+  assert.doesNotMatch(body, /example\.invalid/)
+
+  let oversized: unknown
+  try {
+    await adapterWithFetch(async () => fixtureResponse(
+      '界'.repeat(PROVIDER_BODY_MAX_LENGTH),
+      { status: 400, chunkBytes: 1_024 }
+    )).complete(frozenRequest(), new AbortController().signal)
+  } catch (error) {
+    oversized = error
+  }
+  const boundedBody = (oversized as ModelProviderError).providerBody ?? ''
+  assert.ok(boundedBody.length > 0)
+  assert.ok(Buffer.byteLength(boundedBody, 'utf8') <= PROVIDER_BODY_MAX_LENGTH)
+})
+
+test('classifies a timeout abort without starting a second request', async () => {
+  let attempts = 0
   const controller = new AbortController()
   const adapter = adapterWithFetch(async (_url, init) => {
     attempts += 1

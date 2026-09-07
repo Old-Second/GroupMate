@@ -1,5 +1,6 @@
 import { isAgentErrorCode } from '../../agent/contracts/error.js';
 import { parsePresentationRoute } from '../../agent/contracts/interaction.js';
+import { PROVIDER_BODY_MAX_LENGTH, sanitizeProviderText } from '../../agent/model/model-adapter.js';
 import { parseExactToolArgumentsText } from '../../agent/model/tool-arguments-text.js';
 import { parseRunCheckpoint } from '../../agent/run/run-checkpoint.js';
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js';
@@ -240,6 +241,13 @@ function parseModelTurn(value) {
         text(input.responseId, 'model response ID');
     return input;
 }
+function parseProviderFailureBody(value) {
+    const body = text(value, 'provider failure body');
+    if (Buffer.byteLength(body, 'utf8') > PROVIDER_BODY_MAX_LENGTH) {
+        throw new TypeError('provider failure body is invalid');
+    }
+    return sanitizeProviderText(body, PROVIDER_BODY_MAX_LENGTH);
+}
 function parseSerializedError(value) {
     const input = boundedRecord(value, RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes, 'serialized agent error', { maxDepth: 4, maxNodes: 256 });
     exactKeys(input, ['code', 'stage', 'retryable', 'userMessage', 'details'], ['code', 'stage', 'retryable', 'userMessage', 'details'], 'serialized agent error');
@@ -361,12 +369,19 @@ export function projectRunJournalEvent(value) {
     }
     if (input.type === 'provider.failure') {
         const keys = [
-            'type', 'occurredAt', 'runRef', 'requestRef', 'ordinal', 'attemptKind', 'error'
+            'type', 'occurredAt', 'runRef', 'requestRef', 'ordinal', 'attemptKind', 'error',
+            'providerBody'
         ];
-        exactKeys(input, keys, keys, 'provider failure journal event');
+        exactKeys(input, keys, keys.slice(0, -1), 'provider failure journal event');
         return {
             type: input.type,
-            payload: { ...parseProviderCommon(input), error: parseSerializedError(input.error) }
+            payload: {
+                ...parseProviderCommon(input),
+                error: parseSerializedError(input.error),
+                ...(input.providerBody === undefined
+                    ? {}
+                    : { providerBody: parseProviderFailureBody(input.providerBody) })
+            }
         };
     }
     throw new TypeError('run journal event type is invalid');

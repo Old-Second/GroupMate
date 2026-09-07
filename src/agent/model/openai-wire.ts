@@ -1,5 +1,5 @@
 import type { JsonObject } from './json-value.js'
-import { modelProtocolError } from './model-adapter.js'
+import { modelProtocolError, sanitizeProviderText } from './model-adapter.js'
 
 export interface OpenAIHeadersLike {
   get(name: string): string | null
@@ -127,15 +127,6 @@ export async function readBoundedResponseText (
   })
 }
 
-function sanitizeWireText (value: string, maxLength: number): string {
-  return value
-    .slice(0, maxLength)
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
-    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
-    .replace(/sk-[A-Za-z0-9_-]+/g, 'sk-[redacted]')
-    .replace(/https?:\/\/[^\s"']+/gi, '[url]')
-}
-
 function extractProviderCode (body: string): string | undefined {
   try {
     const parsed = JSON.parse(body) as unknown
@@ -159,10 +150,10 @@ export async function readBoundedWireError (
     truncate: true,
     overflowReason: 'error_body_too_large'
   })
-  const body = sanitizeWireText(bounded.text, maxBytes)
+  const body = sanitizeProviderText(bounded.text, maxBytes)
   return Object.freeze({
     status: response.status,
-    statusText: sanitizeWireText(response.statusText, 128),
+    statusText: sanitizeProviderText(response.statusText, 128),
     body,
     truncated: bounded.truncated,
     providerCode: extractProviderCode(body)

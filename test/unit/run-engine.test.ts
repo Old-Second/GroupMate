@@ -10,7 +10,7 @@ import type {
   ModelTurn,
   ProviderRequestMetadata
 } from '../../src/agent/model/model-adapter.js'
-import { ModelProviderError } from '../../src/agent/model/model-adapter.js'
+import { ModelProviderError, PROVIDER_BODY_MAX_LENGTH } from '../../src/agent/model/model-adapter.js'
 import { deepSeekCompatibilityProfile } from '../../src/agent/model/deepseek-compatibility-profile.js'
 import { standardOpenAIProfile } from '../../src/agent/model/standard-openai-profile.js'
 import { createContextPlanV1, contextWireHash } from '../../src/agent/context/context-plan.js'
@@ -1388,6 +1388,55 @@ test('RunEngine bounds the complete Provider failure envelope across UTF-8 bound
       errorCode: 'provider_unavailable'
     }, boundary.label)
   }
+})
+
+test('RunEngine journals the sanitized Provider body without exposing it to the run error', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([new ModelProviderError({
+    code: 'provider_invalid_request',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: '请求格式不正确，请联系机器人主人。',
+    details: Object.freeze({ status: 400, providerCode: 'invalid_image_url' }),
+    statusCode: 400,
+    providerBody: '{"error":{"message":"failed to download image","code":"invalid_image_url"}}'
+  })], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  const result = await fixture.engine.start(fixture.input)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+
+  assert.equal(failure?.type, 'provider.failure')
+  assert.equal(failure?.type === 'provider.failure' ? failure.providerBody : null,
+    '{"error":{"message":"failed to download image","code":"invalid_image_url"}}')
+  assert.deepEqual(failure?.type === 'provider.failure' ? failure.error.details : null,
+    { status: 400, providerCode: 'invalid_image_url' })
+  assert.equal(result.kind, 'failed')
+  assert.equal(JSON.stringify(result).includes('failed to download image'), false)
+})
+
+test('RunEngine truncates an oversized Provider body to protect the failure envelope', async () => {
+  const journalEvents: RunContentJournalEvent[] = []
+  const fixture = harness([new ModelProviderError({
+    code: 'provider_unavailable',
+    stage: 'model.response',
+    retryable: false,
+    userMessage: 'AI 服务暂时不可用。',
+    details: Object.freeze({ status: 503 }),
+    providerBody: '界'.repeat(PROVIDER_BODY_MAX_LENGTH * 2)
+  })], {
+    contentJournal: { record: event => { journalEvents.push(event) } }
+  })
+
+  await fixture.engine.start(fixture.input)
+  const failure = journalEvents.find(event => event.type === 'provider.failure')
+  const body = failure?.type === 'provider.failure' ? failure.providerBody ?? '' : ''
+
+  assert.ok(body.length > 0)
+  assert.ok(Buffer.byteLength(body, 'utf8') <= PROVIDER_BODY_MAX_LENGTH)
+  assert.ok(Buffer.byteLength(JSON.stringify(failure), 'utf8') <=
+    RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes)
 })
 
 test('RunEngine journals Provider timeout classification before returning the same failure', async () => {

@@ -38,6 +38,9 @@ export interface ProviderFailureContentJournalEvent
   extends ProviderContentJournalEventBase {
   readonly type: 'provider.failure'
   readonly error: SerializedAgentError
+  // Sanitized provider wording. It never joins `error.details`, so it stays out of
+  // the run checkpoint and the redacted trace and only reaches the content journal.
+  readonly providerBody?: string
 }
 
 export interface RunTerminalCommittedContentJournalEvent {

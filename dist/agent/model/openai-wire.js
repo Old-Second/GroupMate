@@ -1,4 +1,4 @@
-import { modelProtocolError } from './model-adapter.js';
+import { modelProtocolError, sanitizeProviderText } from './model-adapter.js';
 const SAFE_PROVIDER_CODE = /^[a-z0-9_.:-]{1,128}$/i;
 function toBytes(value) {
     if (typeof value === 'string')
@@ -74,14 +74,6 @@ export async function readBoundedResponseText(response, signal, maxBytes, option
         truncated
     });
 }
-function sanitizeWireText(value, maxLength) {
-    return value
-        .slice(0, maxLength)
-        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
-        .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
-        .replace(/sk-[A-Za-z0-9_-]+/g, 'sk-[redacted]')
-        .replace(/https?:\/\/[^\s"']+/gi, '[url]');
-}
 function extractProviderCode(body) {
     try {
         const parsed = JSON.parse(body);
@@ -103,10 +95,10 @@ export async function readBoundedWireError(response, signal, maxBytes) {
         truncate: true,
         overflowReason: 'error_body_too_large'
     });
-    const body = sanitizeWireText(bounded.text, maxBytes);
+    const body = sanitizeProviderText(bounded.text, maxBytes);
     return Object.freeze({
         status: response.status,
-        statusText: sanitizeWireText(response.statusText, 128),
+        statusText: sanitizeProviderText(response.statusText, 128),
         body,
         truncated: bounded.truncated,
         providerCode: extractProviderCode(body)

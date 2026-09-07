@@ -179,14 +179,45 @@ export interface ModelProviderErrorOptions {
   readonly statusCode?: number | null
   readonly providerCode?: string
   readonly profileCode?: string
+  readonly providerBody?: string
 }
 
 const SAFE_CODE = /^[a-z0-9_.:-]{1,128}$/i
+
+// The provider body is diagnostic content, not a scalar error field: it stays off
+// `details` so it never reaches the run checkpoint or the redacted trace, and only
+// the content journal may persist it.
+export const PROVIDER_BODY_MAX_LENGTH = 4_096
+
+export function sanitizeProviderText (value: string, maxLength: number): string {
+  return value
+    .slice(0, maxLength)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
+    .replace(/sk-[A-Za-z0-9_-]+/g, 'sk-[redacted]')
+    .replace(/https?:\/\/[^\s"']+/gi, '[url]')
+}
+
+// The journal projection rejects an over-long body, so the byte bound has to hold
+// here as well: a multi-byte body must lose characters, not the whole record.
+export function boundedProviderBody (value: string): string {
+  const sanitized = sanitizeProviderText(value, PROVIDER_BODY_MAX_LENGTH).trim()
+  const kept: string[] = []
+  let bytes = 0
+  for (const character of sanitized) {
+    const size = Buffer.byteLength(character, 'utf8')
+    if (bytes + size > PROVIDER_BODY_MAX_LENGTH) break
+    kept.push(character)
+    bytes += size
+  }
+  return kept.join('')
+}
 
 export class ModelProviderError extends AgentError {
   readonly statusCode: number | null
   readonly providerCode?: string
   readonly profileCode?: string
+  readonly providerBody?: string
 
   constructor (options: ModelProviderErrorOptions) {
     super({
@@ -204,6 +235,10 @@ export class ModelProviderError extends AgentError {
     this.profileCode = options.profileCode && SAFE_CODE.test(options.profileCode)
       ? options.profileCode
       : undefined
+    const providerBody = options.providerBody === undefined
+      ? ''
+      : boundedProviderBody(options.providerBody)
+    this.providerBody = providerBody === '' ? undefined : providerBody
   }
 }
 

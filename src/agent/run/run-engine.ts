@@ -568,14 +568,20 @@ type ProviderFailureJournalEvent = Extract<
 
 type ProviderFailureJournalFields = Omit<
   ProviderFailureJournalEvent,
-  'type' | 'error'
+  'type' | 'error' | 'providerBody'
 >
 
 function providerFailureJournalEvent (
   fields: ProviderFailureJournalFields,
-  error: SerializedAgentError
+  error: SerializedAgentError,
+  providerBody?: string
 ): ProviderFailureJournalEvent {
-  return Object.freeze({ type: 'provider.failure', ...fields, error })
+  return Object.freeze({
+    type: 'provider.failure',
+    ...fields,
+    error,
+    ...(providerBody === undefined ? {} : { providerBody })
+  })
 }
 
 function serializedAgentError (
@@ -662,7 +668,11 @@ function canonicalProviderCallError (
   error: unknown,
   aborted: boolean,
   journalFields: ProviderFailureJournalFields | null
-): Readonly<{ error: AgentError, serialized: SerializedAgentError }> {
+): Readonly<{
+  error: AgentError
+  serialized: SerializedAgentError
+  providerBody?: string
+}> {
   const classified = aborted
     ? new AgentError({
         code: 'cancelled',
@@ -674,14 +684,26 @@ function canonicalProviderCallError (
     : error instanceof ModelProviderError
       ? error
       : internalError(error)
-  const serialized = boundedSerializedAgentError(classified, journalFields === null
+  const fits = journalFields === null
     ? undefined
-    : candidate => Buffer.byteLength(JSON.stringify(
-      providerFailureJournalEvent(journalFields, candidate)
+    : (candidate: SerializedAgentError) => Buffer.byteLength(JSON.stringify(
+        providerFailureJournalEvent(journalFields, candidate)
+      ), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes
+  const serialized = boundedSerializedAgentError(classified, fits)
+  // The body is the last thing to claim the envelope budget: a long provider message
+  // must never push the codes that make the failure attributable out of the record.
+  const providerBody = journalFields === null || !(classified instanceof ModelProviderError)
+    ? undefined
+    : classified.providerBody
+  const boundedBody = providerBody === undefined
+    ? undefined
+    : longestFittingPrefix(providerBody, prefix => Buffer.byteLength(JSON.stringify(
+      providerFailureJournalEvent(journalFields as ProviderFailureJournalFields, serialized, prefix)
     ), 'utf8') <= RUN_RESOURCE_LIMITS.sanitizedErrorBodyBytes)
   return Object.freeze({
     error: new AgentError({ ...serialized, cause: error }),
-    serialized
+    serialized,
+    ...(boundedBody === undefined || boundedBody === '' ? {} : { providerBody: boundedBody })
   })
 }
 
@@ -2301,7 +2323,11 @@ export class RunEngine {
             if (journalFields === null) {
               throw new TypeError('provider failure journal identity is unavailable')
             }
-            return providerFailureJournalEvent(journalFields, classified.serialized)
+            return providerFailureJournalEvent(
+              journalFields,
+              classified.serialized,
+              classified.providerBody
+            )
           })
           const failedAttemptDraft: EventDraft = Object.freeze({
             type: 'model.attempted',
