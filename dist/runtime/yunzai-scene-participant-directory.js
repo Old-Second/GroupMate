@@ -40,7 +40,7 @@ function unwrapMemberInfo(value, expectedUserId) {
     }
     return null;
 }
-async function invokePickMember(group, userId, signal) {
+async function invokePickMember(group, userId, signal, noCache) {
     if (typeof group.pickMember !== 'function')
         return null;
     return await new Promise((resolve, reject) => {
@@ -69,7 +69,7 @@ async function invokePickMember(group, userId, signal) {
         try {
             const returned = Reflect.apply(group.pickMember, group, [
                 hostIdentifier(userId),
-                true,
+                noCache,
                 finish
             ]);
             if (returned !== undefined && returned !== null) {
@@ -87,7 +87,7 @@ async function invokePickMember(group, userId, signal) {
         }
     });
 }
-async function refreshMember(event, groupId, userId, signal) {
+async function refreshMember(event, groupId, userId, signal, noCache = true) {
     throwIfAborted(signal);
     const bot = event.bot;
     if (typeof bot?.sendApi === 'function') {
@@ -97,7 +97,7 @@ async function refreshMember(event, groupId, userId, signal) {
                 Object.freeze({
                     group_id: hostIdentifier(groupId),
                     user_id: hostIdentifier(userId),
-                    no_cache: true
+                    no_cache: noCache
                 })
             ]);
             throwIfAborted(signal);
@@ -115,7 +115,7 @@ async function refreshMember(event, groupId, userId, signal) {
             const raw = await Reflect.apply(bot.getGroupMemberInfo, bot, [
                 hostIdentifier(groupId),
                 hostIdentifier(userId),
-                true
+                noCache
             ]);
             throwIfAborted(signal);
             const member = unwrapMemberInfo(raw, userId);
@@ -135,7 +135,7 @@ async function refreshMember(event, groupId, userId, signal) {
             ]);
             if (raw !== null && typeof raw === 'object' &&
                 typeof raw.getInfo === 'function') {
-                raw = await Reflect.apply(raw.getInfo, raw, [true]);
+                raw = await Reflect.apply(raw.getInfo, raw, [noCache]);
             }
             throwIfAborted(signal);
             const member = unwrapMemberInfo(raw, userId);
@@ -155,7 +155,7 @@ async function refreshMember(event, groupId, userId, signal) {
                 : null;
         const raw = group === null || typeof group !== 'object'
             ? null
-            : await invokePickMember(group, userId, signal);
+            : await invokePickMember(group, userId, signal, noCache);
         throwIfAborted(signal);
         return unwrapMemberInfo(raw, userId);
     }
@@ -164,6 +164,20 @@ async function refreshMember(event, groupId, userId, signal) {
             throw abortError();
         return null;
     }
+}
+/**
+ * Resolves the bot's own group membership.
+ *
+ * Only the immutable `join_time` of this record derives the group lifecycle id,
+ * so the host member cache is authoritative enough here and an uncached lookup
+ * is merely the fallback. An uncached `get_group_member_info` costs the host
+ * 120-190 ms against 13-20 ms cached, which alone exceeds the recall budget.
+ */
+async function refreshBotMember(event, groupId, accountId, signal) {
+    const cached = await refreshMember(event, groupId, accountId, signal, false);
+    if (cached !== null && groupLifecycleId(groupId, cached) !== null)
+        return cached;
+    return await refreshMember(event, groupId, accountId, signal, true);
 }
 function mentionedUserIds(event, accountId) {
     const result = [];
@@ -255,7 +269,7 @@ export function createYunzaiSceneParticipantDirectoryV1() {
             const groupId = qqId(event.group_id);
             if (groupId === null)
                 return null;
-            const botMember = await refreshMember(event, groupId, accountId, signal);
+            const botMember = await refreshBotMember(event, groupId, accountId, signal);
             if (botMember === null)
                 return null;
             const lifecycle = groupLifecycleId(groupId, botMember);

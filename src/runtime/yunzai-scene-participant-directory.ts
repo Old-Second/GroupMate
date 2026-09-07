@@ -78,7 +78,8 @@ function unwrapMemberInfo (value: unknown, expectedUserId: string): YunzaiRecord
 async function invokePickMember (
   group: YunzaiRecord,
   userId: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  noCache: boolean
 ): Promise<unknown> {
   if (typeof group.pickMember !== 'function') return null
   return await new Promise((resolve, reject) => {
@@ -104,7 +105,7 @@ async function invokePickMember (
     try {
       const returned = Reflect.apply(group.pickMember, group, [
         hostIdentifier(userId),
-        true,
+        noCache,
         finish
       ])
       if (returned !== undefined && returned !== null) {
@@ -125,7 +126,8 @@ async function refreshMember (
   event: YunzaiRecord,
   groupId: string,
   userId: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  noCache = true
 ): Promise<YunzaiRecord | null> {
   throwIfAborted(signal)
   const bot = event.bot as YunzaiRecord | undefined
@@ -136,7 +138,7 @@ async function refreshMember (
         Object.freeze({
           group_id: hostIdentifier(groupId),
           user_id: hostIdentifier(userId),
-          no_cache: true
+          no_cache: noCache
         })
       ])
       throwIfAborted(signal)
@@ -151,7 +153,7 @@ async function refreshMember (
       const raw = await Reflect.apply(bot.getGroupMemberInfo, bot, [
         hostIdentifier(groupId),
         hostIdentifier(userId),
-        true
+        noCache
       ])
       throwIfAborted(signal)
       const member = unwrapMemberInfo(raw, userId)
@@ -168,7 +170,7 @@ async function refreshMember (
       ])
       if (raw !== null && typeof raw === 'object' &&
         typeof (raw as YunzaiRecord).getInfo === 'function') {
-        raw = await Reflect.apply((raw as YunzaiRecord).getInfo, raw, [true])
+        raw = await Reflect.apply((raw as YunzaiRecord).getInfo, raw, [noCache])
       }
       throwIfAborted(signal)
       const member = unwrapMemberInfo(raw, userId)
@@ -185,13 +187,32 @@ async function refreshMember (
         : null
     const raw = group === null || typeof group !== 'object'
       ? null
-      : await invokePickMember(group, userId, signal)
+      : await invokePickMember(group, userId, signal, noCache)
     throwIfAborted(signal)
     return unwrapMemberInfo(raw, userId)
   } catch (error) {
     if (signal.aborted) throw abortError()
     return null
   }
+}
+
+/**
+ * Resolves the bot's own group membership.
+ *
+ * Only the immutable `join_time` of this record derives the group lifecycle id,
+ * so the host member cache is authoritative enough here and an uncached lookup
+ * is merely the fallback. An uncached `get_group_member_info` costs the host
+ * 120-190 ms against 13-20 ms cached, which alone exceeds the recall budget.
+ */
+async function refreshBotMember (
+  event: YunzaiRecord,
+  groupId: string,
+  accountId: string,
+  signal: AbortSignal
+): Promise<YunzaiRecord | null> {
+  const cached = await refreshMember(event, groupId, accountId, signal, false)
+  if (cached !== null && groupLifecycleId(groupId, cached) !== null) return cached
+  return await refreshMember(event, groupId, accountId, signal, true)
 }
 
 function mentionedUserIds (event: YunzaiRecord, accountId: string): readonly string[] {
@@ -287,7 +308,7 @@ YunzaiSceneParticipantDirectoryInputV1
 
       const groupId = qqId(event.group_id)
       if (groupId === null) return null
-      const botMember = await refreshMember(event, groupId, accountId, signal)
+      const botMember = await refreshBotMember(event, groupId, accountId, signal)
       if (botMember === null) return null
       const lifecycle = groupLifecycleId(groupId, botMember)
       if (lifecycle === null) return null

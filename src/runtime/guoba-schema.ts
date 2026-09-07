@@ -156,7 +156,7 @@ export function buildGuobaSchemas ({
     field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入已 opt-in 用户的个人记忆；空列表表示群聊全部不允许，私聊仍受用户独立 opt-in 控制。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
     field('personalMemoryRecallMaxItems', '单次召回条数上限', '每次请求最多注入的个人记忆条数，范围 1 到 12；默认 6。修改后需重启。', 'InputNumber', { min: 1, max: 12, step: 1 }),
     field('personalMemoryRecallMaxTokens', '单次召回 Token 上限', '每次请求中个人记忆正文的独立 Token 预算，范围 1 到 2400；默认 1200，仍受总上下文预算约束。修改后需重启。', 'InputNumber', { min: 1, max: 2_400, step: 1 }),
-    field('personalMemoryRecallTimeoutMs', '单次召回超时毫秒', '个人记忆召回总超时，范围 1 到 500 毫秒；默认 150，超时会无记忆继续普通回复。修改后需重启。', 'InputNumber', { min: 1, max: 500, step: 1 }),
+    field('personalMemoryRecallTimeoutMs', '单次召回超时毫秒', '个人记忆检索超时，范围 1 到 500 毫秒；默认 150，超时会无记忆继续普通回复。群成员身份核验走宿主接口，有独立预算，不占用这里的时间。修改后需重启。', 'InputNumber', { min: 1, max: 500, step: 1 }),
     field('personalMemoryOperationsStatus', '长期记忆运行状态', '只读取当前已装配实例的有界计数，不会初始化 SQLite、Redis、worker、timer 或外部服务，也不会显示记忆正文和查询内容。', 'InputTextArea', { disabled: true }),
     field('personalMemoryMaintenanceAction', '长期记忆维护动作', '保存时可执行完整性校验或重建可派生的词法索引；动作不会删除 canonical 记忆，关闭模式下不会初始化存储或执行维护。', 'Select', {
       options: [

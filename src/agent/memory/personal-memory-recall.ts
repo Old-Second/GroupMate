@@ -61,6 +61,7 @@ export interface CreatePersonalMemoryRecallSourceOptionsV1<TParticipantInput> {
   readonly retriever: MemoryRetrievalAdapterV2
   readonly now?: () => Date
   readonly timeoutMs?: number
+  readonly participantTimeoutMs?: number
   readonly limits?: Readonly<{
     readonly maxCandidates: number
     readonly maxTokens: number
@@ -79,6 +80,8 @@ const DEFAULT_LIMITS: PersonalMemoryRecallLimitsV1 = Object.freeze({
   maxTokens: 1_200,
   maxBytes: 32 * 1_024
 })
+const DEFAULT_PARTICIPANT_TIMEOUT_MS = 600
+const MAX_PARTICIPANT_TIMEOUT_MS = 2_000
 
 function unavailable (
   reason: Extract<MemoryRetrievalResultV2, { status: 'unavailable' }>['reason']
@@ -147,6 +150,22 @@ function checkedTimeout (value: number | undefined): number {
   return timeout
 }
 
+/**
+ * Bounds the participant identity resolution that runs before retrieval.
+ *
+ * Scene identity comes from the chat host, not from the memory index, so it owns
+ * a budget of its own: an authoritative uncached group member lookup costs the
+ * host 120-190 ms and would otherwise consume the whole retrieval deadline.
+ */
+function checkedParticipantTimeout (value: number | undefined): number {
+  const timeout = value ?? DEFAULT_PARTICIPANT_TIMEOUT_MS
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 ||
+    timeout > MAX_PARTICIPANT_TIMEOUT_MS) {
+    throw new TypeError('personal memory participant timeout is invalid')
+  }
+  return timeout
+}
+
 function checkedLimits (
   value: CreatePersonalMemoryRecallSourceOptionsV1<unknown>['limits']
 ): PersonalMemoryRecallLimitsV1 {
@@ -207,6 +226,7 @@ export function createPersonalMemoryRecallSourceV1<TParticipantInput> (
 ): PersonalMemoryRecallSourceV1<TParticipantInput> {
   const now = options.now ?? (() => new Date())
   const timeoutMs = checkedTimeout(options.timeoutMs)
+  const participantTimeoutMs = checkedParticipantTimeout(options.participantTimeoutMs)
   const limits = checkedLimits(options.limits)
   const issuer = createMemoryAccessCapabilityIssuerV1(() => true)
 
@@ -220,14 +240,28 @@ export function createPersonalMemoryRecallSourceV1<TParticipantInput> (
       if (mode === null) return unavailable('policy_unavailable')
       if (mode === 'off') return unavailable('disabled')
 
+      let resolved: Readonly<{ snapshot: PersonalMemoryParticipantSnapshotV1 }> |
+      MemoryRetrievalResultV2
+      try {
+        resolved = await withinDeadline(async signal => {
+          const snapshot = await options.participants.resolve(input.participantInput, signal)
+          throwIfAborted(signal)
+          return snapshot === null
+            ? unavailable('policy_unavailable')
+            : Object.freeze({ snapshot })
+        }, callerSignal, now, participantTimeoutMs)
+      } catch {
+        if (callerSignal?.aborted === true) throw abortError()
+        return unavailable('policy_unavailable')
+      }
+      if (!('snapshot' in resolved)) return resolved
+      const snapshot = resolved.snapshot
+
       let result: MemoryRetrievalResultV2
       try {
         result = await withinDeadline(async (signal, deadline) => {
           const observed = trustedNow(now)
           if (observed === null) return unavailable('policy_unavailable')
-          const snapshot = await options.participants.resolve(input.participantInput, signal)
-          throwIfAborted(signal)
-          if (snapshot === null) return unavailable('policy_unavailable')
 
           let subjects: readonly PersonalMemorySubjectV1[]
           let scope: ReturnType<typeof buildPersonalMemoryAccessScopeV1>

@@ -8,6 +8,8 @@ const DEFAULT_LIMITS = Object.freeze({
     maxTokens: 1_200,
     maxBytes: 32 * 1_024
 });
+const DEFAULT_PARTICIPANT_TIMEOUT_MS = 600;
+const MAX_PARTICIPANT_TIMEOUT_MS = 2_000;
 function unavailable(reason) {
     return Object.freeze({ schemaVersion: 2, status: 'unavailable', reason });
 }
@@ -70,6 +72,21 @@ function checkedTimeout(value) {
     }
     return timeout;
 }
+/**
+ * Bounds the participant identity resolution that runs before retrieval.
+ *
+ * Scene identity comes from the chat host, not from the memory index, so it owns
+ * a budget of its own: an authoritative uncached group member lookup costs the
+ * host 120-190 ms and would otherwise consume the whole retrieval deadline.
+ */
+function checkedParticipantTimeout(value) {
+    const timeout = value ?? DEFAULT_PARTICIPANT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 ||
+        timeout > MAX_PARTICIPANT_TIMEOUT_MS) {
+        throw new TypeError('personal memory participant timeout is invalid');
+    }
+    return timeout;
+}
 function checkedLimits(value) {
     const limits = value ?? DEFAULT_LIMITS;
     if (!Number.isSafeInteger(limits.maxCandidates) || limits.maxCandidates <= 0 ||
@@ -123,6 +140,7 @@ async function withinDeadline(operation, callerSignal, now, timeoutMs) {
 export function createPersonalMemoryRecallSourceV1(options) {
     const now = options.now ?? (() => new Date());
     const timeoutMs = checkedTimeout(options.timeoutMs);
+    const participantTimeoutMs = checkedParticipantTimeout(options.participantTimeoutMs);
     const limits = checkedLimits(options.limits);
     const issuer = createMemoryAccessCapabilityIssuerV1(() => true);
     return Object.freeze({
@@ -133,15 +151,29 @@ export function createPersonalMemoryRecallSourceV1(options) {
                 return unavailable('policy_unavailable');
             if (mode === 'off')
                 return unavailable('disabled');
+            let resolved;
+            try {
+                resolved = await withinDeadline(async (signal) => {
+                    const snapshot = await options.participants.resolve(input.participantInput, signal);
+                    throwIfAborted(signal);
+                    return snapshot === null
+                        ? unavailable('policy_unavailable')
+                        : Object.freeze({ snapshot });
+                }, callerSignal, now, participantTimeoutMs);
+            }
+            catch {
+                if (callerSignal?.aborted === true)
+                    throw abortError();
+                return unavailable('policy_unavailable');
+            }
+            if (!('snapshot' in resolved))
+                return resolved;
+            const snapshot = resolved.snapshot;
             let result;
             try {
                 result = await withinDeadline(async (signal, deadline) => {
                     const observed = trustedNow(now);
                     if (observed === null)
-                        return unavailable('policy_unavailable');
-                    const snapshot = await options.participants.resolve(input.participantInput, signal);
-                    throwIfAborted(signal);
-                    if (snapshot === null)
                         return unavailable('policy_unavailable');
                     let subjects;
                     let scope;

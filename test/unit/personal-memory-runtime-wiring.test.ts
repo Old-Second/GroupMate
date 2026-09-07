@@ -341,7 +341,8 @@ test('internal timeout fails open while caller cancellation propagates', async (
       retrieve: async (request: MemoryRetrievalRequestV2) => completedResult(request)
     }),
     now: () => new Date(NOW),
-    timeoutMs: 10
+    timeoutMs: 10,
+    participantTimeoutMs: 10
   })
   assert.deepEqual(await createSource().recall(recallInput('private')), {
     schemaVersion: 2,
@@ -355,6 +356,91 @@ test('internal timeout fails open while caller cancellation propagates', async (
   await assert.rejects(pending, (error: unknown) => (
     error instanceof DOMException && error.name === 'AbortError'
   ))
+})
+
+test('host identity resolution owns a budget outside the retrieval deadline', async () => {
+  let retrievals = 0
+  const slowDirectory: PersonalMemoryParticipantDirectoryV1<string> = Object.freeze({
+    resolve: async () => await new Promise<PersonalMemoryParticipantSnapshotV1 | null>(
+      resolve => { setTimeout(() => { resolve(privateSnapshot()) }, 100) }
+    )
+  })
+  const source = createPersonalMemoryRecallSourceV1({
+    deploymentMode: () => 'explicit',
+    groupAllowlist: () => Object.freeze([]),
+    participants: slowDirectory,
+    enrollment: enrollmentPort(() => true),
+    retriever: Object.freeze({
+      retrieve: async (request: MemoryRetrievalRequestV2) => {
+        retrievals += 1
+        return completedResult(request)
+      }
+    }),
+    now: () => new Date(NOW),
+    timeoutMs: 50,
+    participantTimeoutMs: 500
+  })
+
+  assert.equal((await source.recall(recallInput('private'))).status, 'completed')
+  assert.equal(retrievals, 1)
+})
+
+test('host identity resolution exceeding its own budget fails open without retrieval', async () => {
+  let retrievals = 0
+  const stalledDirectory: PersonalMemoryParticipantDirectoryV1<string> = Object.freeze({
+    resolve: async (_input: string, signal: AbortSignal) => await new Promise<
+    PersonalMemoryParticipantSnapshotV1 | null
+    >((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(
+        new DOMException('aborted', 'AbortError')
+      ), { once: true })
+    })
+  })
+  const source = createPersonalMemoryRecallSourceV1({
+    deploymentMode: () => 'explicit',
+    groupAllowlist: () => Object.freeze([]),
+    participants: stalledDirectory,
+    enrollment: enrollmentPort(() => true),
+    retriever: Object.freeze({
+      retrieve: async (request: MemoryRetrievalRequestV2) => {
+        retrievals += 1
+        return completedResult(request)
+      }
+    }),
+    now: () => new Date(NOW),
+    timeoutMs: 500,
+    participantTimeoutMs: 10
+  })
+
+  assert.deepEqual(await source.recall(recallInput('private')), {
+    schemaVersion: 2,
+    status: 'unavailable',
+    reason: 'deadline_exceeded'
+  })
+  assert.equal(retrievals, 0)
+})
+
+test('an invalid host identity budget is rejected when the source is created', () => {
+  const options = {
+    deploymentMode: () => 'explicit' as const,
+    groupAllowlist: () => Object.freeze([]),
+    participants: Object.freeze({ resolve: async () => privateSnapshot() }),
+    enrollment: enrollmentPort(() => true),
+    retriever: Object.freeze({
+      retrieve: async (request: MemoryRetrievalRequestV2) => completedResult(request)
+    }),
+    now: () => new Date(NOW)
+  }
+  for (const participantTimeoutMs of [0, -1, 2_001, 1.5, Number.NaN]) {
+    assert.throws(
+      () => createPersonalMemoryRecallSourceV1({ ...options, participantTimeoutMs }),
+      TypeError
+    )
+  }
+  assert.equal(
+    typeof createPersonalMemoryRecallSourceV1({ ...options, participantTimeoutMs: 2_000 }).recall,
+    'function'
+  )
 })
 
 test('memory projection fixes user role, untrusted trust and revision provenance', () => {
@@ -474,6 +560,7 @@ function evidence (): PreparedYunzaiMessageEvidenceV1 {
 
 test('Yunzai directory uses event proof plus bounded single-member refresh for quote and mentions', async () => {
   const calls: string[] = []
+  const cachePolicy: Array<Readonly<{ userId: string, noCache: unknown }>> = []
   const members: Record<string, Record<string, unknown>> = {
     [ACCOUNT_ID]: { user_id: ACCOUNT_ID, nickname: '机器人', join_time: 123456, role: 'member' },
     '70002': { user_id: '70002', nickname: '引用昵称', card: '引用名片', role: 'admin' },
@@ -500,6 +587,7 @@ test('Yunzai directory uses event proof plus bounded single-member refresh for q
         assert.equal(name, 'get_group_member_info')
         const userId = String(params.user_id)
         calls.push(userId)
+        cachePolicy.push(Object.freeze({ userId, noCache: params.no_cache }))
         return Object.freeze({ data: Object.freeze(members[userId]) })
       }
     }
@@ -514,6 +602,12 @@ test('Yunzai directory uses event proof plus bounded single-member refresh for q
   }, new AbortController().signal)
   assert.notEqual(snapshot, null)
   assert.deepEqual(calls, [ACCOUNT_ID, '70002', '70003', '70004'])
+  assert.deepEqual(cachePolicy, [
+    { userId: ACCOUNT_ID, noCache: false },
+    { userId: '70002', noCache: true },
+    { userId: '70003', noCache: true },
+    { userId: '70004', noCache: true }
+  ])
   assert.equal(snapshot?.scene.kind, 'group')
   if (snapshot?.scene.kind !== 'group') assert.fail('expected group scene')
   assert.equal(snapshot.scene.groupLifecycleId, LIFECYCLE_ID)
@@ -529,6 +623,48 @@ test('Yunzai directory uses event proof plus bounded single-member refresh for q
     'admin', 'member', 'owner'
   ])
   assert.equal('getMemberMap' in event.group, false)
+})
+
+test('Yunzai directory falls back to an uncached bot lookup when the cache lacks a join time', async () => {
+  const cachePolicy: unknown[] = []
+  const directory = createYunzaiSceneParticipantDirectoryV1()
+  const snapshot = await directory.resolve({
+    event: {
+      isGroup: true,
+      group_id: GROUP_ID,
+      user_id: CURRENT_USER_ID,
+      sender: { user_id: CURRENT_USER_ID, nickname: '当前用户', role: 'member' },
+      message: Object.freeze([]),
+      group: { async getChatHistory () { return Object.freeze([]) } },
+      bot: {
+        async sendApi (_name: string, params: Readonly<Record<string, unknown>>) {
+          cachePolicy.push(params.no_cache)
+          return Object.freeze({
+            data: Object.freeze({
+              user_id: ACCOUNT_ID,
+              nickname: '机器人',
+              role: 'member',
+              ...(params.no_cache === true ? { join_time: 123456 } : {})
+            })
+          })
+        }
+      }
+    },
+    messageEvidence: Object.freeze({
+      ...evidence(),
+      hasReply: false,
+      replyResolved: false,
+      quotedMessageId: null,
+      quotedMessage: undefined
+    }),
+    accountId: ACCOUNT_ID,
+    observedAt: NOW
+  }, new AbortController().signal)
+
+  assert.deepEqual(cachePolicy, [false, true])
+  assert.equal(snapshot?.scene.kind, 'group')
+  if (snapshot?.scene.kind !== 'group') assert.fail('expected group scene')
+  assert.equal(snapshot.scene.groupLifecycleId, LIFECYCLE_ID)
 })
 
 test('Yunzai directory refreshes at most three referenced group members', async () => {
