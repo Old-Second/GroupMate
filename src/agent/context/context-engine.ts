@@ -244,8 +244,38 @@ function sourcePriority (source: ContextSource): ContextSpanPriority {
   return 'low'
 }
 
-function modelImageUrls (message: AgentMessage): readonly string[] {
+/**
+ * How long a replayed image input stays attached to a context message.
+ *
+ * Host image links are signed and expire, so an old history image makes the
+ * provider reject the whole request instead of answering it. Past the window the
+ * message keeps its text projection and only loses the image reference.
+ */
+const CONTEXT_IMAGE_INPUT_MAX_AGE_MS = 10 * 60 * 1_000
+
+function referenceInstantMs (items: readonly ContextItem[]): number {
+  const current = items.find(item => item.source === 'current_request')
+  const currentAt = Date.parse(current?.message.createdAt ?? '')
+  if (Number.isFinite(currentAt)) return currentAt
+  let newest = Number.NaN
+  for (const item of items) {
+    const at = Date.parse(item.message.createdAt)
+    if (Number.isFinite(at) && (!Number.isFinite(newest) || at > newest)) newest = at
+  }
+  return newest
+}
+
+function imageInputExpired (message: AgentMessage, referenceAtMs: number): boolean {
+  if (!Number.isFinite(referenceAtMs)) return false
+  const createdAtMs = Date.parse(message.createdAt)
+  // Only a provable age drops an image reference.
+  if (!Number.isFinite(createdAtMs)) return false
+  return referenceAtMs - createdAtMs > CONTEXT_IMAGE_INPUT_MAX_AGE_MS
+}
+
+function modelImageUrls (message: AgentMessage, referenceAtMs: number): readonly string[] {
   if (message.role !== 'user') return Object.freeze([])
+  if (imageInputExpired(message, referenceAtMs)) return Object.freeze([])
   const imageUrls: string[] = []
   for (const part of message.parts) {
     if (part.type !== 'resource_ref' || part.resourceType !== 'image') continue
@@ -259,7 +289,7 @@ function modelImageUrls (message: AgentMessage): readonly string[] {
   return Object.freeze(imageUrls)
 }
 
-function ordinaryModelMessage (item: ContextItem): ModelMessage {
+function ordinaryModelMessage (item: ContextItem, referenceAtMs: number): ModelMessage {
   const content = messageText(item.message)
   if (item.source === 'system_instruction') {
     return Object.freeze({ role: 'system' as const, content })
@@ -267,7 +297,7 @@ function ordinaryModelMessage (item: ContextItem): ModelMessage {
   if (item.source === 'session_history' && item.message.role === 'assistant') {
     return Object.freeze({ role: 'assistant' as const, content })
   }
-  const imageUrls = modelImageUrls(item.message)
+  const imageUrls = modelImageUrls(item.message, referenceAtMs)
   return imageUrls.length === 0
     ? Object.freeze({ role: 'user' as const, content })
     : Object.freeze({ role: 'user' as const, content, imageUrls })
@@ -342,15 +372,22 @@ function provenanceKind (source: ContextSource): ContextSpanV1['provenance']['ki
 function ordinaryProjection (
   item: ContextItem,
   namespaceRef: string,
-  semanticOrder: number
+  semanticOrder: number,
+  referenceAtMs: number
 ): StrictProjection {
-  return ordinaryGroupProjection(Object.freeze([item]), namespaceRef, semanticOrder)
+  return ordinaryGroupProjection(
+    Object.freeze([item]),
+    namespaceRef,
+    semanticOrder,
+    referenceAtMs
+  )
 }
 
 function ordinaryGroupProjection (
   items: readonly ContextItem[],
   namespaceRef: string,
-  semanticOrder: number
+  semanticOrder: number,
+  referenceAtMs: number
 ): StrictProjection {
   const first = items[0]
   if (first === undefined || items.some(item => item.source !== first.source) ||
@@ -393,7 +430,7 @@ function ordinaryGroupProjection (
       if (!refs.has(sourceRef.ref)) refs.set(sourceRef.ref, sourceRef)
     }
   }
-  const messages = Object.freeze(items.map(ordinaryModelMessage))
+  const messages = Object.freeze(items.map(item => ordinaryModelMessage(item, referenceAtMs)))
   const safeItems = Object.freeze(items.map((item, index) => safeOrdinaryItem(
     item,
     first.source,
@@ -511,6 +548,7 @@ function strictProjections (
   const atomicGroups = new Map<string, ContextItem[]>()
   const protocolLastIndex = new Map<string, number>()
   const atomicLastIndex = new Map<string, number>()
+  const referenceAtMs = referenceInstantMs(items)
   const projections: Array<{ order: number; value: StrictProjection }> = []
   for (const [index, item] of items.entries()) {
     if (item.protocolSpanId !== undefined) {
@@ -550,7 +588,10 @@ function strictProjections (
       else group.push(item)
       continue
     }
-    projections.push({ order: index, value: ordinaryProjection(item, namespaceRef, index + 1) })
+    projections.push({
+      order: index,
+      value: ordinaryProjection(item, namespaceRef, index + 1, referenceAtMs)
+    })
   }
   for (const [spanId, group] of protocolGroups) {
     const order = items.findIndex(item => item.protocolSpanId === spanId)
@@ -563,7 +604,12 @@ function strictProjections (
     const order = items.findIndex(item => item.atomicGroupId === groupId)
     projections.push({
       order,
-      value: ordinaryGroupProjection(Object.freeze(group), namespaceRef, order + 1)
+      value: ordinaryGroupProjection(
+        Object.freeze(group),
+        namespaceRef,
+        order + 1,
+        referenceAtMs
+      )
     })
   }
   return Object.freeze(projections.sort((left, right) => left.order - right.order).map(entry => entry.value))

@@ -185,8 +185,40 @@ function sourcePriority(source) {
         return 'normal';
     return 'low';
 }
-function modelImageUrls(message) {
+/**
+ * How long a replayed image input stays attached to a context message.
+ *
+ * Host image links are signed and expire, so an old history image makes the
+ * provider reject the whole request instead of answering it. Past the window the
+ * message keeps its text projection and only loses the image reference.
+ */
+const CONTEXT_IMAGE_INPUT_MAX_AGE_MS = 10 * 60 * 1_000;
+function referenceInstantMs(items) {
+    const current = items.find(item => item.source === 'current_request');
+    const currentAt = Date.parse(current?.message.createdAt ?? '');
+    if (Number.isFinite(currentAt))
+        return currentAt;
+    let newest = Number.NaN;
+    for (const item of items) {
+        const at = Date.parse(item.message.createdAt);
+        if (Number.isFinite(at) && (!Number.isFinite(newest) || at > newest))
+            newest = at;
+    }
+    return newest;
+}
+function imageInputExpired(message, referenceAtMs) {
+    if (!Number.isFinite(referenceAtMs))
+        return false;
+    const createdAtMs = Date.parse(message.createdAt);
+    // Only a provable age drops an image reference.
+    if (!Number.isFinite(createdAtMs))
+        return false;
+    return referenceAtMs - createdAtMs > CONTEXT_IMAGE_INPUT_MAX_AGE_MS;
+}
+function modelImageUrls(message, referenceAtMs) {
     if (message.role !== 'user')
+        return Object.freeze([]);
+    if (imageInputExpired(message, referenceAtMs))
         return Object.freeze([]);
     const imageUrls = [];
     for (const part of message.parts) {
@@ -202,7 +234,7 @@ function modelImageUrls(message) {
     }
     return Object.freeze(imageUrls);
 }
-function ordinaryModelMessage(item) {
+function ordinaryModelMessage(item, referenceAtMs) {
     const content = messageText(item.message);
     if (item.source === 'system_instruction') {
         return Object.freeze({ role: 'system', content });
@@ -210,7 +242,7 @@ function ordinaryModelMessage(item) {
     if (item.source === 'session_history' && item.message.role === 'assistant') {
         return Object.freeze({ role: 'assistant', content });
     }
-    const imageUrls = modelImageUrls(item.message);
+    const imageUrls = modelImageUrls(item.message, referenceAtMs);
     return imageUrls.length === 0
         ? Object.freeze({ role: 'user', content })
         : Object.freeze({ role: 'user', content, imageUrls });
@@ -275,10 +307,10 @@ function provenanceKind(source) {
         return 'tool_ledger';
     return 'run';
 }
-function ordinaryProjection(item, namespaceRef, semanticOrder) {
-    return ordinaryGroupProjection(Object.freeze([item]), namespaceRef, semanticOrder);
+function ordinaryProjection(item, namespaceRef, semanticOrder, referenceAtMs) {
+    return ordinaryGroupProjection(Object.freeze([item]), namespaceRef, semanticOrder, referenceAtMs);
 }
-function ordinaryGroupProjection(items, namespaceRef, semanticOrder) {
+function ordinaryGroupProjection(items, namespaceRef, semanticOrder, referenceAtMs) {
     const first = items[0];
     if (first === undefined || items.some(item => item.source !== first.source) ||
         (first.source === 'current_request' && items.length !== 1) ||
@@ -319,7 +351,7 @@ function ordinaryGroupProjection(items, namespaceRef, semanticOrder) {
                 refs.set(sourceRef.ref, sourceRef);
         }
     }
-    const messages = Object.freeze(items.map(ordinaryModelMessage));
+    const messages = Object.freeze(items.map(item => ordinaryModelMessage(item, referenceAtMs)));
     const safeItems = Object.freeze(items.map((item, index) => safeOrdinaryItem(item, first.source, trust, messages[index])));
     const span = createContextSpanV1(Object.freeze({
         spanId: legacyRef('span-group', groupKey),
@@ -424,6 +456,7 @@ function strictProjections(items, namespaceRef) {
     const atomicGroups = new Map();
     const protocolLastIndex = new Map();
     const atomicLastIndex = new Map();
+    const referenceAtMs = referenceInstantMs(items);
     const projections = [];
     for (const [index, item] of items.entries()) {
         if (item.protocolSpanId !== undefined) {
@@ -467,7 +500,10 @@ function strictProjections(items, namespaceRef) {
                 group.push(item);
             continue;
         }
-        projections.push({ order: index, value: ordinaryProjection(item, namespaceRef, index + 1) });
+        projections.push({
+            order: index,
+            value: ordinaryProjection(item, namespaceRef, index + 1, referenceAtMs)
+        });
     }
     for (const [spanId, group] of protocolGroups) {
         const order = items.findIndex(item => item.protocolSpanId === spanId);
@@ -480,7 +516,7 @@ function strictProjections(items, namespaceRef) {
         const order = items.findIndex(item => item.atomicGroupId === groupId);
         projections.push({
             order,
-            value: ordinaryGroupProjection(Object.freeze(group), namespaceRef, order + 1)
+            value: ordinaryGroupProjection(Object.freeze(group), namespaceRef, order + 1, referenceAtMs)
         });
     }
     return Object.freeze(projections.sort((left, right) => left.order - right.order).map(entry => entry.value));

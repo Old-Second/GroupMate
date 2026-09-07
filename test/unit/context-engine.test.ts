@@ -417,6 +417,84 @@ test('ordinary current requests preserve public user image resources in prepared
   assert.deepEqual(currentSpan?.messages[0], currentMessage)
 })
 
+test('recent history keeps its image input while an expired link is dropped', async () => {
+  const currentAt = '2026-07-13T01:00:00.000Z'
+  const recentUrl = 'https://cdn.example.test/recent.png'
+  const expiredUrl = 'https://cdn.example.test/expired.png'
+  const withImage = (
+    id: string,
+    source: ContextSource,
+    text: string,
+    createdAt: string,
+    imageUrl: string
+  ): ContextItem => {
+    const base = item(id, source, text, undefined, createdAt)
+    return Object.freeze({
+      ...base,
+      message: Object.freeze({
+        ...base.message,
+        parts: Object.freeze([
+          ...base.message.parts,
+          Object.freeze({
+            type: 'resource_ref' as const,
+            resourceType: 'image' as const,
+            resourceId: imageUrl
+          })
+        ])
+      })
+    })
+  }
+  const contextInput = input({
+    sessionHistory: [
+      // 9 minutes before the current request: still inside the window.
+      withImage('recent', 'session_history', '看这张', '2026-07-13T00:51:00.000Z', recentUrl),
+      // 11 minutes before the current request: the host link is assumed expired.
+      withImage('expired', 'session_history', '还有这张', '2026-07-13T00:49:00.000Z', expiredUrl)
+    ],
+    currentRequest: item('current', 'current_request', '继续说', undefined, currentAt)
+  })
+  const engine = new ContextEngine({ estimator })
+  const snapshot = await engine.prepare(contextInput, budget(100))
+  const projected = (id: string) => snapshot.items.find(value => value.id === id)?.modelMessage
+
+  assert.deepEqual(projected('recent'), {
+    role: 'user',
+    content: `看这张\n[image: ${recentUrl}]`,
+    imageUrls: [recentUrl]
+  })
+  assert.deepEqual(projected('expired'), {
+    role: 'user',
+    content: `还有这张\n[image: ${expiredUrl}]`
+  })
+})
+
+test('image inputs survive when the message instant cannot be parsed', async () => {
+  const imageUrl = 'https://cdn.example.test/undated.png'
+  const base = item('current', 'current_request', '这是什么', undefined, 'not-a-timestamp')
+  const currentRequest = Object.freeze({
+    ...base,
+    message: Object.freeze({
+      ...base.message,
+      parts: Object.freeze([
+        ...base.message.parts,
+        Object.freeze({
+          type: 'resource_ref' as const,
+          resourceType: 'image' as const,
+          resourceId: imageUrl
+        })
+      ])
+    })
+  })
+  const engine = new ContextEngine({ estimator })
+  const snapshot = await engine.prepare(input({ currentRequest }), budget(100))
+
+  assert.deepEqual(snapshot.items.find(value => value.id === 'current')?.modelMessage, {
+    role: 'user',
+    content: `这是什么\n[image: ${imageUrl}]`,
+    imageUrls: [imageUrl]
+  })
+})
+
 test('strict planner pressure never splits a selected legacy atomic group', async () => {
   const atomic = [1, 2, 3].map(index => item(
     `atomic-${index}`,
