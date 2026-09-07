@@ -11,7 +11,7 @@ import { translate, translateLangSupports } from '../dist/runtime/translation-se
 import AzureTTS from '../utils/tts/microsoft-azure.js'
 import VoiceVoxTTS from '../utils/tts/voicevox.js'
 import { URL } from 'node:url'
-import { getBots } from '../utils/bot.js'
+import { listYunzaiBots, sendYunzaiGroupMessage as sendGroupMessage } from '../dist/runtime/yunzai-bot-registry.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 
 let useSilk = false
@@ -397,7 +397,7 @@ ${translateLangLabels}
         continue
       }
       let groupId = parseInt(element)
-      let bots = this.e ? [this.e.bot] : getBots()
+      let bots = this.e ? [this.e.bot] : listYunzaiBots()
       for (let bot of bots) {
         if (bot.gl?.get(groupId)) {
           // 打招呼概率
@@ -455,12 +455,12 @@ ${translateLangLabels}
                 }
               }
               if (useSilk) {
-                await bot.sendGroupMsg(groupId, await uploadRecord(audio))
+                await sendGroupMessage(bot, groupId, await uploadRecord(audio))
               } else {
-                await bot.sendGroupMsg(groupId, segment.record(audio))
+                await sendGroupMessage(bot, groupId, segment.record(audio))
               }
             } else {
-              await bot.sendGroupMsg(groupId, message)
+              await sendGroupMessage(bot, groupId, message)
             }
           } else {
             logger.info(`时机未到，这次就不打招呼给群聊${groupId}了`)

@@ -1,6 +1,6 @@
 import { UserInfo, AddUser } from './user_data.js'
 import { randomString, getUserData, getMasterQQ, getUin } from '../../utils/common.js'
-import { getBots } from '../../utils/bot.js';
+import { listYunzaiBots } from '../../dist/runtime/yunzai-bot-registry.js';
 import fs from 'fs'
 import path from 'path';
 
@@ -64,7 +64,7 @@ async function User (fastify, options) {
       { EX: 60000 }
     )
     const master = (await getMasterQQ())[0]
-    let bots = getBots()
+    let bots = listYunzaiBots()
     for (let bot of bots) {
       if(isTrss) {
         try {
