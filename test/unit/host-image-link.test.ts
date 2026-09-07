@@ -354,6 +354,44 @@ test('the host key source caches one request per bot and fails open', async () =
   }
 })
 
+test('a host that never answers is abandoned and not asked again at once', async () => {
+  const previous = Reflect.get(globalThis, 'Bot')
+  let calls = 0
+  let now = NOW
+  Reflect.set(globalThis, 'Bot', {
+    uin: ['1'],
+    bots: { 1: { pickGroup: () => undefined, sendApi: async () => undefined } }
+  })
+  try {
+    const source = new YunzaiHostImageLinkKeySource({
+      now: () => now,
+      requestTimeoutMs: 20,
+      // The host adapter ignores abort signals, so the promise never settles.
+      requestKeys: async () => {
+        calls += 1
+        return await new Promise(() => undefined)
+      }
+    })
+    const signal = new AbortController().signal
+
+    const started = Date.now()
+    assert.equal(await source.keys('1', signal), null)
+    assert.ok(Date.now() - started < 1_000, 'the wait must be bounded')
+    assert.equal(calls, 2)
+
+    // Inside the backoff window the host is left alone.
+    assert.equal(await source.keys('1', signal), null)
+    assert.equal(calls, 2)
+
+    now += 5 * 60 * 1_000 + 1
+    assert.equal(await source.keys('1', signal), null)
+    assert.equal(calls, 4)
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(globalThis, 'Bot')
+    else Reflect.set(globalThis, 'Bot', previous)
+  }
+})
+
 test('without a host bot the key source reports no key', async () => {
   const previous = Reflect.get(globalThis, 'Bot')
   Reflect.deleteProperty(globalThis, 'Bot')

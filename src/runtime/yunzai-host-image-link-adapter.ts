@@ -22,7 +22,8 @@ import { listYunzaiBots } from './yunzai-bot-registry.js'
 
 type YunzaiRecord = Record<string, any>
 
-const KEY_REQUEST_TIMEOUT_MS = 2_000
+const KEY_REQUEST_TIMEOUT_MS = 1_500
+const KEY_FAILURE_BACKOFF_MS = 5 * 60 * 1_000
 const MAX_KEY_LIFETIME_MS = 60 * 60 * 1_000
 const MAX_KEY_REUSE_MS = 10 * 60 * 1_000
 const KEY_EXPIRY_MARGIN_MS = 60 * 1_000
@@ -128,8 +129,34 @@ export function parseHostImageLinkKeys (
   })
 }
 
+/**
+ * Bounds a host action that cannot be cancelled.
+ *
+ * The host's OneBot adapter ignores abort signals and waits a full minute for a
+ * reply before it gives up, so the caller has to stop waiting on its own or a
+ * silent host would stall the reply it is preparing.
+ */
+async function boundedHostAction<T> (
+  action: Promise<T>,
+  timeoutMs: number
+): Promise<T> {
+  action.catch(() => undefined)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      action,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => { reject(new Error('host action timed out')) }, timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export interface YunzaiHostImageLinkKeySourceOptions {
   readonly now?: () => number
+  readonly requestTimeoutMs?: number
   readonly requestKeys?: (
     bot: YunzaiRecord,
     action: string,
@@ -139,6 +166,7 @@ export interface YunzaiHostImageLinkKeySourceOptions {
 
 export class YunzaiHostImageLinkKeySource implements HostImageLinkKeySource {
   readonly #now: () => number
+  readonly #requestTimeoutMs: number
   readonly #requestKeys: (
     bot: YunzaiRecord,
     action: string,
@@ -147,9 +175,11 @@ export class YunzaiHostImageLinkKeySource implements HostImageLinkKeySource {
 
   readonly #cache = new Map<string, HostImageLinkKeys>()
   readonly #inflight = new Map<string, Promise<HostImageLinkKeys | null>>()
+  readonly #retryAfter = new Map<string, number>()
 
   constructor (options: YunzaiHostImageLinkKeySourceOptions = {}) {
     this.#now = options.now ?? (() => Date.now())
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? KEY_REQUEST_TIMEOUT_MS
     this.#requestKeys = options.requestKeys ?? (async (bot, action, signal) => {
       const sendApi = Reflect.get(bot, 'sendApi')
       if (typeof sendApi !== 'function') return null
@@ -163,6 +193,9 @@ export class YunzaiHostImageLinkKeySource implements HostImageLinkKeySource {
     if (cached !== undefined && this.#isReusable(cached)) return cached
     const inflight = this.#inflight.get(scope)
     if (inflight !== undefined) return await inflight
+    // A host that cannot answer must not be asked once per message.
+    const retryAfter = this.#retryAfter.get(scope)
+    if (retryAfter !== undefined && this.#now() < retryAfter) return null
     const request = this.#fetch(scope, botId, signal)
       .finally(() => { this.#inflight.delete(scope) })
     this.#inflight.set(scope, request)
@@ -184,20 +217,20 @@ export class YunzaiHostImageLinkKeySource implements HostImageLinkKeySource {
     if (bot === null) return null
     for (const action of KEY_ACTIONS) {
       try {
-        const budget = AbortSignal.timeout(KEY_REQUEST_TIMEOUT_MS)
-        const payload = await this.#requestKeys(
-          bot,
-          action,
-          AbortSignal.any([signal, budget])
+        const payload = await boundedHostAction(
+          this.#requestKeys(bot, action, signal),
+          this.#requestTimeoutMs
         )
         const keys = parseHostImageLinkKeys(payload, this.#now())
         if (keys === null) continue
         this.#cache.set(scope, keys)
+        this.#retryAfter.delete(scope)
         return keys
       } catch {
         continue
       }
     }
+    this.#retryAfter.set(scope, this.#now() + KEY_FAILURE_BACKOFF_MS)
     return null
   }
 }
