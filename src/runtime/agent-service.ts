@@ -598,19 +598,6 @@ function modelMessageFor (item: ContextItem, referenceAtMs: number): ModelMessag
   })
 }
 
-function currentRunItemOrder (items: readonly ContextItem[]): readonly ContextItem[] {
-  const runtimeFacts = items.filter(item => item.source === 'runtime_fact')
-  if (runtimeFacts.length === 0) return items
-  const ordered = items.filter(item => item.source !== 'runtime_fact')
-  const currentIndex = ordered.findIndex(item => item.source === 'current_request')
-  if (currentIndex < 0) return Object.freeze([...ordered, ...runtimeFacts])
-  return Object.freeze([
-    ...ordered.slice(0, currentIndex),
-    ...runtimeFacts,
-    ...ordered.slice(currentIndex)
-  ])
-}
-
 function mergeableTextRole (
   message: ModelMessage
 ): 'system' | 'developer' | 'user' | 'assistant' | null {
@@ -1572,11 +1559,11 @@ export class AgentService {
         request.contextBudget,
         signal
       )
-      const items = currentRunItemOrder(snapshot.items)
+      // Prefix-stability order is the context engine's; do not reorder here.
       const referenceAtMs = referenceInstantMs(snapshot.items)
       return Object.freeze({
         messages: coalesceModelMessages(
-          items.map(item => modelMessageFor(item, referenceAtMs))
+          snapshot.items.map(item => modelMessageFor(item, referenceAtMs))
         ),
         estimatedInputTokens: snapshot.estimatedInputTokens
       })

@@ -175,7 +175,7 @@ export async function auditPhase7dContextSurfaces(projectRootValue) {
         boundedSource(root, 'test/unit/presentation-trace.test.ts')
     ]);
     const contextSource = engine ?? '';
-    const cacheFriendlyOrder = matchCount(contextSource, /\.\.\.input\.systemInstructions,\s*\.\.\.input\.runtimeFacts,\s*\.\.\.input\.sessionHistory,\s*\.\.\.input\.groupContext,\s*\.\.\.input\.memoryContext,\s*input\.currentRequest,\s*\.\.\.input\.toolMessages/g) >= 2;
+    const cacheFriendlyOrder = matchCount(contextSource, /\.\.\.input\.systemInstructions,\s*\.\.\.input\.sessionHistory,\s*\.\.\.input\.groupContext,\s*\.\.\.input\.memoryContext,\s*\.\.\.input\.runtimeFacts,\s*input\.currentRequest,\s*\.\.\.input\.toolMessages/g) >= 2;
     const mandatoryContextProtected = /return source === 'system_instruction' \|\| source === 'current_request'/.test(contextSource) && /const mandatoryGroups = groups\.filter\(group => group\.mandatory\)/.test(contextSource) &&
         /if \(mandatoryTokens > availableInputTokens\)/.test(contextSource);
     const memoryUntrusted = /first\.source === 'memory'\s*\? 'untrusted' as const/.test(contextSource) && /strictSource === 'system_instruction' \|\| strictSource === 'current_request'/.test(contextSource);

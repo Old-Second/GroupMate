@@ -325,7 +325,7 @@ export async function auditPhase7dContextSurfaces (
   const contextSource = engine ?? ''
   const cacheFriendlyOrder = matchCount(
     contextSource,
-    /\.\.\.input\.systemInstructions,\s*\.\.\.input\.runtimeFacts,\s*\.\.\.input\.sessionHistory,\s*\.\.\.input\.groupContext,\s*\.\.\.input\.memoryContext,\s*input\.currentRequest,\s*\.\.\.input\.toolMessages/g
+    /\.\.\.input\.systemInstructions,\s*\.\.\.input\.sessionHistory,\s*\.\.\.input\.groupContext,\s*\.\.\.input\.memoryContext,\s*\.\.\.input\.runtimeFacts,\s*input\.currentRequest,\s*\.\.\.input\.toolMessages/g
   ) >= 2
   const mandatoryContextProtected = /return source === 'system_instruction' \|\| source === 'current_request'/.test(
     contextSource

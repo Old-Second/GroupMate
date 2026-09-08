@@ -372,9 +372,9 @@ test('ordinary compatibility mapping preserves source order and safe session ass
     value.id, value.source, value.message.role, value.modelMessage?.role
   ]), [
     ['system', 'system_instruction', 'system', 'system'],
-    ['runtime', 'runtime_fact', 'user', 'user'],
     ['session-assistant', 'session_history', 'assistant', 'assistant'],
     ['group', 'group_context', 'user', 'user'],
+    ['runtime', 'runtime_fact', 'user', 'user'],
     ['current', 'current_request', 'user', 'user'],
     ['plain-tool', 'tool_chain', 'user', 'user']
   ])
@@ -688,9 +688,9 @@ test('optional sources are selected by fixed priority as budget grows', async ()
   const expected = [
     ['system', 'runtime', 'current'],
     ['system', 'runtime', 'current', 'tool'],
-    ['system', 'runtime', 'session', 'current', 'tool'],
-    ['system', 'runtime', 'session', 'group', 'current', 'tool'],
-    ['system', 'runtime', 'session', 'group', 'memory', 'current', 'tool']
+    ['system', 'session', 'runtime', 'current', 'tool'],
+    ['system', 'session', 'group', 'runtime', 'current', 'tool'],
+    ['system', 'session', 'group', 'memory', 'runtime', 'current', 'tool']
   ]
 
   for (let optionalCount = 1; optionalCount <= 5; optionalCount += 1) {
@@ -712,7 +712,7 @@ test('selected items return in stable semantic order', async () => {
   }), budget(20))
 
   assert.deepEqual(snapshot.includedIds, [
-    'system-2', 'runtime', 'session', 'group', 'current', 'tool'
+    'system-2', 'session', 'group', 'runtime', 'current', 'tool'
   ])
 })
 
@@ -789,6 +789,33 @@ test('resolved memory context is projected as ordinary untrusted user data', asy
   assert.equal(Object.isFrozen(projected?.modelMessage), true)
 })
 
+test('per-turn runtime facts sit last so a changed turn keeps the earlier prefix', () => {
+  const engine = new ContextEngine({ estimator })
+  const stable = {
+    sessionHistory: [item('history', 'session_history', 'H')],
+    groupContext: [item('group-1', 'group_context', 'G1'), item('group-2', 'group_context', 'G2')],
+    memoryContext: [memoryItem('memory', 'M')]
+  }
+  const wire = (facts: string): readonly string[] => engine
+    .projectSourceSpans(
+      input({ ...stable, runtimeFacts: [item('runtime', 'runtime_fact', facts)] }),
+      'run:prefix-stability'
+    )
+    .flatMap(span => span.messages.map(value => `${value.role}:${String(value.content)}`))
+
+  const earlier = wire('turn one metadata')
+  const later = wire('turn two metadata, longer')
+  const shared = earlier.findIndex((value, index) => value !== later[index])
+
+  // Everything the two turns have in common must come before the runtime facts,
+  // and the runtime facts must be the only thing left before the current request.
+  assert.deepEqual(earlier.slice(0, shared), [
+    'system:S', 'user:H', 'user:G1', 'user:G2', 'user:M'
+  ])
+  assert.deepEqual(earlier.slice(shared), ['user:turn one metadata', 'user:U'])
+  assert.deepEqual(later.slice(shared), ['user:turn two metadata, longer', 'user:U'])
+})
+
 test('source projection creates deterministic immutable spans before planner selection', () => {
   const engine = new ContextEngine({ estimator })
   const sourceInput = input({
@@ -804,9 +831,9 @@ test('source projection creates deterministic immutable spans before planner sel
   assert.equal(Object.isFrozen(first), true)
   assert.deepEqual(first.map(span => span.source), [
     'system_instruction',
-    'runtime_fact',
     'session_history',
     'group_context',
+    'runtime_fact',
     'current_request'
   ])
   assert.deepEqual(first.map(span => span.requirement), [

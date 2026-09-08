@@ -184,10 +184,10 @@ test('dynamic memory follows the stable prefix and cannot displace mandatory con
   const spans = engine.projectSourceSpans(contextInput(), 'run:phase7d-context')
   assert.deepEqual(spans.map(span => span.source), [
     'system_instruction',
-    'runtime_fact',
     'session_history',
     'group_context',
     'memory',
+    'runtime_fact',
     'current_request'
   ])
   assert.equal(spans.find(value => value.source === 'memory')?.trust, 'untrusted')

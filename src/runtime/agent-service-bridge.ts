@@ -53,6 +53,7 @@ import {
   type ConversationSessionPort
 } from './agent-service.js'
 import { HostImageLinkService } from './host-image-link-service.js'
+import { stableGroupContextWindow } from './group-context-window.js'
 import {
   HostImageLinkFetchProbe,
   YunzaiHostImageLinkKeySource
@@ -141,8 +142,6 @@ const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ 
 const RUN_DEADLINE_MS = 240_000
 const MAX_GROUP_CONTEXT_ITEMS = 64
 const MAX_GROUP_CONTEXT_TEXT = 4_096
-/** Average number of group messages between two window anchors. */
-const GROUP_WINDOW_ANCHOR_STEP = 6
 /**
  * Everything about the current turn that used to branch the system block.
  *
@@ -1011,59 +1010,6 @@ function runtimeIdentityItem (
   })
 }
 
-function groupRowIdentity (raw: unknown): string | null {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const record = raw as YunzaiRecord
-  const value = record.message_id ?? record.seq
-  if (typeof value !== 'string' && typeof value !== 'number') return null
-  const identity = String(value).slice(0, 128)
-  return identity === '' ? null : identity
-}
-
-/**
- * Whether a group message may start the context window.
- *
- * Derived from the message's own identity, so the same message is an anchor in
- * every request that carries it, on any process, without stored state.
- */
-function isGroupWindowAnchor (raw: unknown): boolean {
-  const identity = groupRowIdentity(raw)
-  if (identity === null) return false
-  const digest = createHash('sha256')
-    .update('groupmate.group-context.window-anchor.v1 ')
-    .update(identity)
-    .digest()
-  return digest[0] % GROUP_WINDOW_ANCHOR_STEP === 0
-}
-
-/**
- * Where to start the group context window so that consecutive turns only append.
- *
- * The host serves group history as "the newest N messages", so keeping a fixed
- * count drops the oldest message on every new one and rewrites the whole block.
- * That block is the largest part of a group prompt and it sits ahead of memory,
- * the session metadata and the current request, so a provider that only credits
- * a byte-identical prefix charges all of it as a miss every single turn.
- *
- * Pinning the start to a message instead of to an offset fixes that: among the
- * positions that still leave `minimumItems` messages, the newest anchor wins, and
- * it keeps winning while it stays inside the fetched window — so later turns are
- * the earlier prompt plus the messages that arrived since. The anchor moves once
- * every `GROUP_WINDOW_ANCHOR_STEP` messages on average, and only that turn pays
- * for a rewritten window. The window therefore holds between `minimumItems` and
- * `MAX_GROUP_CONTEXT_ITEMS` messages instead of exactly `minimumItems`.
- */
-function stableGroupWindowStart (
-  rows: readonly unknown[],
-  minimumItems: number
-): number {
-  const overshoot = Math.max(0, rows.length - Math.max(1, minimumItems))
-  for (let index = overshoot; index >= 0; index -= 1) {
-    if (isGroupWindowAnchor(rows[index])) return index
-  }
-  return overshoot
-}
-
 async function loadGroupContext (
   options: YunzaiAgentServiceBridgeOptions,
   event: YunzaiMessageEvent,
@@ -1090,7 +1036,7 @@ async function loadGroupContext (
       ? String(rawCurrentMessageId)
       : null
     const fetched = history.slice(-MAX_GROUP_CONTEXT_ITEMS)
-    const window = fetched.slice(stableGroupWindowStart(fetched, limit))
+    const window = stableGroupContextWindow(fetched, limit)
     return Object.freeze(window.flatMap((raw, position) => {
       const item = groupContextItem(
         requestId,

@@ -689,12 +689,20 @@ export class ContextEngine {
   ): readonly ContextSpanV1[] {
     assertNotAborted(signal)
     validateInputContainers(input)
+    // Most stable block first, least stable last. A provider disk cache only
+    // credits a complete prefix unit, so a block that changes between turns
+    // costs every token after it too. Runtime facts carry the per-turn
+    // metadata — actor, quoted-message state, local date — and therefore sit
+    // immediately before the current request instead of ahead of the history
+    // and group window they would otherwise invalidate. `prepare` below must
+    // keep the same order: the run engine takes the wire order from the
+    // `semanticOrder` of the spans projected here.
     const semanticItems = Object.freeze([
       ...input.systemInstructions,
-      ...input.runtimeFacts,
       ...input.sessionHistory,
       ...input.groupContext,
       ...input.memoryContext,
+      ...input.runtimeFacts,
       input.currentRequest,
       ...input.toolMessages
     ])
@@ -739,12 +747,13 @@ export class ContextEngine {
     const availableInputTokens = availableTokens(budget)
     const hardMaxItems = Math.min(budget.maxItems, MAX_CONTEXT_SPANS)
     const hardMaxBytes = Math.min(budget.maxBytes, MAX_CONTEXT_PLANNER_INPUT_BYTES)
+    // Same prefix-stability order as `projectSourceSpans`; keep the two in step.
     const semanticItems: ContextItem[] = [
       ...input.systemInstructions,
-      ...input.runtimeFacts,
       ...input.sessionHistory,
       ...input.groupContext,
       ...input.memoryContext,
+      ...input.runtimeFacts,
       input.currentRequest,
       ...input.toolMessages
     ]

@@ -348,20 +348,6 @@ function modelMessageFor(item, referenceAtMs) {
         userMessage: '会话历史格式不兼容，请重新开始对话。'
     });
 }
-function currentRunItemOrder(items) {
-    const runtimeFacts = items.filter(item => item.source === 'runtime_fact');
-    if (runtimeFacts.length === 0)
-        return items;
-    const ordered = items.filter(item => item.source !== 'runtime_fact');
-    const currentIndex = ordered.findIndex(item => item.source === 'current_request');
-    if (currentIndex < 0)
-        return Object.freeze([...ordered, ...runtimeFacts]);
-    return Object.freeze([
-        ...ordered.slice(0, currentIndex),
-        ...runtimeFacts,
-        ...ordered.slice(currentIndex)
-    ]);
-}
 function mergeableTextRole(message) {
     if (message.role === 'tool')
         return null;
@@ -1134,10 +1120,10 @@ export class AgentService {
         });
         const prepare = async (dropOptional, signal) => {
             const snapshot = await this.#contextEngine.prepare(dropOptional ? sourceInput(true) : initialInput, request.contextBudget, signal);
-            const items = currentRunItemOrder(snapshot.items);
+            // Prefix-stability order is the context engine's; do not reorder here.
             const referenceAtMs = referenceInstantMs(snapshot.items);
             return Object.freeze({
-                messages: coalesceModelMessages(items.map(item => modelMessageFor(item, referenceAtMs))),
+                messages: coalesceModelMessages(snapshot.items.map(item => modelMessageFor(item, referenceAtMs))),
                 estimatedInputTokens: snapshot.estimatedInputTokens
             });
         };
