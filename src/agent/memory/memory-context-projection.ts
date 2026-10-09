@@ -14,6 +14,13 @@ function sensitivity (
   return value === 'personal' ? 'private' : value
 }
 
+/**
+ * `ranking` is deliberately absent: the ranks are numbered against whichever
+ * candidates survived *this* query's budget, so one candidate more or less
+ * rewrites them for every record that stayed. That rewrites the memory block of
+ * the prompt and, with it, everything a provider could have reused after it. The
+ * order the candidates appear in already carries the same information.
+ */
 function candidatePayload (candidate: MemoryRetrievalCandidateV2): string {
   return JSON.stringify({
     schemaVersion: 1,
@@ -37,8 +44,7 @@ function candidatePayload (candidate: MemoryRetrievalCandidateV2): string {
     sensitivity: candidate.sensitivity,
     conflict: candidate.conflict,
     consent: candidate.consent,
-    sources: candidate.sources,
-    ranking: candidate.ranking
+    sources: candidate.sources
   })
 }
 

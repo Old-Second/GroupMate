@@ -436,13 +436,6 @@ function sameSessionAddress (left: SessionAddress, right: SessionAddress): boole
   return false
 }
 
-function dateOnly (date: Date): string {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
-}
-
 function displayDate (date: Date): string {
   return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ` +
     `${date.getHours()}:${date.getMinutes()}`
@@ -603,8 +596,10 @@ async function runOrdinaryChat (
     const cast = policy.actorCastApi.trim() !== ''
       ? policy.actorCastApi
       : policy.promptPrefixOverride
-    const systemInstruction = `You are ${policy.assistantLabel}. ${cast} ` +
-      `Current date: ${dateOnly((options.now ?? (() => new Date()))())}.`
+    // The current date is per-turn data and travels in the session metadata item
+    // instead: a date inside the first system message rewrites the prompt prefix
+    // every midnight and costs the provider's whole cached prefix with it.
+    const systemInstruction = `You are ${policy.assistantLabel}. ${cast}`
     const feedbackInstruction = augmentedPrompt.startsWith(prepared.evidence.prompt)
       ? augmentedPrompt.slice(prepared.evidence.prompt.length).trim()
       : augmentedPrompt.trim()

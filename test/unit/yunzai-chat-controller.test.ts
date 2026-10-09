@@ -654,8 +654,10 @@ test('typed chat controller builds authorized reply input without chat source co
   assert.equal(Object.hasOwn(agent.evidence, 'event'), false)
   assert.equal(Object.values(agent.evidence).some(value => value === activeEvent), false)
   assert.equal(Object.values(agent.handleOptions).some(value => value === activeEvent), false)
+  // No date, and nothing else that moves per turn: the first system message has
+  // to stay byte-identical for the provider to reuse the prompt prefix.
   assert.match(agent.handleOptions.systemInstructions[0] ?? '',
-    /^You are 派蒙\. 你是可靠的群友。 Current date: 2026-07-17\.$/)
+    /^You are 派蒙\. 你是可靠的群友。$/)
   assert.equal(agent.handleOptions.enableGroupContext, true)
   assert.equal(agent.handleOptions.thinkingMode, 'enabled')
   assert.equal(agent.handleOptions.reasoningEffort, 'high')

@@ -706,20 +706,29 @@ test('adds trusted quote grounding after ordinary group history is loaded', asyn
   assert.equal(unresolvedEvidence.hasReply, true)
   assert.equal(unresolvedEvidence.replyResolved, false)
   assert.equal(modelRequests.length, 2)
-  assert.equal(modelRequests[0]?.messages.some(message =>
-    message.role === 'system' &&
-    typeof message.content === 'string' &&
-    message.content.includes('当前 QQ 请求没有携带可解析的引用消息') &&
-    message.content.includes('不得从会话历史猜测')
-  ), true)
+  const systemBlock = (request: ModelRequest | undefined): string => (request?.messages ?? [])
+    .filter(message => message.role === 'system')
+    .map(message => (typeof message.content === 'string' ? message.content : ''))
+    .join('\n\n')
+  const sessionMetadata = (request: ModelRequest | undefined): string => (request?.messages ?? [])
+    .map(message => (typeof message.content === 'string' ? message.content : ''))
+    .find(content => content.includes('当前会话元数据')) ?? ''
+  // The reply state is data, not a branch in the instructions: the system block
+  // stays byte-identical between an absent and an unreadable quote so the
+  // provider can still reuse the prompt prefix across the two turns.
+  assert.equal(systemBlock(modelRequests[0]), systemBlock(modelRequests[1]))
+  assert.match(systemBlock(modelRequests[0]), /quotedMessageState/)
+  assert.match(systemBlock(modelRequests[0]), /不得从会话历史猜测/)
+  assert.equal(
+    sessionMetadata(modelRequests[0]).includes('"quotedMessageState":"absent"'),
+    true
+  )
+  assert.equal(
+    sessionMetadata(modelRequests[1]).includes('"quotedMessageState":"unreadable"'),
+    true
+  )
   assert.equal(modelRequests[0]?.messages.some(message =>
     typeof message.content === 'string' && message.content.includes('很像被引用目标的旧消息')
-  ), true)
-  assert.equal(modelRequests[1]?.messages.some(message =>
-    message.role === 'system' &&
-    typeof message.content === 'string' &&
-    message.content.includes('当前 QQ 请求包含引用标记，但被引用内容不可读取') &&
-    message.content.includes('不得从会话历史猜测')
   ), true)
   assert.equal(modelRequests[1]?.messages.some(message =>
     typeof message.content === 'string' && message.content.includes('很像被引用目标的旧消息')

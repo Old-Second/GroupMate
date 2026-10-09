@@ -550,7 +550,10 @@ test('prepared message evidence supplies quote images and current intent without
   assert.equal(historyReads, 0)
   assert.equal(imageReads, 0)
   assert.match(run.promptAddition, /https:\/\/evidence\.example\/image\.png/)
-  assert.match(run.systemAddition, /quoted-evidence/)
+  // The manage target travels as session metadata, so the instruction itself
+  // carries no per-turn id and stays byte-identical across turns.
+  assert.match(run.systemAddition, /replyTargetMessageId/)
+  assert.equal(run.systemAddition.includes('quoted-evidence'), false)
 })
 
 test('Yunzai recovery rebuilds group-user runtime and rejects snapshot or actor drift', async () => {
