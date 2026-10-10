@@ -3,6 +3,8 @@ import { test } from 'node:test'
 import type { AgentContentPart, AgentMessage } from '../../src/agent/contracts/content.js'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
+import { planModelTurn } from '../../src/agent/context/context-planner.js'
+import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../../src/agent/context/context-token-estimator.js'
 import { resourceReferenceLabel } from '../../src/agent/contracts/content-projection.js'
 import type {
   ContextInput,
@@ -711,8 +713,8 @@ test('optional sources are selected by fixed priority as budget grows', async ()
   const expected = [
     ['system', 'runtime', 'current'],
     ['system', 'runtime', 'current', 'tool'],
-    ['system', 'session', 'runtime', 'current', 'tool'],
-    ['system', 'session', 'group', 'runtime', 'current', 'tool'],
+    ['system', 'memory', 'runtime', 'current', 'tool'],
+    ['system', 'session', 'memory', 'runtime', 'current', 'tool'],
     ['system', 'session', 'group', 'memory', 'runtime', 'current', 'tool']
   ]
 
@@ -720,6 +722,25 @@ test('optional sources are selected by fixed priority as budget grows', async ()
     const snapshot = await engine.prepare(priorityInput, budget(2 + optionalCount))
     assert.deepEqual(snapshot.includedIds, expected[optionalCount - 1])
   }
+})
+
+test('retrieved untrusted memory survives planner pressure from session and group history', () => {
+  const engine = new ContextEngine({ estimator })
+  const spans = engine.projectSourceSpans(input({
+    sessionHistory: Array.from({ length: 20 }, (_, index) => item(`history-${index}`, 'session_history', `history ${index}`)),
+    groupContext: Array.from({ length: 20 }, (_, index) => item(`group-${index}`, 'group_context', `group ${index}`)),
+    memoryContext: [memoryItem('recalled-fact', 'retrieved preference')]
+  }), 'namespace:memory-pressure')
+  const result = planModelTurn(deepFreeze({ schemaVersion: 1, namespaceRef: 'namespace:memory-pressure',
+    generation: 1, transition: 'normal', previousPlan: null, estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
+    capabilityHash: '1'.repeat(64), artifactPolicy: 'disabled', spans, artifacts: [],
+    budget: { schemaVersion: 1, maxInputTokens: 10000, maxSerializedMessageBytes: 10000,
+      maxMessages: 5, estimatedToolTokens: 0, reservedOutputTokens: 0 }
+  }))
+  if (result.status !== 'ready') assert.fail('expected ready context plan')
+  assert.deepEqual(result.messages.map(message => message.content), ['S', 'retrieved preference', 'U'])
+  assert.equal(result.messages[1]?.role, 'user')
+  assert.equal(spans.find(span => span.source === 'memory')?.trust, 'untrusted')
 })
 
 test('selected items return in stable semantic order', async () => {

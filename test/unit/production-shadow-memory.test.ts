@@ -5,6 +5,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { test, type TestContext } from 'node:test'
 import type { ModelRequest, ModelTurn } from '../../src/agent/model/model-adapter.js'
+import { parseMemoryRetrievalResultV2 } from '../../src/agent/memory/memory-retrieval.js'
 import { createProductionPersonalMemoryRuntimeV1 } from '../../src/runtime/production-personal-memory-runtime.js'
 import type { PostReplyMemoryCandidatePortV1 } from '../../src/runtime/ProductionShadowMemory.js'
 
@@ -276,9 +277,37 @@ test('automatic production defaults to participation, approves a sourced distinc
   const lexical = new DatabaseSync(path.join(directory, 'personal-memory-lexical.sqlite'), { readOnly: true })
   try { assert.equal(lexical.prepare('SELECT count(*) AS n FROM lexical_documents').get()?.n, 1) }
   finally { lexical.close() }
+  const recalled = parseMemoryRetrievalResultV2(await runtime.recallSource.recall({
+    event: request.event, request: { sessionAddress: request.prepared.route.sessionAddress, createdAt: new Date().toISOString() },
+    messageEvidence: request.prepared.evidence, queryText: '我喜欢喝薄荷茶吗？'
+  }))
+  assert.equal(recalled.status, 'completed')
+  if (recalled.status === 'completed') assert.deepEqual(recalled.candidates.map(candidate => candidate.text), ['我喜欢喝薄荷茶'])
   await runtime.postReplyCandidate!.enqueue(input('我喜欢喝薄荷茶'))
   await runtime.waitForCandidateIdle!()
   assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+})
+
+test('a fact automatically approved in a group is recalled by that subject without an enrollment command', async t => {
+  const bot = { sendApi: async (_action: string, value: Readonly<Record<string, unknown>>) => ({
+    user_id: value.user_id, nickname: '测试用户', join_time: 1_700_000_000, role: 'member'
+  }) }
+  const { runtime } = await setup(t, 'automatic', undefined, bot)
+  const original = input('我平时喜欢喝不加糖的乌龙茶。')
+  const request = { ...original,
+    event: { ...original.event, isPrivate: false, isGroup: true, group_id: '30003', bot } as Input['event'],
+    prepared: { ...original.prepared, route: { ...original.prepared.route,
+      sessionAddress: { botId: '10001', scope: { kind: 'group_user' as const, groupId: '30003', userId: '20002' } }
+    } }
+  }
+  await runtime.postReplyCandidate!.enqueue(request)
+  await runtime.waitForCandidateIdle!()
+  const recalled = parseMemoryRetrievalResultV2(await runtime.recallSource.recall({
+    event: request.event, request: { sessionAddress: request.prepared.route.sessionAddress, createdAt: new Date().toISOString() },
+    messageEvidence: request.prepared.evidence, queryText: '我平时喝乌龙茶有什么偏好？。P7D-AUTOMATIC-RECALL。'
+  }))
+  assert.equal(recalled.status, 'completed')
+  if (recalled.status === 'completed') assert.deepEqual(recalled.candidates.map(candidate => candidate.text), [original.prepared.evidence.prompt])
 })
 
 test('manual opt-out before the first ordinary message persists and defeats automatic defaults across restart', async t => {

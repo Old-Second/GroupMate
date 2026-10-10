@@ -54,9 +54,9 @@ interface StrictProjection {
 const optionalPriority: Readonly<Record<ContextSource, number>> = {
   system_instruction: 0,
   runtime_fact: 5,
-  session_history: 3,
-  group_context: 2,
-  memory: 1,
+  session_history: 2,
+  group_context: 1,
+  memory: 3,
   current_request: 0,
   tool_chain: 4
 }
@@ -227,7 +227,9 @@ function canonicalLegacyMessages (items: readonly ContextItem[]): readonly Model
 
 function sourcePriority (source: ContextSource): ContextSpanPriority {
   if (source === 'system_instruction' || source === 'current_request') return 'critical'
-  if (source === 'runtime_fact' || source === 'tool_chain') return 'high'
+  // Relevance-filtered memory must survive ambient history pressure. Priority
+  // affects retention only; the projected record remains untrusted user data.
+  if (source === 'runtime_fact' || source === 'tool_chain' || source === 'memory') return 'high'
   if (source === 'session_history') return 'normal'
   return 'low'
 }
