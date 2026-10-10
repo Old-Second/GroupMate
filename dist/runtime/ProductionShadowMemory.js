@@ -15,6 +15,7 @@ import { decidePersonalMemoryPilotV1 } from '../agent/memory/personal-memory-pil
 import { buildPersonalMemoryAccessScopeV1, selectPersonalMemorySubjectsV1 } from '../agent/memory/scene-participant.js';
 import { createSqliteMemoryExtractionQueueV1 } from '../agent/memory/sqlite-memory-extraction-queue.js';
 import { createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js';
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js';
 async function abortable(pending, signal) {
     let onAbort = () => undefined;
     const aborted = new Promise((_resolve, reject) => {
@@ -47,6 +48,12 @@ export function createProductionShadowMemoryV1(options) {
     // Reject overload before retaining event/host objects or doing member lookups.
     const enqueues = new Set();
     const enabled = () => options.mode() === 'shadow';
+    const report = (stage, outcome) => {
+        try {
+            options.onAdmission?.(Object.freeze({ stage, outcome }));
+        }
+        catch { }
+    };
     const contextFor = async (job, signal) => {
         if (job.source.scene.kind === 'group') {
             // Durable jobs cannot turn the original event into a fresh membership proof.
@@ -210,35 +217,49 @@ export function createProductionShadowMemoryV1(options) {
         if (evidence.currentMessageId === null || evidence.hasReply || evidence.imageUrls.length !== 0 ||
             evidence.ocrTexts.length !== 0 || prompt.startsWith('#') || prompt === '' ||
             Buffer.byteLength(prompt, 'utf8') > 1_024 || [...prompt].length > 500 ||
-            memoryCredentialRejectionReasonV1(prompt) !== null)
+            memoryCredentialRejectionReasonV1(prompt) !== null) {
+            report('evidence', 'rejected');
             return;
+        }
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 1_000);
+        let stage = 'participant';
         try {
             const instant = options.now();
             const accountId = input.prepared.route.sessionAddress.botId;
             const snapshot = await abortable(participants.resolve({ event: input.event, messageEvidence: evidence,
                 accountId, observedAt: instant }, controller.signal), controller.signal);
-            if (snapshot === null || closed || controller.signal.aborted)
+            if (snapshot === null || closed || controller.signal.aborted) {
+                report(stage, 'rejected');
                 return;
+            }
+            stage = 'scope';
             const address = input.prepared.route.sessionAddress.scope;
             if (input.prepared.route.actorId !== snapshot.current.identity.userId ||
                 (snapshot.scene.kind === 'private'
                     ? address.kind !== 'private' || address.userId !== snapshot.current.identity.userId
                     : address.kind === 'private' || address.groupId !== snapshot.scene.groupId ||
-                        (address.kind === 'group_user' && address.userId !== snapshot.current.identity.userId)))
+                        (address.kind === 'group_user' && address.userId !== snapshot.current.identity.userId))) {
+                report(stage, 'rejected');
                 return;
+            }
             const subjects = selectPersonalMemorySubjectsV1({ scene: snapshot.scene,
                 current: snapshot.current, references: [], now: instant });
             const scope = buildPersonalMemoryAccessScopeV1({ botInstanceId: options.botInstanceId,
                 accountId, scene: snapshot.scene, subjects, now: instant });
             const namespace = scope.namespaces[0];
-            if (namespace === undefined || subjects.length !== 1)
+            if (namespace === undefined || subjects.length !== 1) {
+                report(stage, 'rejected');
                 return;
+            }
             const access = issueMemoryAccessCapabilityV1(issuer, scope.context, [namespace], instant);
+            stage = 'enrollment';
             const enrollment = await options.enrollment.read({ schemaVersion: 1, namespace, access }, controller.signal);
-            if (enrollment.status !== 'found')
+            if (enrollment.status !== 'found') {
+                report(stage, 'rejected');
                 return;
+            }
+            stage = 'job';
             const identity = snapshot.current.identity;
             const { userId, nickname, groupCard, groupTitle, groupRole, displayName } = identity;
             const actor = { userId, nickname, groupCard, groupTitle, groupRole, displayName };
@@ -249,18 +270,31 @@ export function createProductionShadowMemoryV1(options) {
                     : { kind: 'group', groupId: scene.groupId, groupLifecycleId: scene.groupLifecycleId, groupName: scene.groupName },
                 observedAt: instant, normalizedText: prompt, resourceRefs: [] });
             const reply = [...input.envelope.completion.text.normalize('NFC')].slice(0, 500).join('').trim();
+            if (!RUN_REF_PATTERN.test(input.envelope.runRef)) {
+                report(stage, 'rejected');
+                return;
+            }
             const job = createMemoryExtractionJobV1({ namespace, namespaceGeneration: enrollment.policy.namespaceGeneration,
                 enrollmentPolicyGeneration: enrollment.policy.policyGeneration,
-                subject: actor, source, sceneRef: access.sceneRef, sourceRunRef: input.envelope.runRef,
+                // Kernel refs are bare 32-digit hex; memory provenance uses domain-prefixed opaque ids.
+                subject: actor, source, sceneRef: access.sceneRef, sourceRunRef: `run:${input.envelope.runRef}`,
                 sourceModelProfile: options.model.model(), requestedMode: 'shadow', priority: 'asserted',
                 enqueuedAt: instant, assistantReply: reply });
-            if (await abortable(authorize(job, controller.signal), controller.signal) === null)
+            stage = 'authorization';
+            if (await abortable(authorize(job, controller.signal), controller.signal) === null) {
+                report(stage, 'rejected');
                 return;
+            }
+            stage = 'queue';
             openQueue();
             if (queue !== null && !closed && !controller.signal.aborted) {
-                await queue.enqueue(job, controller.signal);
+                const result = await queue.enqueue(job, controller.signal);
+                report(stage, result.status === 'stored' || result.status === 'unchanged' ? 'accepted' : 'rejected');
                 kick();
             }
+        }
+        catch {
+            report(stage, controller.signal.aborted ? 'timeout' : 'failed');
         }
         finally {
             clearTimeout(timeout);

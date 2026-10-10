@@ -39,6 +39,7 @@ export async function initializeProductionPersonalMemoryRuntimeV1(options) {
         recallMaxTokens: options.recallMaxTokens,
         recallTimeoutMs: options.recallTimeoutMs,
         ...(options.candidateModel === undefined ? {} : { candidateModel: options.candidateModel }),
-        ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot })
+        ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot }),
+        ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission })
     }));
 }

@@ -23,7 +23,7 @@ function input (prompt: string, overrides: Partial<Input> = {}): Input {
         quotedMessageId: null, hasReply: false, replyResolved: true,
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] }
     },
-    envelope: { kind: 'completed', runRef: `run:shadow-${id}`, completion: { kind: 'reply_text', text: '了解了。' } } as Input['envelope'],
+    envelope: { kind: 'completed', runRef: id.toString(16).padStart(32, '0'), completion: { kind: 'reply_text', text: '了解了。' } } as Input['envelope'],
     presentation: { schemaVersion: 1, outcome: 'complete', deliveries: [
       { kind: 'sent', media: 'text', attempt: 1, receipt: { schemaVersion: 1, media: 'text' } }
     ] } as unknown as Input['presentation'],
@@ -41,11 +41,13 @@ async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' 
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   const requests: ModelRequest[] = []
   const usage: unknown[] = []
+  const admissions: unknown[] = []
   const runtime = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
     deploymentMode: () => mode, groupAllowlist: () => ['30003'],
     recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
     candidateBot: () => bot,
+    candidateAdmission: value => admissions.push(value),
     candidateModel: { model: () => 'test-model', onUsage: value => usage.push(value), adapter: {
       complete: async (request, signal) => {
         requests.push(request)
@@ -66,7 +68,7 @@ async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' 
   }
   const db = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
   t.after(() => db.close())
-  return { directory, runtime, send, db, requests, usage }
+  return { directory, runtime, send, db, requests, usage, admissions }
 }
 
 test('shadow production stores a sourced pending proposal, records separate usage and never recalls it', async t => {
@@ -98,6 +100,41 @@ test('shadow production stores a sourced pending proposal, records separate usag
   assert.equal(status.extraction.status, 'idle')
   assert.equal(status.extraction.pendingRecords, 0)
   assert.equal(statSync(path.join(directory, 'personal-memory-extraction.sqlite')).mode & 0o777, 0o600)
+})
+
+test('admission failures report only a bounded stage/outcome and leave ordinary replies alone', async t => {
+  const { runtime, send, requests, admissions } = await setup(t)
+  await send('#长期记忆 开启')
+  const request = input('我喜欢红茶')
+  await runtime.postReplyCandidate!.enqueue({ ...request, event: { ...request.event,
+    isGroup: true, group_id: '30003', bot: { sendApi: async () => { throw new Error('private host details') } }
+  } as unknown as Input['event'] })
+  assert.deepEqual(admissions, [{ stage: 'participant', outcome: 'rejected' }])
+  assert.equal(requests.length, 0)
+  await runtime.postReplyCandidate!.enqueue(input('password=secret123'))
+  assert.deepEqual(admissions.at(-1), { stage: 'evidence', outcome: 'rejected' })
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢红茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.deepEqual(admissions.at(-1), { stage: 'queue', outcome: 'accepted' })
+})
+
+test('kernel run refs become namespaced memory provenance; invalid refs never reach the queue', async t => {
+  const { runtime, send, directory, admissions } = await setup(t, 'shadow', async (_request, signal) =>
+    await new Promise<ModelTurn>((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+  await send('#长期记忆 开启')
+  const request = input('我喜欢红茶')
+  await runtime.postReplyCandidate!.enqueue({ ...request, envelope: { ...request.envelope, runRef: 'unavailable' } })
+  assert.deepEqual(admissions, [{ stage: 'job', outcome: 'rejected' }])
+  const queuePath = path.join(directory, 'personal-memory-extraction.sqlite')
+  assert.equal(existsSync(queuePath), false)
+  await runtime.postReplyCandidate!.enqueue(request)
+  const queue = new DatabaseSync(queuePath, { readOnly: true })
+  try {
+    const columns = queue.prepare('SELECT job_wire FROM memory_extraction_jobs').get()!
+    assert.equal(JSON.parse(String(columns.job_wire)).sourceRunRef, `run:${request.envelope.runRef}`)
+  } finally { queue.close(); await runtime.close() }
 })
 
 test('group candidates recheck live membership after extraction and reject users who left', async t => {

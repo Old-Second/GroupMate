@@ -1407,6 +1407,9 @@ try {
     recallMaxTokens: () => Config.personalMemoryRecallMaxTokens,
     recallTimeoutMs: () => Config.personalMemoryRecallTimeoutMs,
     candidateBot: accountId => botPicker.pick(accountId),
+    candidateAdmission: diagnostic => runtimeLogger.info(Object.freeze({
+      event: 'groupmate.personal_memory.shadow_admission', ...diagnostic
+    })),
     candidateModel: Object.freeze({
       adapter: modelPort,
       model: () => normalizedText(Config.model, 128),
