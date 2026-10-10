@@ -60,6 +60,8 @@ function aborted (signal?: AbortSignal): boolean { return signal?.aborted === tr
 
 /** Event driven single worker; automatic defaults remain subordinate to a durable personal opt-out. */
 export function createProductionShadowMemoryV1 (options: ShadowOptions) {
+  // Compare delimiters without rewriting the stored exact source excerpt.
+  const factKey = (text: string): string => text.trim().replace(/[。.!！]+$/u, '')
   const issuer = createMemoryAccessCapabilityIssuerV1(() => true)
   const root = createMemoryLifecycleAuthorityRootV1(() => true)
   const participants = createYunzaiSceneParticipantDirectoryV1()
@@ -194,7 +196,7 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
         extractor: createOpenAiMemoryCandidateExtractorV1(options.model),
         classifier: { classify: async ({ job, candidate }) => {
           const records = recordsFor(job)
-          const duplicate = records.find(record => record.text === candidate.text)
+          const duplicate = records.find(record => factKey(record.text) === factKey(candidate.text))
           if (duplicate !== undefined) return { status: 'duplicate', relatedMemoryIds: [duplicate.memoryId] }
           const conflicts = records.filter(record => record.kind === candidate.kind).slice(0, 4)
           return conflicts.length === 0 ? { status: 'distinct' }
@@ -209,7 +211,7 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
           `).all(input.job.namespaceRef, input.job.namespaceGeneration)
           if (rows.length > 32) return { status: 'capacity' }
           const duplicate = rows.map(row => decodeMemoryProposalV2(row.proposal_wire)).find(proposal =>
-            proposal.text === input.candidate.text && proposal.kind === input.candidate.kind &&
+            factKey(proposal.text) === factKey(input.candidate.text) && proposal.kind === input.candidate.kind &&
             Date.parse(proposal.suggestedRetention.validUntil) > Date.parse(options.now()))
           if (duplicate !== undefined) return input.approvalMode === 'policy_approved'
             ? { status: 'denied', reason: 'policy' }
