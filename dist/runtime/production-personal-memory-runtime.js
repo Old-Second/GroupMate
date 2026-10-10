@@ -20,6 +20,7 @@ import { createSqlitePersonalMemoryEnrollmentAdapterV1 } from '../agent/memory/s
 import { createSqliteMemoryCanonicalRehydratorV1 } from '../agent/memory/sqlite-memory-canonical-rehydrator.js';
 import { bindYunzaiPersonalMemoryRecallSourceV1, createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js';
 import { createYunzaiPersonalMemoryControllerV1 } from './yunzai-personal-memory-controller.js';
+import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js';
 const CANONICAL_FILE = 'personal-memory.sqlite';
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite';
 const EXPORT_DIRECTORY = 'exports';
@@ -470,7 +471,12 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             lexical: lexicalIndex,
             now: nowIso
         });
-        await projector.rebuild();
+        const deletionCleanup = createSqlitePersonalMemoryDeletionCleanupV1({
+            database: canonical.database, botInstanceId: options.botInstanceId,
+            now: nowIso, rebuildLexical: async () => await projector.rebuild()
+        });
+        if (!deletionCleanup.hasPending() || !await deletionCleanup.resume())
+            await projector.rebuild();
         const enrollmentAdapter = createSqlitePersonalMemoryEnrollmentAdapterV1({
             database: canonical.database,
             now: nowIso
@@ -557,7 +563,8 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             facade,
             control,
             exportDelivery: exportDeliveryRuntime.delivery,
-            rebuildLexical: async () => await projector.rebuild()
+            rebuildLexical: async () => await projector.rebuild(),
+            completeNamespaceDeletion: deletionCleanup.resume
         });
         let closed = false;
         return Object.freeze({
@@ -565,7 +572,12 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
                 recall: async (input, signal) => await recallSource.recall(input, signal)
             }),
             operations: Object.freeze({
-                inspect: async (signal) => await operations.inspect(signal),
+                inspect: async (signal) => {
+                    const status = await operations.inspect(signal);
+                    return status.status === 'ready' && deletionCleanup.hasPending()
+                        ? Object.freeze({ ...status, status: 'maintenance' })
+                        : status;
+                },
                 execute: async (request, signal) => await operations.execute(request, signal)
             }),
             commands,

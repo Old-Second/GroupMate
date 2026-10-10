@@ -1,11 +1,12 @@
 import { encodeMemoryOutboxEventV1 } from './memory-codec.js';
 import { parseMemoryOutboxEventV1 } from './memory-domain.js';
-import { inspectMemoryArray, inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js';
+import { inspectMemoryArray, inspectMemoryRecord, invalidMemoryValue, parseMemoryNamespaceRefV1 } from './memory-namespace.js';
 import { createMemoryPortSignalScopeV1 } from './memory-port-signal.js';
 import { MEMORY_RESOURCE_LIMITS, memoryAsciiWithinLimit } from './memory-resource-limits.js';
-const OUTBOX_OPERATIONS = ['claim', 'ack', 'retry', 'usage'];
+const OUTBOX_OPERATIONS = ['claim', 'claim_namespace_deletion', 'ack', 'retry', 'usage'];
 const OUTBOX_REQUEST_FIELDS = [
-    'ownerId', 'limit', 'leaseToken', 'eventId', 'sequence', 'retryAt', 'reasonCode'
+    'ownerId', 'limit', 'leaseToken', 'eventId', 'sequence', 'retryAt', 'reasonCode',
+    'namespaceRef', 'namespaceGeneration'
 ];
 const WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const LEASE_PATTERN = /^memory-lease:v1:[0-9a-f]{64}$/;
@@ -71,6 +72,15 @@ function parseMemoryOutboxRequestV1(value, now) {
             ownerId: workerId(input.ownerId),
             limit: positiveInteger(input.limit, MEMORY_RESOURCE_LIMITS.operationBatchRecords)
         });
+    }
+    if (operation === 'claim_namespace_deletion') {
+        const input = inspectMemoryRecord(value, ['schemaVersion', 'operation', 'ownerId',
+            'limit', 'namespaceRef', 'namespaceGeneration']);
+        return Object.freeze({ schemaVersion: 1, operation,
+            ownerId: workerId(input.ownerId),
+            limit: positiveInteger(input.limit, MEMORY_RESOURCE_LIMITS.operationBatchRecords),
+            namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
+            namespaceGeneration: positiveInteger(input.namespaceGeneration) });
     }
     if (operation === 'ack') {
         const input = inspectMemoryRecord(value, [
@@ -141,6 +151,10 @@ function parseClaimedResult(value, request, now) {
         events.some((event, index) => index > 0 && event.sequence <= events[index - 1].sequence)) {
         return invalidMemoryValue();
     }
+    if (request.operation === 'claim_namespace_deletion' && events.some(event => event.namespaceRef !== request.namespaceRef ||
+        event.namespaceGeneration !== request.namespaceGeneration ||
+        event.eventKind !== 'namespace_deleted'))
+        return invalidMemoryValue();
     return Object.freeze({
         status: 'claimed',
         ownerId: request.ownerId,
@@ -156,12 +170,12 @@ function parseMemoryOutboxResultV1(value, request, now, signalAborted) {
     const status = discriminator.status;
     if (status === 'empty') {
         inspectMemoryRecord(value, ['status']);
-        if (request.operation !== 'claim')
+        if (request.operation !== 'claim' && request.operation !== 'claim_namespace_deletion')
             return invalidMemoryValue();
         return Object.freeze({ status });
     }
     if (status === 'claimed') {
-        if (request.operation !== 'claim')
+        if (request.operation !== 'claim' && request.operation !== 'claim_namespace_deletion')
             return invalidMemoryValue();
         return parseClaimedResult(value, request, now);
     }

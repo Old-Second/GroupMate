@@ -2,10 +2,18 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import {
   createProductionPersonalMemoryRuntimeV1
 } from '../../src/runtime/production-personal-memory-runtime.js'
+import { createMemoryAccessCapabilityIssuerV1, issueMemoryAccessCapabilityV1 } from '../../src/agent/memory/memory-access-gate.js'
+import { createMemoryLifecycleAuthorityRootV1, issueMemoryLifecycleActorCapabilityV1 } from '../../src/agent/memory/memory-lifecycle-authority.js'
+import { createMemoryLifecycleCommandV1 } from '../../src/agent/memory/memory-lifecycle-command.js'
+import { createMemoryLifecyclePortV1 } from '../../src/agent/memory/memory-lifecycle-port.js'
+import { memoryNamespaceRefV1, parseMemoryNamespaceV1 } from '../../src/agent/memory/memory-namespace.js'
+import { openSqliteMemoryDatabaseV3 } from '../../src/agent/memory/sqlite-memory-database.js'
+import { createSqliteMemoryLifecycleAdapterV1 } from '../../src/agent/memory/sqlite-memory-lifecycle.js'
 
 function options (storageDirectory: string) {
   return Object.freeze({
@@ -18,6 +26,124 @@ function options (storageDirectory: string) {
     recallTimeoutMs: () => 150
   })
 }
+
+function privateSender (runtime: Awaited<ReturnType<typeof createProductionPersonalMemoryRuntimeV1>>, prefix: string) {
+  let sequence = 0
+  return async (text: string, userId = '20002'): Promise<string> => {
+    const replies: string[] = []
+    assert.equal(await runtime.commands.handle({
+      event: { isPrivate: true, isGroup: false, self_id: '10001', user_id: userId,
+        message_id: `${prefix}-${++sequence}`, sender: { user_id: userId, nickname: '测试用户' } },
+      text, replyText: async value => { replies.push(value) }, sendPrivateFile: async () => undefined
+    }), true)
+    assert.equal(replies.length, 1)
+    return replies[0]!
+  }
+}
+
+async function legacyLogicalDelete (directory: string): Promise<void> {
+  const now = (): string => new Date().toISOString()
+  const store = openSqliteMemoryDatabaseV3({ location: path.join(directory, 'personal-memory.sqlite'), now, manifests: [] })
+  try {
+    const row = store.database.prepare('SELECT revision_wire FROM revision_payloads WHERE revision_wire LIKE ?')
+      .get('%一次性删除种子%')!
+    const namespace = parseMemoryNamespaceV1(JSON.parse(String(row.revision_wire)).record.namespace)
+    const namespaceRef = memoryNamespaceRefV1(namespace)
+    const instant = now()
+    const access = issueMemoryAccessCapabilityV1(createMemoryAccessCapabilityIssuerV1(() => true),
+      { schemaVersion: 1, botInstanceId: namespace.botInstanceId, adapter: 'qq', accountId: namespace.accountId,
+        scene: { kind: 'private', peerUserId: '20002' } }, [namespace], instant)
+    const actorRef = `actor:${'a'.repeat(64)}`
+    const actor = issueMemoryLifecycleActorCapabilityV1(createMemoryLifecycleAuthorityRootV1(() => true),
+      { schemaVersion: 1, botInstanceId: namespace.botInstanceId, adapter: 'qq', accountId: namespace.accountId,
+        namespace, namespaceRef, sceneRef: access.sceneRef, generation: 1, actorRef, actorUserId: '20002',
+        role: 'personal_subject', roleObservedAt: null, actions: ['delete_namespace'] }, instant)
+    const command = createMemoryLifecycleCommandV1({ commandRef: `command:${'b'.repeat(64)}`,
+      operation: 'namespace.delete', initiatedByActorRef: actorRef, namespaceRef,
+      expectedNamespaceGeneration: 1, aggregateRef: null, expectedRevision: null, expectedAggregateHash: null,
+      occurredAt: instant, newValidUntil: null, newPurgeAt: null, material: null })
+    const lifecycle = createMemoryLifecyclePortV1({ now,
+      execute: createSqliteMemoryLifecycleAdapterV1({ database: store.database, now }).execute })
+    assert.equal((await lifecycle.execute({ schemaVersion: 1, command, access,
+      authority: { kind: 'actor', capability: actor } })).status, 'deletion_pending')
+    assert.equal(store.database.prepare('SELECT count(*) AS count FROM revision_payloads').get()?.count, 1)
+  } finally { store.close() }
+}
+
+test('production namespace deletion removes bodies and leaves another account and its outbox unchanged', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-deletion-isolation-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const runtime = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  t.after(async () => await runtime.close())
+  const send = privateSender(runtime, 'isolation')
+  await send('#长期记忆 开启')
+  await send('#长期记忆 记住 一次性删除种子')
+  await send('#长期记忆 开启', '30003')
+  await send('#长期记忆 记住 必须保留的另一账号记录', '30003')
+  const database = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
+  try {
+    const other = database.prepare('SELECT namespace_ref FROM revision_payloads WHERE revision_wire LIKE ?')
+      .get('%必须保留的另一账号记录%')!.namespace_ref!
+    const payloads = (): string => JSON.stringify(database.prepare('SELECT * FROM revision_payloads WHERE namespace_ref = ?').all(other))
+    const events = (): string => JSON.stringify(database.prepare('SELECT * FROM outbox WHERE namespace_ref = ? ORDER BY sequence').all(other))
+    const before = { payloads: payloads(), events: events() }
+    assert.match(await send('#长期记忆 删除全部 确认'), /已全部删除/)
+    assert.deepEqual({ payloads: payloads(), events: events() }, before)
+    assert.equal(database.prepare('SELECT count(*) AS count FROM revision_payloads').get()?.count, 1)
+    assert.match(await send('#长期记忆 列表', '30003'), /必须保留的另一账号记录/)
+  } finally { database.close() }
+})
+
+test('production startup resumes a durable deletion left by the legacy composition', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-deletion-resume-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const first = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  const send = privateSender(first, 'legacy')
+  await send('#长期记忆 开启')
+  await send('#长期记忆 记住 一次性删除种子')
+  await first.close()
+  await legacyLogicalDelete(directory)
+  const reopened = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  t.after(async () => await reopened.close())
+  const database = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
+  try {
+    assert.equal(database.prepare('SELECT count(*) AS count FROM revision_payloads').get()?.count, 0)
+    assert.deepEqual({ ...database.prepare('SELECT canonical_bodies, stage, derived_cleanup FROM namespace_deletion_checkpoints').get() },
+      { canonical_bodies: 'verified_absent', stage: 'canonical_complete', derived_cleanup: 'applied' })
+    assert.equal((await reopened.operations.inspect() as Record<string, any>).status, 'ready')
+  } finally { database.close() }
+})
+
+test('production deletion reports pending when a reader prevents physical completion and resumes after restart', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-deletion-reader-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const runtime = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  t.after(async () => await runtime.close())
+  const send = privateSender(runtime, 'reader')
+  await send('#长期记忆 开启')
+  await send('#长期记忆 记住 一次性删除种子')
+  const reader = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
+  try {
+    reader.exec('BEGIN')
+    reader.prepare('SELECT count(*) FROM revision_payloads').get()
+    const reply = await send('#长期记忆 删除全部 确认')
+    assert.match(reply, /正文清理尚未完成/)
+    assert.doesNotMatch(reply, /已全部删除/)
+    assert.equal((await runtime.operations.inspect() as Record<string, any>).status, 'maintenance')
+    assert.match(await send('#长期记忆 开启'), /已开启/)
+    assert.match(await send('#长期记忆 记住 二代有效记录'), /已记住/)
+    reader.exec('COMMIT')
+  } finally { reader.close() }
+  await runtime.close()
+  const reopened = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  t.after(async () => await reopened.close())
+  const status = await reopened.operations.inspect() as Record<string, any>
+  assert.equal(status.status, 'ready')
+  assert.equal(status.canonical.activeRecords, 1)
+  const current = await recallPrivate(reopened, '二代有效记录', 100)
+  assert.equal(current.status, 'completed')
+  assert.deepEqual(current.candidates.map((candidate: any) => candidate.text), ['二代有效记录'])
+})
 
 function groupEvent (groupId: string, messageId: string) {
   return Object.freeze({
@@ -220,6 +346,22 @@ test('production personal memory commands complete the private QQ lifecycle and 
     status: 'unavailable',
     reason: 'not_opted_in'
   })
+
+  const canonical = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
+  try {
+    assert.deepEqual({ ...canonical.prepare(`
+      SELECT (SELECT count(*) FROM heads) AS heads,
+        (SELECT count(*) FROM revision_payloads) AS revisions,
+        (SELECT count(*) FROM proposals) AS proposals
+    `).get() }, { heads: 0, revisions: 0, proposals: 0 })
+    const checkpoint = canonical.prepare(`
+      SELECT canonical_bodies, stage, derived_cleanup
+      FROM namespace_deletion_checkpoints
+      WHERE deleting_generation < observed_current_generation
+    `).get()
+    assert.deepEqual({ ...checkpoint }, { canonical_bodies: 'verified_absent',
+      stage: 'canonical_complete', derived_cleanup: 'applied' })
+  } finally { canonical.close() }
 
   assert.match(await send('#长期记忆 列表', '30003'), /还没有保存/)
   await runtime.close()

@@ -64,13 +64,13 @@ import type {
   ProductionPersonalMemoryRuntimeV1
 } from './production-personal-memory-loader.js'
 import type {
-  PersonalMemoryOperationsPortV1,
   PersonalMemoryOperationsRequestV1
 } from './personal-memory-operations.js'
 import {
   createYunzaiPersonalMemoryControllerV1,
   type PersonalMemoryExportDeliveryV1
 } from './yunzai-personal-memory-controller.js'
+import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js'
 
 const CANONICAL_FILE = 'personal-memory.sqlite'
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite'
@@ -386,8 +386,8 @@ function createOperationsPort (options: {
   readonly lexical: DatabaseSync
   readonly lexicalLocation: string
   readonly projector: ReturnType<typeof createLexicalProjector>
-}): PersonalMemoryOperationsPortV1 {
-  const inspect = async (signal?: AbortSignal): Promise<unknown> => {
+}) {
+  const inspect = async (signal?: AbortSignal) => {
     throwIfAborted(signal)
     const canonical = options.canonical.prepare(`
       SELECT g.namespace_records, g.canonical_logical_bytes,
@@ -582,7 +582,11 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       lexical: lexicalIndex,
       now: nowIso
     })
-    await projector.rebuild()
+    const deletionCleanup = createSqlitePersonalMemoryDeletionCleanupV1({
+      database: canonical.database, botInstanceId: options.botInstanceId,
+      now: nowIso, rebuildLexical: async () => await projector.rebuild()
+    })
+    if (!deletionCleanup.hasPending() || !await deletionCleanup.resume()) await projector.rebuild()
     const enrollmentAdapter = createSqlitePersonalMemoryEnrollmentAdapterV1({
       database: canonical.database,
       now: nowIso
@@ -681,7 +685,8 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       facade,
       control,
       exportDelivery: exportDeliveryRuntime.delivery,
-      rebuildLexical: async () => await projector.rebuild()
+      rebuildLexical: async () => await projector.rebuild(),
+      completeNamespaceDeletion: deletionCleanup.resume
     })
     let closed = false
     return Object.freeze({
@@ -692,7 +697,12 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         )
       }),
       operations: Object.freeze({
-        inspect: async (signal?: AbortSignal) => await operations.inspect(signal),
+        inspect: async (signal?: AbortSignal) => {
+          const status = await operations.inspect(signal)
+          return status.status === 'ready' && deletionCleanup.hasPending()
+            ? Object.freeze({ ...status, status: 'maintenance' as const })
+            : status
+        },
         execute: async (request: unknown, signal?: AbortSignal) => await operations.execute(
           request as PersonalMemoryOperationsRequestV1,
           signal
