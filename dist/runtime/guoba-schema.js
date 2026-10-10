@@ -94,15 +94,15 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('bymFuckRecall', '自动撤回反击回复', '开启后只撤回随机参与产生的反击回复，不撤回用户消息或普通错误提示。', 'Switch'),
         field('bymFuckRecallTime', '反击回复撤回秒数', '反击回复成功发送后等待多少秒撤回。', 'InputNumber', { min: 1, max: 3600 }),
         divider('长期记忆'),
-        field('personalMemoryMode', '个人长期记忆模式', '默认关闭。显式模式只允许用户主动管理记忆；影子模式在回复成功后额外抽取候选，候选不用于回答，抽取会产生单独的模型用量。自动批准暂未开放。所有模式仍要求每位用户独立 opt-in，修改后需重启。', 'Select', {
+        field('personalMemoryMode', '个人长期记忆模式', '默认自动：普通回复成功后记录可信的稳定本人事实，不需要用户审批；用户发送“#长期记忆 关闭”可停止参与，关闭状态跨重启保留。显式模式只处理主动管理命令；影子候选不用于回答。抽取产生独立模型用量，修改后需重启。', 'Select', {
             options: [
                 { label: '完全关闭', value: 'off' },
                 { label: '仅显式管理', value: 'explicit' },
                 { label: '影子候选', value: 'shadow' },
-                { label: '自动模式（尚未开放）', value: 'automatic' }
+                { label: '自动记录', value: 'automatic' }
             ]
         }),
-        field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入已 opt-in 用户的个人记忆；空列表表示群聊全部不允许，私聊仍受用户独立 opt-in 控制。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
+        field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入个人记忆；空列表表示群聊全部不允许。自动模式下用户默认参与，手动关闭的用户不会被重新开启。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
         field('personalMemoryRecallMaxItems', '单次召回条数上限', '每次请求最多注入的个人记忆条数，范围 1 到 12；默认 6。修改后需重启。', 'InputNumber', { min: 1, max: 12, step: 1 }),
         field('personalMemoryRecallMaxTokens', '单次召回 Token 上限', '每次请求中个人记忆正文的独立 Token 预算，范围 1 到 2400；默认 1200，仍受总上下文预算约束。修改后需重启。', 'InputNumber', { min: 1, max: 2_400, step: 1 }),
         field('personalMemoryRecallTimeoutMs', '单次召回超时毫秒', '个人记忆检索超时，范围 1 到 500 毫秒；默认 150，超时会无记忆继续普通回复。群成员身份核验走宿主接口，有独立预算，不占用这里的时间。修改后需重启。', 'InputNumber', { min: 1, max: 500, step: 1 }),

@@ -555,6 +555,7 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             botInstanceId: options.botInstanceId, mode: options.deploymentMode,
             groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
             enrollment, lifecycle, model: options.candidateModel, now: nowIso,
+            onApproved: async () => { await projector.rebuild(); },
             ...(options.candidateBot === undefined ? {} : { bot: options.candidateBot }),
             ...(options.candidateAdmission === undefined ? {} : { onAdmission: options.candidateAdmission })
         });

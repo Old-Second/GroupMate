@@ -35,7 +35,7 @@ function turn (text: string): ModelTurn {
   return { text, finishReason: 'stop', toolCalls: [], usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 } }
 }
 
-async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' = 'shadow',
+async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' | (() => 'explicit' | 'shadow' | 'automatic') = 'shadow',
   complete?: (request: ModelRequest, signal: AbortSignal) => Promise<ModelTurn>, bot?: unknown) {
   const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-shadow-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
@@ -44,7 +44,7 @@ async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' 
   const admissions: unknown[] = []
   const runtime = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
-    deploymentMode: () => mode, groupAllowlist: () => ['30003'],
+    deploymentMode: () => typeof mode === 'function' ? mode() : mode, groupAllowlist: () => ['30003'],
     recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
     candidateBot: () => bot,
     candidateAdmission: value => admissions.push(value),
@@ -196,8 +196,8 @@ test('shutdown cancels a pending provider and leaves a durable job for event-dri
   assert.equal(db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 1)
 })
 
-test('explicit, automatic and opted-out sessions do not create queues or make candidate requests', async t => {
-  for (const mode of ['explicit', 'automatic', 'shadow'] as const) {
+test('explicit and opted-out sessions do not create queues or make candidate requests', async t => {
+  for (const mode of ['explicit', 'shadow'] as const) {
     const { directory, runtime, send, requests } = await setup(t, mode)
     if (mode !== 'shadow') await send('#长期记忆 开启')
     await runtime.postReplyCandidate!.enqueue(input('我喜欢喝红茶'))
@@ -205,6 +205,141 @@ test('explicit, automatic and opted-out sessions do not create queues or make ca
     assert.equal(requests.length, 0)
     assert.equal(existsSync(path.join(directory, 'personal-memory-extraction.sqlite')), false)
   }
+})
+
+test('model sensitivity labels cannot authorize health, financial, hypothetical or third-party assertions', async t => {
+  const samples = ['我得了糖尿病', '我的工资是三万元', '我的朋友喜欢喝绿茶',
+    '我如果是虚构角色会喜欢咖啡', 'I would prefer coffee if I were a fictional character', '我今天很开心']
+  for (const text of samples) {
+    const { runtime, send, db } = await setup(t, 'automatic', async () => turn(JSON.stringify({ candidates: [
+      { kind: 'profile_fact', text, confidence: 1, sensitivity: 'personal' }
+    ] })))
+    await send('#长期记忆 开启')
+    await runtime.postReplyCandidate!.enqueue(input(text))
+    await runtime.waitForCandidateIdle!()
+    assert.equal(db.prepare('SELECT count(*) AS n FROM proposals').get()?.n, 0)
+    assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+  }
+})
+
+test('an ungrounded excerpt is a final no-op and does not retain a retryable job body', async t => {
+  const { runtime, send, directory, requests, db } = await setup(t, 'shadow', async () =>
+    turn(JSON.stringify({ candidates: [{ kind: 'preference', text: '我喜欢红茶',
+      confidence: 0.9, sensitivity: 'personal' }] })))
+  await send('#长期记忆 开启')
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢红茶和绿茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(requests.length, 1)
+  assert.equal(db.prepare('SELECT count(*) AS n FROM proposals').get()?.n, 0)
+  const queue = new DatabaseSync(path.join(directory, 'personal-memory-extraction.sqlite'), { readOnly: true })
+  try {
+    assert.equal(queue.prepare('SELECT count(*) AS n FROM memory_extraction_jobs').get()?.n, 0)
+    assert.equal(queue.prepare("SELECT count(*) AS n FROM memory_candidate_audits WHERE outcome = 'no_op'").get()?.n, 1)
+  } finally { queue.close() }
+})
+
+test('automatic production defaults to participation, approves a sourced distinct fact and updates lexical recall', async t => {
+  const { directory, runtime, send, db, requests } = await setup(t, 'automatic')
+  const request = input('我喜欢喝薄荷茶')
+  await runtime.postReplyCandidate!.enqueue(request)
+  await runtime.waitForCandidateIdle!()
+  assert.equal(requests.length, 1)
+  const proposal = JSON.parse(String(db.prepare('SELECT proposal_wire FROM proposals').get()!.proposal_wire))
+  assert.equal(proposal.state, 'approved')
+  assert.equal(proposal.consentRequirement, 'owner_policy')
+  assert.match(proposal.consentPolicyRef, /^policy:[a-f0-9]{64}$/)
+  assert.equal(proposal.sources[0].messageId, request.prepared.evidence.currentMessageId)
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+  assert.match(await send('#长期记忆 列表'), /薄荷茶/)
+  const lexical = new DatabaseSync(path.join(directory, 'personal-memory-lexical.sqlite'), { readOnly: true })
+  try { assert.equal(lexical.prepare('SELECT count(*) AS n FROM lexical_documents').get()?.n, 1) }
+  finally { lexical.close() }
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢喝薄荷茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+})
+
+test('manual opt-out before the first ordinary message persists and defeats automatic defaults across restart', async t => {
+  const { directory, runtime, send, db, requests } = await setup(t, 'automatic')
+  assert.match(await send('#长期记忆 关闭'), /已关闭/)
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢薄荷茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(requests.length, 0)
+  assert.equal(db.prepare("SELECT state FROM personal_memory_policies").get()?.state, 'opted_out')
+  await runtime.close()
+  let calls = 0
+  const reopened = await createProductionPersonalMemoryRuntimeV1({
+    botInstanceId: 'groupmate-production', storageDirectory: directory,
+    deploymentMode: () => 'automatic', groupAllowlist: () => [],
+    recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150,
+    candidateModel: { model: () => 'test-model', adapter: { complete: async () => {
+      calls += 1
+      return turn('{"candidates":[]}')
+    } } }
+  })
+  t.after(async () => await reopened.close())
+  await reopened.postReplyCandidate!.enqueue(input('我喜欢薄荷茶'))
+  await reopened.waitForCandidateIdle!()
+  assert.equal(calls, 0)
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+})
+
+test('automatic defaults upgrade a previous explicit enrollment but preserve an explicit opt-out', async t => {
+  let mode: 'explicit' | 'automatic' = 'explicit'
+  const { runtime, send, requests, db } = await setup(t, () => mode)
+  await send('#长期记忆 开启')
+  mode = 'automatic'
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢薄荷茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(requests.length, 1)
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+  assert.match(await send('#长期记忆 关闭'), /已关闭/)
+  mode = 'explicit'
+  mode = 'automatic'
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢绿茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(requests.length, 1)
+})
+
+test('automatic low-confidence and conflicting facts remain pending and do not overwrite approved facts', async t => {
+  let confidence = 0.9
+  const { runtime, send, db } = await setup(t, 'automatic', async request => {
+    const body = JSON.parse(request.messages[1]!.content!) as { currentMessage: string }
+    return turn(JSON.stringify({ candidates: [{ kind: 'preference', text: body.currentMessage,
+      confidence, sensitivity: 'personal' }] }))
+  })
+  await send('#长期记忆 开启')
+  confidence = 0.7
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢喝白茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+  assert.equal(db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 1)
+  confidence = 0.9
+  // An old shadow proposal cannot be implicitly upgraded by a later automatic job.
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢喝白茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+  await send('#长期记忆 记住 我喜欢喝红茶')
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢喝绿茶'))
+  await runtime.waitForCandidateIdle!()
+  const pending = db.prepare("SELECT proposal_wire FROM proposals WHERE state = 'pending'").all()
+    .map(row => JSON.parse(String(row.proposal_wire)))
+  assert.equal(pending.find(p => p.text.includes('绿茶')).conflict.state, 'possible')
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+})
+
+test('an in-flight automatic extraction cannot approve after deployment mode is narrowed', async t => {
+  let mode: 'shadow' | 'automatic' = 'automatic'
+  const { runtime, send, db } = await setup(t, () => mode, async request => {
+    mode = 'shadow'
+    const body = JSON.parse(request.messages[1]!.content!) as { currentMessage: string }
+    return turn(JSON.stringify({ candidates: [{ kind: 'preference', text: body.currentMessage,
+      confidence: 0.9, sensitivity: 'personal' }] }))
+  })
+  await send('#长期记忆 开启')
+  await runtime.postReplyCandidate!.enqueue(input('我喜欢薄荷茶'))
+  await runtime.waitForCandidateIdle!()
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
 })
 
 test('unknown delivery, secrets, quoted/media evidence and oversized input are rejected before persistence/network', async t => {

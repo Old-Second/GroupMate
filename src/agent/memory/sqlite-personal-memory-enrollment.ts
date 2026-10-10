@@ -510,9 +510,7 @@ function decideEnrollment (
   }
   let namespace = loadNamespace(database, wire.namespaceRef)
   if (namespace === null) {
-    if (wire.operation !== 'enrollment.optIn') {
-      return Object.freeze({ status: 'conflict' as const, category: 'generation' as const })
-    }
+    // A first command may be an opt-out: persist it before automatic participation can start.
     if (wire.expectedNamespaceGeneration !== 1 || wire.expectedPolicyGeneration !== 0) {
       return Object.freeze({ status: 'conflict' as const, category: 'generation' as const })
     }
