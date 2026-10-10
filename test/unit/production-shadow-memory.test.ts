@@ -238,6 +238,26 @@ test('an ungrounded excerpt is a final no-op and does not retain a retryable job
   } finally { queue.close() }
 })
 
+test('sentence boundaries accept exact punctuation without accepting an abbreviated partial fact', async t => {
+  const { runtime, send, db } = await setup(t, 'shadow', async request => {
+    const current = JSON.parse(request.messages[1]!.content!).currentMessage as string
+    const text = current.startsWith('我') ? '我更喜欢没有糖的柠檬水。' :
+      current.startsWith('My') ? 'My native language is English.' : 'I use TypeScript v1.'
+    return turn(JSON.stringify({ candidates: [{ kind: 'preference', text,
+      confidence: 0.9, sensitivity: 'personal' }] }))
+  })
+  await send('#长期记忆 开启')
+  for (const text of ['我更喜欢没有糖的柠檬水。测试结束。',
+    'My native language is English. Trial ended.', 'I use TypeScript v1.2 every day']) {
+    await runtime.postReplyCandidate!.enqueue(input(text))
+    await runtime.waitForCandidateIdle!()
+  }
+  const proposals = db.prepare('SELECT proposal_wire FROM proposals').all()
+    .map(row => JSON.parse(String(row.proposal_wire)).text).sort()
+  assert.deepEqual(proposals, ['My native language is English.', '我更喜欢没有糖的柠檬水。'].sort())
+  assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+})
+
 test('automatic production defaults to participation, approves a sourced distinct fact and updates lexical recall', async t => {
   const { directory, runtime, send, db, requests } = await setup(t, 'automatic')
   const request = input('我喜欢喝薄荷茶')
