@@ -17,10 +17,13 @@ function groundedSelfExcerpt(source, candidate) {
         /["“”「」『』«»]/u.test(candidate))
         return false;
     const before = source.slice(0, offset).trimEnd();
-    const after = source.slice(offset + candidate.length).trimStart();
+    const suffix = source.slice(offset + candidate.length);
+    const after = suffix.trimStart();
     // An embedded first-person quote or a shortened clause is not a self assertion.
     return (before === '' || /[。.!?！？]$/u.test(before)) &&
-        (after === '' || /^[。.!?！？]/u.test(after));
+        // Preserve an exact excerpt whether the model includes its sentence delimiter or not.
+        (after === '' || /^[。.!?！？]/u.test(after) || /[。!?！？]$/u.test(candidate) ||
+            (candidate.endsWith('.') && /^\s/u.test(suffix)));
 }
 function excludedSelfExcerpt(text) {
     // These conservative checks narrow the model's labels; a "personal" label cannot waive them.
