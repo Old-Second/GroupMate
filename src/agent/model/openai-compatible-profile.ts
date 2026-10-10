@@ -8,7 +8,8 @@ import type {
   ProviderRequestMetadata,
   ModelReasoningTrace,
   ModelReasoningOptions,
-  ModelToolMode
+  ModelToolMode,
+  ModelRequest
 } from './model-adapter.js'
 import type { BoundedOpenAIWireError } from './openai-wire.js'
 import type { ProviderTurnState } from '../run/provider-state.js'
@@ -17,6 +18,7 @@ export interface ToolControlInput {
   readonly enabled: boolean
   readonly mode: ModelToolMode
   readonly tools: readonly JsonObject[]
+  readonly reasoning?: ModelReasoningOptions
 }
 
 export interface ModelErrorOverride {
@@ -56,9 +58,13 @@ export interface OpenAICompatibleProfile {
   }>
   resolveModelCapability(model: string, now: Date): ModelCapabilitySnapshotV1 | undefined
   resolveModelPrice(model: string, now: Date): ModelPriceSnapshotV1 | undefined
+  validateRequest?(request: ModelRequest): void
   encodeToolControls(input: ToolControlInput): Readonly<JsonObject>
   encodeRequestExtensions(input: ModelReasoningOptions): Readonly<JsonObject>
   encodeRequestMetadata(input: ProviderRequestMetadata | undefined): Readonly<JsonObject>
+  encodeSamplingOptions?(input: ModelReasoningOptions, temperature?: number, topP?: number): Readonly<JsonObject>
+  encodeImageOptions?(): Readonly<JsonObject>
+  encodeAssistantFallback?(toolsEnabled: boolean, reasoning: ModelReasoningOptions): Readonly<JsonObject>
   decodeUsageExtensions(
     usage: Readonly<JsonObject>,
     common: Readonly<{
@@ -68,7 +74,7 @@ export interface OpenAICompatibleProfile {
     }>
   ): Readonly<{ inputCache?: ModelInputCacheUsage }>
   extractAssistantReasoning(message: Readonly<JsonObject>): ModelReasoningTrace | undefined
-  captureAssistantState(message: Readonly<JsonObject>): ProviderTurnState | undefined
+  captureAssistantState(message: Readonly<JsonObject>, reasoning?: ModelReasoningOptions): ProviderTurnState | undefined
   restoreAssistantExtensions(state: ProviderTurnState): Readonly<JsonObject>
   classifyError(error: BoundedOpenAIWireError): ModelErrorOverride | undefined
   recoveryHint(error: ModelProviderError): 'none' | 'drop_optional_context_once'

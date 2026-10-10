@@ -1,5 +1,6 @@
 import type { AgentMessage } from '../contracts/content.js'
 import type { ModelMessage } from '../model/model-adapter.js'
+import type { ProviderTurnState } from '../run/provider-state.js'
 
 export type ContextSource =
   | 'system_instruction'
@@ -23,6 +24,7 @@ export interface ContextItem {
   readonly atomicGroupId?: string
   readonly protocolSpanId?: string
   readonly modelMessage?: ModelMessage
+  readonly assistantState?: ProviderTurnState
 }
 
 export interface ContextInput {

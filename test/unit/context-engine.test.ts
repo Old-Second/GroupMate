@@ -418,6 +418,29 @@ test('ordinary current requests preserve public user image resources in prepared
   assert.deepEqual(currentSpan?.messages[0], currentMessage)
 })
 
+test('final assistant reasoning survives session reload and ordinary source projection', async () => {
+  const { parseAgentSessionState } = await import('../../src/agent/session/agent-session-state.js')
+  const state = parseAgentSessionState(JSON.parse(JSON.stringify({ schemaVersion: 1, messages: [{
+    kind: 'message', message: { ...message('final', '答复'), role: 'assistant' },
+    providerState: { profileId: 'deepseek', profileVersion: 1,
+      payload: { reasoningContent: '完整思考'.repeat(1000) } }
+  }] })))
+  const stored = state.messages[0]
+  assert.equal(stored?.kind, 'message')
+  if (stored?.kind !== 'message') return
+  const context = input({ sessionHistory: [{ id: 'final', source: 'session_history',
+    message: stored.message, assistantState: stored.providerState }] })
+  const engine = new ContextEngine({ estimator })
+  const spans = await engine.projectSourceSpans(context, 'a'.repeat(32))
+  const assistant = spans.find(span => span.source === 'session_history')?.messages[0]
+  assert.equal(assistant?.role, 'assistant')
+  if (assistant?.role !== 'assistant') return
+  assert.deepEqual(assistant.providerState, stored.providerState)
+  assert.throws(() => parseAgentSessionState({ schemaVersion: 1, messages: [{
+    ...stored, message: { ...stored.message, role: 'user' }
+  }] }), /assistant/)
+})
+
 test('a declared resource expiry drops the image input and keeps the text', async () => {
   const currentAt = '2026-07-13T01:00:00.000Z'
   const liveUrl = 'https://cdn.example.test/live.png'

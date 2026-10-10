@@ -132,7 +132,9 @@ function invalidContextInput (reason: string): never {
 
 function validateInputContainers (input: ContextInput): void {
   const ordinary = (item: ContextItem, source: ContextSource): boolean => (
-    item.source === source && item.memoryRecord === undefined
+    item.source === source && item.memoryRecord === undefined &&
+    (item.assistantState === undefined ||
+      (source === 'session_history' && item.message.role === 'assistant'))
   )
   const valid = input.systemInstructions.every(item => ordinary(item, 'system_instruction')) &&
     input.runtimeFacts.every(item => ordinary(item, 'runtime_fact')) &&
@@ -282,7 +284,8 @@ function ordinaryModelMessage (item: ContextItem, referenceAtMs: number): ModelM
     return Object.freeze({ role: 'system' as const, content })
   }
   if (item.source === 'session_history' && item.message.role === 'assistant') {
-    return Object.freeze({ role: 'assistant' as const, content })
+    return Object.freeze({ role: 'assistant' as const, content,
+      ...(item.assistantState === undefined ? {} : { providerState: item.assistantState }) })
   }
   const imageUrls = modelImageUrls(item.message, referenceAtMs)
   return imageUrls.length === 0

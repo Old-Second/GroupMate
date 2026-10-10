@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
-const MAX_CAPABILITY_TOKENS = 1_000_000;
+const MAX_CAPABILITY_TOKENS = 1_048_576;
 const CAPABILITY_KEYS = Object.freeze([
     'schemaVersion',
     'source',

@@ -35,6 +35,7 @@ import { plainTextPart } from './presentation/text-presentation.js';
 import { PLAIN_TEXT_PRESENTATION_HOOKS } from './runtime-presentation-hooks.js';
 import { createRunPresentationLifecycle } from './run-presentation-lifecycle.js';
 import { createYunzaiToolRuntimeBridge } from './tools/yunzai-tool-runtime.js';
+import { PolicyFetch } from './tools/policy-fetch.js';
 import { adaptYunzaiRequest } from './yunzai-request-adapter.js';
 const DEFAULT_SYSTEM_INSTRUCTION = 'You are GroupMate, a capable member of a QQ group. Prefer concise Chinese replies, participate naturally, and use tools when an action or current external information is required.';
 const RUN_DEADLINE_MS = 240_000;
@@ -446,7 +447,7 @@ export function resolveConfiguredModelCapabilityOverride(config) {
     if (value === undefined || value === 0)
         return undefined;
     if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
-        value < 1 || value > 1_000_000) {
+        value < 1 || value > 1_048_576) {
         throw new TypeError('model context window configuration is invalid');
     }
     return Object.freeze({ contextWindowTokens: value });
@@ -1219,6 +1220,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
     });
     const { outboundFactory, settings, pendingConfig, pendingIndicator } = presentation;
     const toolRuntime = createYunzaiToolRuntimeBridge({
+        policyFetch: new PolicyFetch({ onDiagnostic: event => dependencies.contentJournal?.recordNetworkDiagnostic?.(event) }),
         ...options,
         config: options.config,
         redis: options.redis,

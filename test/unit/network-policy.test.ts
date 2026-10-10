@@ -52,6 +52,35 @@ test('network policy classifies only globally routable addresses as public', () 
   assert.equal(isPublicNetworkAddress('2001:4860:4860::8888'), true)
 })
 
+test('network diagnostics report success and header/body deadlines without exposing requests', async () => {
+  for (const stage of ['complete', 'headers', 'body'] as const) {
+    const diagnostics: unknown[] = []
+    const client = new PolicyFetch({
+      networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+      transport: { request: async () => {
+        if (stage === 'headers') return await new Promise<PolicyTransportResponse>(() => {})
+        if (stage === 'body') return { ...response(), body: {
+          [Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<Uint8Array>>(() => {}) })
+        } }
+        return response()
+      } },
+      onDiagnostic: event => { diagnostics.push(event); throw new Error('logging unavailable') }
+    })
+    const pending = client.request({ url: 'https://example.test/path?private=secret',
+      headers: { Authorization: 'fixture-secret' }, policy: openTextPolicy,
+      timeoutMs: 100, diagnosticTag: 'image_fetch' })
+    if (stage === 'complete') assert.equal((await pending).status, 200)
+    else await assert.rejects(pending, error => error instanceof NetworkPolicyError && error.code === 'network_timeout')
+    assert.equal(diagnostics.length, 1)
+    const event = diagnostics[0] as Record<string, unknown>
+    assert.equal(event.phase, stage)
+    assert.equal(event.result, stage === 'complete' ? 'success' : 'timeout')
+    assert.equal(event.tag, 'image_fetch')
+    assert.equal(typeof event.durationMs, 'number')
+    assert.doesNotMatch(JSON.stringify(event), /secret|Authorization|example/)
+  }
+})
+
 test('URL authorization rejects alternate loopback forms and unsafe URL syntax', async () => {
   const policy = new NetworkPolicy({
     resolve: async () => [{ address: '93.184.216.34', family: 4 }]

@@ -475,7 +475,7 @@ function projectUsage (
 ): PresentationUsageSummaryV1 {
   const usage = parseRunUsageSummary(detachedDataRecord(
     usageValue,
-    RUN_USAGE_KEYS,
+    Object.hasOwn(usageValue, 'cost') ? [...RUN_USAGE_KEYS, 'cost'] : RUN_USAGE_KEYS,
     'presentation run usage'
   ))
   const price = priceValue === null
@@ -517,9 +517,9 @@ function projectUsage (
     cacheHitTokens: usage.cacheHitTokens,
     cacheMissTokens: usage.cacheMissTokens,
     cacheUsageComplete: usage.cacheUsageComplete,
-    cost: cost.kind === 'unavailable'
+    cost: usage.cost ?? (cost.kind === 'unavailable'
       ? cost
-      : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) })
+      : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) }))
   })
 }
 

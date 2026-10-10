@@ -1,4 +1,5 @@
 import { AgentError } from '../agent/contracts/error.js';
+import { compactConversationHistory } from '../agent/context/conversation-summary-compactor.js';
 import { contextArtifactToSpan, encodeContextArtifactV1, parseContextArtifactV1 } from '../agent/context/context-artifact.js';
 import { contextArtifactRefsRetainedOrCleared } from '../agent/context/context-artifact-ref-transition.js';
 import { contextWireHash } from '../agent/context/context-plan.js';
@@ -16,6 +17,11 @@ const CORRECTION_SPAN_ID_HASH_DOMAIN = 'groupmate.runtime.correction-span-id.v1'
 const CORRECTION_SPAN_CONTENT_HASH_DOMAIN = 'groupmate.runtime.correction-span-content.v1';
 const RECOVERY_BASELINE_ID_HASH_DOMAIN = 'groupmate.runtime.recovery-baseline-id.v1';
 const CORRECTION_INSTRUCTION = '请根据以上上下文直接给出最终答复，不要调用工具。';
+const CORRECTION_RESERVE_BYTES = 4_096;
+const CORRECTION_RESERVE_TOKENS = 512;
+// Production text calibration observed actual/byte-quarter up to 1.933.
+// This guard leaves headroom without invalidating historical span/artifact hashes.
+export const CONTEXT_ESTIMATE_GUARD_FACTOR = 2;
 function cancelledError() {
     return new AgentError({
         code: 'cancelled',
@@ -194,23 +200,29 @@ function correctionSpan(checkpoint, generation, semanticOrder) {
         toolProtocol: null
     }));
 }
-function plannerBudget(checkpoint, request) {
+function plannerBudget(checkpoint, request, spans) {
     const estimatedToolTokens = request.kind === 'correction'
         ? 0
         : checkpoint.toolWireSnapshot?.estimatedTokens ??
             MODEL_TURN_CAPACITY_LIMITS.toolSchemaTokens;
     const reservedOutputTokens = Math.min(checkpoint.model.maxOutputTokens, checkpoint.modelCapability.maxOutputTokens);
-    const maxInputTokens = checkpoint.modelCapability.contextWindowTokens -
-        estimatedToolTokens - reservedOutputTokens -
-        MODEL_TURN_CAPACITY_LIMITS.safetyMarginTokens;
+    const correction = request.kind === 'correction';
+    // Low-detail 512px vision is still not represented by the URL's bytes.
+    // Reserve separately; billing remains based on actual provider usage.
+    const imageReserveTokens = spans.reduce((sum, span) => sum + span.messages.reduce((count, message) => count + (message.role === 'user' ? message.imageUrls?.length ?? 0 : 0), 0), 0) * 4_096;
+    const maxInputTokens = Math.floor((checkpoint.modelCapability.contextWindowTokens -
+        estimatedToolTokens * CONTEXT_ESTIMATE_GUARD_FACTOR - reservedOutputTokens -
+        imageReserveTokens -
+        MODEL_TURN_CAPACITY_LIMITS.safetyMarginTokens) / CONTEXT_ESTIMATE_GUARD_FACTOR) -
+        (correction ? 0 : CORRECTION_RESERVE_TOKENS);
     if (!Number.isSafeInteger(maxInputTokens) || maxInputTokens <= 0) {
         throw contextBudgetError('reserved_capacity_exhausted');
     }
     return Object.freeze({
         schemaVersion: 1,
         maxInputTokens,
-        maxSerializedMessageBytes: Math.min(MAX_CONTEXT_PLANNER_INPUT_BYTES, RUN_RESOURCE_LIMITS.providerProtocolChainBytes),
-        maxMessages: 128,
+        maxSerializedMessageBytes: Math.min(MAX_CONTEXT_PLANNER_INPUT_BYTES, RUN_RESOURCE_LIMITS.providerProtocolChainBytes) - (correction ? 0 : CORRECTION_RESERVE_BYTES),
+        maxMessages: correction ? 128 : 127,
         estimatedToolTokens,
         reservedOutputTokens
     });
@@ -391,15 +403,32 @@ export function createRunContextPlanner(options) {
                 ];
             }
             if (request.kind === 'correction') {
+                // Never resurrect an omitted source or compact an already dispatched
+                // prefix in a tool-disabled correction. Only append to its committed wire.
+                const retained = new Set(previousPlan?.included.map(entry => entry.spanId) ?? []);
+                spans = spans.filter(span => span.source === 'recovery_baseline' ||
+                    retained.has(span.spanId) || span.toolProtocol?.phase === 'ready');
                 const semanticOrder = spans.reduce((maximum, span) => Math.max(maximum, span.semanticOrder), 0) + 1;
                 spans.push(correctionSpan(checkpoint, generation, semanticOrder));
             }
-            if (spans.length > MAX_CONTEXT_SPANS)
-                throw contextBudgetError('span_limit_exceeded');
+            const protectedIds = new Set(previousPlan?.included.map(entry => entry.spanId) ?? []);
+            const capacity = request.kind === 'correction' ? MAX_CONTEXT_SPANS : MAX_CONTEXT_SPANS - 16;
+            const removable = spans.filter(span => span.requirement === 'optional' &&
+                !protectedIds.has(span.spanId) && span.supersedes === null)
+                .sort((left, right) => left.semanticOrder - right.semanticOrder);
+            while (spans.length > capacity && removable.length > 0) {
+                const remove = removable.shift();
+                spans = spans.filter(span => span.spanId !== remove.spanId);
+            }
+            if (spans.length > capacity)
+                throw contextBudgetError('active_span_capacity_exceeded');
             const frozenSpans = Object.freeze(spans);
             const spanIds = new Set(frozenSpans.map(span => span.spanId));
+            const committedArtifactIds = new Set(checkpoint.contextArtifactRefs ?? []);
             const relevantArtifacts = () => Object.freeze([...artifacts.values()].filter(artifact => (spanIds.has(artifact.artifactId) ||
-                artifact.sourceSpanIds.every(spanId => spanIds.has(spanId)))));
+                artifact.sourceSpanIds.every(spanId => spanIds.has(spanId)))).sort((left, right) => Number(committedArtifactIds.has(right.artifactId)) -
+                Number(committedArtifactIds.has(left.artifactId)))
+                .slice(0, MAX_CONTEXT_SPANS - frozenSpans.length));
             const invoke = (policy, suppliedArtifacts = relevantArtifacts()) => {
                 try {
                     return planContextModelTurn(Object.freeze({
@@ -411,7 +440,8 @@ export function createRunContextPlanner(options) {
                         estimatorVersion: CONTEXT_TOKEN_ESTIMATOR_VERSION,
                         capabilityHash: modelCapabilityStableHash(checkpoint.modelCapability),
                         artifactPolicy: policy,
-                        budget: plannerBudget(checkpoint, request),
+                        appendOnly: request.kind === 'correction',
+                        budget: plannerBudget(checkpoint, request, frozenSpans),
                         spans: frozenSpans,
                         artifacts: suppliedArtifacts
                     }));
@@ -435,6 +465,18 @@ export function createRunContextPlanner(options) {
                 else {
                     let storedAll = true;
                     for (const compactionRequest of result.compactionRequests) {
+                        if (compactionRequest.kind === 'conversation_summary') {
+                            const sources = compactionRequest.sourceSpanIds.map(id => frozenSpans.find(span => span.spanId === id));
+                            const summary = sources.some(span => span === undefined) ? null
+                                : compactConversationHistory(compactionRequest, sources);
+                            if (summary === null)
+                                continue;
+                            const stored = await storeArtifact(artifactStore, summary, minimumExpiresAtMs);
+                            assertNotAborted(signal);
+                            if (stored !== null)
+                                artifacts.set(stored.artifactId, stored);
+                            continue;
+                        }
                         const span = sourceSpanForRequest(frozenSpans, compactionRequest);
                         const evidence = span === null ? null : evidenceFor(checkpoint, span);
                         if (span === null || evidence === null) {
@@ -454,7 +496,11 @@ export function createRunContextPlanner(options) {
                         artifacts.set(stored.artifactId, stored);
                         artifactSpans.set(stored.artifactId, contextArtifactToSpan(stored, span.semanticOrder));
                     }
+                    // One bounded pass; uncompressible excerpts or unavailable storage
+                    // fall back to trimming without repeating a model or storage operation.
                     result = storedAll ? invoke('enabled') : invoke('disabled');
+                    if (result.status === 'requires_artifacts')
+                        result = invoke('disabled');
                 }
             }
             if (result.status === 'requires_artifacts') {

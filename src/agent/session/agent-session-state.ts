@@ -6,13 +6,14 @@ import {
   type JsonObject,
   type JsonValue
 } from '../model/json-value.js'
-import { parseProviderTurnState } from '../run/provider-state.js'
+import { parseProviderTurnState, type ProviderTurnState } from '../run/provider-state.js'
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js'
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
 
 export interface SemanticConversationMessage {
   readonly kind: 'message'
   readonly message: AgentMessage
+  readonly providerState?: ProviderTurnState
 }
 
 export interface ProviderProtocolSpan {
@@ -194,11 +195,16 @@ export function parseAgentSessionState (value: unknown): AgentSessionState {
   const messages = state.messages.map(rawItem => {
     const item = record(rawItem, 'canonical conversation item')
     if (item.kind === 'message') {
-      exact(item, ['kind', 'message'], 'semantic conversation message')
+      exact(item, ['kind', 'message', 'providerState'], 'semantic conversation message')
       const message = parseAgentMessage(item.message)
+      const providerState = item.providerState === undefined ? undefined : parseProviderTurnState(item.providerState)
+      if (providerState !== undefined && message.role !== 'assistant') {
+        throw new TypeError('semantic provider state belongs to an assistant')
+      }
       if (ids.has(message.id)) throw new TypeError('canonical conversation item ID is duplicated')
       ids.add(message.id)
-      return Object.freeze({ kind: 'message' as const, message })
+      return Object.freeze({ kind: 'message' as const, message,
+        ...(providerState === undefined ? {} : { providerState }) })
     }
     const span = parseProtocolSpan(item)
     if (ids.has(span.id)) throw new TypeError('canonical conversation item ID is duplicated')

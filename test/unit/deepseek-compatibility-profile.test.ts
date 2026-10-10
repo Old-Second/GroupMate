@@ -73,6 +73,47 @@ test('DeepSeek profile owns thinking tool protocol without changing standard', a
   })
 })
 
+test('documented thinking sampling, effort mapping and forced-tool limits are enforced', () => {
+  const request = fixtureRequest({ temperature: 0.5, topP: 0.5,
+    reasoning: Object.freeze({ enabled: true, effort: 'medium' }) })
+  const thinking = buildImmutableChatRequest(request, deepSeekCompatibilityProfile)
+  assert.equal(thinking.temperature, undefined)
+  assert.equal(thinking.top_p, 0.95)
+  assert.equal(thinking.reasoning_effort, 'high')
+  const nonThinking = buildImmutableChatRequest({ ...request, reasoning: { enabled: false } }, deepSeekCompatibilityProfile)
+  assert.equal(nonThinking.temperature, 0.5)
+  assert.equal(nonThinking.top_p, undefined)
+  assert.equal(nonThinking.reasoning_effort, undefined)
+  const tools = Object.freeze([{ name: 'weather', description: 'fixture', parameters: Object.freeze({ type: 'object' }) }])
+  assert.throws(() => buildImmutableChatRequest({ ...request, toolMode: 'required', tools }, deepSeekCompatibilityProfile),
+    error => error instanceof ModelProviderError && error.details.reason === 'deepseek_required_tools_with_thinking')
+  assert.equal(buildImmutableChatRequest({ ...request, toolMode: 'required', tools,
+    reasoning: { enabled: false } }, deepSeekCompatibilityProfile).tool_choice, 'required')
+})
+
+test('non-thinking tool calls retain an empty state and final thinking traces replay without truncation', () => {
+  const nonThinking = deepSeekCompatibilityProfile.captureAssistantState({ content: '', tool_calls: [{ id: 'fixture' }] }, { enabled: false })
+  assert.deepEqual(nonThinking?.payload, { reasoningContent: '' })
+  const trace = '思考'.repeat(2_100)
+  const final = deepSeekCompatibilityProfile.captureAssistantState({ content: '答复', reasoning_content: trace })
+  const body = buildImmutableChatRequest(fixtureRequest({
+    messages: Object.freeze([{ role: 'assistant', content: '答复', providerState: final }]),
+    tools: Object.freeze([{ name: 'weather', description: 'fixture', parameters: Object.freeze({ type: 'object' }) }]),
+    toolMode: 'auto'
+  }), deepSeekCompatibilityProfile)
+  assert.equal((body.messages as readonly JsonObject[])[0].reasoning_content, trace)
+})
+
+test('current Pro rejects images and current models enforce the documented output ceiling', () => {
+  assert.throws(() => buildImmutableChatRequest(fixtureRequest({ model: 'deepseek-v4-pro',
+    messages: [{ role: 'user', content: 'describe', imageUrls: ['https://cdn.example.test/image.png'] }]
+  }), deepSeekCompatibilityProfile), error => error instanceof ModelProviderError &&
+    error.details.reason === 'deepseek_model_does_not_support_images')
+  assert.throws(() => buildImmutableChatRequest(fixtureRequest({ model: 'deepseek-flash', maxOutputTokens: 393_217 }),
+    deepSeekCompatibilityProfile), error => error instanceof ModelProviderError &&
+      error.details.reason === 'deepseek_output_limit_exceeded')
+})
+
 test('DeepSeek owns bounded display reasoning independently of provider state', () => {
   const display = deepSeekCompatibilityProfile.extractAssistantReasoning({
     role: 'assistant',
@@ -149,7 +190,7 @@ test('DeepSeek profile restores a complete assistant tool span and owns wire dif
 
   assert.equal(body.max_tokens, 512)
   assert.equal('max_completion_tokens' in body, false)
-  assert.equal('tool_choice' in body, false)
+  assert.equal(body.tool_choice, 'auto')
   assert.deepEqual(body.thinking, { type: 'enabled' })
   assert.equal(body.reasoning_effort, 'max')
   const messages = body.messages as Array<Record<string, unknown>>

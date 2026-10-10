@@ -125,6 +125,7 @@ import {
   type YunzaiAgentToolRun,
   type YunzaiToolRuntimeBridgeOptions
 } from './tools/yunzai-tool-runtime.js'
+import { PolicyFetch } from './tools/policy-fetch.js'
 import {
   adaptYunzaiRequest,
   type YunzaiAgentRequest,
@@ -799,7 +800,7 @@ export function resolveConfiguredModelCapabilityOverride (
   const value = config.apiContextWindowTokens
   if (value === undefined || value === 0) return undefined
   if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
-    value < 1 || value > 1_000_000) {
+    value < 1 || value > 1_048_576) {
     throw new TypeError('model context window configuration is invalid')
   }
   return Object.freeze({ contextWindowTokens: value })
@@ -1696,6 +1697,7 @@ export function createYunzaiAgentServiceBridge (
   })
   const { outboundFactory, settings, pendingConfig, pendingIndicator } = presentation
   const toolRuntime = createYunzaiToolRuntimeBridge({
+    policyFetch: new PolicyFetch({ onDiagnostic: event => dependencies.contentJournal?.recordNetworkDiagnostic?.(event) }),
     ...options,
     config: options.config,
     redis: options.redis,

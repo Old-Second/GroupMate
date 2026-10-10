@@ -1,4 +1,5 @@
 import { parseAgentMessage, type AgentMessage } from './content.js'
+import { parseProviderTurnState, type ProviderTurnState } from '../run/provider-state.js'
 import {
   parseCompletionDisposition,
   type CompletionDisposition
@@ -40,6 +41,7 @@ export type RunAdvanceResult =
       readonly runRef: string
       readonly completion: CompletionDisposition
       readonly output: AgentMessage | null
+      readonly assistantState?: ProviderTurnState
       readonly presentationTrace: PresentationTrace
       readonly terminal: TerminalFactsV1
     }
@@ -219,7 +221,7 @@ export function parseRunAdvanceResult (value: unknown): RunAdvanceResult {
     throw new TypeError('run advance result run ID is invalid')
   }
   const allowed = result.kind === 'completed'
-    ? ['kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal']
+    ? ['kind', 'runId', 'runRef', 'completion', 'output', 'presentationTrace', 'terminal', 'assistantState']
     : result.kind === 'paused'
       ? ['kind', 'runId', 'runRef', 'interruption']
       : result.kind === 'failed'
@@ -230,7 +232,8 @@ export function parseRunAdvanceResult (value: unknown): RunAdvanceResult {
   if (allowed.length === 0) {
     throw new TypeError('run advance result branch is invalid')
   }
-  exactOwnKeys(result, allowed, 'run advance result')
+  exactOwnKeys(result, Object.hasOwn(result, 'assistantState') ? allowed :
+    allowed.filter(key => key !== 'assistantState'), 'run advance result')
   const runRef = parseRunRef(
     result.runRef,
     result.kind === 'failed' || result.kind === 'cancelled'
@@ -248,6 +251,7 @@ export function parseRunAdvanceResult (value: unknown): RunAdvanceResult {
   if (result.kind === 'completed') {
     const completion = parseCompletionDisposition(result.completion)
     parsePresentationTrace(result.presentationTrace)
+    if (result.assistantState !== undefined) parseProviderTurnState(result.assistantState)
     if (completion.kind === 'already_visible') {
       if (result.output !== null) throw new TypeError('completed run output is invalid')
     } else {

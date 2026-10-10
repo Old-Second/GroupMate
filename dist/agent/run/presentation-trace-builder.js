@@ -374,7 +374,7 @@ function detachedDataRecord(value, keys, label) {
     return Object.freeze(result);
 }
 function projectUsage(usageValue, priceValue) {
-    const usage = parseRunUsageSummary(detachedDataRecord(usageValue, RUN_USAGE_KEYS, 'presentation run usage'));
+    const usage = parseRunUsageSummary(detachedDataRecord(usageValue, Object.hasOwn(usageValue, 'cost') ? [...RUN_USAGE_KEYS, 'cost'] : RUN_USAGE_KEYS, 'presentation run usage'));
     const price = priceValue === null
         ? null
         : parseModelPriceSnapshot(detachedDataRecord(priceValue, MODEL_PRICE_KEYS, 'presentation model price'));
@@ -410,9 +410,9 @@ function projectUsage(usageValue, priceValue) {
         cacheHitTokens: usage.cacheHitTokens,
         cacheMissTokens: usage.cacheMissTokens,
         cacheUsageComplete: usage.cacheUsageComplete,
-        cost: cost.kind === 'unavailable'
+        cost: usage.cost ?? (cost.kind === 'unavailable'
             ? cost
-            : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) })
+            : Object.freeze({ ...cost, picoYuan: cost.picoYuan.toString(10) }))
     });
 }
 function candidateOrder(left, right) {

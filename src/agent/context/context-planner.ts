@@ -59,6 +59,7 @@ export interface ContextPlannerInputV1 {
   readonly budget: ContextPlannerBudgetV1
   readonly spans: readonly ContextSpanV1[]
   readonly artifacts: readonly ContextArtifactV1[]
+  readonly appendOnly?: boolean
 }
 
 export interface ContextCompactionRequestV1 {
@@ -167,7 +168,8 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
   const input = inspectContextRecord(value, [
     'schemaVersion', 'namespaceRef', 'generation', 'transition', 'previousPlan', 'estimatorVersion',
     'capabilityHash', 'artifactPolicy', 'budget', 'spans', 'artifacts'
-  ])
+  ], ['appendOnly'])
+  if (input.appendOnly !== undefined && typeof input.appendOnly !== 'boolean') return invalidContextValue()
   if (input.schemaVersion !== 1 ||
     (input.transition !== 'normal' && input.transition !== 'recovery_prefix_reset') ||
     (input.artifactPolicy !== 'disabled' && input.artifactPolicy !== 'enabled')) {
@@ -178,6 +180,7 @@ export function parseContextPlannerInputV1 (value: unknown): ContextPlannerInput
     .map(parseContextArtifactV1))
   if (spans.length + artifacts.length > MAX_CONTEXT_SPANS) return invalidContextValue()
   const parsed: ContextPlannerInputV1 = Object.freeze({
+    ...(input.appendOnly === undefined ? {} : { appendOnly: input.appendOnly as boolean }),
     schemaVersion: 1 as const,
     namespaceRef: requireContextAscii(input.namespaceRef),
     generation: requireSafeInteger(input.generation, { positive: true }),
@@ -348,6 +351,31 @@ function compactionRequest (span: ContextSpanV1): ContextCompactionRequestV1 | n
     sourceSpanIds: partial.sourceSpanIds,
     sourceRefs: parseContextSourceRefs(partial.sourceRefs)
   })
+}
+
+function conversationCompactionRequests (spans: readonly ContextSpanV1[]): readonly ContextCompactionRequestV1[] {
+  const history = spans.filter(span => span.requirement === 'optional' && span.toolProtocol === null &&
+    (span.source === 'session_history' || span.source === 'group_context')).sort(semanticOrder)
+  const requests: ContextCompactionRequestV1[] = []
+  for (let index = 0; index < history.length; index += 12) {
+    const sources = history.slice(index, index + 12)
+    const prefix = sources.map(span => Object.freeze({ ref: span.spanId, contentHash: contextSpanHash(span) }))
+    const refs = [...prefix]
+    const seen = new Set(prefix.map(ref => ref.ref))
+    for (const span of sources) for (const ref of span.sourceRefs) {
+      if (!seen.has(ref.ref)) { refs.push(ref); seen.add(ref.ref) }
+    }
+    if (refs.length > MAX_CONTEXT_ARTIFACT_REFS) continue
+    const partial = Object.freeze({
+      schemaVersion: 1 as const, namespaceRef: sources[0]!.namespaceRef,
+      generation: Math.max(...sources.map(span => span.originGeneration)),
+      kind: 'conversation_summary' as const,
+      sourceSpanIds: Object.freeze(sources.map(span => span.spanId)), sourceRefs: Object.freeze(refs)
+    })
+    requests.push(Object.freeze({ ...partial,
+      requestId: `request:${domainSeparatedContextHash(CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN, requestJson(partial))}` }))
+  }
+  return Object.freeze(requests)
 }
 
 function materializeArtifacts (
@@ -549,7 +577,7 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
     !artifactCovered.has(span.spanId) && !materialized.inactiveArtifactIds.has(span.spanId))
   const initialUsage = usageFor(candidates)
   const previousMode = input.previousPlan?.mode ?? 'normal'
-  let mode: ContextPlanV1['mode'] = previousMode === 'compacting'
+  let mode: ContextPlanV1['mode'] = input.appendOnly === true ? previousMode : previousMode === 'compacting'
     ? (atOrBelowTarget(initialUsage, input.budget) ? 'normal' : 'compacting')
     : (entersCompacting(rawUsage, input.budget) ? 'compacting' : 'normal')
 
@@ -557,15 +585,16 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
   const mandatoryUsage = usageFor(mandatory)
   if (!fitsHardBudget(mandatoryUsage, input.budget)) return BLOCKED_BUDGET
 
-  if (mode === 'compacting' && input.artifactPolicy === 'enabled' &&
+  if (input.appendOnly !== true && mode === 'compacting' && input.artifactPolicy === 'enabled' &&
     atOrBelowTarget(mandatoryUsage, input.budget)) {
     const consumed = candidates
       .filter(span => span.toolProtocol?.phase === 'consumed')
       .sort((left, right) => left.originGeneration - right.originGeneration || semanticOrder(left, right))
-    if (consumed.length > 0) {
-      const requests = consumed
+    {
+      const requests = [...consumed
         .map(compactionRequest)
-        .filter((request): request is ContextCompactionRequestV1 => request !== null)
+        .filter((request): request is ContextCompactionRequestV1 => request !== null),
+        ...conversationCompactionRequests(candidates)]
       if (requests.length === 0) {
         // Fall through to deterministic optional trimming when provenance cannot fit V1.
       } else {
@@ -584,7 +613,8 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
     .reverse()
   let selectedSpans = candidates
   let selectedUsage = initialUsage
-  const needsTarget = mode === 'compacting'
+  const needsTarget = input.appendOnly !== true && mode === 'compacting'
+  if (input.appendOnly === true && !fitsHardBudget(selectedUsage, input.budget)) return BLOCKED_BUDGET
   while ((!fitsHardBudget(selectedUsage, input.budget) ||
     (needsTarget && !atOrBelowTarget(selectedUsage, input.budget))) && optionalDiscard.length > 0) {
     const discard = optionalDiscard.shift()
@@ -599,9 +629,9 @@ export function planModelTurn (value: ContextPlannerInputV1): ContextPlannerResu
   const wire = Object.freeze(ordered.flatMap(span => span.messages))
   if (!contextWireProtocolIsValid(wire)) return BLOCKED_PROTOCOL
   let prefixMessageCount = commonPrefixMessageCount(priorWire, wire)
-  const requiresFullPrefix = input.transition === 'normal' &&
+  const requiresFullPrefix = input.appendOnly === true || (input.transition === 'normal' &&
     input.previousPlan?.mode === 'normal' &&
-    !entersCompacting(rawUsage, input.budget)
+    !entersCompacting(rawUsage, input.budget))
   if (requiresFullPrefix) {
     if (wire.length < priorWire.length || prefixMessageCount !== priorWire.length) {
       return BLOCKED_BUDGET

@@ -166,7 +166,8 @@ function usageNodeText (usage: PresentationUsageSummaryV1): string {
     : usage.cost.kind === 'upper_bound'
       ? [
           `参考费用上限 ¥${picoYuanAsYuan(usage.cost.picoYuan)}`,
-          '缓存明细不完整，全部输入按未命中估算'
+          usage.cacheUsageComplete ? '请求跨计价时段，按较高单价计算上限'
+            : '缓存明细不完整，全部输入按未命中估算'
         ]
       : ['参考费用不可用']
   const catalogVersion = usage.cost.catalogVersion ?? '不可用'

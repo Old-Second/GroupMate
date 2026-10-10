@@ -1,4 +1,9 @@
-export const DEEPSEEK_CNY_CATALOG_VERSION = 'deepseek-cny-2026-07-19'
+import { deepSeekBillingPeriod } from './deepseek-billing-calendar.js'
+
+export const DEEPSEEK_CNY_CATALOG_VERSION = 'deepseek-cny-2026-10-10'
+export const DEEPSEEK_PRICE_VERIFIED_AT = Date.parse('2026-10-10T00:00:00.000Z')
+export const DEEPSEEK_PRICE_REVIEW_AT = Date.parse('2026-11-09T00:00:00.000Z')
+const LEGACY_CATALOG_VERSION = 'deepseek-cny-2026-07-19'
 const DEEPSEEK_ALIAS_EXPIRY_MS = Date.parse('2026-07-24T16:00:00.000Z')
 
 export interface ModelPriceSnapshotV1 {
@@ -51,7 +56,7 @@ export function parseModelPriceSnapshot (value: unknown): ModelPriceSnapshotV1 {
 
 const DEEPSEEK_V4_FLASH_PRICE: ModelPriceSnapshotV1 = Object.freeze({
   schemaVersion: 1,
-  catalogVersion: DEEPSEEK_CNY_CATALOG_VERSION,
+  catalogVersion: LEGACY_CATALOG_VERSION,
   model: 'deepseek-v4-flash',
   inputCacheHitPicoYuanPerMillionTokens: 20_000_000_000,
   inputCacheMissPicoYuanPerMillionTokens: 1_000_000_000_000,
@@ -60,7 +65,7 @@ const DEEPSEEK_V4_FLASH_PRICE: ModelPriceSnapshotV1 = Object.freeze({
 
 const DEEPSEEK_V4_PRO_PRICE: ModelPriceSnapshotV1 = Object.freeze({
   schemaVersion: 1,
-  catalogVersion: DEEPSEEK_CNY_CATALOG_VERSION,
+  catalogVersion: LEGACY_CATALOG_VERSION,
   model: 'deepseek-v4-pro',
   inputCacheHitPicoYuanPerMillionTokens: 25_000_000_000,
   inputCacheMissPicoYuanPerMillionTokens: 3_000_000_000_000,
@@ -72,6 +77,12 @@ function isValidNow (value: Date): boolean {
 }
 
 function canonicalDeepSeekModel (model: string, now: Date): string | undefined {
+  if (now.getTime() >= DEEPSEEK_PRICE_VERIFIED_AT) {
+    if (['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'].includes(model)) {
+      return 'deepseek-flash'
+    }
+    return model === 'deepseek-v4-pro' ? model : undefined
+  }
   if (model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro') return model
   if ((model === 'deepseek-chat' || model === 'deepseek-reasoner') &&
       now.getTime() < DEEPSEEK_ALIAS_EXPIRY_MS) {
@@ -86,6 +97,24 @@ export function resolveModelPriceSnapshot (
 ): ModelPriceSnapshotV1 | undefined {
   if (typeof model !== 'string' || !isValidNow(now)) {
     throw new TypeError('model price lookup is invalid')
+  }
+  if (now.getTime() >= DEEPSEEK_PRICE_VERIFIED_AT) {
+    if (now.getTime() >= DEEPSEEK_PRICE_REVIEW_AT) return undefined
+    const canonical = canonicalDeepSeekModel(model, now)
+    const period = deepSeekBillingPeriod(now)
+    if (canonical === undefined || period === undefined) return undefined
+    const multiplier = period === 'peak' ? 2 : 1
+    return parseModelPriceSnapshot({
+      schemaVersion: 1,
+      catalogVersion: `${DEEPSEEK_CNY_CATALOG_VERSION}-${period}`,
+      model: canonical,
+      inputCacheHitPicoYuanPerMillionTokens:
+        (canonical === 'deepseek-flash' ? 20_000_000_000 : 150_000_000_000) * multiplier,
+      inputCacheMissPicoYuanPerMillionTokens:
+        (canonical === 'deepseek-flash' ? 1_000_000_000_000 : 4_500_000_000_000) * multiplier,
+      outputPicoYuanPerMillionTokens:
+        (canonical === 'deepseek-flash' ? 4_000_000_000_000 : 13_500_000_000_000) * multiplier
+    })
   }
   switch (canonicalDeepSeekModel(model, now)) {
     case 'deepseek-v4-flash': return parseModelPriceSnapshot(DEEPSEEK_V4_FLASH_PRICE)

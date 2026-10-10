@@ -87,9 +87,11 @@ export function createNodeFetchTransport() {
 export class PolicyFetch {
     #networkPolicy;
     #transport;
+    #onDiagnostic;
     constructor(options = {}) {
         this.#networkPolicy = options.networkPolicy ?? new NetworkPolicy();
         this.#transport = options.transport ?? createNodeFetchTransport();
+        this.#onDiagnostic = options.onDiagnostic;
     }
     async request(request) {
         if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 100 || request.timeoutMs > 30_000) {
@@ -97,6 +99,7 @@ export class PolicyFetch {
         }
         if (cancelled(request.signal))
             throw new NetworkPolicyError('network_cancelled');
+        let headers = normalizedHeaders(request.headers);
         const controller = new AbortController();
         let timedOut = false;
         const onCallerAbort = () => controller.abort();
@@ -118,11 +121,15 @@ export class PolicyFetch {
         }
         let method = (request.method ?? 'GET').toUpperCase();
         let body = request.body;
-        let headers = normalizedHeaders(request.headers);
         let redirects = 0;
+        const startedAt = performance.now();
+        let phase = 'dns';
+        let result = 'failure';
         try {
             while (true) {
+                phase = 'dns';
                 const authorized = await this.#networkPolicy.authorize(currentUrl, request.policy, controller.signal);
+                phase = 'headers';
                 let transportResponse;
                 try {
                     transportResponse = await withAbort(this.#transport.request({
@@ -181,6 +188,7 @@ export class PolicyFetch {
                     throw new NetworkPolicyError('response_too_large');
                 }
                 const chunks = [];
+                phase = 'body';
                 let bytes = 0;
                 const iterator = transportResponse.body[Symbol.asyncIterator]();
                 while (true) {
@@ -214,6 +222,8 @@ export class PolicyFetch {
                     output.set(chunk, offset);
                     offset += chunk.byteLength;
                 }
+                phase = 'complete';
+                result = 'success';
                 return Object.freeze({
                     status: transportResponse.status,
                     statusText: transportResponse.statusText,
@@ -224,6 +234,7 @@ export class PolicyFetch {
             }
         }
         catch (error) {
+            result = timedOut ? 'timeout' : cancelled(request.signal) ? 'cancelled' : 'failure';
             if (error instanceof NetworkPolicyError) {
                 if (error.code === 'network_cancelled' && timedOut)
                     throw new NetworkPolicyError('network_timeout');
@@ -240,6 +251,14 @@ export class PolicyFetch {
         finally {
             clearTimeout(timer);
             request.signal?.removeEventListener('abort', onCallerAbort);
+            try {
+                this.#onDiagnostic?.(Object.freeze({
+                    tag: request.diagnosticTag ?? 'other', phase, result,
+                    durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+                    timeoutMs: request.timeoutMs, redirects
+                }));
+            }
+            catch { }
         }
     }
 }

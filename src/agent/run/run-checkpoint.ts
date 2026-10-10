@@ -27,7 +27,7 @@ import {
 } from '../model/model-price-catalog.js'
 import { parseJsonValue, type JsonObject } from '../model/json-value.js'
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
-import { parseProviderTurnState } from './provider-state.js'
+import { parseProviderTurnState, type ProviderTurnState } from './provider-state.js'
 import { parseApprovalInterruption, type ApprovalInterruption } from './interruption.js'
 import type {
   LegacyRunBudgetLimitsV1,
@@ -200,6 +200,7 @@ RunCheckpointV5,
   readonly contextRuntimeMode: RunContextRuntimeModeV1
   readonly pendingContextMessages: readonly ModelMessage[]
   readonly providerGeneration: FrozenProviderGenerationV1 | null
+  readonly terminalProviderState?: ProviderTurnState
 }
 
 export type LoadedRunCheckpoint =
@@ -246,6 +247,7 @@ export type RunCheckpointChanges = Partial<Pick<RunCheckpoint,
   | 'contextArtifactRefs'
   | 'pendingContextMessages'
   | 'providerGeneration'
+  | 'terminalProviderState'
   | 'modelTurn'
   | 'toolLedgers'
   | 'preparedBatch'
@@ -351,7 +353,7 @@ const CHECKPOINT_V5_KEYS = Object.freeze([
 ])
 const CHECKPOINT_V6_KEYS = Object.freeze([
   ...CHECKPOINT_V5_KEYS,
-  'contextRuntimeMode', 'pendingContextMessages', 'providerGeneration'
+  'contextRuntimeMode', 'pendingContextMessages', 'providerGeneration', 'terminalProviderState'
 ])
 const MODEL_KEYS = Object.freeze([
   'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
@@ -880,7 +882,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
               ? CHECKPOINT_V6_KEYS
           : undefined
   if (checkpointKeys === undefined) throw new TypeError('run checkpoint schema version is invalid')
-  exactKeys(unparsed, checkpointKeys, checkpointKeys, 'checkpoint')
+  exactKeys(unparsed, checkpointKeys, checkpointKeys.filter(key => key !== 'terminalProviderState'), 'checkpoint')
   if (!Array.isArray(unparsed.events)) throw new TypeError('run checkpoint events are invalid')
   if (unparsed.events.length > RUN_RESOURCE_LIMITS.eventCount) {
     throw new TypeError('run event count limit exceeded')
@@ -995,6 +997,13 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   let pendingContextMessages: readonly ModelMessage[] | undefined
   let providerGeneration: FrozenProviderGenerationV1 | null | undefined
   if (parsed.schemaVersion === 6) {
+    if (parsed.terminalProviderState !== undefined) {
+      const state = parseProviderTurnState(parsed.terminalProviderState)
+      if (parsed.status !== 'completed' || parsed.output === null ||
+        state.profileId !== parsed.profileId || state.profileVersion !== parsed.profileVersion) {
+        throw new TypeError('terminal provider state is invalid')
+      }
+    }
     if (parsed.contextRuntimeMode !== 'legacy_compatible' &&
       parsed.contextRuntimeMode !== 'generation_planner') {
       throw new TypeError('run context runtime mode is invalid')
@@ -1346,7 +1355,7 @@ export class RunCheckpointCodec {
     if (checkpointKeys === undefined) {
       throw new TypeError('run checkpoint schema version is invalid')
     }
-    exactKeys(state, checkpointKeys, checkpointKeys, 'checkpoint')
+    exactKeys(state, checkpointKeys, checkpointKeys.filter(key => key !== 'terminalProviderState'), 'checkpoint')
     const envelope = record(
       parseJsonText(eventsRaw, 'run event', RUN_RESOURCE_LIMITS.eventBytes),
       'run event envelope'

@@ -212,7 +212,6 @@ test('presentation usage codec rejects noncanonical costs, cross-state values an
     { ...usage, cacheMissTokens: 19 },
     { ...usage, inputTokens: Number.MAX_SAFE_INTEGER + 1 },
     { ...usage, availability: 'partial' },
-    { ...usage, cost: { ...usage.cost, kind: 'upper_bound' } },
     {
       ...usage,
       cost: {

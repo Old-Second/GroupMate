@@ -149,12 +149,17 @@ export function parseAgentSessionState(value) {
     const messages = state.messages.map(rawItem => {
         const item = record(rawItem, 'canonical conversation item');
         if (item.kind === 'message') {
-            exact(item, ['kind', 'message'], 'semantic conversation message');
+            exact(item, ['kind', 'message', 'providerState'], 'semantic conversation message');
             const message = parseAgentMessage(item.message);
+            const providerState = item.providerState === undefined ? undefined : parseProviderTurnState(item.providerState);
+            if (providerState !== undefined && message.role !== 'assistant') {
+                throw new TypeError('semantic provider state belongs to an assistant');
+            }
             if (ids.has(message.id))
                 throw new TypeError('canonical conversation item ID is duplicated');
             ids.add(message.id);
-            return Object.freeze({ kind: 'message', message });
+            return Object.freeze({ kind: 'message', message,
+                ...(providerState === undefined ? {} : { providerState }) });
         }
         const span = parseProtocolSpan(item);
         if (ids.has(span.id))

@@ -1,7 +1,7 @@
 import type { SessionAddress } from '../../agent/contracts/identity.js'
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../../agent/session/conversation-scope.js'
 import type { ToolResource } from '../../tools/visible-tool-support.js'
-import { normalizeYunzaiHostDispatchResult } from '../yunzai-host-result.js'
+import { normalizeYunzaiHostDispatchResult, normalizeYunzaiHostRecallResult } from '../yunzai-host-result.js'
 import {
   type DeliveryResult,
   type OutboundMedia,
@@ -399,8 +399,9 @@ function createPort (target: SessionAddress, hostTarget: YunzaiHostTargetPort | 
             : 'host_exception_after_dispatch'
         return Object.freeze({ kind: 'outcome_unknown', code })
       }
-      if (race.value === true) return Object.freeze({ kind: 'recalled' })
-      if (race.value === false) return Object.freeze({ kind: 'failed_definite', code: 'host_rejected' })
+      const recalled = normalizeYunzaiHostRecallResult(race.value)
+      if (recalled === true) return Object.freeze({ kind: 'recalled' })
+      if (recalled === false) return Object.freeze({ kind: 'failed_definite', code: 'host_rejected' })
       return Object.freeze({ kind: 'outcome_unknown', code: 'unknown_host_result' })
     }
   }

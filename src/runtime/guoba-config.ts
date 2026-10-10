@@ -195,7 +195,7 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
 
   if (key === 'apiContextWindowTokens') {
     if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
-      value < 0 || value > 1_000_000) {
+      value < 0 || value > 1_048_576) {
       throw new TypeError('模型上下文窗口配置无效。')
     }
     return value

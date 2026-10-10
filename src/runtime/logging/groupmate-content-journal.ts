@@ -1,4 +1,5 @@
 import type { RunContentJournalEvent } from '../../agent/run/run-content-journal.js'
+import type { PolicyNetworkDiagnostic } from '../tools/policy-fetch.js'
 import type { YunzaiAgentRequestDraft } from '../yunzai-request-adapter.js'
 import {
   projectOutboundJournalEvent,
@@ -20,6 +21,7 @@ export interface GroupMateContentJournal {
   recordRequest(request: YunzaiAgentRequestDraft): void
   recordRunEvent(event: RunContentJournalEvent): void
   recordOutbound(event: GroupMateOutboundJournalEvent): void
+  recordNetworkDiagnostic?(event: PolicyNetworkDiagnostic): void
   drain(): Promise<void>
 }
 
@@ -60,6 +62,16 @@ export function createGroupMateContentJournal (
     },
     recordOutbound (event: GroupMateOutboundJournalEvent): void {
       recordProjection('outbound', () => projectOutboundJournalEvent(event))
+    },
+    recordNetworkDiagnostic (event: PolicyNetworkDiagnostic): void {
+      if (!['image_search', 'image_fetch', 'other'].includes(event.tag) ||
+        !['dns', 'headers', 'body', 'complete'].includes(event.phase) ||
+        !['success', 'failure', 'timeout', 'cancelled'].includes(event.result) ||
+        ![event.durationMs, event.timeoutMs, event.redirects].every(value => Number.isSafeInteger(value) && value >= 0)) return
+      safeRecordEvent(Object.freeze({ type: 'tool.network', payload: Object.freeze({
+        tag: event.tag, phase: event.phase, result: event.result,
+        durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects
+      }) }))
     },
     async drain (): Promise<void> {
       try {

@@ -164,10 +164,10 @@ test('leaves scalar Guoba values unchanged', () => {
 })
 
 test('normalizes the explicit context window override with zero as profile default', () => {
-  for (const value of [0, 1, 65_536, 1_000_000]) {
+  for (const value of [0, 1, 65_536, 1_000_000, 1_048_576]) {
     assert.equal(normalizeGuobaConfigValue('apiContextWindowTokens', value), value)
   }
-  for (const value of [-1, 1.5, '65536', 1_000_001, Number.NaN]) {
+  for (const value of [-1, 1.5, '65536', 1_048_577, Number.NaN]) {
     assert.throws(
       () => normalizeGuobaConfigValue('apiContextWindowTokens', value),
       /模型上下文窗口配置无效/

@@ -340,10 +340,10 @@ test('group history cursor falls back to zero for signed NapCat message identifi
 test('model context override is parsed once with zero preserving the selected profile', () => {
   assert.equal(resolveConfiguredModelCapabilityOverride({}), undefined)
   assert.equal(resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 0 }), undefined)
-  const override = resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 1_000_000 })
-  assert.deepEqual(override, { contextWindowTokens: 1_000_000 })
+  const override = resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 1_048_576 })
+  assert.deepEqual(override, { contextWindowTokens: 1_048_576 })
   assert.equal(Object.isFrozen(override), true)
-  for (const value of [-1, 1.5, '65536', 1_000_001]) {
+  for (const value of [-1, 1.5, '65536', 1_048_577]) {
     assert.throws(
       () => resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: value }),
       /context window configuration is invalid/

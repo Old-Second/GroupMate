@@ -145,7 +145,8 @@ function validateSourceMatrix(span) {
     }
     else if (span.source === 'session_history') {
         if (span.kind !== 'message' || span.requirement !== 'optional' || span.toolProtocol !== null ||
-            !ordinary || span.messages.length === 0 ||
+            span.messages.some(message => hasProtocolFields(message) &&
+                !(message.role === 'assistant' && message.toolCalls === undefined)) || span.messages.length === 0 ||
             span.messages.some(message => message.role !== 'user' && message.role !== 'assistant')) {
             return invalidContextValue();
         }

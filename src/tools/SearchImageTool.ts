@@ -53,7 +53,7 @@ export function createSearchImageTool (options: SearchImageToolOptions): ToolDef
   const publicSearch = fixedOriginPolicy('https://serp.ikechan8370.com', ['/image/bing'])
   return readOnlyDefinition({
     name: 'searchImage', description: '搜索公开图片并返回候选图片地址。',
-    inputSchema, network: 'fixed_hosts', retrySafe: options.backend !== 'tavily',
+    inputSchema, network: 'fixed_hosts', retrySafe: options.backend !== 'tavily', timeoutMs: 12_000,
     resourceKeys: input => readResourceKeys('searchImage', input),
     execute: async (input, context) => {
       const q = String(input.q ?? '').trim()
@@ -63,7 +63,7 @@ export function createSearchImageTool (options: SearchImageToolOptions): ToolDef
       if (options.backend === 'tavily') {
         if (options.tavilyApiKey === '') return configurationFailure('图片搜索服务尚未配置。')
         response = await request(options.policyFetch, {
-          url: `${tavily.origin}/search`, policy: tavily.policy, timeoutMs: 10_000,
+          url: `${tavily.origin}/search`, policy: tavily.policy, timeoutMs: 8_000, diagnosticTag: 'image_search',
           signal: context.signal, method: 'POST',
           headers: { authorization: `Bearer ${options.tavilyApiKey}`, 'content-type': 'application/json' },
           body: JSON.stringify({ query: q, max_results: limit, include_images: true, include_image_descriptions: true })
@@ -72,13 +72,13 @@ export function createSearchImageTool (options: SearchImageToolOptions): ToolDef
         if (options.braveApiKey === '') return configurationFailure('图片搜索服务尚未配置。')
         response = await request(options.policyFetch, {
           url: `${brave.origin}/res/v1/images/search?q=${encodeURIComponent(q)}&count=${limit}&safesearch=moderate`,
-          policy: brave.policy, timeoutMs: 10_000, signal: context.signal,
+          policy: brave.policy, timeoutMs: 8_000, signal: context.signal, diagnosticTag: 'image_search',
           headers: { accept: 'application/json', 'x-subscription-token': options.braveApiKey }
         })
       } else {
         response = await request(options.policyFetch, {
           url: `${publicSearch.origin}/image/bing?q=${encodeURIComponent(q)}&limit=${limit}`,
-          policy: publicSearch.policy, timeoutMs: 10_000, signal: context.signal,
+          policy: publicSearch.policy, timeoutMs: 8_000, signal: context.signal, diagnosticTag: 'image_search',
           headers: { 'x-from-library': 'GroupMate' }
         })
       }

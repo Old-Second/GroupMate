@@ -464,7 +464,7 @@ test('Guoba exposes one bounded restart-only context window override', async () 
   ) as Record<string, unknown>
 
   assert.equal(field?.component, 'InputNumber')
-  assert.deepEqual(field?.componentProps, { min: 0, max: 1_000_000, step: 1 })
+  assert.deepEqual(field?.componentProps, { min: 0, max: 1_048_576, step: 1 })
   assert.match(field?.bottomHelpMessage ?? '', /0.*Profile|Profile.*0/)
   assert.match(field?.bottomHelpMessage ?? '', /512 KiB/)
   assert.match(field?.bottomHelpMessage ?? '', /256 KiB/)

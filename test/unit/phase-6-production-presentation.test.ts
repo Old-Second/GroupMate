@@ -752,7 +752,7 @@ test('enabled production journal receives one complete request, provider run and
     assert.match(JSON.stringify(request.systemInstructions), /日志系统指令/)
     assert.deepEqual(
       journal.runEvents.map(event => event.type),
-      ['provider.request', 'provider.response', 'run.terminal_committed']
+      ['model.resolution', 'context.planned', 'provider.request', 'provider.response', 'run.terminal_committed']
     )
     assert.match(
       JSON.stringify(journal.runEvents.find(event => event.type === 'provider.request')),
