@@ -40,7 +40,7 @@ function parseBudget(value) {
     const input = inspectContextRecord(value, [
         'schemaVersion', 'maxInputTokens', 'maxSerializedMessageBytes', 'maxMessages',
         'estimatedToolTokens', 'reservedOutputTokens'
-    ]);
+    ], ['imageTokensPerImage']);
     if (input.schemaVersion !== 1)
         return invalidContextValue();
     const budget = Object.freeze({
@@ -49,7 +49,10 @@ function parseBudget(value) {
         maxSerializedMessageBytes: requireSafeInteger(input.maxSerializedMessageBytes, { positive: true }),
         maxMessages: requireSafeInteger(input.maxMessages, { positive: true }),
         estimatedToolTokens: requireSafeInteger(input.estimatedToolTokens),
-        reservedOutputTokens: requireSafeInteger(input.reservedOutputTokens)
+        reservedOutputTokens: requireSafeInteger(input.reservedOutputTokens),
+        ...(input.imageTokensPerImage === undefined ? {} : {
+            imageTokensPerImage: requireSafeInteger(input.imageTokensPerImage)
+        })
     });
     if (budget.maxSerializedMessageBytes > 512 * 1_024 || budget.maxMessages > 128) {
         return invalidContextValue();
@@ -172,10 +175,11 @@ function optionalKeepOrder(left, right) {
         right.semanticOrder - left.semanticOrder ||
         asciiContextCompare(left.spanId, right.spanId);
 }
-function usageFor(spans) {
+function usageFor(spans, imageTokensPerImage = 0) {
     let bytes = 2;
     let messages = 0;
     let nonemptySpans = 0;
+    let imageTokens = 0;
     for (const span of spans) {
         if (span.messages.length === 0)
             continue;
@@ -183,10 +187,14 @@ function usageFor(spans) {
             bytes = addSafe(bytes, 1);
         bytes = addSafe(bytes, span.serializedBytes - 2);
         messages = addSafe(messages, span.messages.length);
+        for (const message of span.messages) {
+            if (message.role === 'user')
+                imageTokens = addSafe(imageTokens, (message.imageUrls?.length ?? 0) * imageTokensPerImage);
+        }
         nonemptySpans += 1;
     }
     return Object.freeze({
-        tokens: messages === 0 ? 0 : Math.max(1, Math.ceil(bytes / 4)),
+        tokens: addSafe(messages === 0 ? 0 : Math.max(1, Math.ceil(bytes / 4)), imageTokens),
         bytes,
         messages
     });
@@ -459,7 +467,7 @@ export function planModelTurn(value) {
         span.toolProtocol?.phase === 'indeterminate') || !protocolIsGloballyValid(input.spans)) {
         return BLOCKED_PROTOCOL;
     }
-    const rawUsage = usageFor(input.spans);
+    const rawUsage = usageFor(input.spans, input.budget.imageTokensPerImage);
     const crossesCompactionBoundary = input.previousPlan?.mode === 'compacting' ||
         entersCompacting(rawUsage, input.budget);
     const materialized = materializeArtifacts(input, crossesCompactionBoundary);
@@ -486,13 +494,13 @@ export function planModelTurn(value) {
             artifactCovered.add(ref);
     const candidates = allSpans.filter(span => !superseded.has(span.spanId) &&
         !artifactCovered.has(span.spanId) && !materialized.inactiveArtifactIds.has(span.spanId));
-    const initialUsage = usageFor(candidates);
+    const initialUsage = usageFor(candidates, input.budget.imageTokensPerImage);
     const previousMode = input.previousPlan?.mode ?? 'normal';
     let mode = input.appendOnly === true ? previousMode : previousMode === 'compacting'
         ? (atOrBelowTarget(initialUsage, input.budget) ? 'normal' : 'compacting')
         : (entersCompacting(rawUsage, input.budget) ? 'compacting' : 'normal');
     const mandatory = candidates.filter(span => span.requirement === 'mandatory');
-    const mandatoryUsage = usageFor(mandatory);
+    const mandatoryUsage = usageFor(mandatory, input.budget.imageTokensPerImage);
     if (!fitsHardBudget(mandatoryUsage, input.budget))
         return BLOCKED_BUDGET;
     if (input.appendOnly !== true && mode === 'compacting' && input.artifactPolicy === 'enabled' &&
@@ -532,7 +540,7 @@ export function planModelTurn(value) {
         if (discard !== undefined)
             selected.delete(discard.spanId);
         selectedSpans = candidates.filter(span => selected.has(span.spanId));
-        selectedUsage = usageFor(selectedSpans);
+        selectedUsage = usageFor(selectedSpans, input.budget.imageTokensPerImage);
     }
     if (!fitsHardBudget(selectedUsage, input.budget))
         return BLOCKED_BUDGET;

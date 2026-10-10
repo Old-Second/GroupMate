@@ -294,8 +294,7 @@ function correctionSpan (
 
 function plannerBudget (
   checkpoint: RunCheckpoint,
-  request: RunContextPlanningRequest,
-  spans: readonly ContextSpanV1[]
+  request: RunContextPlanningRequest
 ) {
   const estimatedToolTokens = request.kind === 'correction'
     ? 0
@@ -306,13 +305,8 @@ function plannerBudget (
     checkpoint.modelCapability.maxOutputTokens
   )
   const correction = request.kind === 'correction'
-  // Low-detail 512px vision is still not represented by the URL's bytes.
-  // Reserve separately; billing remains based on actual provider usage.
-  const imageReserveTokens = spans.reduce((sum, span) => sum + span.messages.reduce((count, message) =>
-    count + (message.role === 'user' ? message.imageUrls?.length ?? 0 : 0), 0), 0) * 4_096
   const maxInputTokens = Math.floor((checkpoint.modelCapability.contextWindowTokens -
     estimatedToolTokens * CONTEXT_ESTIMATE_GUARD_FACTOR - reservedOutputTokens -
-    imageReserveTokens -
     MODEL_TURN_CAPACITY_LIMITS.safetyMarginTokens) / CONTEXT_ESTIMATE_GUARD_FACTOR) -
     (correction ? 0 : CORRECTION_RESERVE_TOKENS)
   if (!Number.isSafeInteger(maxInputTokens) || maxInputTokens <= 0) {
@@ -327,7 +321,10 @@ function plannerBudget (
     ) - (correction ? 0 : CORRECTION_RESERVE_BYTES),
     maxMessages: correction ? 128 : 127,
     estimatedToolTokens,
-    reservedOutputTokens
+    reservedOutputTokens,
+    // Count only images actually selected, so optional history can be trimmed.
+    // The text budget is divided by the guard factor; match that planning unit.
+    imageTokensPerImage: 4_096 / CONTEXT_ESTIMATE_GUARD_FACTOR
   })
 }
 
@@ -580,7 +577,7 @@ export function createRunContextPlanner (
             capabilityHash: modelCapabilityStableHash(checkpoint.modelCapability),
             artifactPolicy: policy,
             appendOnly: request.kind === 'correction',
-            budget: plannerBudget(checkpoint, request, frozenSpans),
+            budget: plannerBudget(checkpoint, request),
             spans: frozenSpans,
             artifacts: suppliedArtifacts
           }))

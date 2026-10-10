@@ -489,6 +489,39 @@ test('correction pressure uses reserved capacity while preserving its committed 
   assert.equal(corrected.plan.prefixMessageCount, first.messages.length)
 })
 
+test('image pressure trims optional history while preserving the current image and correction prefix', async () => {
+  const current = baseSpans.find(span => span.source === 'current_request')!
+  const { schemaVersion, serializedBytes, estimatedTokens, ...currentDraft } = current
+  const currentImage = createContextSpanV1(Object.freeze({ ...currentDraft,
+    messages: Object.freeze([Object.freeze({ role: 'user' as const, content: '当前图片',
+      imageUrls: Object.freeze(['https://cdn.example.test/current.png']) })]) }))
+  const history = Array.from({ length: 12 }, (_, index) => {
+    const original = ordinarySpan(`image-history-${index}`, 'runtime_fact', 'user', '历史图片')
+    const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
+    return createContextSpanV1(Object.freeze({ ...draft, source: 'group_context' as const, trust: 'untrusted' as const,
+      semanticOrder: index + 4, provenance: Object.freeze({ ...draft.provenance, kind: 'group_snapshot' as const }),
+      messages: Object.freeze([Object.freeze({ role: 'user' as const, content: '历史图片',
+        imageUrls: Object.freeze([`https://cdn.example.test/${index}.png`]) })]) }))
+  })
+  const planner = createRunContextPlanner({ namespaceRef: runRef,
+    initialSpans: [...baseSpans.filter(span => span.source !== 'current_request'), currentImage, ...history] })
+  const first = await planner.planModelTurn(plannerCheckpoint(), { kind: 'normal', transition: 'normal' },
+    new AbortController().signal)
+  assert.ok(first.plan.omitted.length > 0)
+  assert.ok(first.messages.some(message => message.role === 'user' && message.imageUrls?.[0]?.endsWith('/current.png')))
+  const imageCount = first.messages.reduce((sum, message) => sum +
+    (message.role === 'user' ? message.imageUrls?.length ?? 0 : 0), 0)
+  assert.ok(first.estimatedInputTokens * 2 + imageCount * 4096 + 8192 + 256 + 1024 <= 32768)
+  const corrected = await planner.planModelTurn(plannerCheckpoint({ contextPlan: first.plan, messages: first.messages }),
+    { kind: 'correction', transition: 'normal' }, new AbortController().signal)
+  assert.deepEqual(corrected.messages.slice(0, -1), first.messages)
+
+  const small = { ...plannerCheckpoint().modelCapability, contextWindowTokens: 4_000, maxOutputTokens: 4_000 }
+  await assert.rejects(planner.planModelTurn(plannerCheckpoint({ modelCapability: small }),
+    { kind: 'normal', transition: 'normal' }, new AbortController().signal),
+  error => error instanceof AgentError && error.code === 'context_budget_exceeded')
+})
+
 async function planFourLargeToolTurns (store: ContextArtifactStore) {
   const planner = createRunContextPlanner({
     namespaceRef: runRef,
