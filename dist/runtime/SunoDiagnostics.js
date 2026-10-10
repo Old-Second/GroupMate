@@ -1,0 +1,14 @@
+// Never accept a response, error, account or credential object at this boundary.
+export function recordSunoDiagnostic(logger, operation, outcome, status) {
+    if (!['token', 'create', 'poll', 'account', 'credit', 'heartbeat', 'generate'].includes(operation) ||
+        !['success', 'failure', 'retry', 'insufficient_credit'].includes(outcome))
+        return;
+    try {
+        logger?.debug?.(Object.freeze({
+            event: 'groupmate.suno', operation, outcome,
+            ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+                ? { status } : {})
+        }));
+    }
+    catch { }
+}

@@ -1,3 +1,4 @@
+import { recordSunoDiagnostic } from '../dist/runtime/SunoDiagnostics.js'
 import { newFetch } from '../utils/proxy.js'
 import common from '../../../lib/common/common.js'
 import { decrypt } from '../utils/jwt.js'
@@ -17,7 +18,7 @@ export class SunoClient {
     let lastToken = this.sessToken
     let payload = decrypt(lastToken)
     let sid = JSON.parse(payload).sid
-    logger.debug('sid: ' + sid)
+    recordSunoDiagnostic(logger, 'token', 'retry')
     let tokenRes = await newFetch(`https://clerk.suno.ai/v1/client/sessions/${sid}/tokens/api?_clerk_js_version=4.70.0`, {
       method: 'POST',
       headers: {
@@ -30,7 +31,7 @@ export class SunoClient {
     })
     let tokenData = await tokenRes.json()
     let token = tokenData.jwt
-    logger.info('new token got: ' + token)
+    recordSunoDiagnostic(logger, 'token', 'success', tokenRes.status)
     return token
   }
 
@@ -50,7 +51,7 @@ export class SunoClient {
     })
 
     if (createRes.status !== 200) {
-      console.log(await createRes.json())
+      recordSunoDiagnostic(logger, 'create', 'failure', createRes.status)
       throw new Error('Failed to create song ' + createRes.status)
     }
     let createData = await createRes.json()
@@ -66,19 +67,19 @@ export class SunoClient {
           }
         })
         if (queryRes.status === 401) {
+          recordSunoDiagnostic(logger, 'poll', 'retry', queryRes.status)
           sess = await this.getToken()
           continue
         }
         if (queryRes.status !== 200) {
-          logger.error(await queryRes.text())
-          console.error('Failed to query song')
+          recordSunoDiagnostic(logger, 'poll', 'failure', queryRes.status)
         }
         let queryData = await queryRes.json()
-        logger.debug(queryData)
+        recordSunoDiagnostic(logger, 'poll', 'success', queryRes.status)
         allDone = queryData.every(clip => clip.status === 'complete' || clip.status === 'error')
         songs = queryData.filter(clip => clip.status === 'complete')
       } catch (err) {
-        console.error(err)
+        recordSunoDiagnostic(logger, 'poll', 'failure')
       }
       await common.sleep(1000)
       timeout--
@@ -101,7 +102,7 @@ export class SunoClient {
       }
     })
     let userData = await userRes.json()
-    logger.debug(userData)
+    recordSunoDiagnostic(logger, 'account', 'success', userRes.status)
     let user = userData?.user.email
     return user
   }
@@ -119,7 +120,7 @@ export class SunoClient {
       }
     })
     let infoData = await infoRes.json()
-    logger.debug(infoData)
+    recordSunoDiagnostic(logger, 'credit', 'success', infoRes.status)
     let credit = infoData?.total_credits_left
     let email = await this.queryUser(sess)
     return {
@@ -131,7 +132,7 @@ export class SunoClient {
     let lastToken = this.sessToken
     let payload = decrypt(lastToken)
     let sid = JSON.parse(payload).sid
-    logger.debug('sid: ' + sid)
+    recordSunoDiagnostic(logger, 'heartbeat', 'retry')
     let heartbeatUrl = `https://clerk.suno.ai/v1/client/sessions/${sid}/touch?_clerk_js_version=4.70.0`
     let heartbeatRes = await fetch(heartbeatUrl, {
       method: 'POST',
@@ -144,9 +145,8 @@ export class SunoClient {
       },
       body: 'active_organization_id='
     })
-    logger.debug(await heartbeatRes.text())
+    recordSunoDiagnostic(logger, 'heartbeat', heartbeatRes.status === 200 ? 'success' : 'failure', heartbeatRes.status)
     if (heartbeatRes.status === 200) {
-      logger.debug('heartbeat success')
       return true
     }
   }

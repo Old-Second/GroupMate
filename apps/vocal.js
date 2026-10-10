@@ -1,3 +1,4 @@
+import { recordSunoDiagnostic } from '../dist/runtime/SunoDiagnostics.js'
 import plugin from '../../../lib/plugins/plugin.js'
 import { SunoClient } from '../client/SunoClient.js'
 import { Config } from '../utils/config.js'
@@ -60,7 +61,7 @@ export class Vocal extends plugin {
         let clientToken = clientTokens[i]
         let client = new SunoClient({ sessToken: sess, clientToken })
         let { credit, email } = await client.queryCredit()
-        logger.info({ credit, email })
+        recordSunoDiagnostic(logger, 'credit', 'success')
         msg += `用户: ${maskEmail(email)} 余额：${credit}\n`
       }
       msg += '-------------------\n'
@@ -79,10 +80,10 @@ export class Vocal extends plugin {
         let clientToken = clientTokens[index]
         let client = new SunoClient({ sessToken: sess, clientToken })
         let { credit, email } = await client.queryCredit()
-        logger.info({ credit, email })
+        recordSunoDiagnostic(logger, 'credit', 'success')
         if (credit < 10) {
           tried++
-          logger.info(`账户${email}余额不足，尝试下一个账户`)
+          recordSunoDiagnostic(logger, 'credit', 'insufficient_credit')
           continue
         }
 
@@ -116,7 +117,7 @@ export class Vocal extends plugin {
               fs.unlinkSync(videoPath)
             }, 60000)
           } else {
-            logger.warn(`${song.title}下载视频失败，仅发送视频链接`)
+            recordSunoDiagnostic(logger, 'generate', 'failure')
           }
         }
         await e.reply(await common.makeForwardMsg(e, messages, '音乐合成结果'))
@@ -124,7 +125,7 @@ export class Vocal extends plugin {
       }
       await e.reply('所有账户余额不足')
     } catch (err) {
-      console.error(err)
+      recordSunoDiagnostic(logger, 'generate', 'failure')
       await e.reply('生成失败,请查看日志')
     }
   }
