@@ -322,8 +322,8 @@ test('freezes every confirmed provider and tool protocol byte limit', () => {
     tombstoneBytes: 4 * 1_024,
     checkpointKeys: 16,
     eventKeys: 16,
-    tombstoneKeys: 128,
-    referenceKeys: 144,
+    tombstoneKeys: 4096,
+    referenceKeys: 4112,
     indexAdmissionKeys: 64
   })
   assert.equal(Object.isFrozen(RUN_RESOURCE_LIMITS), true)

@@ -14,7 +14,9 @@ export const RUN_RESOURCE_LIMITS = Object.freeze({
     tombstoneBytes: 4 * 1_024,
     checkpointKeys: 16,
     eventKeys: 16,
-    tombstoneKeys: 128,
-    referenceKeys: 144,
+    // One day of ordinary traffic must not consume all terminal slots after 128 replies.
+    // The existing 8 MiB byte ceiling still bounds receipts and their lookup references.
+    tombstoneKeys: 4_096,
+    referenceKeys: 4_112,
     indexAdmissionKeys: 64
 });

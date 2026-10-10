@@ -249,7 +249,7 @@ local current = {
 }
 
 local function exceeds(value)
-  return value.bytes > ${RUN_RESOURCE_LIMITS.namespaceBytes} or
+  return value.bytes + value.checkpoints * ${RUN_RESOURCE_LIMITS.tombstoneBytes} > ${RUN_RESOURCE_LIMITS.namespaceBytes} or
     value.checkpoints > ${RUN_RESOURCE_LIMITS.checkpointKeys} or
     value.events > ${RUN_RESOURCE_LIMITS.eventKeys} or
     value.tombstones > ${RUN_RESOURCE_LIMITS.tombstoneKeys} or
@@ -290,6 +290,8 @@ if operation == 'create' then
   }
   if invalid(projected) then return 'reconcile' end
   if exceeds(projected) then return 'budget' end
+  -- Reserve a terminal receipt for every admitted checkpoint, without evicting live receipts.
+  if projected.tombstones + projected.checkpoints > ${RUN_RESOURCE_LIMITS.tombstoneKeys} then return 'budget' end
   redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[4]))
   redis.call('SET', KEYS[2], ARGV[3], 'EX', tonumber(ARGV[4]))
   redis.call('SET', KEYS[4], ARGV[5], 'EX', tonumber(ARGV[4]))

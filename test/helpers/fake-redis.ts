@@ -429,6 +429,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
       }
       if (this.invalidRunUsage(projected)) return 'reconcile'
       if (this.exceedsRunLimits(projected)) return 'budget'
+      if (projected.tombstones + projected.checkpoints > RUN_RESOURCE_LIMITS.tombstoneKeys) return 'budget'
       this.setDirect(checkpointKey, args[1], Number(args[3]))
       this.setDirect(eventKey, args[2], Number(args[3]))
       this.setDirect(referenceKey, args[4], Number(args[3]))
@@ -1729,7 +1730,7 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     references: number
     tombstoneBytes: number
   }): boolean {
-    return usage.bytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
+    return usage.bytes + usage.checkpoints * RUN_RESOURCE_LIMITS.tombstoneBytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
       usage.checkpoints > RUN_RESOURCE_LIMITS.checkpointKeys ||
       usage.events > RUN_RESOURCE_LIMITS.eventKeys ||
       usage.tombstones > RUN_RESOURCE_LIMITS.tombstoneKeys ||
