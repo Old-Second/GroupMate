@@ -16,6 +16,8 @@ export interface ContextPlannerBudgetV1 {
   readonly maxMessages: number
   readonly estimatedToolTokens: number
   readonly reservedOutputTokens: number
+  /** Planning-only weight; canonical text estimates and historical hashes stay stable. */
+  readonly imageTokensPerImage?: number
 }
 
 export interface ContextSnapshot {
