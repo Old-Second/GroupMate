@@ -37,6 +37,8 @@ export async function initializeProductionPersonalMemoryRuntimeV1(options) {
         groupAllowlist: options.groupAllowlist,
         recallMaxItems: options.recallMaxItems,
         recallMaxTokens: options.recallMaxTokens,
-        recallTimeoutMs: options.recallTimeoutMs
+        recallTimeoutMs: options.recallTimeoutMs,
+        ...(options.candidateModel === undefined ? {} : { candidateModel: options.candidateModel }),
+        ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot })
     }));
 }

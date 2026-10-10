@@ -113,6 +113,7 @@ export interface CreateYunzaiPersonalMemoryControllerOptionsV1 {
   readonly exportDelivery: PersonalMemoryExportDeliveryV1
   readonly rebuildLexical: () => Promise<number>
   readonly completeNamespaceDeletion: (namespace: MemoryNamespaceV1) => Promise<boolean>
+  readonly clearCandidateJobs?: (namespace: MemoryNamespaceV1) => Promise<void>
 }
 
 class PersonalMemoryCommandError extends Error {}
@@ -577,6 +578,7 @@ export function createYunzaiPersonalMemoryControllerV1 (
       await request.replyText(mutationFailureText(result))
       return
     }
+    if (operation === 'enrollment.optOut') await options.clearCandidateJobs?.(auth.namespace)
     await request.replyText(operation === 'enrollment.optIn'
       ? '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
       : `个人长期记忆已关闭。${result.notices.join('')}`)

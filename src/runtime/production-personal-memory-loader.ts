@@ -1,5 +1,7 @@
 import { types as utilTypes } from 'node:util'
 import type { PersonalMemoryCommandPortV1 } from './personal-memory-command.js'
+import type { MemoryCandidateModelV1 } from '../agent/memory/OpenAiMemoryCandidateExtractor.js'
+import type { PostReplyMemoryCandidatePortV1 } from './ProductionShadowMemory.js'
 
 export type ProductionPersonalMemoryModeV1 = 'off' | 'explicit' | 'shadow' | 'automatic'
 
@@ -16,6 +18,8 @@ export interface ProductionPersonalMemoryRuntimeV1 {
   readonly recallSource: ProductionPersonalMemoryRecallSourceV1
   readonly operations: ProductionPersonalMemoryOperationsPortV1
   readonly commands: PersonalMemoryCommandPortV1
+  readonly postReplyCandidate?: PostReplyMemoryCandidatePortV1
+  readonly waitForCandidateIdle?: () => Promise<void>
   readonly close: () => Promise<void>
 }
 
@@ -27,6 +31,8 @@ export interface ProductionPersonalMemoryRuntimeOptionsV1 {
   readonly recallMaxItems: () => number
   readonly recallMaxTokens: () => number
   readonly recallTimeoutMs: () => number
+  readonly candidateModel?: MemoryCandidateModelV1
+  readonly candidateBot?: (accountId: string) => unknown
 }
 
 export interface ProductionPersonalMemoryRuntimeModuleV1 {
@@ -87,6 +93,8 @@ export async function initializeProductionPersonalMemoryRuntimeV1 (
     groupAllowlist: options.groupAllowlist,
     recallMaxItems: options.recallMaxItems,
     recallMaxTokens: options.recallMaxTokens,
-    recallTimeoutMs: options.recallTimeoutMs
+    recallTimeoutMs: options.recallTimeoutMs,
+    ...(options.candidateModel === undefined ? {} : { candidateModel: options.candidateModel }),
+    ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot })
   }))
 }

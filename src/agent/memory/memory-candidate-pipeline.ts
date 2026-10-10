@@ -46,6 +46,8 @@ export interface MemoryExtractionJobV1 {
   readonly priority: MemoryExtractionPriorityV1
   readonly enqueuedAt: string
   readonly assistantReply: string
+  /** Absent only on historical offline V1 jobs; production must bind current opt-in generation. */
+  readonly enrollmentPolicyGeneration?: number
 }
 
 export interface MemoryExtractedCandidateV1 {
@@ -170,7 +172,10 @@ function jobPreimage (
     requestedMode: value.requestedMode,
     priority: value.priority,
     enqueuedAt: value.enqueuedAt,
-    assistantReply: value.assistantReply
+    assistantReply: value.assistantReply,
+    ...(value.enrollmentPolicyGeneration === undefined ? {} : {
+      enrollmentPolicyGeneration: value.enrollmentPolicyGeneration
+    })
   })
 }
 
@@ -194,7 +199,8 @@ function parseJobFields (
   ] as const
   const input = inspectMemoryRecord(
     value,
-    includeComputed ? ['schemaVersion', 'jobId', 'namespaceRef', ...fields] : fields
+    includeComputed ? ['schemaVersion', 'jobId', 'namespaceRef', ...fields] : fields,
+    ['enrollmentPolicyGeneration']
   )
   if (includeComputed && input.schemaVersion !== 1) return invalidMemoryValue()
   const namespace = parseMemoryNamespaceV1(input.namespace)
@@ -215,7 +221,10 @@ function parseJobFields (
     requestedMode: enumValue(input.requestedMode, EXTRACTION_MODES),
     priority: enumValue(input.priority, EXTRACTION_PRIORITIES),
     enqueuedAt: parseMemoryLifecycleInstantV1(input.enqueuedAt),
-    assistantReply: assistantReply(input.assistantReply)
+    assistantReply: assistantReply(input.assistantReply),
+    ...(input.enrollmentPolicyGeneration === undefined ? {} : {
+      enrollmentPolicyGeneration: positiveInteger(input.enrollmentPolicyGeneration)
+    })
   })
   const jobId = deriveJobId(withoutComputed)
   if (includeComputed && (
