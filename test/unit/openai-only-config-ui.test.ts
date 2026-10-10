@@ -220,6 +220,7 @@ const requiredGuobaFields = [
   'emojiBaseURL',
   'enableBYM',
   'bymRecognizeLeadingAlias',
+  'participationMode',
   'bymRate',
   'bymDisableGroup',
   'bymThinkingMode',
@@ -259,7 +260,7 @@ const expectedGuobaGroups = [
     label: '群聊参与',
     fields: [
       'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt',
-      'enableBYM', 'bymRecognizeLeadingAlias', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
+      'enableBYM', 'bymRecognizeLeadingAlias', 'participationMode', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
       'bymReasoningEffort', 'bymPreset', 'bymFuckList', 'bymFuckBlacklist',
       'bymFuckPrompt', 'bymFuckRecall', 'bymFuckRecallTime'
     ]

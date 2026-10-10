@@ -3,6 +3,20 @@ import { parseAgentMessage } from '../../agent/contracts/content.js';
 import { parseJsonValue } from '../../agent/model/json-value.js';
 import { canonicalSessionKey } from '../../agent/session/conversation-scope.js';
 import { parseToolResult } from '../../agent/tools/tool-result.js';
+export function projectParticipationObservation(value) {
+    const data = ownDataRecord(value, 'participation');
+    const fields = ['schemaVersion', 'policyVersion', 'legacyAllowed', 'proposedAllowed', 'reason', 'disagreement', 'scopes', 'candidates', 'stateBytes'];
+    exactKeys(data, fields, fields, 'participation');
+    if (data.schemaVersion !== 1 || data.policyVersion !== 1 ||
+        ['legacyAllowed', 'proposedAllowed', 'disagreement'].some(key => typeof data[key] !== 'boolean') ||
+        data.disagreement !== (data.legacyAllowed !== data.proposedAllowed) ||
+        !['disabled', 'empty', 'sample_miss', 'direct', 'continuation', 'sampled', 'acknowledgement', 'untrusted', 'unavailable'].includes(String(data.reason)) ||
+        !Number.isSafeInteger(data.scopes) || Number(data.scopes) < 0 || Number(data.scopes) > 64 ||
+        !Number.isSafeInteger(data.candidates) || Number(data.candidates) < 0 || Number(data.candidates) > 32 ||
+        !Number.isSafeInteger(data.stateBytes) || Number(data.stateBytes) < 0 || Number(data.stateBytes) > 512 * 1_024)
+        throw new TypeError('participation observation invalid');
+    return Object.freeze({ type: 'participation.shadow', payload: Object.freeze(data) });
+}
 export const CONTENT_JOURNAL_JSON_DEPTH_LIMIT = 32;
 export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 8_192;
 export function createProjectionBudget(options) {

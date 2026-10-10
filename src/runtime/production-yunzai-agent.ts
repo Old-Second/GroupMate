@@ -1,3 +1,6 @@
+import { participationMode } from '../agent/participation/ParticipationContract.js'
+import { ParticipationShadow } from './participation/ParticipationShadow.js'
+import { projectYunzaiParticipation } from './participation/YunzaiParticipationAdapter.js'
 import type { ModelAdapter } from '../agent/model/model-adapter.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
@@ -937,7 +940,19 @@ export function createProductionYunzaiAgent (
       }))
     }
   })
+  const participation = new ParticipationShadow(() => now().getTime(), entry => {
+    contentJournal?.recordParticipation?.(entry)
+  })
   const bymController = createYunzaiBymController({
+    participation: {
+      observe: input => {
+        if (participationMode(options.bridge.config.participationMode) !== 'shadow') return null
+        const event = projectYunzaiParticipation({ ...input,
+          botId: options.bridge.getBotId(input.event), now: now().getTime() })
+        return event === null ? null : participation.compare(event, input.legacyAllowed)
+      },
+      replied: candidate => participation.state.replied(candidate)
+    },
     policy: options.bymPolicy,
     random,
     promptScreening,
@@ -1018,6 +1033,7 @@ export function createProductionYunzaiAgent (
         try {
           return await bridge.shutdown(reason)
         } finally {
+          participation.close()
           try {
             await contentJournal?.drain()
           } catch {}

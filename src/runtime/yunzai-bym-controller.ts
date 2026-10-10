@@ -1,3 +1,5 @@
+import { legacyParticipationAllowed } from '../agent/participation/ParticipationPolicy.js'
+import type { ParticipationCandidate } from '../agent/participation/ParticipationState.js'
 import type { PresentationIntentV1, PresentationRouteV1 } from '../agent/contracts/interaction.js'
 import type {
   ChatReplyEnvelope,
@@ -95,6 +97,10 @@ export interface YunzaiBymControllerOptions {
   readonly hooks: RuntimePresentationHookFactory
   readonly presenter: Pick<ReplyPresenter, 'present'>
   readonly completionCoordinator: PresentationCompletionCoordinator
+  readonly participation?: {
+    observe(input: Readonly<{ event: YunzaiMessageEvent; explicitlyAddressed: boolean; eligible: boolean; legacyAllowed: boolean }>): ParticipationCandidate | null
+    replied(candidate: ParticipationCandidate): void
+  }
   readonly diagnostics?: BymDiagnosticsPort
 }
 
@@ -170,9 +176,9 @@ async function completeProactive (
   event: YunzaiMessageEvent,
   prepared: PreparedBymRequest,
   envelope: FinalChatReplyEnvelope
-): Promise<void> {
+): Promise<boolean> {
   const route = prepared.route
-  await options.completionCoordinator.complete({
+  const result = await options.completionCoordinator.complete({
     envelope,
     present: async projection => {
       const presentationSettings = await options.presentationSettings.load(route.actorId)
@@ -191,6 +197,7 @@ async function completeProactive (
       }))
     }
   })
+  return result.deliveries.some(delivery => delivery.kind === 'sent')
 }
 
 async function runBym (
@@ -210,13 +217,17 @@ async function runBym (
   })
   if (trigger.prompt === null) return
 
-  let probabilitySample = -1
-  if (!trigger.explicitlyAddressed) {
-    const random = options.random()
-    if (!Number.isFinite(random) || random < 0 || random >= 1) return
-    probabilitySample = Math.floor(random * 100)
-  }
-  if (probabilitySample >= policy.ratePercent) return
+  const legacyAllowed = legacyParticipationAllowed({
+    explicitlyAddressed: trigger.explicitlyAddressed,
+    ratePercent: policy.ratePercent,
+    sample: trigger.explicitlyAddressed ? null : options.random()
+  })
+  let candidate: ParticipationCandidate | null = null
+  try {
+    candidate = options.participation?.observe({ event,
+      explicitlyAddressed: trigger.explicitlyAddressed, eligible: true, legacyAllowed }) ?? null
+  } catch {}
+  if (!legacyAllowed) return
 
   const prompt = trigger.prompt
   const actorId = eventActorId(event)
@@ -274,7 +285,10 @@ async function runBym (
         ? { error: true }
         : {}
   }))
-  await completeProactive(options, event, prepared, envelope)
+  const delivered = await completeProactive(options, event, prepared, envelope)
+  if (delivered && candidate !== null) {
+    try { options.participation?.replied(candidate) } catch {}
+  }
 }
 
 export function createYunzaiBymController (

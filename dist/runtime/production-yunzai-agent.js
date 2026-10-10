@@ -1,3 +1,6 @@
+import { participationMode } from '../agent/participation/ParticipationContract.js';
+import { ParticipationShadow } from './participation/ParticipationShadow.js';
+import { projectYunzaiParticipation } from './participation/YunzaiParticipationAdapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { bindYunzaiShutdownSignals, createYunzaiAgentServiceBridge } from './agent-service-bridge.js';
@@ -661,7 +664,20 @@ export function createProductionYunzaiAgent(options) {
             }));
         }
     });
+    const participation = new ParticipationShadow(() => now().getTime(), entry => {
+        contentJournal?.recordParticipation?.(entry);
+    });
     const bymController = createYunzaiBymController({
+        participation: {
+            observe: input => {
+                if (participationMode(options.bridge.config.participationMode) !== 'shadow')
+                    return null;
+                const event = projectYunzaiParticipation({ ...input,
+                    botId: options.bridge.getBotId(input.event), now: now().getTime() });
+                return event === null ? null : participation.compare(event, input.legacyAllowed);
+            },
+            replied: candidate => participation.state.replied(candidate)
+        },
         policy: options.bymPolicy,
         random,
         promptScreening,
@@ -734,6 +750,7 @@ export function createProductionYunzaiAgent(options) {
                     return await bridge.shutdown(reason);
                 }
                 finally {
+                    participation.close();
                     try {
                         await contentJournal?.drain();
                     }

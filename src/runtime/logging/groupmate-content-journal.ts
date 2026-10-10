@@ -5,7 +5,8 @@ import {
   projectOutboundJournalEvent,
   type GroupMateOutboundJournalEvent
 } from './content-journal-outbound-projector.js'
-import type { ProjectedJournalEvent } from './content-journal-projection.js'
+import { projectParticipationObservation, type ProjectedJournalEvent } from './content-journal-projection.js'
+import type { ParticipationObservation } from '../participation/ParticipationShadow.js'
 import {
   projectRequestJournalEvent,
   projectRunJournalEvent
@@ -22,11 +23,12 @@ export interface GroupMateContentJournal {
   recordRunEvent(event: RunContentJournalEvent): void
   recordOutbound(event: GroupMateOutboundJournalEvent): void
   recordNetworkDiagnostic?(event: PolicyNetworkDiagnostic): void
+  recordParticipation?(event: ParticipationObservation): void
   drain(): Promise<void>
 }
 
 type DiskLogPort = Pick<GroupMateDiskLog, 'record' | 'drain'>
-type ProjectionOperation = 'request' | 'run_event' | 'outbound'
+type ProjectionOperation = 'request' | 'run_event' | 'outbound' | 'participation'
 
 function failureEvent (operation: ProjectionOperation): GroupMateDiskLogEvent {
   return Object.freeze({
@@ -54,6 +56,10 @@ export function createGroupMateContentJournal (
     }
   }
   return Object.freeze({
+    recordParticipation (event: ParticipationObservation): void {
+      recordProjection('participation', () => projectParticipationObservation(event))
+    },
+
     recordRequest (request: YunzaiAgentRequestDraft): void {
       recordProjection('request', () => projectRequestJournalEvent(request))
     },

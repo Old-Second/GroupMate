@@ -21,7 +21,7 @@ GroupMate 是一个运行在 Yunzai 体系中的 QQ 群原生交互项目。它�
 
 ## 环境要求
 
-- Node.js 22.23.1 或更高版本（需要内置 SQLite 的 FTS5 支持）
+- Node.js 22.23.1 或更高版本（需要内置 SQLite 的 FTS5 支持）；推荐使用当前 Node.js 24 LTS
 - pnpm 10
 - 可加载 Yunzai 插件的运行环境，例如 TRSS-Yunzai
 
@@ -67,3 +67,9 @@ git diff --check
 ## 来源与许可
 
 GroupMate 是对 [`ikechan8370/chatgpt-plugin`](https://github.com/ikechan8370/chatgpt-plugin) 的独立重构与延续，使用 GNU GPL v3 许可证。项目来源、保留历史和参考项目说明见 [NOTICE](NOTICE.md)。
+
+### 群参与策略与版本更新
+
+`participationMode` 默认是 `legacy`，沿用既有称呼、概率、反击和撤回设置。设为 `shadow` 时，仅将新参与策略的决定与现有策略比对，记录有界计数；实际回复仍由现有策略决定，不增加模型调用、工具执行或群消息。当前不支持启用 `active`。
+
+主人发送原有更新或强制更新命令时，会收到当前版本和更新说明。发布由维护者完成本地验证后，从 `groupmate` 分支按受控部署流程执行。

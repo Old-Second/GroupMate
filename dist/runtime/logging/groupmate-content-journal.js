@@ -1,4 +1,5 @@
 import { projectOutboundJournalEvent } from './content-journal-outbound-projector.js';
+import { projectParticipationObservation } from './content-journal-projection.js';
 import { projectRequestJournalEvent, projectRunJournalEvent } from './content-journal-request-run-projector.js';
 function failureEvent(operation) {
     return Object.freeze({
@@ -22,6 +23,9 @@ export function createGroupMateContentJournal(diskLog) {
         }
     };
     return Object.freeze({
+        recordParticipation(event) {
+            recordProjection('participation', () => projectParticipationObservation(event));
+        },
         recordRequest(request) {
             recordProjection('request', () => projectRequestJournalEvent(request));
         },

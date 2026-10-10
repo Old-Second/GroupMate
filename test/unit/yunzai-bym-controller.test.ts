@@ -8,7 +8,8 @@ import type { PresentationSettings } from '../../src/runtime/presentation/presen
 import type { PresentationInput } from '../../src/runtime/runtime-presentation-hooks.js'
 import {
   createYunzaiBymController,
-  type BymPolicySnapshot
+  type BymPolicySnapshot,
+  type YunzaiBymControllerOptions
 } from '../../src/runtime/yunzai-bym-controller.js'
 
 const settings: PresentationSettings = Object.freeze({
@@ -108,6 +109,7 @@ function fixture (input: Readonly<{
   preparedPrompt?: string
   result?: ChatReplyEnvelope
   agentError?: boolean
+  participation?: YunzaiBymControllerOptions['participation']
 }> = {}) {
   const calls: string[] = []
   const prepared: Array<Readonly<{
@@ -119,6 +121,7 @@ function fixture (input: Readonly<{
   const diagnostics: Readonly<Record<string, unknown>>[] = []
   let completionCalls = 0
   const controller = createYunzaiBymController({
+    participation: input.participation,
     policy: {
       snapshot: () => input.policy ?? basePolicy
     },
@@ -387,4 +390,30 @@ test('BYM diagnostics correlate request and response with the claimed run', asyn
     }
   ])
   assert.doesNotMatch(JSON.stringify(active.diagnostics), /主动回复|大家今天怎么样/)
+})
+
+test('shadow comparisons add no business effects and failures leave legacy responses unchanged', async () => {
+  const baseline = fixture()
+  const observations: unknown[] = []
+  const shadow = fixture({ participation: {
+    observe: input => { observations.push(input.legacyAllowed); return null },
+    replied: () => { throw new Error('must not be invoked without delivery') }
+  } })
+  await baseline.controller.bym(event())
+  await shadow.controller.bym(event())
+  assert.deepEqual(shadow.calls, baseline.calls)
+  assert.deepEqual(shadow.agentInputs, baseline.agentInputs)
+  assert.equal(JSON.stringify(shadow.presentationInputs), JSON.stringify(baseline.presentationInputs))
+  assert.deepEqual(observations, [true])
+  const failure = fixture({ participation: {
+    observe: () => { throw new Error('shadow failed') }, replied: () => {}
+  } })
+  await failure.controller.bym(event())
+  assert.deepEqual(failure.calls, baseline.calls)
+  const miss = fixture({ random: 0.99, participation: {
+    observe: input => { observations.push(input.legacyAllowed); return null }, replied: () => {}
+  } })
+  await miss.controller.bym(event())
+  assert.deepEqual(miss.calls, [])
+  assert.deepEqual(observations, [true, false])
 })

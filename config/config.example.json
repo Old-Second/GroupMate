@@ -120,6 +120,7 @@
   "personalMemoryRecallTimeoutMs": 150,
   "enableBYM": false,
   "bymRecognizeLeadingAlias": true,
+  "participationMode": "legacy",
   "bymRate": 5,
   "bymDisableGroup": [],
   "bymPreset": "",

@@ -129,6 +129,11 @@ export function buildGuobaConfigPatch(value, options) {
     return Object.freeze(patch);
 }
 export function normalizeGuobaConfigValue(key, value) {
+    if (key === 'participationMode') {
+        if (value !== 'legacy' && value !== 'shadow')
+            throw new TypeError('群参与模式配置无效。');
+        return value;
+    }
     if (key === 'personalMemoryMode') {
         if (typeof value !== 'string' || !PERSONAL_MEMORY_MODES.has(value)) {
             throw new TypeError('长期记忆模式配置无效。');

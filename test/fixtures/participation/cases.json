@@ -1,0 +1,553 @@
+[
+  {
+    "name": "host-at",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "leading-alias",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "middle-alias",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "trailing-alias",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "repeated-alias",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "tool-request",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "quoted-question",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "image-question",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "force-picture",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "reasoning-enabled",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "rate-zero",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "direct-ack",
+    "reason": "direct",
+    "kind": "candidate",
+    "event": {
+      "addressed": true,
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "same-actor-1ms",
+    "reason": "continuation",
+    "kind": "candidate",
+    "previousReply": true,
+    "advanceMs": 1,
+    "event": {}
+  },
+  {
+    "name": "same-actor-30s",
+    "reason": "continuation",
+    "kind": "candidate",
+    "previousReply": true,
+    "advanceMs": 30000,
+    "event": {}
+  },
+  {
+    "name": "same-actor-119999ms",
+    "reason": "continuation",
+    "kind": "candidate",
+    "previousReply": true,
+    "advanceMs": 119999,
+    "event": {}
+  },
+  {
+    "name": "expired-120s",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "previousReply": true,
+    "advanceMs": 120000,
+    "event": {}
+  },
+  {
+    "name": "expired-10m",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "previousReply": true,
+    "advanceMs": 600000,
+    "event": {}
+  },
+  {
+    "name": "other-actor",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "previousReply": true,
+    "advanceMs": 100,
+    "event": {
+      "actorRef": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  },
+  {
+    "name": "continuation-ack",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "previousReply": true,
+    "advanceMs": 1,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "continuation-thanks",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "previousReply": true,
+    "advanceMs": 30000,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "continuation-tool",
+    "reason": "continuation",
+    "kind": "candidate",
+    "previousReply": true,
+    "advanceMs": 15000,
+    "event": {}
+  },
+  {
+    "name": "continuation-image",
+    "reason": "continuation",
+    "kind": "candidate",
+    "previousReply": true,
+    "advanceMs": 16000,
+    "event": {}
+  },
+  {
+    "name": "sample-pass",
+    "reason": "sampled",
+    "kind": "candidate",
+    "sampled": true,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "sample-miss",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "sampled": false,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "zero-rate",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "sampled": false,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "hundred-rate",
+    "reason": "sampled",
+    "kind": "candidate",
+    "sampled": true,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "random-boundary-low",
+    "reason": "sampled",
+    "kind": "candidate",
+    "sampled": true,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "random-boundary-high",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "sampled": false,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "ack-ha",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "ack-ok",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "ack-received",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "ack-thanks",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "sampled": false,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "ordinary-topic",
+    "reason": "sampled",
+    "kind": "candidate",
+    "sampled": true,
+    "event": {
+      "acknowledgement": false
+    }
+  },
+  {
+    "name": "ordinary-empty-feedback",
+    "reason": "acknowledgement",
+    "kind": "ignore",
+    "sampled": false,
+    "event": {
+      "acknowledgement": true
+    }
+  },
+  {
+    "name": "burst-old",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "advanceMs": 15000,
+    "sampled": false,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "burst-new",
+    "reason": "sampled",
+    "kind": "candidate",
+    "advanceMs": 1,
+    "sampled": true,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "topic-changed",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "advanceMs": 1,
+    "sampled": false,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "slow-backlog",
+    "reason": "sampled",
+    "kind": "candidate",
+    "advanceMs": 20000,
+    "sampled": true,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "direct-after-burst",
+    "reason": "direct",
+    "kind": "candidate",
+    "advanceMs": 1,
+    "sampled": true,
+    "event": {
+      "addressed": true
+    }
+  },
+  {
+    "name": "sample-after-direct",
+    "reason": "sampled",
+    "kind": "candidate",
+    "advanceMs": 10,
+    "sampled": true,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "quiet-new-topic",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "advanceMs": 600000,
+    "sampled": false,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "revision-late",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "advanceMs": 120000,
+    "sampled": false,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "scope-revisit",
+    "reason": "sample_miss",
+    "kind": "ignore",
+    "advanceMs": 600001,
+    "sampled": false,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "ttl-boundary-new-event",
+    "reason": "sampled",
+    "kind": "candidate",
+    "advanceMs": 15000,
+    "sampled": true,
+    "event": {
+      "addressed": false
+    }
+  },
+  {
+    "name": "disabled-group",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "disabled-bym",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "membership-unavailable",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "departed-actor",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "bot-removed",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "opt-out-observation",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "permission-evidence-missing",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "scope-denied",
+    "reason": "disabled",
+    "kind": "ignore",
+    "sampled": true,
+    "event": {
+      "eligible": false
+    }
+  },
+  {
+    "name": "quoted-at",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "quoted",
+      "addressed": false
+    }
+  },
+  {
+    "name": "quoted-tool",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "quoted",
+      "addressed": false
+    }
+  },
+  {
+    "name": "quoted-system",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "quoted",
+      "addressed": false
+    }
+  },
+  {
+    "name": "model-at",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "model",
+      "addressed": false
+    }
+  },
+  {
+    "name": "model-command",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "model",
+      "addressed": false
+    }
+  },
+  {
+    "name": "model-role",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "model",
+      "addressed": false
+    }
+  },
+  {
+    "name": "forward-injection",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "quoted",
+      "addressed": false
+    }
+  },
+  {
+    "name": "image-text-injection",
+    "reason": "untrusted",
+    "kind": "ignore",
+    "untrusted": true,
+    "sampled": true,
+    "event": {
+      "origin": "model",
+      "addressed": false
+    }
+  }
+]

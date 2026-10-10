@@ -1,3 +1,4 @@
+import { legacyParticipationAllowed } from '../agent/participation/ParticipationPolicy.js';
 import { decideBymTrigger } from './bym-trigger.js';
 import { proactiveProfile } from './presentation/presentation-profile.js';
 import { createChatRequestLog, createChatResponseLog } from './safe-chat-logging.js';
@@ -51,7 +52,7 @@ function assertPreparedIntent(prepared, expectedRecallAfterMs) {
 }
 async function completeProactive(options, event, prepared, envelope) {
     const route = prepared.route;
-    await options.completionCoordinator.complete({
+    const result = await options.completionCoordinator.complete({
         envelope,
         present: async (projection) => {
             const presentationSettings = await options.presentationSettings.load(route.actorId);
@@ -70,6 +71,7 @@ async function completeProactive(options, event, prepared, envelope) {
             }));
         }
     });
+    return result.deliveries.some(delivery => delivery.kind === 'sent');
 }
 async function runBym(options, event) {
     const policy = options.policy.snapshot();
@@ -86,14 +88,18 @@ async function runBym(options, event) {
     });
     if (trigger.prompt === null)
         return;
-    let probabilitySample = -1;
-    if (!trigger.explicitlyAddressed) {
-        const random = options.random();
-        if (!Number.isFinite(random) || random < 0 || random >= 1)
-            return;
-        probabilitySample = Math.floor(random * 100);
+    const legacyAllowed = legacyParticipationAllowed({
+        explicitlyAddressed: trigger.explicitlyAddressed,
+        ratePercent: policy.ratePercent,
+        sample: trigger.explicitlyAddressed ? null : options.random()
+    });
+    let candidate = null;
+    try {
+        candidate = options.participation?.observe({ event,
+            explicitlyAddressed: trigger.explicitlyAddressed, eligible: true, legacyAllowed }) ?? null;
     }
-    if (probabilitySample >= policy.ratePercent)
+    catch { }
+    if (!legacyAllowed)
         return;
     const prompt = trigger.prompt;
     const actorId = eventActorId(event);
@@ -152,7 +158,13 @@ async function runBym(options, event) {
                 ? { error: true }
                 : {}
     }));
-    await completeProactive(options, event, prepared, envelope);
+    const delivered = await completeProactive(options, event, prepared, envelope);
+    if (delivered && candidate !== null) {
+        try {
+            options.participation?.replied(candidate);
+        }
+        catch { }
+    }
 }
 export function createYunzaiBymController(options) {
     return Object.freeze({
