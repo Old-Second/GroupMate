@@ -9,6 +9,7 @@ import {
   parsePresentationTrace
 } from '../../src/agent/contracts/presentation-trace.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
+import type { ContextItem } from '../../src/agent/context/context-item.js'
 import type {
   ModelAdapter,
   ModelRequest,
@@ -522,6 +523,47 @@ function contractEngine (
     ...methods
   }) as unknown as RunEngine
 }
+
+test('service input bounding retains retrieved memory when group context exceeds the item or byte budget', async () => {
+  for (const pressure of ['items', 'bytes'] as const) {
+    const revisionHash = 'a'.repeat(64)
+    const draft = request(`memory-pressure-${pressure}`, 'recall my preference')
+    const groupContext: readonly ContextItem[] = Object.freeze(Array.from({ length: 12 }, (_, index) => Object.freeze({
+      id: `group-context-${index}`, source: 'group_context' as const,
+      message: Object.freeze({ ...draft.message, id: `group-message-${index}`,
+        parts: Object.freeze([{ type: 'text' as const, text: 'ambient '.repeat(500) }]) })
+    })))
+    const memory: ContextItem = Object.freeze({ id: 'recalled-preference', source: 'memory',
+      message: Object.freeze({ ...draft.message, id: 'memory-message',
+        parts: Object.freeze([{ type: 'text' as const, text: 'retrieved durable preference' }]),
+        provenance: Object.freeze({ ...draft.message.provenance, sourceId: `memory:${revisionHash}` }) }),
+      memoryRecord: Object.freeze({ memoryId: `memory:${'b'.repeat(64)}`, revision: 1,
+        revisionHash, namespaceRef: `namespace:${'c'.repeat(64)}` })
+    })
+    let prepared = false
+    let preparationError: unknown
+    const service = new AgentService({ sessions: contractSessions(), runStore: new InMemoryRunStore(),
+      admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+      contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+      createEngine: () => contractEngine({ start: async input => {
+        try {
+          const context = await input.runtime.prepareContext(new AbortController().signal)
+          assert(context.messages.some(message => message.content?.includes('retrieved durable preference')))
+          assert(context.messages.length <= (pressure === 'items' ? 5 : 64))
+        } catch (error) { preparationError = error; throw error }
+        prepared = true
+        return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: 'done' })
+      } }),
+      createRuntime: async () => Object.freeze({ ...contractRuntime(), groupContext, memoryContext: Object.freeze([memory]) }),
+      now: () => new Date(createdAt), generateId: () => `memory-pressure-${pressure}`
+    })
+    const outcome = await service.handle(Object.freeze({ ...draft, contextBudget: Object.freeze({ ...draft.contextBudget,
+      maxItems: pressure === 'items' ? 5 : 64, maxBytes: pressure === 'bytes' ? 10 * 1024 : 256 * 1024 }) }))
+    assert.ifError(preparationError)
+    assert.equal(outcome.kind, 'completed', outcome.kind === 'failed' ? JSON.stringify(outcome.error) : undefined)
+    assert.equal(prepared, true)
+  }
+})
 
 test('fresh admission maps only the three fixed rejection reasons before run claim', async () => {
   const cases = [

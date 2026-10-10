@@ -485,12 +485,14 @@ function boundedOptionalContext(mandatory, runtimeFacts, history, groupContext, 
     ]);
     while ((current().length > budget.maxItems || encodedContextBytes(current()) > budget.maxBytes) &&
         (memoryGroups.length > 0 || groupGroups.length > 0 || historyGroups.length > 0)) {
-        if (memoryGroups.length > 0)
-            memoryGroups.shift();
-        else if (groupGroups.length > 0)
+        // Apply the same retention order before projection as the Context Planner:
+        // ambient group/history must not erase relevance-filtered memory first.
+        if (groupGroups.length > 0)
             groupGroups.shift();
-        else
+        else if (historyGroups.length > 0)
             historyGroups.shift();
+        else
+            memoryGroups.shift();
     }
     return Object.freeze({
         runtimeFacts: Object.freeze([...runtimeFacts]),
