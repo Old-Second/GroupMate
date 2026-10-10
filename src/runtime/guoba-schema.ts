@@ -147,12 +147,12 @@ export function buildGuobaSchemas ({
     field('bymFuckRecallTime', '反击回复撤回秒数', '反击回复成功发送后等待多少秒撤回。', 'InputNumber', { min: 1, max: 3600 }),
 
     divider('长期记忆'),
-    field('personalMemoryMode', '个人长期记忆模式', '默认关闭。显式模式只允许用户主动管理记忆；影子模式额外记录待评估候选但不用于回答；自动模式只自动批准严格白名单候选。所有模式仍要求每位用户独立 opt-in，修改后需重启。', 'Select', {
+    field('personalMemoryMode', '个人长期记忆模式', '默认关闭。显式模式只允许用户主动管理记忆；影子模式在回复成功后额外抽取候选，候选不用于回答，抽取会产生单独的模型用量。自动批准暂未开放。所有模式仍要求每位用户独立 opt-in，修改后需重启。', 'Select', {
       options: [
         { label: '完全关闭', value: 'off' },
         { label: '仅显式管理', value: 'explicit' },
         { label: '影子候选', value: 'shadow' },
-        { label: '策略自动批准', value: 'automatic' }
+        { label: '自动模式（尚未开放）', value: 'automatic' }
       ]
     }),
     field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入已 opt-in 用户的个人记忆；空列表表示群聊全部不允许，私聊仍受用户独立 opt-in 控制。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),

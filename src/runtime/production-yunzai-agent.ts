@@ -103,6 +103,7 @@ import {
   type OpenAiBillingPort,
   type RuntimePresentationHookFactory,
   type SuggestionGenerationPort,
+  type YunzaiChatControllerOptions,
   type TtsAdministrationPort,
   type YunzaiChatController
 } from './yunzai-chat-controller.js'
@@ -210,6 +211,7 @@ export interface ProductionYunzaiAgentOptions {
     YunzaiAgentServiceBridgeDependencies['personalMemoryRecallSource']
     >
     readonly close: () => Promise<void>
+    readonly postReplyCandidate?: YunzaiChatControllerOptions['postReplyCandidate']
   }>
   readonly providerIsolationIdSourceFactory?: ProviderIsolationIdSourceFactory
   readonly random?: () => number
@@ -890,6 +892,9 @@ export function createProductionYunzaiAgent (
     presenter,
     completionCoordinator,
     diagnostics,
+    ...(options.personalMemoryRuntime?.postReplyCandidate === undefined ? {} : {
+      postReplyCandidate: options.personalMemoryRuntime.postReplyCandidate
+    }),
     now
   }, CONVERSATION_MODE_PREFIXES)
   const bymRequests: BymRequestPreparationPort = Object.freeze({

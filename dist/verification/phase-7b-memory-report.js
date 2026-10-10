@@ -724,7 +724,10 @@ export function phase7bRuntimeMemoryRecallSeamIsExact(value) {
     const productionPath = 'src/runtime/production-yunzai-agent.ts';
     const production = input[productionPath];
     if (production !== undefined && (typeof production !== 'string' ||
-        matchCount(production, /\bpersonalMemoryRuntime\b/g) !== 4 ||
+        ![4, 6].includes(matchCount(production, /\bpersonalMemoryRuntime\b/g)) ||
+        (matchCount(production, /\bpersonalMemoryRuntime\b/g) === 6 && (!/options\.personalMemoryRuntime\?\.postReplyCandidate === undefined/.test(production) ||
+            !/postReplyCandidate: options\.personalMemoryRuntime\.postReplyCandidate/.test(production) ||
+            !/readonly postReplyCandidate\?: YunzaiChatControllerOptions\['postReplyCandidate'\]/.test(production))) ||
         matchCount(production, /\bpersonalMemoryRecallSource\b/g) !== 2 ||
         !/options\.personalMemoryRuntime === undefined/.test(production) ||
         !/personalMemoryRecallSource: options\.personalMemoryRuntime\.recallSource/.test(production) ||

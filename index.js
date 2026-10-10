@@ -1405,7 +1405,26 @@ try {
     groupAllowlist: () => Config.personalMemoryGroupAllowlist,
     recallMaxItems: () => Config.personalMemoryRecallMaxItems,
     recallMaxTokens: () => Config.personalMemoryRecallMaxTokens,
-    recallTimeoutMs: () => Config.personalMemoryRecallTimeoutMs
+    recallTimeoutMs: () => Config.personalMemoryRecallTimeoutMs,
+    candidateBot: accountId => botPicker.pick(accountId),
+    candidateModel: Object.freeze({
+      adapter: modelPort,
+      model: () => normalizedText(Config.model, 128),
+      resolveModelPrice: (model, now) => resolveOpenAICompatibleModelRuntimeConfig({
+        openAiCompatibilityProfile: Config.openAiCompatibilityProfile
+      }).profile.resolveModelPrice(model, now),
+      onUsage: (usage, cost) => runtimeLogger.info(Object.freeze({
+        event: 'groupmate.personal_memory.extraction_usage',
+        purpose: 'shadow_candidate',
+        inputTokens: usage?.inputTokens ?? null,
+        outputTokens: usage?.outputTokens ?? null,
+        cacheHitTokens: usage?.inputCache?.hitTokens ?? null,
+        cacheMissTokens: usage?.inputCache?.missTokens ?? null,
+        referenceCostKind: cost.kind,
+        referenceCostPicoYuan: cost.kind === 'unavailable' ? null : cost.picoYuan.toString(),
+        catalogVersion: cost.catalogVersion
+      }))
+    })
   })
   if (personalMemoryRuntime !== null) {
     configureProductionPersonalMemoryOperationsPortV1(personalMemoryRuntime.operations)

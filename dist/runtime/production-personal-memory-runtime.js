@@ -21,6 +21,7 @@ import { createSqliteMemoryCanonicalRehydratorV1 } from '../agent/memory/sqlite-
 import { bindYunzaiPersonalMemoryRecallSourceV1, createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js';
 import { createYunzaiPersonalMemoryControllerV1 } from './yunzai-personal-memory-controller.js';
 import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js';
+import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js';
 const CANONICAL_FILE = 'personal-memory.sqlite';
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite';
 const EXPORT_DIRECTORY = 'exports';
@@ -327,12 +328,12 @@ function createOperationsPort(options) {
                 sqliteFileBytes: fileBytes(options.lexicalLocation),
                 lagRecords: Math.max(0, activeRecords - lexicalRecords)
             }),
-            extraction: Object.freeze({
+            extraction: Object.freeze(options.shadow === undefined ? {
                 status: pendingRecords === 0 ? 'idle' : 'paused',
                 pendingRecords,
                 deadLetterRecords: 0,
                 logicalBytes: integerRow(extraction?.queued_logical_bytes)
-            }),
+            } : await options.shadow.inspect()),
             hotCache: Object.freeze({ status: 'disabled', records: 0, logicalBytes: 0 }),
             semantic: Object.freeze({
                 embedding: 'disabled', vector: 'disabled', rerank: 'disabled'
@@ -455,6 +456,7 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
     const lexicalLocation = path.join(options.storageDirectory, LEXICAL_FILE);
     let canonical = null;
     let lexical = null;
+    let shadow;
     try {
         canonical = openSqliteMemoryDatabaseV3({
             location: canonicalLocation,
@@ -547,12 +549,22 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             botInstanceId: options.botInstanceId,
             source
         });
+        shadow = options.candidateModel === undefined ? undefined : createProductionShadowMemoryV1({
+            database: canonical.database,
+            queueLocation: path.join(options.storageDirectory, 'personal-memory-extraction.sqlite'),
+            botInstanceId: options.botInstanceId, mode: options.deploymentMode,
+            groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
+            enrollment, lifecycle, model: options.candidateModel, now: nowIso,
+            ...(options.candidateBot === undefined ? {} : { bot: options.candidateBot })
+        });
+        await shadow?.resume();
         const operations = createOperationsPort({
             canonical: canonical.database,
             canonicalLocation,
             lexical: lexical.database,
             lexicalLocation,
-            projector
+            projector,
+            ...(shadow === undefined ? {} : { shadow })
         });
         const commands = createYunzaiPersonalMemoryControllerV1({
             botInstanceId: options.botInstanceId,
@@ -564,7 +576,12 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             control,
             exportDelivery: exportDeliveryRuntime.delivery,
             rebuildLexical: async () => await projector.rebuild(),
-            completeNamespaceDeletion: deletionCleanup.resume
+            completeNamespaceDeletion: async (namespace) => {
+                if (namespace !== undefined)
+                    await shadow?.clearNamespace(namespace);
+                return await deletionCleanup.resume(namespace);
+            },
+            ...(shadow === undefined ? {} : { clearCandidateJobs: shadow.clearNamespace })
         });
         let closed = false;
         return Object.freeze({
@@ -581,10 +598,14 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
                 execute: async (request, signal) => await operations.execute(request, signal)
             }),
             commands,
+            ...(shadow === undefined ? {} : {
+                postReplyCandidate: shadow.postReplyCandidate, waitForCandidateIdle: shadow.waitForIdle
+            }),
             close: async () => {
                 if (closed)
                     return;
                 closed = true;
+                await shadow?.close();
                 await projector.waitForIdle().catch(() => undefined);
                 exportDeliveryRuntime.close();
                 lexical?.close();
@@ -593,6 +614,10 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
         });
     }
     catch (error) {
+        try {
+            await shadow?.close();
+        }
+        catch { }
         try {
             lexical?.close();
         }

@@ -624,6 +624,9 @@ export function createProductionYunzaiAgent(options) {
         presenter,
         completionCoordinator,
         diagnostics,
+        ...(options.personalMemoryRuntime?.postReplyCandidate === undefined ? {} : {
+            postReplyCandidate: options.personalMemoryRuntime.postReplyCandidate
+        }),
         now
     }, CONVERSATION_MODE_PREFIXES);
     const bymRequests = Object.freeze({

@@ -429,6 +429,8 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
             await request.replyText(mutationFailureText(result));
             return;
         }
+        if (operation === 'enrollment.optOut')
+            await options.clearCandidateJobs?.(auth.namespace);
         await request.replyText(operation === 'enrollment.optIn'
             ? '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
             : `个人长期记忆已关闭。${result.notices.join('')}`);

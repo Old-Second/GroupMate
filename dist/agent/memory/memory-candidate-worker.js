@@ -398,7 +398,7 @@ export function createMemoryCandidateWorkerV1(optionsValue) {
                     extractorVersion: extracted.extractorVersion,
                     extractorModelProfile: extracted.modelProfile,
                     approvalMode,
-                    submittedAt: now
+                    submittedAt: readNow(options.now)
                 });
                 const result = parseSubmissionResult(await options.sink.submit(submission, boundedSignal));
                 if (result.status === 'aborted')
