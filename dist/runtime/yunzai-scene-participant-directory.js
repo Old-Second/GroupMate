@@ -281,12 +281,17 @@ export function createYunzaiSceneParticipantDirectoryV1() {
                 groupLifecycleId: lifecycle,
                 groupName: text(event.group?.name ?? event.group_name)
             });
+            const refreshed = input.refreshCurrentRole === true
+                ? await refreshMember(event, groupId, currentUserId, signal)
+                : null;
+            if (input.refreshCurrentRole === true && refreshed === null)
+                return null;
             const current = createSceneParticipantV1(Object.freeze({
-                identity: identityInput(event.sender ?? {}, currentUserId, 'current_event'),
+                identity: identityInput(refreshed ?? event.sender ?? {}, currentUserId, refreshed === null ? 'current_event' : 'member_refresh'),
                 scene,
                 membership: Object.freeze({
                     state: 'verified_present',
-                    source: 'current_event',
+                    source: refreshed === null ? 'current_event' : 'member_refresh',
                     observedAt: input.observedAt
                 })
             }));

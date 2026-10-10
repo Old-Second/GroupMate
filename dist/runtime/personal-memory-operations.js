@@ -52,7 +52,8 @@ function actionValue(value) {
     }
 }
 function parseStatus(value, mode) {
-    const input = exactRecord(value, STATUS_FIELDS);
+    const withRetention = value !== null && typeof value === 'object' && Object.hasOwn(value, 'retention');
+    const input = exactRecord(value, withRetention ? [...STATUS_FIELDS, 'retention'] : STATUS_FIELDS);
     if (input.schemaVersion !== 1)
         throw new TypeError('长期记忆运维数据无效。');
     const status = enumValue(input.status, ['ready', 'degraded', 'maintenance']);
@@ -88,6 +89,9 @@ function parseStatus(value, mode) {
     if (semanticInput.embedding !== 'disabled' || semanticInput.vector !== 'disabled' ||
         semanticInput.rerank !== 'disabled')
         throw new TypeError('长期记忆运维数据无效。');
+    const retained = withRetention ? exactRecord(input.retention, ['status', 'running', 'lastProcessedRecords']) : null;
+    if (retained !== null && typeof retained.running !== 'boolean')
+        throw new TypeError('长期记忆运维数据无效。');
     return Object.freeze({
         schemaVersion: 1,
         status,
@@ -96,6 +100,10 @@ function parseStatus(value, mode) {
         lexical,
         extraction,
         hotCache,
+        ...(retained === null ? {} : { retention: Object.freeze({
+                status: enumValue(retained.status, ['idle', 'completed', 'degraded']),
+                running: retained.running, lastProcessedRecords: counter(retained.lastProcessedRecords)
+            }) }),
         semantic: Object.freeze({
             embedding: 'disabled',
             vector: 'disabled',
@@ -192,6 +200,7 @@ export function formatPersonalMemoryOperationsStatusV1(value) {
         `候选队列 ${value.extraction.pendingRecords} 条`,
         `死信 ${value.extraction.deadLetterRecords} 条`,
         `热缓存 ${value.hotCache.status}/${value.hotCache.records} 条`,
+        ...(value.retention === undefined ? [] : [`保留清理 ${value.retention.status}/${value.retention.lastProcessedRecords} 条`]),
         '语义外发关闭'
     ].join('；');
 }

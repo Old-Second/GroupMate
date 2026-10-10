@@ -232,6 +232,7 @@ test('production personal memory runtime bootstraps, reports and reopens bounded
       logicalBytes: 0
     },
     hotCache: { status: 'disabled', records: 0, logicalBytes: 0 },
+    retention: { status: 'completed', running: false, lastProcessedRecords: 0 },
     semantic: { embedding: 'disabled', vector: 'disabled', rerank: 'disabled' }
   })
   assert.deepEqual(await first.operations.execute({

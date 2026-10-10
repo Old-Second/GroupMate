@@ -18,6 +18,8 @@ export interface YunzaiSceneParticipantDirectoryInputV1 {
   readonly accountId: string
   readonly observedAt: string
   readonly strictTargetUserIds?: readonly string[]
+  /** Group governance must refresh the current role, never trust an event's cached role. */
+  readonly refreshCurrentRole?: boolean
 }
 
 export interface YunzaiPersonalMemoryRecallInputV1 {
@@ -318,12 +320,17 @@ YunzaiSceneParticipantDirectoryInputV1
         groupLifecycleId: lifecycle,
         groupName: text(event.group?.name ?? event.group_name)
       })
+      const refreshed = input.refreshCurrentRole === true
+        ? await refreshMember(event, groupId, currentUserId, signal)
+        : null
+      if (input.refreshCurrentRole === true && refreshed === null) return null
       const current = createSceneParticipantV1(Object.freeze({
-        identity: identityInput(event.sender ?? {}, currentUserId, 'current_event'),
+        identity: identityInput(refreshed ?? event.sender ?? {}, currentUserId,
+          refreshed === null ? 'current_event' : 'member_refresh'),
         scene,
         membership: Object.freeze({
           state: 'verified_present' as const,
-          source: 'current_event' as const,
+          source: refreshed === null ? 'current_event' as const : 'member_refresh' as const,
           observedAt: input.observedAt
         })
       }))

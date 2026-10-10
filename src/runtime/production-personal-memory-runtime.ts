@@ -72,6 +72,9 @@ import {
 } from './yunzai-personal-memory-controller.js'
 import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js'
 import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js'
+import { createGroupMemoryV1 } from './GroupMemory.js'
+import { parseMemoryRetrievalResultV2, type MemoryRetrievalCandidateV2 } from '../agent/memory/memory-retrieval.js'
+import { createProductionMemoryRetentionV1 } from './ProductionMemoryRetention.js'
 
 const CANONICAL_FILE = 'personal-memory.sqlite'
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite'
@@ -569,6 +572,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
   let canonical: SqliteMemoryDatabaseV1 | null = null
   let lexical: SqliteMemoryLexicalDatabaseV1 | null = null
   let shadow: ReturnType<typeof createProductionShadowMemoryV1> | undefined
+  let retention: ReturnType<typeof createProductionMemoryRetentionV1> | undefined
   try {
     canonical = openSqliteMemoryDatabaseV3({
       location: canonicalLocation,
@@ -590,6 +594,10 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       now: nowIso, rebuildLexical: async () => await projector.rebuild()
     })
     if (!deletionCleanup.hasPending() || !await deletionCleanup.resume()) await projector.rebuild()
+    retention = createProductionMemoryRetentionV1({ database: canonical.database,
+      botInstanceId: options.botInstanceId, now: nowIso,
+      rebuildLexical: async () => await projector.rebuild(), resumeDeletion: deletionCleanup.resume })
+    await retention.run()
     const enrollmentAdapter = createSqlitePersonalMemoryEnrollmentAdapterV1({
       database: canonical.database,
       now: nowIso
@@ -707,33 +715,71 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       },
       ...(shadow === undefined ? {} : { clearCandidateJobs: shadow.clearNamespace })
     })
+    const groupMemory = createGroupMemoryV1({
+      botInstanceId: options.botInstanceId, database: canonical.database,
+      enabled: () => ['explicit', 'shadow', 'automatic'].includes(options.deploymentMode()),
+      groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist), now: nowIso,
+      lifecycle, control, export: exportPort, exportDelivery: exportDeliveryRuntime.delivery,
+      retriever: createLexicalMemoryRetrieverV2({ index: lexicalIndex,
+        canonical: createSqliteMemoryCanonicalRehydratorV1({ database: canonical.database, now: nowIso }), now: nowIso }),
+      rebuildLexical: async () => await projector.rebuild(),
+      completeNamespaceDeletion: deletionCleanup.resume,
+      recallLimits: () => ({
+        maxCandidates: boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS),
+        maxTokens: boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS), maxBytes: 32768
+      }),
+      recallTimeoutMs: () => boundedInteger(options.recallTimeoutMs, DEFAULT_RECALL_TIMEOUT_MS, MAX_RECALL_TIMEOUT_MS)
+    })
     let closed = false
+    retention.start()
     return Object.freeze({
       recallSource: Object.freeze({
-        recall: async (input: unknown, signal?: AbortSignal) => await recallSource.recall(
-          input as Parameters<typeof recallSource.recall>[0],
-          signal
-        )
+        recall: async (input: unknown, signal?: AbortSignal) => {
+          const typed = input as Parameters<typeof recallSource.recall>[0]
+          const personal = parseMemoryRetrievalResultV2(await recallSource.recall(typed, signal))
+          if (typed.event.isGroup !== true) return personal
+          const group = await groupMemory.recall(typed, signal)
+          if (group.status !== 'completed' || group.candidates.length === 0) return personal
+          if (personal.status !== 'completed') return group
+          const candidates: MemoryRetrievalCandidateV2[] = []
+          let tokens = 0
+          let bytes = 0
+          const maxItems = boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS)
+          const maxTokens = boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS)
+          for (const candidate of [...group.candidates, ...personal.candidates]) {
+            const size = Buffer.byteLength(JSON.stringify(candidate))
+            if (candidates.length >= maxItems || tokens + candidate.estimatedTokens > maxTokens || bytes + size > 32768) continue
+            candidates.push(candidate)
+            tokens += candidate.estimatedTokens
+            bytes += size
+          }
+          return parseMemoryRetrievalResultV2({ ...personal, candidates })
+        }
       }),
       operations: Object.freeze({
         inspect: async (signal?: AbortSignal) => {
           const status = await operations.inspect(signal)
-          return status.status === 'ready' && deletionCleanup.hasPending()
+          const observed = status.status === 'ready' && deletionCleanup.hasPending()
             ? Object.freeze({ ...status, status: 'maintenance' as const })
             : status
+          return Object.freeze({ ...observed, retention: retention?.inspect() })
         },
         execute: async (request: unknown, signal?: AbortSignal) => await operations.execute(
           request as PersonalMemoryOperationsRequestV1,
           signal
         )
       }),
-      commands,
+      commands: Object.freeze({
+        handle: async (request: Parameters<typeof commands.handle>[0]) => /^#群记忆(?:\s|$)/u.test(request.text)
+          ? await groupMemory.commands.handle(request) : await commands.handle(request)
+      }),
       ...(shadow === undefined ? {} : {
         postReplyCandidate: shadow.postReplyCandidate, waitForCandidateIdle: shadow.waitForIdle
       }),
       close: async () => {
         if (closed) return
         closed = true
+        await retention?.close()
         await shadow?.close()
         await projector.waitForIdle().catch(() => undefined)
         exportDeliveryRuntime.close()
@@ -742,6 +788,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       }
     })
   } catch (error) {
+    try { await retention?.close() } catch {}
     try { await shadow?.close() } catch {}
     try { lexical?.close() } catch {}
     try { canonical?.close() } catch {}
