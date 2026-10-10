@@ -589,7 +589,8 @@ function modelMessageFor (item: ContextItem, referenceAtMs: number): ModelMessag
       ? Object.freeze({ role: 'user', content })
       : Object.freeze({ role: 'user', content, imageUrls })
   }
-  if (item.message.role === 'assistant') return Object.freeze({ role: 'assistant', content })
+  if (item.message.role === 'assistant') return Object.freeze({ role: 'assistant', content,
+    ...(item.assistantState === undefined ? {} : { providerState: item.assistantState }) })
   throw new AgentError({
     code: 'invalid_session',
     stage: 'context.session',
@@ -703,7 +704,8 @@ function sessionItems (
       return [Object.freeze({
         id: `session:${item.message.id}`,
         source: 'session_history' as const,
-        message: item.message
+        message: item.message,
+        ...(item.providerState === undefined ? {} : { assistantState: item.providerState })
       })]
     }
     return item.messages.map((message, index) => protocolMessageItem(item, message, index))
@@ -879,7 +881,8 @@ function appendTerminalTurn (
     ids.add(request.message.id)
   }
   if (result.output !== null && !ids.has(result.output.id)) {
-    appended.push(Object.freeze({ kind: 'message', message: result.output }))
+    appended.push(Object.freeze({ kind: 'message', message: result.output,
+      ...(result.assistantState === undefined ? {} : { providerState: result.assistantState }) }))
   }
   const messages = [...existing, ...appended].slice(-128)
   let state: AgentSessionState | undefined

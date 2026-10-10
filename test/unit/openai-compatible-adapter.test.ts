@@ -180,11 +180,11 @@ test('vision messages encode external image URLs as OpenAI-compatible content bl
     { type: 'text', text: '这张图里有什么？' },
     {
       type: 'image_url',
-      image_url: { url: 'https://cdn.example.test/one.jpg' }
+      image_url: { url: 'https://cdn.example.test/one.jpg', detail: 'low' }
     },
     {
       type: 'image_url',
-      image_url: { url: 'http://cdn.example.test/two.webp' }
+      image_url: { url: 'http://cdn.example.test/two.webp', detail: 'low' }
     }
   ])
 })
@@ -374,7 +374,7 @@ test('DeepSeek reserves user_id from reasoning extensions and metadata cannot ov
   assert.equal(attempts, 0)
 })
 
-test('DeepSeek non-streaming final turns expose display reasoning without provider state', async () => {
+test('DeepSeek non-streaming final turns retain complete provider reasoning alongside display reasoning', async () => {
   const response = JSON.stringify({
     id: 'fixture-deepseek-final',
     choices: [{
@@ -398,7 +398,7 @@ test('DeepSeek non-streaming final turns expose display reasoning without provid
     text: '最终轮思考',
     truncated: false
   })
-  assert.equal(turn.providerState, undefined)
+  assert.deepEqual(turn.providerState?.payload, { reasoningContent: '  最终轮思考  ' })
 })
 
 test('DeepSeek non-streaming turns decode input cache usage', async () => {

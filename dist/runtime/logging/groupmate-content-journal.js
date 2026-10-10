@@ -31,6 +31,17 @@ export function createGroupMateContentJournal(diskLog) {
         recordOutbound(event) {
             recordProjection('outbound', () => projectOutboundJournalEvent(event));
         },
+        recordNetworkDiagnostic(event) {
+            if (!['image_search', 'image_fetch', 'other'].includes(event.tag) ||
+                !['dns', 'headers', 'body', 'complete'].includes(event.phase) ||
+                !['success', 'failure', 'timeout', 'cancelled'].includes(event.result) ||
+                ![event.durationMs, event.timeoutMs, event.redirects].every(value => Number.isSafeInteger(value) && value >= 0))
+                return;
+            safeRecordEvent(Object.freeze({ type: 'tool.network', payload: Object.freeze({
+                    tag: event.tag, phase: event.phase, result: event.result,
+                    durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects
+                }) }));
+        },
         async drain() {
             try {
                 await diskLog.drain();

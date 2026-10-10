@@ -1000,6 +1000,22 @@ test('rejects structural credential and configuration extras with fixed failure 
   }
 })
 
+test('model and network diagnostics keep a typed projection when callers include unrelated fields', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const diagnostic = { type: 'model.resolution' as const, occurredAt: FIXED_TIMESTAMP,
+    runRef: '2'.repeat(32), requestRef: '1'.repeat(32),
+    capabilitySource: 'profile' as const, priceStatus: 'available' as const }
+  journal.recordRunEvent(diagnostic)
+  journal.recordRunEvent({ ...diagnostic, config: 'fixture-secret' } as RunContentJournalEvent)
+  journal.recordNetworkDiagnostic?.({ tag: 'image_fetch', phase: 'body', result: 'timeout',
+    durationMs: 8000, timeoutMs: 8000, redirects: 1, Authorization: 'fixture-secret'
+  } as Parameters<NonNullable<GroupMateContentJournal['recordNetworkDiagnostic']>>[0])
+  assert.equal(events[0]?.type, 'model.resolution')
+  assert.equal(events[1]?.type, 'groupmate.content_journal.projection_failure')
+  assert.equal(events[2]?.type, 'tool.network')
+  assert.doesNotMatch(JSON.stringify(events), /fixture-secret|Authorization|config/)
+})
+
 test('rejects unbounded hostile and binary generic content with fixed failure evidence', () => {
   const { journal, events } = inMemoryContentJournal()
   const invalidRequests: ModelRequest[] = []

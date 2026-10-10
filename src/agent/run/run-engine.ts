@@ -123,6 +123,7 @@ import {
 } from './run-trace.js'
 import { appendRunReasoningSegment } from './run-reasoning-segment.js'
 import { recordRunUsage } from './run-usage.js'
+import { calculateModelCost, type ModelCost } from '../model/model-cost.js'
 import { buildPresentationTrace } from './presentation-trace-builder.js'
 import {
   applyToolPreflight,
@@ -281,6 +282,7 @@ interface KnownProviderFailure {
 }
 
 interface ModelAttemptResult extends ModelAttemptState {
+  readonly requestStartedAt: string
   readonly turn: ModelTurn
   readonly previousProviderUsage: Pick<
     RunObservationCountersV1,
@@ -811,6 +813,7 @@ function terminalResult (
       runRef: checkpoint.runRef,
       completion: checkpoint.completion,
       output: checkpoint.output,
+      ...(checkpoint.terminalProviderState === undefined ? {} : { assistantState: checkpoint.terminalProviderState }),
       presentationTrace: buildPresentationTrace({
         reasoningSegments: checkpoint.reasoningSegments,
         toolLedgers: checkpoint.toolLedgers,
@@ -1390,9 +1393,11 @@ export class RunEngine {
         : { override: input.modelCapabilityOverride }),
       now: snapshotAt
     })
-    const modelPrice = modelCapability.priceCatalogVersion === null
-      ? null
-      : this.#profile.resolveModelPrice(model.model, snapshotAt) ?? null
+    const modelPrice = this.#profile.resolveModelPrice(model.model, snapshotAt) ?? null
+    this.#recordContentJournal(() => Object.freeze({
+      type: 'model.resolution', occurredAt: createdAt, runRef: input.runRef, requestRef: input.requestRef,
+      capabilitySource: modelCapability.source, priceStatus: modelPrice === null ? 'missing_or_expired' : 'available'
+    }))
     const checkpoint = createInitialRunCheckpoint({
       profileId: this.#profile.id,
       profileVersion: this.#profile.version,
@@ -1863,6 +1868,10 @@ export class RunEngine {
       signal
     )
     this.#validatePlannedContext(checkpoint, planned)
+    this.#recordContentJournal(() => Object.freeze({
+      type: 'context.planned', occurredAt: this.#timestamp(), runRef: checkpoint.runRef,
+      requestRef: checkpoint.requestRef, plan: planned.plan
+    }))
     return await this.#commit(checkpoint, 'preparing', {
       messages: Object.freeze([...planned.messages]),
       estimatedInputTokens: planned.estimatedInputTokens,
@@ -1938,6 +1947,10 @@ export class RunEngine {
       ...checkpoint.messages,
       ...checkpoint.pendingContextMessages
     ])
+    this.#recordContentJournal(() => Object.freeze({
+      type: 'context.planned', occurredAt: this.#timestamp(), runRef: checkpoint.runRef,
+      requestRef: checkpoint.requestRef, plan: planned.plan
+    }))
     const correctionPrefix = Object.freeze(planned.messages.slice(
       0,
       expectedCorrectionPrefix.length
@@ -2504,6 +2517,7 @@ export class RunEngine {
           previousProviderUsage: reservedDispatch.previousUsage,
           attemptKind,
           activeRuntimeMs,
+          requestStartedAt: current.updatedAt,
           occurredAt: completionOccurredAt,
           budgetError: accounted.budgetError
         })
@@ -2539,7 +2553,21 @@ export class RunEngine {
     let journalTurn: ModelTurn | null = null
     try {
       const usage = detachModelUsage(modelTurnUsageDataProperty(attempted.turn))
-      const recordedUsage = recordRunUsage(checkpoint.usage, usage)
+      const startPrice = this.#profile.resolveModelPrice(checkpoint.model.model, new Date(attempted.requestStartedAt))
+      const endPrice = this.#profile.resolveModelPrice(checkpoint.model.model, new Date(attempted.occurredAt))
+      // The public API has no billing timestamp or per-request debited amount.
+      // Crossing a tariff boundary is bounded using the greater rate, rather
+      // than claiming the whole response was billed at the run's start price.
+      const changed = startPrice?.catalogVersion !== endPrice?.catalogVersion
+      const price = startPrice === undefined || endPrice === undefined ? undefined
+        : endPrice.outputPicoYuanPerMillionTokens > startPrice.outputPicoYuanPerMillionTokens
+          ? endPrice : startPrice
+      const calculated = calculateModelCost(price, usage)
+      const requestCost: ModelCost = changed && calculated.kind === 'exact'
+        ? Object.freeze({ ...calculated, kind: 'upper_bound' }) : calculated
+      const recordedUsage = recordRunUsage(checkpoint.usage, usage,
+        checkpoint.modelPrice === null && checkpoint.usage.cost === undefined && price === undefined
+          ? undefined : requestCost)
       const accounted = this.#recordProviderUsage(
         this.#runBudget(checkpoint),
         attempted.counters,
@@ -2788,6 +2816,7 @@ export class RunEngine {
           changes: Object.freeze({
             ...common,
             output,
+            ...(rawProviderState === undefined ? {} : { terminalProviderState: parseProviderTurnState(rawProviderState) }),
             completion
           }),
           drafts: Object.freeze([

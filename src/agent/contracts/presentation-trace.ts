@@ -194,7 +194,7 @@ function boundedCatalogVersion (value: unknown, label: string): string {
   return value
 }
 
-function parsePresentationCost (value: unknown): PresentationModelCostV1 {
+export function parsePresentationCost (value: unknown): PresentationModelCostV1 {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
     utilTypes.isProxy(value)) {
     throw new TypeError('presentation usage cost is invalid')
@@ -272,8 +272,7 @@ export function parsePresentationUsageSummary (
   const cost = parsePresentationCost(usage.cost)
   if ((cost.kind === 'exact' &&
       (usage.availability !== 'complete' || !usage.cacheUsageComplete)) ||
-    (cost.kind === 'upper_bound' &&
-      (usage.availability !== 'complete' || usage.cacheUsageComplete)) ||
+    (cost.kind === 'upper_bound' && usage.availability !== 'complete') ||
     (cost.kind === 'unavailable' && usage.availability === 'complete' &&
       usage.cacheUsageComplete && cost.catalogVersion !== null)) {
     throw new TypeError('presentation usage cost state is inconsistent')

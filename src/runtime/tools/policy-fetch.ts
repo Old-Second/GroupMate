@@ -31,6 +31,7 @@ export interface PolicyTransport {
 }
 
 export interface PolicyRequest {
+  readonly diagnosticTag?: 'image_search' | 'image_fetch'
   readonly url: string
   readonly policy: NetworkRequestPolicy
   readonly timeoutMs: number
@@ -49,8 +50,18 @@ export interface PolicyResponse {
 }
 
 export interface PolicyFetchOptions {
+  readonly onDiagnostic?: (diagnostic: PolicyNetworkDiagnostic) => void
   readonly networkPolicy?: NetworkPolicy
   readonly transport?: PolicyTransport
+}
+
+export interface PolicyNetworkDiagnostic {
+  readonly tag: 'image_search' | 'image_fetch' | 'other'
+  readonly phase: 'dns' | 'headers' | 'body' | 'complete'
+  readonly result: 'success' | 'failure' | 'timeout' | 'cancelled'
+  readonly durationMs: number
+  readonly timeoutMs: number
+  readonly redirects: number
 }
 
 const redirectStatuses = new Set([301, 302, 303, 307, 308])
@@ -149,10 +160,12 @@ export function createNodeFetchTransport (): PolicyTransport {
 export class PolicyFetch {
   readonly #networkPolicy: NetworkPolicy
   readonly #transport: PolicyTransport
+  readonly #onDiagnostic?: PolicyFetchOptions['onDiagnostic']
 
   constructor (options: PolicyFetchOptions = {}) {
     this.#networkPolicy = options.networkPolicy ?? new NetworkPolicy()
     this.#transport = options.transport ?? createNodeFetchTransport()
+    this.#onDiagnostic = options.onDiagnostic
   }
 
   async request (request: PolicyRequest): Promise<PolicyResponse> {
@@ -160,6 +173,7 @@ export class PolicyFetch {
       throw new TypeError('network timeout is invalid')
     }
     if (cancelled(request.signal)) throw new NetworkPolicyError('network_cancelled')
+    let headers = normalizedHeaders(request.headers)
     const controller = new AbortController()
     let timedOut = false
     const onCallerAbort = (): void => controller.abort()
@@ -180,12 +194,16 @@ export class PolicyFetch {
     }
     let method = (request.method ?? 'GET').toUpperCase()
     let body = request.body
-    let headers = normalizedHeaders(request.headers)
     let redirects = 0
+    const startedAt = performance.now()
+    let phase: PolicyNetworkDiagnostic['phase'] = 'dns'
+    let result: PolicyNetworkDiagnostic['result'] = 'failure'
 
     try {
       while (true) {
+        phase = 'dns'
         const authorized = await this.#networkPolicy.authorize(currentUrl, request.policy, controller.signal)
+        phase = 'headers'
         let transportResponse: PolicyTransportResponse
         try {
           transportResponse = await withAbort(
@@ -243,6 +261,7 @@ export class PolicyFetch {
         }
 
         const chunks: Uint8Array[] = []
+        phase = 'body'
         let bytes = 0
         const iterator = transportResponse.body[Symbol.asyncIterator]()
         while (true) {
@@ -271,6 +290,8 @@ export class PolicyFetch {
           output.set(chunk, offset)
           offset += chunk.byteLength
         }
+        phase = 'complete'
+        result = 'success'
         return Object.freeze({
           status: transportResponse.status,
           statusText: transportResponse.statusText,
@@ -280,6 +301,7 @@ export class PolicyFetch {
         })
       }
     } catch (error) {
+      result = timedOut ? 'timeout' : cancelled(request.signal) ? 'cancelled' : 'failure'
       if (error instanceof NetworkPolicyError) {
         if (error.code === 'network_cancelled' && timedOut) throw new NetworkPolicyError('network_timeout')
         if (error.code === 'network_cancelled' && cancelled(request.signal)) throw error
@@ -291,6 +313,13 @@ export class PolicyFetch {
     } finally {
       clearTimeout(timer)
       request.signal?.removeEventListener('abort', onCallerAbort)
+      try {
+        this.#onDiagnostic?.(Object.freeze({
+          tag: request.diagnosticTag ?? 'other', phase, result,
+          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          timeoutMs: request.timeoutMs, redirects
+        }))
+      } catch {}
     }
   }
 }

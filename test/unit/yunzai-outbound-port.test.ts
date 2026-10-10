@@ -79,6 +79,24 @@ test('outbound normalizes a signed NapCat numeric message ID and recalls with it
   assert.deepEqual(fixture.recalls, [-12_345_678])
 })
 
+test('TRSS delete_msg response arrays confirm recall only when every acknowledgement succeeds', async () => {
+  for (const [response, expected] of [
+    [[{ status: 'ok', retcode: 0, data: null }], { kind: 'recalled' }],
+    [[{ status: 'ok', retcode: 0, data: {} }, { status: 'ok', retcode: 0, data: null }], { kind: 'recalled' }],
+    [[{ status: 'failed', retcode: 100, data: null }], { kind: 'failed_definite', code: 'host_rejected' }],
+    [[{ status: 'ok', retcode: 0, data: null }, null], { kind: 'outcome_unknown', code: 'unknown_host_result' }],
+    [[], { kind: 'outcome_unknown', code: 'unknown_host_result' }],
+    [[{ status: 'ok', retcode: '0', data: null }], { kind: 'outcome_unknown', code: 'unknown_host_result' }]
+  ] as const) {
+    const fixture = hostTarget([{ message_id: 'synthetic-recall' }], [response])
+    const port = await createYunzaiOutboundPortFactory({ forTarget: async () => fixture.target }).forTarget(groupUserTarget)
+    const delivered: DeliveryResult<'text'> = await port.deliver(textPart, 1)
+    if (delivered.kind !== 'sent') throw new Error('test delivery did not succeed')
+    assert.deepEqual(await port.recall(delivered.receipt), expected)
+    assert.equal(fixture.recalls.length, 1)
+  }
+})
+
 test('Yunzai host boundary projects a successful OneBot proxy without reading virtual receipt fields', async () => {
   const virtualReads: PropertyKey[] = []
   const envelope = new Proxy(

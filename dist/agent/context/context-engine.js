@@ -73,7 +73,9 @@ function invalidContextInput(reason) {
     });
 }
 function validateInputContainers(input) {
-    const ordinary = (item, source) => (item.source === source && item.memoryRecord === undefined);
+    const ordinary = (item, source) => (item.source === source && item.memoryRecord === undefined &&
+        (item.assistantState === undefined ||
+            (source === 'session_history' && item.message.role === 'assistant')));
     const valid = input.systemInstructions.every(item => ordinary(item, 'system_instruction')) &&
         input.runtimeFacts.every(item => ordinary(item, 'runtime_fact')) &&
         input.sessionHistory.every(item => ordinary(item, 'session_history')) &&
@@ -227,7 +229,8 @@ function ordinaryModelMessage(item, referenceAtMs) {
         return Object.freeze({ role: 'system', content });
     }
     if (item.source === 'session_history' && item.message.role === 'assistant') {
-        return Object.freeze({ role: 'assistant', content });
+        return Object.freeze({ role: 'assistant', content,
+            ...(item.assistantState === undefined ? {} : { providerState: item.assistantState }) });
     }
     const imageUrls = modelImageUrls(item.message, referenceAtMs);
     return imageUrls.length === 0

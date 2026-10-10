@@ -1,3 +1,4 @@
+import { parsePresentationCost } from '../contracts/presentation-trace.js';
 const USAGE_KEYS = Object.freeze([
     'schemaVersion',
     'availability',
@@ -29,7 +30,8 @@ function safeSum(left, right) {
 export function parseRunUsageSummary(value) {
     const input = record(value);
     const keys = Object.keys(input);
-    if (keys.length !== USAGE_KEYS.length || keys.some(key => !USAGE_KEYS.includes(key)) ||
+    if (USAGE_KEYS.some(key => !keys.includes(key)) ||
+        keys.some(key => !USAGE_KEYS.includes(key) && key !== 'cost') ||
         input.schemaVersion !== 1 ||
         (input.availability !== 'complete' && input.availability !== 'partial' &&
             input.availability !== 'unavailable') ||
@@ -67,7 +69,8 @@ export function parseRunUsageSummary(value) {
         cacheMissTokens: input.cacheMissTokens,
         turnsWithUsage: input.turnsWithUsage,
         turnsWithoutUsage: input.turnsWithoutUsage,
-        cacheUsageComplete: input.cacheUsageComplete
+        cacheUsageComplete: input.cacheUsageComplete,
+        ...(input.cost === undefined ? {} : { cost: parsePresentationCost(input.cost) })
     });
 }
 export function createInitialRunUsageSummary() {
@@ -107,14 +110,16 @@ function parseTurnUsage(value) {
     }
     return value;
 }
-export function recordRunUsage(current, usage) {
+export function recordRunUsage(current, usage, requestCost) {
     const parsed = parseRunUsageSummary(current);
+    const cost = requestCost === undefined ? parsed.cost : accumulateCost(parsed, requestCost);
     if (usage === undefined) {
         return parseRunUsageSummary({
             ...parsed,
             availability: parsed.availability === 'unavailable' ? 'unavailable' : 'partial',
             turnsWithoutUsage: safeSum(parsed.turnsWithoutUsage, 1),
-            cacheUsageComplete: false
+            cacheUsageComplete: false,
+            ...(cost === undefined ? {} : { cost })
         });
     }
     const turn = parseTurnUsage(usage);
@@ -126,6 +131,24 @@ export function recordRunUsage(current, usage) {
         cacheHitTokens: safeSum(parsed.cacheHitTokens, turn.inputCache?.hitTokens ?? 0),
         cacheMissTokens: safeSum(parsed.cacheMissTokens, turn.inputCache?.missTokens ?? 0),
         turnsWithUsage: safeSum(parsed.turnsWithUsage, 1),
-        cacheUsageComplete: parsed.cacheUsageComplete && turn.inputCache !== undefined
+        cacheUsageComplete: parsed.cacheUsageComplete && turn.inputCache !== undefined,
+        ...(cost === undefined ? {} : { cost })
+    });
+}
+function accumulateCost(current, next) {
+    const prior = current.cost;
+    if (next.kind === 'unavailable' || prior?.kind === 'unavailable' ||
+        (prior === undefined && current.turnsWithUsage + current.turnsWithoutUsage > 0)) {
+        return Object.freeze({ kind: 'unavailable', catalogVersion: null, billingAuthority: false });
+    }
+    const version = (value) => value.replace(/-(peak|offpeak)$/, '');
+    if (prior !== undefined && version(prior.catalogVersion) !== version(next.catalogVersion)) {
+        return Object.freeze({ kind: 'unavailable', catalogVersion: null, billingAuthority: false });
+    }
+    return parsePresentationCost({
+        kind: next.kind === 'upper_bound' || prior?.kind === 'upper_bound' ? 'upper_bound' : 'exact',
+        currency: 'CNY', billingAuthority: false,
+        catalogVersion: version(next.catalogVersion),
+        picoYuan: (BigInt(prior?.picoYuan ?? '0') + next.picoYuan).toString(10)
     });
 }

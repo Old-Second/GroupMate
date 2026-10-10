@@ -1,4 +1,6 @@
 import type { ModelUsage } from '../model/model-adapter.js'
+import { parsePresentationCost, type PresentationModelCostV1 } from '../contracts/presentation-trace.js'
+import type { ModelCost } from '../model/model-cost.js'
 
 export interface RunUsageSummaryV1 {
   readonly schemaVersion: 1
@@ -11,6 +13,8 @@ export interface RunUsageSummaryV1 {
   readonly turnsWithUsage: number
   readonly turnsWithoutUsage: number
   readonly cacheUsageComplete: boolean
+  /** Per-request accounting. Absent on historical checkpoints; never reprice them. */
+  readonly cost?: PresentationModelCostV1
 }
 
 const USAGE_KEYS = Object.freeze([
@@ -47,7 +51,8 @@ function safeSum (left: number, right: number): number {
 export function parseRunUsageSummary (value: unknown): RunUsageSummaryV1 {
   const input = record(value)
   const keys = Object.keys(input)
-  if (keys.length !== USAGE_KEYS.length || keys.some(key => !USAGE_KEYS.includes(key)) ||
+  if (USAGE_KEYS.some(key => !keys.includes(key)) ||
+    keys.some(key => !USAGE_KEYS.includes(key) && key !== 'cost') ||
     input.schemaVersion !== 1 ||
     (input.availability !== 'complete' && input.availability !== 'partial' &&
       input.availability !== 'unavailable') ||
@@ -85,7 +90,8 @@ export function parseRunUsageSummary (value: unknown): RunUsageSummaryV1 {
     cacheMissTokens: input.cacheMissTokens,
     turnsWithUsage: input.turnsWithUsage,
     turnsWithoutUsage: input.turnsWithoutUsage,
-    cacheUsageComplete: input.cacheUsageComplete
+    cacheUsageComplete: input.cacheUsageComplete,
+    ...(input.cost === undefined ? {} : { cost: parsePresentationCost(input.cost) })
   })
 }
 
@@ -130,15 +136,18 @@ function parseTurnUsage (value: ModelUsage): ModelUsage {
 
 export function recordRunUsage (
   current: RunUsageSummaryV1,
-  usage: ModelUsage | undefined
+  usage: ModelUsage | undefined,
+  requestCost?: ModelCost
 ): RunUsageSummaryV1 {
   const parsed = parseRunUsageSummary(current)
+  const cost = requestCost === undefined ? parsed.cost : accumulateCost(parsed, requestCost)
   if (usage === undefined) {
     return parseRunUsageSummary({
       ...parsed,
       availability: parsed.availability === 'unavailable' ? 'unavailable' : 'partial',
       turnsWithoutUsage: safeSum(parsed.turnsWithoutUsage, 1),
-      cacheUsageComplete: false
+      cacheUsageComplete: false,
+      ...(cost === undefined ? {} : { cost })
     })
   }
   const turn = parseTurnUsage(usage)
@@ -150,6 +159,25 @@ export function recordRunUsage (
     cacheHitTokens: safeSum(parsed.cacheHitTokens, turn.inputCache?.hitTokens ?? 0),
     cacheMissTokens: safeSum(parsed.cacheMissTokens, turn.inputCache?.missTokens ?? 0),
     turnsWithUsage: safeSum(parsed.turnsWithUsage, 1),
-    cacheUsageComplete: parsed.cacheUsageComplete && turn.inputCache !== undefined
+    cacheUsageComplete: parsed.cacheUsageComplete && turn.inputCache !== undefined,
+    ...(cost === undefined ? {} : { cost })
+  })
+}
+
+function accumulateCost (current: RunUsageSummaryV1, next: ModelCost): PresentationModelCostV1 {
+  const prior = current.cost
+  if (next.kind === 'unavailable' || prior?.kind === 'unavailable' ||
+    (prior === undefined && current.turnsWithUsage + current.turnsWithoutUsage > 0)) {
+    return Object.freeze({ kind: 'unavailable', catalogVersion: null, billingAuthority: false })
+  }
+  const version = (value: string): string => value.replace(/-(peak|offpeak)$/, '')
+  if (prior !== undefined && version(prior.catalogVersion) !== version(next.catalogVersion)) {
+    return Object.freeze({ kind: 'unavailable', catalogVersion: null, billingAuthority: false })
+  }
+  return parsePresentationCost({
+    kind: next.kind === 'upper_bound' || prior?.kind === 'upper_bound' ? 'upper_bound' : 'exact',
+    currency: 'CNY', billingAuthority: false,
+    catalogVersion: version(next.catalogVersion),
+    picoYuan: (BigInt(prior?.picoYuan ?? '0') + next.picoYuan).toString(10)
   })
 }

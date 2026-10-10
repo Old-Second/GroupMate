@@ -3,6 +3,31 @@ interface OwnDataResult {
   readonly value?: unknown
 }
 
+/** delete_msg has no message_id. TRSS wraps its OneBot acknowledgements in an array. */
+export function normalizeYunzaiHostRecallResult (value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value
+  if (value === null || typeof value !== 'object') return null
+  if (arrayState(value) === true) {
+    const length = ownData(value, 'length')?.value
+    if (!Number.isSafeInteger(length) || Number(length) < 1 || Number(length) > 16) return null
+    const results: Array<boolean | null> = []
+    for (let index = 0; index < Number(length); index += 1) {
+      const item = ownData(value, String(index))
+      if (item?.found !== true || (item.value !== null && typeof item.value === 'object' &&
+        arrayState(item.value) !== false)) return null
+      results.push(normalizeYunzaiHostRecallResult(item.value))
+    }
+    return results.every(result => result === true) ? true
+      : results.every(result => result === false) ? false : null
+  }
+  const status = ownData(value, 'status')
+  const retcode = ownData(value, 'retcode')
+  const data = ownData(value, 'data')
+  if (status?.found !== true || retcode?.found !== true || data?.found !== true) return null
+  if (status.value === 'ok' && retcode.value === 0) return true
+  return status.value === 'failed' && Number.isSafeInteger(retcode.value) && retcode.value !== 0 ? false : null
+}
+
 function ownData (value: object, key: PropertyKey): OwnDataResult | null {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)

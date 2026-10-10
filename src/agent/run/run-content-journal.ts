@@ -11,6 +11,8 @@ import {
   type TerminalCommitReceiptV1
 } from './run-store.js'
 import type { ProviderAttemptEventPayloadV1 } from './run-trace.js'
+import type { ContextPlanV1 } from '../context/context-plan.js'
+import type { ModelCapabilitySnapshotV1 } from '../model/model-capability.js'
 
 export type JournalModelRequest = Omit<ModelRequest, 'metadata'>
 
@@ -57,6 +59,21 @@ export type RunContentJournalEvent =
   | ProviderResponseContentJournalEvent
   | ProviderFailureContentJournalEvent
   | RunTerminalCommittedContentJournalEvent
+  | Readonly<{
+      type: 'context.planned'
+      occurredAt: string
+      runRef: string
+      requestRef: string
+      plan: ContextPlanV1
+    }>
+  | Readonly<{
+      type: 'model.resolution'
+      occurredAt: string
+      runRef: string
+      requestRef: string
+      capabilitySource: ModelCapabilitySnapshotV1['source']
+      priceStatus: 'available' | 'missing_or_expired'
+    }>
 
 export interface RunContentJournal {
   // Synchronous best-effort hook; authoritative run state must never depend on it.

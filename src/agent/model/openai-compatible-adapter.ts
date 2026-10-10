@@ -194,7 +194,9 @@ function wireToolCall (call: Readonly<{
 
 function wireMessage (
   message: ModelMessage,
-  profile: OpenAICompatibleProfile
+  profile: OpenAICompatibleProfile,
+  request: Pick<ModelRequest, 'reasoning'>,
+  toolsEnabled: boolean
 ): JsonObject {
   if (message.role === 'system' || message.role === 'developer') {
     const role = message.role === 'developer' && !profile.capabilities.supportsDeveloperRole
@@ -226,7 +228,7 @@ function wireMessage (
         Object.freeze({ type: 'text', text: content }),
         ...uniqueImageUrls.map(url => Object.freeze({
           type: 'image_url',
-          image_url: Object.freeze({ url })
+          image_url: Object.freeze({ url, ...profile.encodeImageOptions?.() })
         }))
       ])
     })
@@ -246,12 +248,14 @@ function wireMessage (
   if (message.role !== 'assistant') throw modelRequestError('invalid_model_message_role')
 
   const calls = message.toolCalls?.map(wireToolCall) ?? []
-  if (calls.length > 0 && profile.capabilities.requiresReasoningStateForToolCalls &&
+  if (calls.length > 0 && request.reasoning.enabled && toolsEnabled &&
+      profile.capabilities.requiresReasoningStateForToolCalls &&
       message.providerState === undefined) {
     throw modelRequestError('missing_provider_state')
   }
-  let extensions: Readonly<JsonObject> = Object.freeze({})
-  if (message.providerState !== undefined) {
+  let extensions: Readonly<JsonObject> = profile.encodeAssistantFallback?.(toolsEnabled, request.reasoning) ?? Object.freeze({})
+  if (message.providerState !== undefined && (calls.length > 0 ||
+      (message.providerState.profileId === profile.id && message.providerState.profileVersion === profile.version))) {
     try {
       extensions = profile.restoreAssistantExtensions(message.providerState)
     } catch {
@@ -319,6 +323,7 @@ export function buildImmutableChatRequest (
   }
   if (request.temperature !== undefined) assertFiniteNumber(request.temperature, 'invalid_temperature')
   if (request.topP !== undefined) assertFiniteNumber(request.topP, 'invalid_top_p')
+  profile.validateRequest?.(request)
   const metadata = request.metadata === undefined
     ? undefined
     : parseProviderRequestMetadata(request.metadata)
@@ -330,7 +335,8 @@ export function buildImmutableChatRequest (
   const toolControls = profile.encodeToolControls({
     enabled: request.toolMode !== 'disabled' && tools.length > 0,
     mode: request.toolMode,
-    tools
+    tools,
+    reasoning: request.reasoning
   })
   if (Object.keys(toolControls).some(key => !ALLOWED_TOOL_CONTROL_KEYS.has(key))) {
     throw modelRequestError('invalid_tool_controls')
@@ -366,13 +372,20 @@ export function buildImmutableChatRequest (
   )
 
   const tokenField = profile.capabilities.outputTokenField
+  const sampling = profile.encodeSamplingOptions?.(request.reasoning, request.temperature, request.topP) ?? {
+    ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+    ...(request.topP === undefined ? {} : { top_p: request.topP })
+  }
+  if (Object.keys(sampling).some(key => key !== 'temperature' && key !== 'top_p')) {
+    throw modelRequestError('invalid_sampling_extensions')
+  }
   const candidate = {
     model,
-    messages: Object.freeze(request.messages.map(message => wireMessage(message, profile))),
+    messages: Object.freeze(request.messages.map(message => wireMessage(message, profile, request,
+      request.toolMode !== 'disabled' && tools.length > 0))),
     stream: request.streaming,
     [tokenField]: request.maxOutputTokens,
-    ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
-    ...(request.topP === undefined ? {} : { top_p: request.topP }),
+    ...sampling,
     ...requestExtensions,
     ...metadataExtensions,
     ...toolControls
@@ -445,11 +458,12 @@ function parseResponseId (value: unknown): string | undefined {
 
 function captureProviderState (
   message: JsonObject,
-  profile: OpenAICompatibleProfile
+  profile: OpenAICompatibleProfile,
+  reasoning?: ModelRequest['reasoning']
 ): ProviderTurnState | undefined {
   let captured: ProviderTurnState | undefined
   try {
-    captured = profile.captureAssistantState(message)
+    captured = profile.captureAssistantState(message, reasoning)
   } catch {
     throw modelProtocolError('invalid_provider_state')
   }
@@ -488,7 +502,8 @@ function parseJsonText (text: string): unknown {
 async function readBoundedJsonTurn (
   response: OpenAIResponseLike,
   profile: OpenAICompatibleProfile,
-  signal: AbortSignal
+  signal: AbortSignal,
+  reasoningOptions?: ModelRequest['reasoning']
 ): Promise<ModelTurn> {
   const bounded = await readBoundedResponseText(
     response,
@@ -538,7 +553,7 @@ async function readBoundedJsonTurn (
   } catch {
     throw modelProtocolError('invalid_assistant_message')
   }
-  const providerState = captureProviderState(frozenMessage, profile)
+  const providerState = captureProviderState(frozenMessage, profile, reasoningOptions)
   const reasoning = captureDisplayReasoning(frozenMessage, profile)
   return Object.freeze({
     text: typeof message.content === 'string' ? message.content : '',
@@ -622,7 +637,8 @@ function parseSseChoice (root: Record<string, unknown>): Record<string, unknown>
 async function readBoundedEventStream (
   response: OpenAIResponseLike,
   profile: OpenAICompatibleProfile,
-  signal: AbortSignal
+  signal: AbortSignal,
+  reasoningOptions?: ModelRequest['reasoning']
 ): Promise<ModelTurn> {
   const toolAccumulator = new SseToolCallAccumulator()
   const extensionAccumulator = new AssistantExtensionAccumulator()
@@ -716,7 +732,7 @@ async function readBoundedEventStream (
     ...(toolCallsWire.length > 0 ? { tool_calls: Object.freeze(toolCallsWire) } : {}),
     ...extensionAccumulator.value()
   }) as JsonObject
-  const providerState = captureProviderState(assistantMessage, profile)
+  const providerState = captureProviderState(assistantMessage, profile, reasoningOptions)
   const reasoning = captureDisplayReasoning(assistantMessage, profile)
   return Object.freeze({
     text,
@@ -907,8 +923,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     }
     try {
       return request.streaming
-        ? await readBoundedEventStream(response, this.#profile, signal)
-        : await readBoundedJsonTurn(response, this.#profile, signal)
+        ? await readBoundedEventStream(response, this.#profile, signal, request.reasoning)
+        : await readBoundedJsonTurn(response, this.#profile, signal, request.reasoning)
     } catch (error) {
       if (error instanceof ModelProviderError) throw error
       if (signal.aborted) throw classifyTransportFailure(error, signal)

@@ -403,7 +403,58 @@ test('correction planning appends one mandatory tool-disabled instruction', asyn
   assert.match(corrected.messages.at(-1)?.content ?? '', /不要调用工具/)
 })
 
-test('correction pressure fails closed instead of compacting its committed prefix', async () => {
+test('128 initial spans leave space for tool generations and an append-only correction', async () => {
+  const spans = Object.freeze([
+    ...Array.from({ length: 126 }, (_, index) => {
+      const original = ordinarySpan(`many-${index}`, 'runtime_fact', 'user', '历史')
+      const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
+      return createContextSpanV1(Object.freeze({ ...draft, semanticOrder: index + 4 }))
+    }), ...baseSpans.filter(span => span.requirement === 'mandatory')
+  ])
+  assert.equal(spans.length, 128)
+  const planner = createRunContextPlanner({ namespaceRef: runRef, initialSpans: spans })
+  const first = await planner.planModelTurn(plannerCheckpoint(),
+    Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal)
+  const pending = protocol(1, 'capacity-tool')
+  const second = await planner.planModelTurn(plannerCheckpoint({
+    contextPlan: first.plan, messages: first.messages, pendingContextMessages: Object.freeze([pending.assistant, pending.tool]),
+    toolLedgers: Object.freeze([pending.ledger]), step: 1
+  }), Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal)
+  const corrected = await planner.planModelTurn(plannerCheckpoint({
+    contextPlan: second.plan, messages: second.messages, toolLedgers: Object.freeze([pending.ledger]), step: 1
+  }), Object.freeze({ kind: 'correction', transition: 'normal' }), new AbortController().signal)
+  assert.deepEqual(corrected.messages.slice(0, -1), second.messages)
+  assert.ok(corrected.messages.length <= 128)
+})
+
+test('ordinary history compacts into provenance-linked untrusted excerpts with bounded storage', async () => {
+  const store = new RecordingArtifactStore()
+  const history = Array.from({ length: 100 }, (_, index) => {
+    const original = ordinarySpan(`summary-${index}`, 'runtime_fact', 'user', `${index}: ${'历史事实。'.repeat(160)}`)
+    const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
+    return createContextSpanV1(Object.freeze({ ...draft, source: 'group_context', trust: 'untrusted',
+      priority: 'normal', semanticOrder: index + 4,
+      provenance: Object.freeze({ ...draft.provenance, kind: 'group_snapshot' }) }))
+  })
+  const planner = createRunContextPlanner({ namespaceRef: runRef,
+    initialSpans: Object.freeze([...baseSpans, ...history]), artifactStore: store })
+  const first = await planner.planModelTurn(plannerCheckpoint(),
+    Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal)
+  assert.ok(store.puts.some(entry => entry.artifact.kind === 'conversation_summary'))
+  assert.ok(first.artifactRefs.length > 0)
+  for (const entry of store.puts) {
+    assert.ok(entry.artifact.sourceSpanIds.length <= 12)
+    assert.ok(entry.artifact.sourceRefs.length <= 32)
+    assert.match(entry.artifact.content, /仅作引用资料/)
+    assert.ok(Buffer.byteLength(entry.artifact.content) <= 8 * 1_024)
+  }
+  const corrected = await planner.planModelTurn(plannerCheckpoint({ contextPlan: first.plan,
+    messages: first.messages, contextArtifactRefs: first.artifactRefs }),
+  Object.freeze({ kind: 'correction', transition: 'normal' }), new AbortController().signal)
+  assert.deepEqual(corrected.messages.slice(0, -1), first.messages)
+})
+
+test('correction pressure uses reserved capacity while preserving its committed prefix', async () => {
   const planner = createRunContextPlanner({
     namespaceRef: runRef,
     initialSpans: Object.freeze([
@@ -428,14 +479,14 @@ test('correction pressure fails closed instead of compacting its committed prefi
   )
   assert.equal(first.plan.mode, 'normal')
 
-  await assert.rejects(planner.planModelTurn(plannerCheckpoint({
+  const corrected = await planner.planModelTurn(plannerCheckpoint({
     modelCapability: capability,
     contextPlan: first.plan,
     messages: first.messages
   }), Object.freeze({ kind: 'correction', transition: 'normal' }),
-  new AbortController().signal), error => (
-    error instanceof AgentError && error.code === 'context_budget_exceeded'
-  ))
+  new AbortController().signal)
+  assert.deepEqual(corrected.messages.slice(0, -1), first.messages)
+  assert.equal(corrected.plan.prefixMessageCount, first.messages.length)
 })
 
 async function planFourLargeToolTurns (store: ContextArtifactStore) {

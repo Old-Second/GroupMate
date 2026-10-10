@@ -89,15 +89,15 @@ const intent = Object.freeze({
   replyMessageId: null
 })
 
-type ProviderJournalEvent = Exclude<
+type ProviderJournalEvent = Extract<
   RunContentJournalEvent,
-  { readonly type: 'run.terminal_committed' }
+  { readonly type: 'provider.request' | 'provider.response' | 'provider.failure' }
 >
 
 function isProviderJournalEvent (
   event: RunContentJournalEvent
 ): event is ProviderJournalEvent {
-  return event.type !== 'run.terminal_committed'
+  return event.type === 'provider.request' || event.type === 'provider.response' || event.type === 'provider.failure'
 }
 
 function success (text: string, effect: 'none' | 'background' | 'visible' = 'none'): ToolResult {
@@ -2653,7 +2653,7 @@ test('RunEngine projects completed usage from the terminal checkpoint frozen pri
   assert.equal(Object.hasOwn(result.terminal.snapshot, 'usage'), false)
 })
 
-test('RunEngine active resume keeps accumulated usage and the original frozen alias price', async () => {
+test('RunEngine active resume keeps the frozen alias snapshot but marks unpriced later requests unavailable', async () => {
   const store = new PostSuccessCasCrashStore()
   const first = harness([Object.freeze({
     ...modelTools([toolCall(0, 'priced-resume', 'normalRead')]),
@@ -2707,9 +2707,58 @@ test('RunEngine active resume keeps accumulated usage and the original frozen al
     cacheMissTokens: 30,
     cacheUsageComplete: true,
     cost: {
-      kind: 'exact', currency: 'CNY', picoYuan: '71400000',
-      catalogVersion: 'deepseek-cny-2026-07-19', billingAuthority: false
+      kind: 'unavailable', catalogVersion: null, billingAuthority: false
     }
+  })
+})
+
+test('RunEngine accounts a tariff-crossing response as an upper bound and persists final reasoning', async () => {
+  const store = new TerminalCaptureStore()
+  let instant = new Date('2026-10-12T00:59:59.000Z')
+  const providerState = Object.freeze({ profileId: 'deepseek', profileVersion: 1,
+    payload: Object.freeze({ reasoningContent: '完整终态思考' }) })
+  const fixture = harness([async () => {
+    instant = new Date('2026-10-12T01:00:01.000Z')
+    return Object.freeze({ ...modelText('完成'), providerState,
+      usage: Object.freeze({ inputTokens: 100, outputTokens: 20, totalTokens: 120,
+        inputCache: Object.freeze({ hitTokens: 80, missTokens: 20 }) }) })
+  }], { profile: deepSeekCompatibilityProfile, now: () => instant, store })
+  const result = await fixture.engine.start(Object.freeze({ ...fixture.input,
+    deadlineAt: '2026-10-12T01:03:00.000Z',
+    model: Object.freeze({ ...fixture.input.model, model: 'deepseek-flash' }) }))
+  assert.equal(result.kind, 'completed')
+  if (result.kind !== 'completed') return
+  assert.deepEqual(result.assistantState, providerState)
+  if (result.presentationTrace.schemaVersion !== 2) throw new Error('usage trace required')
+  assert.equal(result.presentationTrace.usage?.cacheUsageComplete, true)
+  assert.deepEqual(result.presentationTrace.usage?.cost, {
+    kind: 'upper_bound', currency: 'CNY', picoYuan: '203200000',
+    catalogVersion: 'deepseek-cny-2026-10-10', billingAuthority: false
+  })
+  const decoded = parseRunCheckpoint(JSON.parse(JSON.stringify(store.terminalCheckpoint)))
+  assert.deepEqual(decoded.terminalProviderState, providerState)
+  assert.deepEqual(decoded.usage.cost, result.presentationTrace.usage?.cost)
+})
+
+test('RunEngine sums two response tariffs rather than applying the run-start tariff to both', async () => {
+  let instant = new Date('2026-10-12T00:59:58.000Z')
+  const usage = Object.freeze({ inputTokens: 100, outputTokens: 20, totalTokens: 120,
+    inputCache: Object.freeze({ hitTokens: 80, missTokens: 20 }) })
+  const fixture = harness([
+    Object.freeze({ ...modelTools([toolCall(0, 'priced-current', 'normalRead')]), usage }),
+    Object.freeze({ ...modelText('完成'), usage })
+  ], { profile: deepSeekCompatibilityProfile, now: () => instant,
+    contextFor: async () => { instant = new Date('2026-10-12T01:00:01.000Z'); return execution() } })
+  const result = await fixture.engine.start(Object.freeze({ ...fixture.input,
+    deadlineAt: '2026-10-12T01:03:00.000Z',
+    model: Object.freeze({ ...fixture.input.model, model: 'deepseek-flash' }) }))
+  assert.equal(result.kind, 'completed')
+  if (result.kind !== 'completed') return
+  if (result.presentationTrace.schemaVersion !== 2) throw new Error('usage trace required')
+  assert.equal(result.presentationTrace.usage?.totalTokens, 240)
+  assert.deepEqual(result.presentationTrace.usage?.cost, {
+    kind: 'exact', currency: 'CNY', picoYuan: '304800000',
+    catalogVersion: 'deepseek-cny-2026-10-10', billingAuthority: false
   })
 })
 

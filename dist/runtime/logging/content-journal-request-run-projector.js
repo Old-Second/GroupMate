@@ -3,6 +3,7 @@ import { parsePresentationRoute } from '../../agent/contracts/interaction.js';
 import { PROVIDER_BODY_MAX_LENGTH, sanitizeProviderText } from '../../agent/model/model-adapter.js';
 import { parseExactToolArgumentsText } from '../../agent/model/tool-arguments-text.js';
 import { parseRunCheckpoint } from '../../agent/run/run-checkpoint.js';
+import { parseContextPlanV1 } from '../../agent/context/context-plan.js';
 import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js';
 import { parseProviderTurnState } from '../../agent/run/provider-state.js';
 import { RUN_REF_PATTERN } from '../../agent/run/run-reference.js';
@@ -344,6 +345,26 @@ export function projectRequestJournalEvent(request) {
 }
 export function projectRunJournalEvent(value) {
     const envelope = ownDataRecord(value, 'run journal event');
+    if (envelope.type === 'context.planned' || envelope.type === 'model.resolution') {
+        const keys = ['type', 'occurredAt', 'runRef', 'requestRef', ...(envelope.type === 'context.planned'
+                ? ['plan'] : ['capabilitySource', 'priceStatus'])];
+        exactKeys(envelope, keys, keys, 'run diagnostic');
+        const occurredAt = timestamp(envelope.occurredAt, 'diagnostic timestamp');
+        if (typeof envelope.runRef !== 'string' || !RUN_REF_PATTERN.test(envelope.runRef) ||
+            typeof envelope.requestRef !== 'string' || !RUN_REF_PATTERN.test(envelope.requestRef)) {
+            throw new TypeError('run diagnostic reference is invalid');
+        }
+        const payload = { occurredAt, runRef: envelope.runRef, requestRef: envelope.requestRef };
+        if (envelope.type === 'context.planned') {
+            return { type: envelope.type, payload: { ...payload, plan: parseContextPlanV1(envelope.plan) } };
+        }
+        if (!['profile', 'user_override', 'safe_default'].includes(String(envelope.capabilitySource)) ||
+            !['available', 'missing_or_expired'].includes(String(envelope.priceStatus))) {
+            throw new TypeError('model resolution diagnostic is invalid');
+        }
+        return { type: envelope.type, payload: { ...payload,
+                capabilitySource: envelope.capabilitySource, priceStatus: envelope.priceStatus } };
+    }
     if (envelope.type === 'run.terminal_committed')
         return projectTerminalEvent(envelope);
     const input = boundedRecord(value, RUN_RESOURCE_LIMITS.providerResponseBytes, 'run journal event');

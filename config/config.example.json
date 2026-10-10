@@ -23,7 +23,7 @@
   "openAiBaseUrl": "https://api.deepseek.com",
   "openAiCompatibilityProfile": "deepseek",
   "openAiForceUseReverse": false,
-  "model": "deepseek-v4-flash-vision-exp",
+  "model": "deepseek-flash",
   "temperature": 0.8,
   "forwardReasoning": true,
   "forwardToolDetails": true,

@@ -330,6 +330,46 @@ test('typed effect finalizes only successful visible results', () => {
   }), false)
 })
 
+test('picture dispatch exceptions stay unknown and stop before the next image', async () => {
+  let dispatches = 0
+  const services = visibleOptions([])
+  const definitions = createVisibleToolDefinitions({ ...services, qq: { ...services.qq,
+    sendImage: async () => { dispatches += 1; throw new Error('host acknowledgement lost') }
+  } })
+  const result = await byName(definitions, 'sendPicture').execute({
+    urls: ['https://image.example/one.png', 'https://image.example/two.png']
+  }, context)
+  assert.equal(result.status, 'indeterminate')
+  assert.equal(result.retryable, false)
+  assert.equal(dispatches, 1)
+})
+
+test('a second download failure preserves the confirmed picture result without replaying it', async () => {
+  let downloads = 0
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+  const services = visibleOptions(calls)
+  const definitions = createVisibleToolDefinitions({ ...services,
+    policyFetch: new PolicyFetch({
+      networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+      transport: { request: async () => {
+        downloads += 1
+        if (downloads === 2) throw new Error('download unavailable')
+        return response('image', 'image/png')
+      } }
+    })
+  })
+  const result = await byName(definitions, 'sendPicture').execute({
+    urls: ['https://image.example/one.png', 'https://image.example/two.png', 'https://image.example/three.png']
+  }, context)
+  assert.equal(result.status, 'success')
+  if (result.status !== 'success') return
+  assert.equal(result.effect, 'visible')
+  assert.match(JSON.stringify(result.content), /已发送 1 张图片/)
+  assert.equal(downloads, 2)
+  assert.equal(calls.length, 1)
+  assert.equal(result.retryable, false)
+})
+
 test('successful background and visible effects stop further tool calls', () => {
   assert.equal(shouldFinalizeToolExecution('side_effect', {
     status: 'success', effect: 'background',
@@ -437,7 +477,10 @@ test('multi-part visible tools never replay a confirmed prefix after definite fa
       ? { ...services.qq, sendImage: async () => next() as DeliveryResult<'picture'> }
       : { ...services.qq, sendDice: async () => next() as DeliveryResult<'dice'> }
     const result = await byName(createVisibleToolDefinitions({ ...services, qq }), name).execute(input, context)
-    assert.equal(result.status, 'indeterminate', name)
+    assert.equal(result.status, name === 'sendPicture' ? 'success' : 'indeterminate', name)
+    if (name === 'sendPicture' && result.status === 'success') {
+      assert.match(JSON.stringify(result.content), /已发送 1 张/)
+    }
     if (result.status === 'indeterminate') assert.equal(result.retryable, false, name)
     assert.equal(attempts, 2, name)
 
