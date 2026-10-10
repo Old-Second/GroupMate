@@ -13,7 +13,7 @@ import {
   phase7bBridgeMemoryDefaultOffIsExact,
   phase7bComputedImportBoundaryIsClosed,
   phase7bMemoryControlFieldIsForbidden,
-  phase7bPersonalMemoryConfigIsDefaultOff,
+  phase7bPersonalMemoryConfigMatchesDefaults,
   phase7bMemoryTelemetrySourceFindings,
   phase7bOutboxSurfaceIsBodyFree,
   phase7bRuntimeMemoryRecallSeamIsExact
@@ -97,7 +97,7 @@ test('Phase 7B production boundary remains default-off with one reviewed recall 
   assert.equal(audit.forbiddenMemoryToolNames, 0)
   assert.equal(audit.productionToolNamesExact, true)
   assert.equal(audit.guobaMemoryControlFieldsExact, true)
-  assert.equal(audit.configMemoryDefaultsOff, true)
+  assert.equal(audit.configMemoryDefaultsMatch, true)
   assert.equal(audit.memoryTelemetryEdges, 0)
   assert.deepEqual(audit.coldImport, {
     passed: true,
@@ -312,7 +312,7 @@ test('runtime memory seam and telemetry edges reject shorthand and comment bypas
   ), 0)
 })
 
-test('Guoba and example config expose only the reviewed default-off personal memory surface', async () => {
+test('Guoba and example config expose the reviewed automatic default with bounded personal memory scopes', async () => {
   const fields = buildGuobaSchemas({
     vitsRoleOptions: [],
     voicevoxRoleOptions: [],
@@ -331,12 +331,12 @@ test('Guoba and example config expose only the reviewed default-off personal mem
     'personalMemoryRecallMaxTokens',
     'personalMemoryRecallTimeoutMs'
   ])
-  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff(config), true)
-  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff({
+  assert.equal(phase7bPersonalMemoryConfigMatchesDefaults(config), true)
+  assert.equal(phase7bPersonalMemoryConfigMatchesDefaults({
     ...config,
     personalMemoryMode: 'explicit'
   }), false)
-  assert.equal(phase7bPersonalMemoryConfigIsDefaultOff({
+  assert.equal(phase7bPersonalMemoryConfigMatchesDefaults({
     ...config,
     qdrantEnabled: false
   }), false)

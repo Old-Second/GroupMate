@@ -31,7 +31,7 @@ const PERSONAL_MEMORY_MAINTENANCE_ACTIONS = new Set(['none', 'verify', 'rebuild_
 const GUOBA_SECRET_MAXIMUM_UTF8_BYTES = 16 * 1_024
 
 export const PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
-  personalMemoryMode: 'off',
+  personalMemoryMode: 'automatic',
   personalMemoryGroupAllowlist: Object.freeze([]) as readonly string[],
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1_200,

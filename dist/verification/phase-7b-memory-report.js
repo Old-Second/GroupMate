@@ -178,7 +178,7 @@ export function phase7bMemoryControlFieldIsForbidden(value) {
     return normalized.includes('memory') || normalized.includes('qdrant');
 }
 const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
-    personalMemoryMode: 'off',
+    personalMemoryMode: 'automatic',
     personalMemoryGroupAllowlist: Object.freeze([]),
     personalMemoryRecallMaxItems: 6,
     personalMemoryRecallMaxTokens: 1_200,
@@ -189,7 +189,7 @@ const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([
     'personalMemoryOperationsStatus',
     'personalMemoryMaintenanceAction'
 ]);
-export function phase7bPersonalMemoryConfigIsDefaultOff(value) {
+export function phase7bPersonalMemoryConfigMatchesDefaults(value) {
     let input;
     try {
         input = exactRecord(value, 'personal memory config');
@@ -1134,18 +1134,18 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
     catch {
         guobaMemoryControlFieldsExact = false;
     }
-    let configMemoryDefaultsOff = false;
+    let configMemoryDefaultsMatch = false;
     if (sources.config !== null) {
         try {
             const config = exactRecord(JSON.parse(sources.config), 'example config');
-            configMemoryDefaultsOff = phase7bPersonalMemoryConfigIsDefaultOff(config);
+            configMemoryDefaultsMatch = phase7bPersonalMemoryConfigMatchesDefaults(config);
         }
         catch {
-            configMemoryDefaultsOff = false;
+            configMemoryDefaultsMatch = false;
         }
     }
     const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge) &&
-        configMemoryDefaultsOff;
+        configMemoryDefaultsMatch;
     const bridgeDependenciesClosed = phase7bBridgeDependenciesAreClosed(bridge);
     const memoryRecallSeamExact = phase7bRuntimeMemoryRecallSeamIsExact(runtimeSourceGraph);
     const service = sources.service ?? '';
@@ -1181,7 +1181,7 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
         forbiddenMemoryToolNames,
         productionToolNamesExact,
         guobaMemoryControlFieldsExact,
-        configMemoryDefaultsOff,
+        configMemoryDefaultsMatch,
         memoryTelemetryEdges: telemetryEdges,
         coldImport,
         passed: productionMemoryDefaultOff && productionDependenciesClosed &&
@@ -1191,7 +1191,7 @@ export async function auditPhase7bMemoryWiring(projectRootValue) {
             reachability.forbiddenContextSourceModules === 0 &&
             forbiddenMemoryToolFactories === 0 && forbiddenMemoryToolNames === 0 &&
             productionToolNamesExact &&
-            guobaMemoryControlFieldsExact && configMemoryDefaultsOff &&
+            guobaMemoryControlFieldsExact && configMemoryDefaultsMatch &&
             telemetryEdges === 0 && coldImport.passed
     });
     return result;

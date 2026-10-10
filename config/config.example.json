@@ -113,7 +113,7 @@
   "apiStream": false,
   "apiMaxToken": 4096,
   "apiContextWindowTokens": 0,
-  "personalMemoryMode": "off",
+  "personalMemoryMode": "automatic",
   "personalMemoryGroupAllowlist": [],
   "personalMemoryRecallMaxItems": 6,
   "personalMemoryRecallMaxTokens": 1200,

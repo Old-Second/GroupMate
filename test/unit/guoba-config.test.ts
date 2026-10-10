@@ -31,7 +31,7 @@ test('normalizes editable Guoba list fields into unique trimmed values', () => {
 
 test('normalizes the bounded personal memory pilot configuration fail closed', () => {
   assert.deepEqual(PERSONAL_MEMORY_CONFIG_DEFAULTS, {
-    personalMemoryMode: 'off',
+    personalMemoryMode: 'automatic',
     personalMemoryGroupAllowlist: [],
     personalMemoryRecallMaxItems: 6,
     personalMemoryRecallMaxTokens: 1_200,

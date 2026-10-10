@@ -399,10 +399,6 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
     const handleEnrollment = async (request, auth, operation) => {
         const namespaceRef = memoryNamespaceRefV1(auth.namespace);
         const state = namespaceState(options.database, namespaceRef);
-        if (operation === 'enrollment.optOut' && state?.enrollmentState !== 'opted_in') {
-            await request.replyText('个人长期记忆尚未开启。');
-            return;
-        }
         const mode = currentMode(options.mode);
         const candidateMode = operation === 'enrollment.optOut' || mode === 'explicit'
             ? 'off'
@@ -432,7 +428,11 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
         if (operation === 'enrollment.optOut')
             await options.clearCandidateJobs?.(auth.namespace);
         await request.replyText(operation === 'enrollment.optIn'
-            ? '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
+            ? mode === 'automatic'
+                ? '个人长期记忆已开启。普通消息中明确陈述的稳定本人事实，可按授权策略自动保存；冲突或不确定内容只生成待确认候选。可随时发送“#长期记忆 关闭”停止。'
+                : mode === 'shadow'
+                    ? '个人长期记忆已开启。普通消息中的稳定本人事实只生成待确认候选；只有你明确要求记住的内容才会立即保存。'
+                    : '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
             : `个人长期记忆已关闭。${result.notices.join('')}`);
     };
     const handleRemember = async (request, auth, value) => {
@@ -746,7 +746,7 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
                     const enrollment = await readEnrollment(auth);
                     const state = enrollment.result.status === 'found' && 'policy' in enrollment.result
                         ? enrollment.result.policy.state === 'opted_in' ? '已开启' : '已关闭'
-                        : enrollment.result.status === 'not_enrolled' ? '未开启' : '状态暂不可用';
+                        : enrollment.result.status === 'not_enrolled' ? mode === 'automatic' ? '默认自动记录' : '未开启' : '状态暂不可用';
                     await request.replyText(`个人长期记忆：${state}；部署模式：${mode}。\n发送“#长期记忆 帮助”查看命令。`);
                     return true;
                 }

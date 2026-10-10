@@ -293,7 +293,7 @@ test('personal enrollment read rechecks cancellation and access after dispatch',
   assert.deepEqual(await cancelled.read(request, controller.signal), { status: 'aborted' })
 })
 
-test('sqlite enrollment does not create state for a first opt-out', async t => {
+test('sqlite enrollment persists a first opt-out without creating any memory body', async t => {
   const namespace = personalMemoryNamespaceFixture()
   const state = harness(t)
   const request = envelope(namespace, {
@@ -302,14 +302,16 @@ test('sqlite enrollment does not create state for a first opt-out', async t => {
       candidateMode: 'off'
     })
   })
-  assert.deepEqual(await state.port.decide(request), {
-    status: 'conflict',
-    category: 'generation'
-  })
-  assert.equal(state.store.database.prepare('SELECT count(*) AS count FROM namespaces').get()?.count, 0)
+  const result = await state.port.decide(request)
+  assert.equal(result.status, 'stored')
+  if (result.status !== 'stored') assert.fail('expected durable opt-out')
+  assert.equal(result.policy.state, 'opted_out')
+  assert.equal(result.policy.candidateMode, 'off')
+  assert.equal(state.store.database.prepare('SELECT count(*) AS count FROM namespaces').get()?.count, 1)
   assert.equal(state.store.database.prepare(
     'SELECT count(*) AS count FROM personal_memory_policies'
-  ).get()?.count, 0)
+  ).get()?.count, 1)
+  assert.equal(state.store.database.prepare('SELECT count(*) AS count FROM revision_payloads').get()?.count, 0)
 })
 
 test('sqlite enrollment creates an empty namespace and exact replay survives restart', async t => {

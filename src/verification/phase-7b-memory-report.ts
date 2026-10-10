@@ -260,7 +260,7 @@ export interface Phase7bMemoryWiringAudit {
   readonly forbiddenMemoryToolNames: number
   readonly productionToolNamesExact: boolean
   readonly guobaMemoryControlFieldsExact: boolean
-  readonly configMemoryDefaultsOff: boolean
+  readonly configMemoryDefaultsMatch: boolean
   readonly memoryTelemetryEdges: number
   readonly coldImport: Phase7bMemoryColdImportAudit
   readonly passed: boolean
@@ -366,7 +366,7 @@ export function phase7bMemoryControlFieldIsForbidden (value: unknown): boolean {
 }
 
 const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
-  personalMemoryMode: 'off',
+  personalMemoryMode: 'automatic',
   personalMemoryGroupAllowlist: Object.freeze([]) as readonly string[],
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1_200,
@@ -379,7 +379,7 @@ const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([
   'personalMemoryMaintenanceAction'
 ])
 
-export function phase7bPersonalMemoryConfigIsDefaultOff (value: unknown): boolean {
+export function phase7bPersonalMemoryConfigMatchesDefaults (value: unknown): boolean {
   let input: Record<string, unknown>
   try {
     input = exactRecord(value, 'personal memory config')
@@ -1459,17 +1459,17 @@ export async function auditPhase7bMemoryWiring (
   } catch {
     guobaMemoryControlFieldsExact = false
   }
-  let configMemoryDefaultsOff = false
+  let configMemoryDefaultsMatch = false
   if (sources.config !== null) {
     try {
       const config = exactRecord(JSON.parse(sources.config) as unknown, 'example config')
-      configMemoryDefaultsOff = phase7bPersonalMemoryConfigIsDefaultOff(config)
+      configMemoryDefaultsMatch = phase7bPersonalMemoryConfigMatchesDefaults(config)
     } catch {
-      configMemoryDefaultsOff = false
+      configMemoryDefaultsMatch = false
     }
   }
   const productionMemoryDefaultOff = phase7bBridgeMemoryDefaultOffIsExact(bridge) &&
-    configMemoryDefaultsOff
+    configMemoryDefaultsMatch
   const bridgeDependenciesClosed = phase7bBridgeDependenciesAreClosed(bridge)
   const memoryRecallSeamExact = phase7bRuntimeMemoryRecallSeamIsExact(runtimeSourceGraph)
   const service = sources.service ?? ''
@@ -1514,7 +1514,7 @@ export async function auditPhase7bMemoryWiring (
     forbiddenMemoryToolNames,
     productionToolNamesExact,
     guobaMemoryControlFieldsExact,
-    configMemoryDefaultsOff,
+    configMemoryDefaultsMatch,
     memoryTelemetryEdges: telemetryEdges,
     coldImport,
     passed: productionMemoryDefaultOff && productionDependenciesClosed &&
@@ -1524,7 +1524,7 @@ export async function auditPhase7bMemoryWiring (
       reachability.forbiddenContextSourceModules === 0 &&
       forbiddenMemoryToolFactories === 0 && forbiddenMemoryToolNames === 0 &&
       productionToolNamesExact &&
-      guobaMemoryControlFieldsExact && configMemoryDefaultsOff &&
+      guobaMemoryControlFieldsExact && configMemoryDefaultsMatch &&
       telemetryEdges === 0 && coldImport.passed
   })
   return result

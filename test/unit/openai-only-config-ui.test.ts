@@ -612,7 +612,7 @@ test('Guoba groups supported settings into ten functional sections', () => {
   )
 })
 
-test('long-term memory pilot is default-off, bounded and operationally explicit', async () => {
+test('long-term memory defaults to automatic participation with explicit opt-out and bounded scopes', async () => {
   const schemas = buildGuobaSchemas({
     vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
   })
@@ -629,8 +629,8 @@ test('long-term memory pilot is default-off, bounded and operationally explicit'
       .map(option => option.value),
     ['off', 'explicit', 'shadow', 'automatic']
   )
-  assert.equal(example.personalMemoryMode, 'off')
-  assert.match(source, /^  personalMemoryMode: 'off',/m)
+  assert.equal(example.personalMemoryMode, 'automatic')
+  assert.match(source, /^  personalMemoryMode: 'automatic',/m)
   assert.deepEqual(example.personalMemoryGroupAllowlist, [])
   assert.deepEqual(fields.get('personalMemoryGroupAllowlist')?.componentProps, {
     allowAdd: true,
@@ -660,7 +660,7 @@ test('long-term memory pilot is default-off, bounded and operationally explicit'
     'personalMemoryMode', 'personalMemoryGroupAllowlist', 'personalMemoryRecallMaxItems',
     'personalMemoryRecallMaxTokens', 'personalMemoryRecallTimeoutMs'
   ]) assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
-  assert.match(fields.get('personalMemoryMode')?.bottomHelpMessage ?? '', /用户.*独立.*加入|opt-in/)
+  assert.match(fields.get('personalMemoryMode')?.bottomHelpMessage ?? '', /默认自动.*不需要用户审批.*关闭.*跨重启/)
   assert.match(fields.get('personalMemoryGroupAllowlist')?.bottomHelpMessage ?? '', /空.*群聊.*不允许/)
   assert.match(fields.get('personalMemoryOperationsStatus')?.bottomHelpMessage ?? '', /不会.*初始化/)
   assert.match(fields.get('personalMemoryMaintenanceAction')?.bottomHelpMessage ?? '', /不会.*删除/)
