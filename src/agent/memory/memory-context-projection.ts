@@ -24,7 +24,7 @@ function sensitivity (
 function candidatePayload (candidate: MemoryRetrievalCandidateV2): string {
   return JSON.stringify({
     schemaVersion: 1,
-    type: 'personal_memory_record',
+    type: candidate.sensitivity === 'group' ? 'group_memory_record' : 'personal_memory_record',
     dataOnly: true,
     identity: {
       memoryId: candidate.memoryId,
@@ -59,7 +59,7 @@ function projectCandidate (candidate: MemoryRetrievalCandidateV2): ContextItem {
     })]),
     createdAt: candidate.updatedAt,
     provenance: Object.freeze({
-      source: 'personal_memory_retrieval',
+      source: candidate.sensitivity === 'group' ? 'group_memory_retrieval' : 'personal_memory_retrieval',
       trust: 'untrusted' as const,
       sensitivity: sensitivity(candidate.sensitivity),
       sourceId,

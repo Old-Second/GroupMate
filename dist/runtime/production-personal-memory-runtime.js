@@ -22,6 +22,9 @@ import { bindYunzaiPersonalMemoryRecallSourceV1, createYunzaiSceneParticipantDir
 import { createYunzaiPersonalMemoryControllerV1 } from './yunzai-personal-memory-controller.js';
 import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js';
 import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js';
+import { createGroupMemoryV1 } from './GroupMemory.js';
+import { parseMemoryRetrievalResultV2 } from '../agent/memory/memory-retrieval.js';
+import { createProductionMemoryRetentionV1 } from './ProductionMemoryRetention.js';
 const CANONICAL_FILE = 'personal-memory.sqlite';
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite';
 const EXPORT_DIRECTORY = 'exports';
@@ -457,6 +460,7 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
     let canonical = null;
     let lexical = null;
     let shadow;
+    let retention;
     try {
         canonical = openSqliteMemoryDatabaseV3({
             location: canonicalLocation,
@@ -479,6 +483,10 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
         });
         if (!deletionCleanup.hasPending() || !await deletionCleanup.resume())
             await projector.rebuild();
+        retention = createProductionMemoryRetentionV1({ database: canonical.database,
+            botInstanceId: options.botInstanceId, now: nowIso,
+            rebuildLexical: async () => await projector.rebuild(), resumeDeletion: deletionCleanup.resume });
+        await retention.run();
         const enrollmentAdapter = createSqlitePersonalMemoryEnrollmentAdapterV1({
             database: canonical.database,
             now: nowIso
@@ -585,21 +593,65 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             },
             ...(shadow === undefined ? {} : { clearCandidateJobs: shadow.clearNamespace })
         });
+        const groupMemory = createGroupMemoryV1({
+            botInstanceId: options.botInstanceId, database: canonical.database,
+            enabled: () => ['explicit', 'shadow', 'automatic'].includes(options.deploymentMode()),
+            groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist), now: nowIso,
+            lifecycle, control, export: exportPort, exportDelivery: exportDeliveryRuntime.delivery,
+            retriever: createLexicalMemoryRetrieverV2({ index: lexicalIndex,
+                canonical: createSqliteMemoryCanonicalRehydratorV1({ database: canonical.database, now: nowIso }), now: nowIso }),
+            rebuildLexical: async () => await projector.rebuild(),
+            completeNamespaceDeletion: deletionCleanup.resume,
+            recallLimits: () => ({
+                maxCandidates: boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS),
+                maxTokens: boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS), maxBytes: 32768
+            }),
+            recallTimeoutMs: () => boundedInteger(options.recallTimeoutMs, DEFAULT_RECALL_TIMEOUT_MS, MAX_RECALL_TIMEOUT_MS)
+        });
         let closed = false;
+        retention.start();
         return Object.freeze({
             recallSource: Object.freeze({
-                recall: async (input, signal) => await recallSource.recall(input, signal)
+                recall: async (input, signal) => {
+                    const typed = input;
+                    const personal = parseMemoryRetrievalResultV2(await recallSource.recall(typed, signal));
+                    if (typed.event.isGroup !== true)
+                        return personal;
+                    const group = await groupMemory.recall(typed, signal);
+                    if (group.status !== 'completed' || group.candidates.length === 0)
+                        return personal;
+                    if (personal.status !== 'completed')
+                        return group;
+                    const candidates = [];
+                    let tokens = 0;
+                    let bytes = 0;
+                    const maxItems = boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS);
+                    const maxTokens = boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS);
+                    for (const candidate of [...group.candidates, ...personal.candidates]) {
+                        const size = Buffer.byteLength(JSON.stringify(candidate));
+                        if (candidates.length >= maxItems || tokens + candidate.estimatedTokens > maxTokens || bytes + size > 32768)
+                            continue;
+                        candidates.push(candidate);
+                        tokens += candidate.estimatedTokens;
+                        bytes += size;
+                    }
+                    return parseMemoryRetrievalResultV2({ ...personal, candidates });
+                }
             }),
             operations: Object.freeze({
                 inspect: async (signal) => {
                     const status = await operations.inspect(signal);
-                    return status.status === 'ready' && deletionCleanup.hasPending()
+                    const observed = status.status === 'ready' && deletionCleanup.hasPending()
                         ? Object.freeze({ ...status, status: 'maintenance' })
                         : status;
+                    return Object.freeze({ ...observed, retention: retention?.inspect() });
                 },
                 execute: async (request, signal) => await operations.execute(request, signal)
             }),
-            commands,
+            commands: Object.freeze({
+                handle: async (request) => /^#群记忆(?:\s|$)/u.test(request.text)
+                    ? await groupMemory.commands.handle(request) : await commands.handle(request)
+            }),
             ...(shadow === undefined ? {} : {
                 postReplyCandidate: shadow.postReplyCandidate, waitForCandidateIdle: shadow.waitForIdle
             }),
@@ -607,6 +659,7 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
                 if (closed)
                     return;
                 closed = true;
+                await retention?.close();
                 await shadow?.close();
                 await projector.waitForIdle().catch(() => undefined);
                 exportDeliveryRuntime.close();
@@ -616,6 +669,10 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
         });
     }
     catch (error) {
+        try {
+            await retention?.close();
+        }
+        catch { }
         try {
             await shadow?.close();
         }

@@ -76,15 +76,22 @@ export function createSqlitePersonalMemoryDeletionCleanupV1 (options: DeletionOp
         const generation = Number(row.namespace_generation)
         const targetGeneration = Number(row.deleting_generation)
         const deletionRef = String(row.deletion_ref)
-        if (namespace.botInstanceId !== options.botInstanceId || namespace.scope.kind !== 'personal' ||
+        if (namespace.botInstanceId !== options.botInstanceId ||
           namespaceRef !== row.namespace_ref || !Number.isSafeInteger(generation) ||
           !Number.isSafeInteger(targetGeneration) || targetGeneration < 1 || targetGeneration >= generation) {
           return false
         }
-        const subject = namespace.scope.subjectUserId
+        const scene: MemoryAccessContextV1['scene'] = namespace.scope.kind === 'personal'
+          ? { kind: 'private', peerUserId: namespace.scope.subjectUserId }
+          : { kind: 'group', groupId: namespace.scope.groupId,
+              groupLifecycleId: namespace.scope.groupLifecycleId,
+              trustedMemberUserIds: [], observedAt: now() }
         const issuer = createMemoryAccessCapabilityIssuerV1((context: MemoryAccessContextV1) =>
           context.botInstanceId === namespace.botInstanceId && context.accountId === namespace.accountId &&
-          context.scene.kind === 'private' && context.scene.peerUserId === subject)
+          (scene.kind === 'private'
+            ? context.scene.kind === 'private' && context.scene.peerUserId === scene.peerUserId
+            : context.scene.kind === 'group' && context.scene.groupId === scene.groupId &&
+              context.scene.groupLifecycleId === scene.groupLifecycleId))
         const root = createMemoryLifecycleAuthorityRootV1(request =>
           request.kind === 'maintenance' && request.context.namespaceRef === namespaceRef &&
           request.context.botInstanceId === namespace.botInstanceId &&
@@ -105,7 +112,7 @@ export function createSqlitePersonalMemoryDeletionCleanupV1 (options: DeletionOp
           return await maintenance.execute({ schemaVersion: 1, command,
             access: issueMemoryAccessCapabilityV1(issuer, { schemaVersion: 1,
               botInstanceId: namespace.botInstanceId, adapter: 'qq', accountId: namespace.accountId,
-              scene: { kind: 'private', peerUserId: subject } }, [namespace], instant),
+              scene: scene.kind === 'group' ? { ...scene, observedAt: instant } : scene }, [namespace], instant),
             maintenance: issueMemoryMaintenanceCapabilityV1(root, { schemaVersion: 1,
               botInstanceId: namespace.botInstanceId, adapter: 'qq', accountId: namespace.accountId,
               namespace, namespaceRef, currentGeneration: generation,

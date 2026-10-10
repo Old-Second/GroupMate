@@ -74,11 +74,11 @@ function isAborted(signal) {
     return signal !== undefined && signal.aborted;
 }
 function sourceProjection(record) {
-    if (record.namespace.scope.kind !== 'personal')
-        return Object.freeze([]);
-    const subjectUserId = record.namespace.scope.subjectUserId;
+    const scope = record.namespace.scope;
     const sources = record.sources
-        .filter(source => source.actor.userId === subjectUserId)
+        .filter(source => scope.kind === 'personal' ? source.actor.userId === scope.subjectUserId :
+        source.scene.kind === 'group' && source.scene.groupId === scope.groupId &&
+            source.scene.groupLifecycleId === scope.groupLifecycleId)
         .slice(0, 8)
         .map(source => Object.freeze({
         schemaVersion: 1,
@@ -119,7 +119,9 @@ function validRecord(result, hit, requestedNamespaces, nowMs, expectedBody, expe
         return null;
     const record = result.record;
     if (!requestedNamespaces.has(record.namespaceRef) ||
-        record.namespace.scope.kind !== 'personal' ||
+        (record.namespace.scope.kind === 'group' &&
+            (record.sensitivity !== 'group' && record.sensitivity !== 'public' ||
+                !['group_rule', 'group_culture', 'task_fact', 'other'].includes(record.kind))) ||
         record.namespaceRef !== hit.namespaceRef ||
         record.namespaceGeneration !== hit.namespaceGeneration ||
         record.memoryId !== hit.memoryId || record.revision !== hit.memoryRevision ||
