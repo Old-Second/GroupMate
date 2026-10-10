@@ -48,7 +48,7 @@ import {
   createFrozenObservationPolicy,
   createRunTerminalSnapshot
 } from '../../src/agent/run/run-observation.js'
-import { RunReferenceConflictError } from '../../src/agent/run/run-store.js'
+import { RunReferenceConflictError, createRunTombstoneV2 } from '../../src/agent/run/run-store.js'
 import { FIXTURE_MODEL_CAPABILITY } from '../helpers/trace-fixture.js'
 import {
   RedisRunStore,
@@ -1255,6 +1255,44 @@ test('RedisRunStore enforces checkpoint key and namespace byte budgets before wr
   assert.equal(await largeRedis.get(redisRunKeys('run-byte-limit').checkpoint), null)
 })
 
+test('RedisRunStore completes more than 128 requests without evicting their 24-hour receipts', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const store = new RedisRunStore({ client: redis })
+  let firstExpiry: number | null | undefined
+  for (let index = 0; index < 129; index += 1) {
+    const created = await store.create(checkpoint(`receipt-traffic-${index}`))
+    const cancelled = nextRunCheckpoint(created, 'cancelled', { cancellationReason: 'user_cancelled' },
+      [event(created.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+    await store.commitTerminal(created, cancelled, createRunTerminalSnapshot(cancelled))
+    if (index === 0) firstExpiry = redis.artifactExpiryForTest(redisRunKeys(created.runId).tombstone)
+  }
+  assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|')[3], '129')
+  assert.equal(redis.artifactExpiryForTest(redisRunKeys('receipt-traffic-0').tombstone), firstExpiry)
+  assert.equal(await redis.ttl(redisRunKeys('receipt-traffic-0').tombstone), 86400)
+  assert.equal((await store.loadTombstone('receipt-traffic-128'))?.status, 'cancelled')
+})
+
+test('RedisRunStore reserves the final receipt slot before admission and lets its owner finish', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  const seed = checkpoint('receipt-reservation-seed')
+  const terminal = nextRunCheckpoint(seed, 'cancelled', { cancellationReason: 'user_cancelled' },
+    [event(seed.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+  const tombstone = createRunTombstoneV2(createRunTerminalSnapshot(terminal))
+  for (let index = 0; index < RUN_RESOURCE_LIMITS.tombstoneKeys - 1; index += 1) {
+    await redis.set(redisRunKeys(`receipt-seed-${index}`).tombstone, JSON.stringify({ ...tombstone,
+      runRef: index.toString(16).padStart(32, '0') }), { EX: 86400 })
+  }
+  const store = new RedisRunStore({ client: redis })
+  const created = await store.create(checkpoint('reserved-terminal-owner'))
+  await assert.rejects(store.create(checkpoint('receipt-over-capacity')), error =>
+    error instanceof AgentError && error.code === 'run_budget_exceeded')
+  assert.equal(await redis.get(redisRunKeys('receipt-over-capacity').checkpoint), null)
+  const cancelled = nextRunCheckpoint(created, 'cancelled', { cancellationReason: 'user_cancelled' },
+    [event(created.runId, 1, 'run.cancelled', { reason: 'user_cancelled' })], timestamp)
+  await store.commitTerminal(created, cancelled, createRunTerminalSnapshot(cancelled))
+  assert.equal((await redis.get(RUN_STORE_METADATA_KEY))?.split('|')[3], String(RUN_RESOURCE_LIMITS.tombstoneKeys))
+})
+
 test('RedisRunStore reclaims expired tombstones before namespace admission', async () => {
   let nowMs = Date.parse(timestamp)
   const redis = new FakeRedis(() => nowMs)
@@ -1275,7 +1313,7 @@ test('RedisRunStore reclaims expired tombstones before namespace admission', asy
 
 test('RedisRunStore counts orphan references during bounded namespace reconcile', async () => {
   const redis = new FakeRedis(() => Date.parse(timestamp))
-  for (let index = 0; index < 145; index += 1) {
+  for (let index = 0; index <= RUN_RESOURCE_LIMITS.referenceKeys; index += 1) {
     await redis.set(
       redisRunReferenceKey(index.toString(16).padStart(32, '0')),
       `orphan-run-${index}`,

@@ -27,8 +27,8 @@ test('Phase 5 keeps every wire, protocol, checkpoint and namespace limit explici
     tombstoneBytes: 4 * 1_024,
     checkpointKeys: 16,
     eventKeys: 16,
-    tombstoneKeys: 128,
-    referenceKeys: 144,
+    tombstoneKeys: 4096,
+    referenceKeys: 4112,
     indexAdmissionKeys: 64
   })
 })

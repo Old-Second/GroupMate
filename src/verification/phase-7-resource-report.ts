@@ -46,8 +46,8 @@ export const PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS = Object.freeze({
   tombstoneBytes: 4 * 1_024,
   checkpointKeys: 16,
   eventKeys: 16,
-  tombstoneKeys: 128,
-  referenceKeys: 144,
+  tombstoneKeys: 4096,
+  referenceKeys: 4112,
   indexAdmissionKeys: 64
 })
 

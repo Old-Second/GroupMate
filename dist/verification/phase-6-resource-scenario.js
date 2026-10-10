@@ -252,6 +252,8 @@ class Phase6ResourceRedis {
             };
             if (this.#runBudgetExceeded(projected))
                 return 'budget';
+            if (projected.tombstones + projected.checkpoints > RUN_RESOURCE_LIMITS.tombstoneKeys)
+                return 'budget';
             this.#setDirect(checkpointKey, args[1], Number(args[3]));
             this.#setDirect(eventKey, args[2], Number(args[3]));
             this.#setDirect(referenceKey, args[4], Number(args[3]));
@@ -499,7 +501,7 @@ class Phase6ResourceRedis {
     #runBudgetExceeded(usage) {
         if (Object.values(usage).some(value => !Number.isSafeInteger(value) || value < 0))
             return true;
-        return usage.bytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
+        return usage.bytes + usage.checkpoints * RUN_RESOURCE_LIMITS.tombstoneBytes > RUN_RESOURCE_LIMITS.namespaceBytes ||
             usage.checkpoints > RUN_RESOURCE_LIMITS.checkpointKeys ||
             usage.events > RUN_RESOURCE_LIMITS.eventKeys ||
             usage.tombstones > RUN_RESOURCE_LIMITS.tombstoneKeys ||
