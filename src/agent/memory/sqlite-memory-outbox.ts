@@ -380,9 +380,13 @@ function decodeClaimedRow (
 
 function claimEvents (
   database: DatabaseSync,
-  request: Extract<MemoryOutboxRequestV1, { readonly operation: 'claim' }>,
+  request: Extract<MemoryOutboxRequestV1, { readonly operation: 'claim' | 'claim_namespace_deletion' }>,
   nowMs: number
 ): MemoryOutboxResultV1 {
+  const scoped = request.operation === 'claim_namespace_deletion'
+  const predicate = scoped
+    ? "AND namespace_ref = ? AND namespace_generation = ? AND event_kind = 'namespace_deleted'"
+    : ''
   const rows = database.prepare(`
     SELECT sequence, event_id, namespace_ref, namespace_generation, aggregate,
            aggregate_id, revision, event_kind, occurred_at_ms, event_wire,
@@ -390,12 +394,14 @@ function claimEvents (
     FROM outbox
     WHERE available_at_ms <= ? AND attempt_count < ?
       AND (lease_owner_id IS NULL OR leased_until_ms <= ?)
+      ${predicate}
     ORDER BY sequence ASC
     LIMIT ?
   `).all(
     nowMs,
     SQLITE_MEMORY_OUTBOX_MAX_ATTEMPTS_V1,
     nowMs,
+    ...(scoped ? [request.namespaceRef, request.namespaceGeneration] : []),
     request.limit
   )
   if (rows.length === 0) return Object.freeze({ status: 'empty' as const })
@@ -571,6 +577,7 @@ function executeAdapter (
   const nowMs = Date.parse(nowInstant(now))
   switch (request.operation) {
     case 'claim':
+    case 'claim_namespace_deletion':
       return runImmediate(database, () => claimEvents(database, request, nowMs))
     case 'ack':
       return runImmediate(database, () => ackEvent(database, request, nowMs))

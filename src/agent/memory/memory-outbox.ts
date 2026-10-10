@@ -8,7 +8,8 @@ import {
 import {
   inspectMemoryArray,
   inspectMemoryRecord,
-  invalidMemoryValue
+  invalidMemoryValue,
+  parseMemoryNamespaceRefV1
 } from './memory-namespace.js'
 import { createMemoryPortSignalScopeV1 } from './memory-port-signal.js'
 import {
@@ -22,6 +23,14 @@ export type MemoryOutboxRequestV1 =
       readonly operation: 'claim'
       readonly ownerId: string
       readonly limit: number
+    }
+  | {
+      readonly schemaVersion: 1
+      readonly operation: 'claim_namespace_deletion'
+      readonly ownerId: string
+      readonly limit: number
+      readonly namespaceRef: string
+      readonly namespaceGeneration: number
     }
   | {
       readonly schemaVersion: 1
@@ -89,11 +98,12 @@ interface MemoryOutboxPortOptionsV1 {
   ) => Promise<unknown>
 }
 
-const OUTBOX_OPERATIONS = ['claim', 'ack', 'retry', 'usage'] as const
+const OUTBOX_OPERATIONS = ['claim', 'claim_namespace_deletion', 'ack', 'retry', 'usage'] as const
 type MemoryOutboxOperationV1 = typeof OUTBOX_OPERATIONS[number]
 
 const OUTBOX_REQUEST_FIELDS = [
-  'ownerId', 'limit', 'leaseToken', 'eventId', 'sequence', 'retryAt', 'reasonCode'
+  'ownerId', 'limit', 'leaseToken', 'eventId', 'sequence', 'retryAt', 'reasonCode',
+  'namespaceRef', 'namespaceGeneration'
 ] as const
 
 const WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
@@ -172,6 +182,15 @@ function parseMemoryOutboxRequestV1 (
       limit: positiveInteger(input.limit, MEMORY_RESOURCE_LIMITS.operationBatchRecords)
     })
   }
+  if (operation === 'claim_namespace_deletion') {
+    const input = inspectMemoryRecord(value, ['schemaVersion', 'operation', 'ownerId',
+      'limit', 'namespaceRef', 'namespaceGeneration'])
+    return Object.freeze({ schemaVersion: 1 as const, operation,
+      ownerId: workerId(input.ownerId),
+      limit: positiveInteger(input.limit, MEMORY_RESOURCE_LIMITS.operationBatchRecords),
+      namespaceRef: parseMemoryNamespaceRefV1(input.namespaceRef),
+      namespaceGeneration: positiveInteger(input.namespaceGeneration) })
+  }
   if (operation === 'ack') {
     const input = inspectMemoryRecord(value, [
       'schemaVersion', 'operation', 'ownerId', 'leaseToken', 'eventId', 'sequence'
@@ -222,7 +241,7 @@ function parseOutboxUsage (value: unknown): MemoryOutboxUsageV1 {
 
 function parseClaimedResult (
   value: unknown,
-  request: Extract<MemoryOutboxRequestV1, { readonly operation: 'claim' }>,
+  request: Extract<MemoryOutboxRequestV1, { readonly operation: 'claim' | 'claim_namespace_deletion' }>,
   now: string
 ): MemoryOutboxResultV1 {
   const input = inspectMemoryRecord(value, [
@@ -247,6 +266,10 @@ function parseClaimedResult (
     events.some((event, index) => index > 0 && event.sequence <= events[index - 1]!.sequence)) {
     return invalidMemoryValue()
   }
+  if (request.operation === 'claim_namespace_deletion' && events.some(event =>
+    event.namespaceRef !== request.namespaceRef ||
+    event.namespaceGeneration !== request.namespaceGeneration ||
+    event.eventKind !== 'namespace_deleted')) return invalidMemoryValue()
   return Object.freeze({
     status: 'claimed' as const,
     ownerId: request.ownerId,
@@ -269,11 +292,11 @@ function parseMemoryOutboxResultV1 (
 
   if (status === 'empty') {
     inspectMemoryRecord(value, ['status'])
-    if (request.operation !== 'claim') return invalidMemoryValue()
+    if (request.operation !== 'claim' && request.operation !== 'claim_namespace_deletion') return invalidMemoryValue()
     return Object.freeze({ status })
   }
   if (status === 'claimed') {
-    if (request.operation !== 'claim') return invalidMemoryValue()
+    if (request.operation !== 'claim' && request.operation !== 'claim_namespace_deletion') return invalidMemoryValue()
     return parseClaimedResult(value, request, now)
   }
   if (status === 'acked') {

@@ -112,6 +112,7 @@ export interface CreateYunzaiPersonalMemoryControllerOptionsV1 {
   readonly control: MemoryControlRepositoryPortV1
   readonly exportDelivery: PersonalMemoryExportDeliveryV1
   readonly rebuildLexical: () => Promise<number>
+  readonly completeNamespaceDeletion: (namespace: MemoryNamespaceV1) => Promise<boolean>
 }
 
 class PersonalMemoryCommandError extends Error {}
@@ -930,8 +931,10 @@ export function createYunzaiPersonalMemoryControllerV1 (
       await request.replyText(mutationFailureText(result))
       return
     }
-    const projected = await projectAfterMutation()
-    await request.replyText(`${projected ? '个人长期记忆已全部删除并清理检索索引。' : '个人长期记忆已删除，但索引清理暂时失败。'}${result.notices.join('')}`)
+    let complete = false
+    try { complete = await options.completeNamespaceDeletion(auth.namespace) } catch {}
+    if (!complete) await projectAfterMutation()
+    await request.replyText(`${complete ? '个人长期记忆已全部删除并清理检索索引。' : '已停止召回和新写入，正文清理尚未完成，请稍后联系机器人主人处理。'}${result.notices.join('')}`)
   }
 
   return Object.freeze({
