@@ -591,6 +591,23 @@ export function createYunzaiPersonalMemoryControllerV1 (
   ): Promise<void> => {
     const text = validMemoryText(value)
     const namespaceRef = memoryNamespaceRefV1(auth.namespace)
+    // A first explicit save follows the same default participation rule as ordinary chat.
+    // A durable opt-out still requires the user's separate opening command.
+    if (currentMode(options.mode) === 'automatic' &&
+      namespaceState(options.database, namespaceRef)?.enrollmentState == null) {
+      const enrolled = await options.facade.execute(facadeRequest('enrollment.optIn', auth, {
+        schemaVersion: 1, namespace: auth.namespace, access: auth.access, actor: auth.actor,
+        command: createPersonalMemoryEnrollmentCommandV1({
+          commandRef: commandRef(auth.source, 'enrollment.defaultAutomatic'), operation: 'enrollment.optIn',
+          initiatedByActorRef: auth.actorRef, namespaceRef, expectedNamespaceGeneration: auth.generation,
+          expectedPolicyGeneration: 0, candidateMode: 'policy_approved', occurredAt: auth.now, source: auth.source
+        })
+      }))
+      if (!mutationSucceeded(enrolled)) {
+        await request.replyText(mutationFailureText(enrolled))
+        return
+      }
+    }
     const ref = commandRef(auth.source, 'proposal.createAndApprove')
     const proposal = buildMemoryProposalDraftV2({
       commandRef: ref,
