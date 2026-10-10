@@ -20,8 +20,14 @@ import { createSqliteMemoryExtractionQueueV1, type SqliteMemoryExtractionQueueV1
 import { createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js'
 import type { ProductionPersonalMemoryModeV1 } from './production-personal-memory-loader.js'
 import type { YunzaiChatControllerOptions } from './yunzai-chat-controller.js'
+import { RUN_REF_PATTERN } from '../agent/run/run-reference.js'
 
 export type PostReplyMemoryCandidatePortV1 = NonNullable<YunzaiChatControllerOptions['postReplyCandidate']>
+
+export interface ShadowMemoryAdmissionDiagnosticV1 {
+  readonly stage: 'evidence' | 'participant' | 'scope' | 'enrollment' | 'job' | 'authorization' | 'queue'
+  readonly outcome: 'accepted' | 'rejected' | 'failed' | 'timeout'
+}
 
 interface ShadowOptions {
   readonly database: DatabaseSync
@@ -34,6 +40,7 @@ interface ShadowOptions {
   readonly model: MemoryCandidateModelV1
   readonly now: () => string
   readonly bot?: (accountId: string) => unknown
+  readonly onAdmission?: (diagnostic: ShadowMemoryAdmissionDiagnosticV1) => void
 }
 
 async function abortable<T> (pending: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -65,6 +72,10 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
   const enqueues = new Set<Promise<void>>()
 
   const enabled = (): boolean => options.mode() === 'shadow'
+  const report = (stage: ShadowMemoryAdmissionDiagnosticV1['stage'],
+    outcome: ShadowMemoryAdmissionDiagnosticV1['outcome']): void => {
+    try { options.onAdmission?.(Object.freeze({ stage, outcome })) } catch {}
+  }
   const contextFor = async (job: MemoryExtractionJobV1, signal?: AbortSignal) => {
     if (job.source.scene.kind === 'group') {
       // Durable jobs cannot turn the original event into a fresh membership proof.
@@ -205,30 +216,34 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
     if (evidence.currentMessageId === null || evidence.hasReply || evidence.imageUrls.length !== 0 ||
       evidence.ocrTexts.length !== 0 || prompt.startsWith('#') || prompt === '' ||
       Buffer.byteLength(prompt, 'utf8') > 1_024 || [...prompt].length > 500 ||
-      memoryCredentialRejectionReasonV1(prompt) !== null) return
+      memoryCredentialRejectionReasonV1(prompt) !== null) { report('evidence', 'rejected'); return }
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 1_000)
+    let stage: ShadowMemoryAdmissionDiagnosticV1['stage'] = 'participant'
     try {
       const instant = options.now()
       const accountId = input.prepared.route.sessionAddress.botId
       const snapshot = await abortable(participants.resolve({ event: input.event, messageEvidence: evidence,
         accountId, observedAt: instant }, controller.signal), controller.signal)
-      if (snapshot === null || closed || controller.signal.aborted) return
+      if (snapshot === null || closed || controller.signal.aborted) { report(stage, 'rejected'); return }
+      stage = 'scope'
       const address = input.prepared.route.sessionAddress.scope
       if (input.prepared.route.actorId !== snapshot.current.identity.userId ||
         (snapshot.scene.kind === 'private'
           ? address.kind !== 'private' || address.userId !== snapshot.current.identity.userId
           : address.kind === 'private' || address.groupId !== snapshot.scene.groupId ||
-            (address.kind === 'group_user' && address.userId !== snapshot.current.identity.userId))) return
+            (address.kind === 'group_user' && address.userId !== snapshot.current.identity.userId))) { report(stage, 'rejected'); return }
       const subjects = selectPersonalMemorySubjectsV1({ scene: snapshot.scene,
         current: snapshot.current, references: [], now: instant })
       const scope = buildPersonalMemoryAccessScopeV1({ botInstanceId: options.botInstanceId,
         accountId, scene: snapshot.scene, subjects, now: instant })
       const namespace = scope.namespaces[0]
-      if (namespace === undefined || subjects.length !== 1) return
+      if (namespace === undefined || subjects.length !== 1) { report(stage, 'rejected'); return }
       const access = issueMemoryAccessCapabilityV1(issuer, scope.context, [namespace], instant)
+      stage = 'enrollment'
       const enrollment = await options.enrollment.read({ schemaVersion: 1, namespace, access }, controller.signal)
-      if (enrollment.status !== 'found') return
+      if (enrollment.status !== 'found') { report(stage, 'rejected'); return }
+      stage = 'job'
       const identity = snapshot.current.identity
       const { userId, nickname, groupCard, groupTitle, groupRole, displayName } = identity
       const actor = { userId, nickname, groupCard, groupTitle, groupRole, displayName }
@@ -239,18 +254,24 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
           : { kind: 'group', groupId: scene.groupId, groupLifecycleId: scene.groupLifecycleId, groupName: scene.groupName },
         observedAt: instant, normalizedText: prompt, resourceRefs: [] })
       const reply = [...input.envelope.completion.text.normalize('NFC')].slice(0, 500).join('').trim()
+      if (!RUN_REF_PATTERN.test(input.envelope.runRef)) { report(stage, 'rejected'); return }
       const job = createMemoryExtractionJobV1({ namespace, namespaceGeneration: enrollment.policy.namespaceGeneration,
         enrollmentPolicyGeneration: enrollment.policy.policyGeneration,
-        subject: actor, source, sceneRef: access.sceneRef, sourceRunRef: input.envelope.runRef,
+        // Kernel refs are bare 32-digit hex; memory provenance uses domain-prefixed opaque ids.
+        subject: actor, source, sceneRef: access.sceneRef, sourceRunRef: `run:${input.envelope.runRef}`,
         sourceModelProfile: options.model.model(), requestedMode: 'shadow', priority: 'asserted',
         enqueuedAt: instant, assistantReply: reply })
-      if (await abortable(authorize(job, controller.signal), controller.signal) === null) return
+      stage = 'authorization'
+      if (await abortable(authorize(job, controller.signal), controller.signal) === null) { report(stage, 'rejected'); return }
+      stage = 'queue'
       openQueue()
       if (queue !== null && !closed && !controller.signal.aborted) {
-        await queue.enqueue(job, controller.signal)
+        const result = await queue.enqueue(job, controller.signal)
+        report(stage, result.status === 'stored' || result.status === 'unchanged' ? 'accepted' : 'rejected')
         kick()
       }
-    } finally { clearTimeout(timeout) }
+    } catch { report(stage, controller.signal.aborted ? 'timeout' : 'failed') }
+    finally { clearTimeout(timeout) }
   }
   const postReplyCandidate: PostReplyMemoryCandidatePortV1 = Object.freeze({
     async enqueue (input) {
