@@ -139,6 +139,8 @@ export interface Phase6ResourceSample {
 }
 
 export interface Phase6ResourceScenarioOptions {
+  /** Exercise the production active BYM path with synthetic pilot groups; default fixtures stay unchanged. */
+  readonly activeParticipation?: boolean
   readonly settleMs?: number
   readonly gc?: () => void
   readonly memoryUsage?: () => NodeJS.MemoryUsage
@@ -1128,6 +1130,7 @@ interface GraphFixture {
 }
 
 function graphFixture (input: {
+  readonly activeParticipation?: boolean
   readonly scenario: Phase6ResourceScenarioName
   readonly redis: Phase6ResourceRedis
   readonly host: HostFixture
@@ -1151,7 +1154,8 @@ function graphFixture (input: {
         model: 'fixture-model',
         toolPolicyProfile: input.scenario === 'checkpointResume' ? 'safe' : 'compatible',
         toolApprovalTtlSeconds: 120,
-        observabilityLevel: input.observabilityLevel
+        observabilityLevel: input.observabilityLevel,
+        ...(input.activeParticipation ? { participationMode: 'active', participationActiveGroups: ['303', '304'] } : {})
       }),
       redis: input.redis,
       getMasterIds: async () => Object.freeze(['7']),
@@ -1233,7 +1237,8 @@ function graphFixture (input: {
         hardLimitUsd: 0, totalUsageUsd: 0, expiresAt: new Date(0)
       })
     }),
-    bymPolicy: Object.freeze({ snapshot: () => disabledBymPolicy }),
+    bymPolicy: Object.freeze({ snapshot: () => input.activeParticipation
+      ? Object.freeze({ ...disabledBymPolicy, enabled: true }) : disabledBymPolicy }),
     buttonPolicy: Object.freeze({
       snapshot: () => Object.freeze({ markdownEnabled: false, openAiConfigured: false })
     }),
@@ -1369,6 +1374,7 @@ export async function runPhase6ResourceScenario (
     ? new ApprovalScenarioModel()
     : new ScenarioModel(scenario)
   const primary = graphFixture({
+    activeParticipation: options.activeParticipation,
     scenario,
     redis,
     host,
@@ -1389,13 +1395,22 @@ export async function runPhase6ResourceScenario (
     picture = false,
     graph = primary.graph
   ): Promise<void> => {
-    const handled = await graph.chatController.chatgpt1(groupEvent(
+    const event = groupEvent(
       actorId,
       marker,
       host,
-      { picture }
-    ))
-    if (!handled) throw new Error('resource chat scenario was not handled')
+      { picture, ...(options.activeParticipation ? {
+        groupId: actorId === 'dual-b' ? '304' : '303', rawMessage: `GroupMate ${marker}`
+      } : {}) }
+    )
+    if (options.activeParticipation) {
+      const before = primary.dispatches.length
+      await graph.bymController.bym(event)
+      if (primary.dispatches.length <= before) throw new Error('active production run was not delivered')
+    } else {
+      const handled = await graph.chatController.chatgpt1(event)
+      if (!handled) throw new Error('resource chat scenario was not handled')
+    }
     observations.push(memoryUsage().rss)
   }
 

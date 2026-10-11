@@ -1,5 +1,6 @@
 import { participationMode } from '../agent/participation/ParticipationContract.js';
 import { ParticipationShadow } from './participation/ParticipationShadow.js';
+import { ActiveParticipationHost } from './participation/ActiveParticipationHost.js';
 import { projectYunzaiParticipation } from './participation/YunzaiParticipationAdapter.js';
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { ProactiveCoordination } from './participation/ProactiveCoordination.js';
@@ -657,20 +658,32 @@ export function createProductionYunzaiAgent(options) {
         }
     });
     const bymAgent = Object.freeze({
-        async handleEphemeral({ event, prepared, systemInstructions, enableGroupContext, thinkingMode, reasoningEffort }) {
+        async handleEphemeral({ event, prepared, systemInstructions, enableGroupContext, thinkingMode, reasoningEffort, participation }) {
             return await bridge.handleEphemeral(event, prepared.evidence, Object.freeze({
                 presentationRoute: prepared.route,
                 systemInstructions,
                 enableGroupContext,
                 thinkingMode,
-                reasoningEffort
+                reasoningEffort,
+                ...(participation === undefined ? {} : { participation })
             }));
         }
     });
     const participation = new ParticipationShadow(() => now().getTime(), entry => {
         contentJournal?.recordParticipation?.(entry);
     });
+    const activeParticipation = new ActiveParticipationHost(() => {
+        const time = monotonicNow();
+        if (time === 'unavailable')
+            throw new TypeError('participation clock unavailable');
+        return time;
+    }, () => ({ participationMode: options.bridge.config.participationMode,
+        participationActiveGroups: options.bridge.config.participationActiveGroups }), event => options.bridge.getBotId(event), groupId => {
+        const policy = options.bymPolicy.snapshot();
+        return policy.enabled && !policy.disabledGroupIds.includes(groupId);
+    });
     const bymController = createYunzaiBymController({
+        activeParticipation: (event, direct, sampled) => activeParticipation.select(event, direct, sampled),
         coordinate: (event, direct) => event.group_id === undefined ? undefined : proactiveCoordination.begin(String(options.bridge.getBotId(event)), String(event.group_id), 'bym', direct),
         participation: {
             observe: input => {
@@ -787,6 +800,7 @@ export function createProductionYunzaiAgent(options) {
                 }
                 finally {
                     participation.close();
+                    activeParticipation.close();
                     proactiveCoordination.close();
                     try {
                         await contentJournal?.drain();

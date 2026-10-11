@@ -114,6 +114,16 @@ test('V7 round trip retains dependency proof, approval ledger and consumed budge
   assert.deepEqual(codec.decode(old.checkpoint, old.events), v6)
   assert.throws(() => parseRunCheckpoint({ ...v7, contextDependencies: undefined }))
   assert.throws(() => parseRunCheckpoint({ ...v7, schemaVersion: 8 }))
+  const live = parseRunCheckpoint({ ...v7, contextDependencies: {
+    ...v7.contextDependencies, requiresLiveParticipation: true
+  } })
+  const encodedLive = codec.encode(live)
+  assert.deepEqual(codec.decode(encodedLive.checkpoint, encodedLive.events), live)
+  for (const invalid of [false, 'true', null]) {
+    assert.throws(() => parseRunCheckpoint({ ...live, contextDependencies: {
+      ...live.contextDependencies, requiresLiveParticipation: invalid
+    } }))
+  }
 })
 
 function runEvent (type: AgentEvent['type'] = 'run.created'): AgentEvent {

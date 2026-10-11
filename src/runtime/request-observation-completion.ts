@@ -1,4 +1,5 @@
 import type { PresentationResult } from './presentation/presentation-result.js'
+import { notifyRunFinalDelivery } from '../agent/run/RunBoundary.js'
 import type { SessionPersistenceOutcome } from '../agent/contracts/completion.js'
 import type { FinalRunResult } from './runtime-presentation-hooks.js'
 import {
@@ -72,10 +73,14 @@ export function createPresentationCompletionCoordinator (input: {
         throw new RequestObservationAlreadyCompletedError()
       }
       completed.add(draft)
+      let delivered = false
       try {
         const projection = projectFinalPresentation(envelope)
-        return await present(projection)
+        const result = await present(projection)
+        delivered = result.deliveries.some(delivery => delivery.kind === 'sent')
+        return result
       } finally {
+        notifyRunFinalDelivery(envelope, delivered)
         const observation = finalizeRequestObservation({
           draft,
           finishedAtMonotonicMs: safeMonotonicNow(input.monotonicNow)

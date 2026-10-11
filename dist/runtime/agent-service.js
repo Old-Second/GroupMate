@@ -1,4 +1,5 @@
-import { bindRunBoundaryGuard, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js';
+import { bindRunBoundaryGuard, bindRunFinalDelivery, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js';
+import { isParticipationRun } from '../agent/participation/ParticipationRun.js';
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { agentMessageText } from '../agent/contracts/content-projection.js';
@@ -749,6 +750,7 @@ export class AgentService {
         catch (error) {
             this.#pending.delete(runId);
             await pending.lease.release().catch(() => undefined);
+            pending.participation?.finish(false);
             return activeFinalEnvelope(failedRunResult(runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
         }
     }
@@ -854,10 +856,13 @@ export class AgentService {
             requestKind: draft.requestKind,
             startedAtMonotonicMs
         });
-        if (draft.requestKind !== (ephemeral ? 'proactive_chat' : 'ordinary_chat') ||
+        if ((options.participation !== undefined && (!ephemeral || !isParticipationRun(options.participation))) ||
+            draft.requestKind !== (ephemeral ? 'proactive_chat' : 'ordinary_chat') ||
             (options.requestObservationContext !== undefined &&
                 (options.requestObservationContext.requestRef !== draft.requestRef ||
                     options.requestObservationContext.requestKind !== draft.requestKind))) {
+            if (isParticipationRun(options.participation))
+                options.participation.finish(false);
             return preCreateEnvelope(failedRunResult(runId, new AgentError({
                 code: 'invalid_request',
                 stage: 'agent.service.observation',
@@ -876,14 +881,26 @@ export class AgentService {
         const finishOperation = this.#beginRunOperation(runId);
         if (finishOperation === null) {
             linked.dispose();
+            options.participation?.finish(false);
             return preCreateEnvelope(cancelledRunResult(runId, this.#shutdownReason), requestObservationContext, 'rejected_admission', 'queue_aborted', 'unavailable', 'not_attempted');
         }
         try {
             try {
-                lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
+                if (options.participation?.admission === 'immediate') {
+                    lease = await this.#admission.tryAcquire?.(request.sessionAddress, linked.signal) ?? undefined;
+                    if (lease === undefined)
+                        throw new RunAdmissionRejectionError('queue_full');
+                }
+                else {
+                    lease = await this.#admission.acquire(request.sessionAddress, linked.signal);
+                }
+                options.participation?.admit();
                 queueDurationMs = elapsed(queueStarted, readMonotonic(this.#monotonicNow));
             }
             catch (error) {
+                await lease?.release().catch(() => undefined);
+                lease = undefined;
+                options.participation?.finish(false);
                 queueDurationMs = elapsed(queueStarted, readMonotonic(this.#monotonicNow));
                 const reason = error instanceof RunAdmissionRejectionError
                     ? error.rejectionReason
@@ -924,7 +941,22 @@ export class AgentService {
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
             const hostImageLinks = await this.#resolveHostImageLinks(request, session, runtime, linked.signal);
-            let binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks);
+            const createBinding = () => {
+                const base = this.#bindingFor(runId, request, session, runtime, hostImageLinks);
+                const participation = options.participation;
+                if (participation === undefined)
+                    return base;
+                return Object.freeze({ ...base,
+                    contextDependencies: Object.freeze({
+                        schemaVersion: 1, memories: Object.freeze([]), authorityStamp: null,
+                        ...base.contextDependencies, requiresLiveParticipation: true
+                    }),
+                    checkBoundary: async (boundary, signal) => {
+                        await base.checkBoundary?.(boundary, signal);
+                        await participation.checkBoundary(boundary, signal);
+                    } });
+            };
+            let binding = createBinding();
             const presentationLifecycle = options.presentationLifecycle ??
                 await this.#lifecycleFor(request.presentationRoute, runtime.progress);
             let presentationStarted = false;
@@ -965,7 +997,7 @@ export class AgentService {
                             throw error;
                         runRef = this.#createRunRef();
                         request = freezeRequest(draft, runRef);
-                        binding = this.#bindingFor(runId, request, session, runtime, hostImageLinks);
+                        binding = createBinding();
                     }
                 }
             }
@@ -980,6 +1012,7 @@ export class AgentService {
             if (result === undefined)
                 throw new RunReferenceConflictError();
             if (result.runRef === 'unavailable') {
+                options.participation?.finish(false);
                 await lease.release().catch(() => undefined);
                 lease = undefined;
                 if (result.kind === 'paused' || result.kind === 'completed') {
@@ -994,6 +1027,7 @@ export class AgentService {
                 sessionLoadDurationMs
             });
             const pending = Object.freeze({
+                ...(options.participation === undefined ? {} : { participation: options.participation }),
                 runId,
                 request,
                 session,
@@ -1016,6 +1050,7 @@ export class AgentService {
                 await lease.release().catch(() => undefined);
             }
             this.#pending.delete(runId);
+            options.participation?.finish(false);
             const result = linked.signal.aborted
                 ? cancelledRunResult(runId, linked.signal.reason ?? this.#shutdownReason)
                 : failedRunResult(runId, error);
@@ -1159,6 +1194,10 @@ export class AgentService {
             return null;
         if (isTerminalRunStatus(checkpoint.status))
             return null;
+        if (checkpoint.schemaVersion === 7 && checkpoint.contextDependencies.requiresLiveParticipation) {
+            throw new AgentError({ code: 'authorization_changed', stage: 'participation.recovery', retryable: false,
+                userMessage: '参与任务的现场已失效，请重新发起。' });
+        }
         if (this.#recoverRuntime === undefined) {
             throw new AgentError({
                 code: 'checkpoint_invalid',
@@ -1301,7 +1340,7 @@ export class AgentService {
             this.#pending.delete(pending.runId);
             await pending.lease.release().catch(() => undefined);
         }
-        return bindRunBoundaryGuard(activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs), pending.binding.checkBoundary);
+        return bindRunFinalDelivery(bindRunBoundaryGuard(activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs), pending.binding.checkBoundary), pending.participation === undefined ? undefined : delivered => pending.participation.finish(delivered && result.kind === 'completed' && result.completion.kind === 'reply_text'));
     }
     async #abortPending(pending, error) {
         let cancelled = null;
@@ -1316,6 +1355,7 @@ export class AgentService {
         }
         this.#pending.delete(pending.runId);
         await pending.lease.release().catch(() => undefined);
+        pending.participation?.finish(false);
         return activeFinalEnvelope(failedRunResult(pending.runId, error, pending.request?.runRef ?? pending.requestObservationContext.runRef), pending.requestObservationContext, 'not_attempted', 'not_attempted');
     }
     #reportObserverFailure() {

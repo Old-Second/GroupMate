@@ -130,9 +130,15 @@ export function buildGuobaConfigPatch(value, options) {
 }
 export function normalizeGuobaConfigValue(key, value) {
     if (key === 'participationMode') {
-        if (value !== 'legacy' && value !== 'shadow')
+        if (value !== 'legacy' && value !== 'shadow' && value !== 'active')
             throw new TypeError('群参与模式配置无效。');
         return value;
+    }
+    if (key === 'participationActiveGroups') {
+        if (!Array.isArray(value) || value.length > 64 || value.some(group => typeof group !== 'string' || !/^[1-9]\d{0,19}$/.test(group)) ||
+            new Set(value).size !== value.length)
+            throw new TypeError('受控参与群列表配置无效。');
+        return Object.freeze([...value]);
     }
     if (key === 'personalMemoryMode') {
         if (typeof value !== 'string' || !PERSONAL_MEMORY_MODES.has(value)) {

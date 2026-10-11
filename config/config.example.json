@@ -121,6 +121,7 @@
   "enableBYM": false,
   "bymRecognizeLeadingAlias": true,
   "participationMode": "legacy",
+  "participationActiveGroups": [],
   "bymRate": 5,
   "bymDisableGroup": [],
   "bymPreset": "",

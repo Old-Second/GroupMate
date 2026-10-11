@@ -17,6 +17,8 @@ export interface SceneDependency {
 }
 
 export interface ContextDependencyProof {
+  /** Denial-only restart constraint; this is never a serialized participation capability. */
+  readonly requiresLiveParticipation?: true
   readonly scene?: SceneDependency
   readonly schemaVersion: 1
   readonly memories: readonly MemoryDependency[]
@@ -26,7 +28,10 @@ export interface ContextDependencyProof {
 export function parseContextDependencyProof (value: unknown): ContextDependencyProof {
   const proof = parseJsonValue(value, { maxBytes: 8 * 1024, maxDepth: 4, maxNodes: 256 }) as unknown as ContextDependencyProof
   if (proof === null || typeof proof !== 'object' || Array.isArray(proof) ||
-    Object.keys(proof).sort().join(',') !== (proof.scene === undefined ? 'authorityStamp,memories,schemaVersion' : 'authorityStamp,memories,scene,schemaVersion') ||
+    Object.keys(proof).sort().join(',') !== ['authorityStamp', 'memories', 'schemaVersion',
+      ...(proof.scene === undefined ? [] : ['scene']),
+      ...(Object.hasOwn(proof, 'requiresLiveParticipation') ? ['requiresLiveParticipation'] : [])].sort().join(',') ||
+    (Object.hasOwn(proof, 'requiresLiveParticipation') && proof.requiresLiveParticipation !== true) ||
     proof.schemaVersion !== 1 || !Array.isArray(proof.memories) || proof.memories.length > 12 ||
     (proof.authorityStamp !== null && !/^[a-f0-9]{64}$/.test(proof.authorityStamp))) {
     throw new TypeError('context dependency proof is invalid')

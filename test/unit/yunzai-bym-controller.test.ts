@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { ActiveParticipationHost } from '../../src/runtime/participation/ActiveParticipationHost.js'
 import type { PresentationRouteV1 } from '../../src/agent/contracts/interaction.js'
 import type { ChatReplyEnvelope } from '../../src/runtime/agent-service.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../../src/runtime/message-input.js'
 import type { PresentationResult } from '../../src/runtime/presentation/presentation-result.js'
+import type { RuntimeDeliveryReceipt } from '../../src/runtime/presentation/presentation-result.js'
 import type { PresentationSettings } from '../../src/runtime/presentation/presentation-settings.js'
 import type { PresentationInput } from '../../src/runtime/runtime-presentation-hooks.js'
 import {
@@ -46,6 +48,52 @@ const presentationResult: PresentationResult = Object.freeze({
   schemaVersion: 1,
   outcome: 'complete',
   deliveries: Object.freeze([])
+})
+
+test('active host routes protocol at through a sample miss, ignores cold messages and requires actual delivery for continuation', async () => {
+  for (const deliveryKind of ['sent', 'outcome_unknown'] as const) {
+    let sequence = 0
+    const host = new ActiveParticipationHost(() => 1000,
+      () => ({ participationMode: 'active', participationActiveGroups: ['303'] }), () => '101', () => true)
+    const currentEvent = (msg: string, message: unknown[] = [], actor = 202) => event({
+      group_id: 303, self_id: 101, user_id: actor, sender: { user_id: actor },
+      message_id: ++sequence, msg, message
+    })
+    const delivery: PresentationResult = { schemaVersion: 1, outcome: deliveryKind === 'sent' ? 'complete' : 'unknown',
+      deliveries: [deliveryKind === 'sent'
+        ? { kind: 'sent', media: 'text', attempt: 1, receipt: { schemaVersion: 1, media: 'text' } as RuntimeDeliveryReceipt<'text'> }
+        : { kind: 'outcome_unknown', media: 'text', attempt: 1, code: 'unknown_host_result' }] }
+    const f = fixture({ random: 0.99, delivery,
+      activeParticipation: (e, direct, sampled) => host.select(e, direct, sampled) })
+    await f.controller.bym(currentEvent('普通消息'))
+    await f.controller.bym(currentEvent('我比较派蒙和其他机器人'))
+    assert.equal(f.agentInputs.length, 0)
+    await f.controller.bym(currentEvent('请回答', [{ type: 'at', qq: 101 }]))
+    assert.equal(f.agentInputs.length, 1)
+    assert((f.agentInputs[0] as { systemInstructions: readonly string[] }).systemInstructions.some(s => s.includes('明确请求')))
+    await f.controller.bym(currentEvent('谢谢！'))
+    await f.controller.bym(currentEvent('别人的续问', [], 505))
+    await f.controller.bym(currentEvent('下一步怎么办？', [{ type: 'at', qq: 999 }]))
+    assert.equal(f.agentInputs.length, 1)
+    await f.controller.bym(currentEvent('下一步怎么办？'))
+    assert.equal(f.agentInputs.length, deliveryKind === 'sent' ? 2 : 1)
+    host.close()
+  }
+})
+
+test('failed passive participation finalizes observation without presenting a failure hint', async () => {
+  const host = new ActiveParticipationHost(() => 1000,
+    () => ({ participationMode: 'active', participationActiveGroups: ['303'] }), () => '101', () => true)
+  const e = event({ group_id: 303, self_id: 101, user_id: 202, sender: { user_id: 202 }, message_id: 1 })
+  const prime = host.select(e, true, false); assert(prime); prime.admit(); prime.finish(true)
+  const f = fixture({ activeParticipation: (current, direct, sampled) => host.select(current, direct, sampled),
+    result: { kind: 'failed', runRef: 'unavailable', error: {}, terminal: null,
+      requestObservationDraft: {}, sessionPersistence: 'not_attempted' } as unknown as ChatReplyEnvelope })
+  await f.controller.bym({ ...e, message_id: 2 })
+  assert.equal(f.agentInputs.length, 1)
+  assert.equal(f.completionCalls(), 1)
+  assert.equal(f.presentationInputs.length, 0)
+  host.close()
 })
 
 const basePolicy: BymPolicySnapshot = Object.freeze({
@@ -110,6 +158,8 @@ function fixture (input: Readonly<{
   result?: ChatReplyEnvelope
   agentError?: boolean
   participation?: YunzaiBymControllerOptions['participation']
+  activeParticipation?: YunzaiBymControllerOptions['activeParticipation']
+  delivery?: PresentationResult
 }> = {}) {
   const calls: string[] = []
   const prepared: Array<Readonly<{
@@ -122,6 +172,7 @@ function fixture (input: Readonly<{
   let completionCalls = 0
   const controller = createYunzaiBymController({
     participation: input.participation,
+    activeParticipation: input.activeParticipation,
     policy: {
       snapshot: () => input.policy ?? basePolicy
     },
@@ -170,6 +221,7 @@ function fixture (input: Readonly<{
       handleEphemeral: async agentInput => {
         calls.push('agent')
         agentInputs.push(agentInput)
+        agentInput.participation?.admit()
         if (input.agentError === true) throw new Error('provider detail must stay silent')
         return input.result ?? completedEnvelope('完整主动回复。第二句。')
       }
@@ -189,7 +241,7 @@ function fixture (input: Readonly<{
       present: async presentationInput => {
         calls.push('present')
         presentationInputs.push(presentationInput)
-        return presentationResult
+        return input.delivery ?? presentationResult
       }
     },
     completionCoordinator: {

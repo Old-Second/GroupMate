@@ -1,7 +1,7 @@
 import { types } from 'node:util'
 
 export const PARTICIPATION_POLICY_VERSION = 1
-export type ParticipationMode = 'legacy' | 'shadow'
+export type ParticipationMode = 'legacy' | 'shadow' | 'active'
 export type ParticipationReason = 'disabled' | 'empty' | 'sample_miss' | 'direct' | 'continuation' | 'sampled' | 'acknowledgement' | 'untrusted' | 'unavailable'
 export interface ParticipationEvent {
   readonly schemaVersion: 1
@@ -51,5 +51,5 @@ export function isTrustedParticipationEvent (event: ParticipationEvent): boolean
 }
 
 export function participationMode (value: unknown): ParticipationMode {
-  return value === 'shadow' ? 'shadow' : 'legacy'
+  return value === 'shadow' || value === 'active' ? value : 'legacy'
 }

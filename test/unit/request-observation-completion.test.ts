@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { bindRunFinalDelivery, notifyRunFinalDelivery } from '../../src/agent/run/RunBoundary.js'
+import type { RuntimeDeliveryReceipt } from '../../src/runtime/presentation/presentation-result.js'
 import type { PresentationResult } from '../../src/runtime/presentation/presentation-result.js'
 import {
   beginRequestObservation,
@@ -16,6 +18,26 @@ import type {
 } from '../../src/runtime/agent-service.js'
 
 const requestRef = '1'.repeat(32)
+
+test('final delivery observers consume one typed outcome, treat failures as undelivered and isolate cleanup exceptions', async () => {
+  for (const kind of ['sent', 'outcome_unknown', 'failed_definite', 'throw'] as const) {
+    const outcomes: boolean[] = []
+    const envelope = bindRunFinalDelivery(finalEnvelope(), delivered => { outcomes.push(delivered); throw new Error('cleanup') })
+    const coordinator = createPresentationCompletionCoordinator({ publisher: { publish: () => {} }, monotonicNow: () => 20 })
+    const expected: PresentationResult = { schemaVersion: 1, outcome: kind === 'sent' ? 'complete' : 'failed', deliveries:
+      kind === 'throw' ? [] : [kind === 'sent'
+        ? { kind: 'sent', media: 'text', attempt: 1, receipt: { schemaVersion: 1, media: 'text' } as RuntimeDeliveryReceipt<'text'> }
+        : { kind, media: 'text', attempt: 1, code: 'unknown_host_result' }] }
+    const complete = coordinator.complete({ envelope, present: async () => {
+      if (kind === 'throw') throw new Error('presenter failure')
+      return expected
+    } })
+    if (kind === 'throw') await assert.rejects(complete, /presenter failure/)
+    else assert.equal(await complete, expected)
+    notifyRunFinalDelivery(envelope, true)
+    assert.deepEqual(outcomes, [kind === 'sent'])
+  }
+})
 
 function finalEnvelope (
   startedAtMonotonicMs: number | 'unavailable' = 10

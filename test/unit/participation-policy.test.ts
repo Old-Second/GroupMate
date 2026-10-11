@@ -34,7 +34,7 @@ test('exact parser rejects fake roles, fields, accessors, scopes and claimed ori
   assert.equal(reads, 0)
   assert.equal(decideParticipation(parseParticipationEvent({ ...baseEvent, addressed: true }), { sampled: true, continuation: true }).reason, 'untrusted')
   assert.throws(() => hostParticipationEvent({ ...baseEvent, origin: 'model' }))
-  assert.equal(participationMode('active'), 'legacy')
+  assert.equal(participationMode('active'), 'active')
 })
 
 test('60 synthetic decisions use fixed independent expectations and no provider, tools or outputs', async () => {

@@ -204,6 +204,7 @@ export interface YunzaiAgentServiceBridgeOptions extends Omit<
 }
 
 export interface YunzaiAgentHandleOptions {
+  readonly participation?: import('../agent/participation/ParticipationRun.js').ParticipationRun
   readonly systemInstructions?: readonly string[]
   readonly enableGroupContext?: boolean
   readonly thinkingMode?: unknown
@@ -1384,6 +1385,7 @@ export class YunzaiAgentServiceBridge {
       }
       const result = requestKind === 'proactive_chat'
         ? await this.#bridge.handleEphemeral(request, {
+            ...(options.participation === undefined ? {} : { participation: options.participation }),
             requestObservationContext,
             ...(options.presentationLifecycle === undefined
               ? {}

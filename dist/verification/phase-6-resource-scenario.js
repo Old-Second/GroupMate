@@ -942,7 +942,8 @@ function graphFixture(input) {
                 model: 'fixture-model',
                 toolPolicyProfile: input.scenario === 'checkpointResume' ? 'safe' : 'compatible',
                 toolApprovalTtlSeconds: 120,
-                observabilityLevel: input.observabilityLevel
+                observabilityLevel: input.observabilityLevel,
+                ...(input.activeParticipation ? { participationMode: 'active', participationActiveGroups: ['303', '304'] } : {})
             }),
             redis: input.redis,
             getMasterIds: async () => Object.freeze(['7']),
@@ -1024,7 +1025,8 @@ function graphFixture(input) {
                 hardLimitUsd: 0, totalUsageUsd: 0, expiresAt: new Date(0)
             })
         }),
-        bymPolicy: Object.freeze({ snapshot: () => disabledBymPolicy }),
+        bymPolicy: Object.freeze({ snapshot: () => input.activeParticipation
+                ? Object.freeze({ ...disabledBymPolicy, enabled: true }) : disabledBymPolicy }),
         buttonPolicy: Object.freeze({
             snapshot: () => Object.freeze({ markdownEnabled: false, openAiConfigured: false })
         }),
@@ -1152,6 +1154,7 @@ export async function runPhase6ResourceScenario(scenario, options = {}) {
         ? new ApprovalScenarioModel()
         : new ScenarioModel(scenario);
     const primary = graphFixture({
+        activeParticipation: options.activeParticipation,
         scenario,
         redis,
         host,
@@ -1166,9 +1169,20 @@ export async function runPhase6ResourceScenario(scenario, options = {}) {
     const cpuStart = process.cpuUsage();
     const wallStart = performance.now();
     const runChat = async (actorId, marker, picture = false, graph = primary.graph) => {
-        const handled = await graph.chatController.chatgpt1(groupEvent(actorId, marker, host, { picture }));
-        if (!handled)
-            throw new Error('resource chat scenario was not handled');
+        const event = groupEvent(actorId, marker, host, { picture, ...(options.activeParticipation ? {
+                groupId: actorId === 'dual-b' ? '304' : '303', rawMessage: `GroupMate ${marker}`
+            } : {}) });
+        if (options.activeParticipation) {
+            const before = primary.dispatches.length;
+            await graph.bymController.bym(event);
+            if (primary.dispatches.length <= before)
+                throw new Error('active production run was not delivered');
+        }
+        else {
+            const handled = await graph.chatController.chatgpt1(event);
+            if (!handled)
+                throw new Error('resource chat scenario was not handled');
+        }
         observations.push(memoryUsage().rss);
     };
     try {

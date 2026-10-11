@@ -99,83 +99,103 @@ async function runBym(options, event) {
             explicitlyAddressed: trigger.explicitlyAddressed, eligible: true, legacyAllowed }) ?? null;
     }
     catch { }
-    if (!legacyAllowed)
+    const activeDirect = trigger.explicitlyAddressed && (event.hasAlias === true ||
+        (typeof policy.assistantLabel === 'string' && policy.assistantLabel.trim() !== '' && trigger.prompt.trimStart().startsWith(policy.assistantLabel)));
+    const activeRun = options.activeParticipation?.(event, activeDirect, legacyAllowed);
+    if (activeRun === null || (activeRun === undefined && !legacyAllowed))
         return;
-    const prompt = trigger.prompt;
-    const actorId = eventActorId(event);
-    const retaliationHit = policy.retaliationWords.some(word => prompt.includes(word));
-    const retaliation = retaliationHit &&
-        !policy.retaliationBlacklistActorIds.includes(actorId);
-    const recall = recallAfterMs(policy, retaliation);
-    const presentationIntent = Object.freeze({
-        schemaVersion: 1,
-        kind: 'proactive',
-        recallAfterMs: recall
-    });
-    const prepared = await options.requests.prepare({
-        event,
-        prompt,
-        presentationIntent
-    });
-    assertPreparedIntent(prepared, recall);
-    if (await options.promptScreening.isBlocked({
-        event,
-        prompt: prepared.evidence.prompt
-    }))
-        return;
-    const lease = options.coordinate?.(event, trigger.explicitlyAddressed);
-    if (options.coordinate !== undefined && lease === null)
-        return;
-    let sent = false;
+    let sent = false, paused = false;
     try {
-        const envelope = await options.agent.handleEphemeral({
-            event,
-            prepared,
-            systemInstructions: Object.freeze([
-                proactiveSystemInstruction(policy, retaliation)
-            ]),
-            enableGroupContext: true,
-            thinkingMode: policy.thinkingMode,
-            reasoningEffort: policy.reasoningEffort
+        const prompt = trigger.prompt;
+        const actorId = eventActorId(event);
+        const retaliationHit = policy.retaliationWords.some(word => prompt.includes(word));
+        const retaliation = retaliationHit &&
+            !policy.retaliationBlacklistActorIds.includes(actorId);
+        const recall = recallAfterMs(policy, retaliation);
+        const presentationIntent = Object.freeze({
+            schemaVersion: 1,
+            kind: 'proactive',
+            recallAfterMs: recall
         });
-        recordDiagnostic(options.diagnostics, createChatRequestLog({
-            mode: 'api',
-            stream: false,
-            prompt: prepared.evidence.prompt,
-            correlation: Object.freeze({
-                runRef: envelope.runRef,
-                terminalObservationId: 'not_attempted'
-            })
-        }));
-        if (envelope.kind === 'paused')
+        const prepared = await options.requests.prepare({
+            event,
+            prompt,
+            presentationIntent
+        });
+        assertPreparedIntent(prepared, recall);
+        if (await options.promptScreening.isBlocked({
+            event,
+            prompt: prepared.evidence.prompt
+        }))
             return;
-        recordDiagnostic(options.diagnostics, createChatResponseLog({
-            mode: 'api',
-            correlation: Object.freeze({
-                runRef: envelope.runRef,
-                terminalObservationId: envelope.runRef === 'unavailable'
-                    ? 'not_attempted'
-                    : envelope.terminal?.snapshot.observationId ?? 'unavailable'
-            }),
-            response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
-                ? { text: envelope.completion.text }
-                : envelope.kind === 'failed'
-                    ? { error: true }
-                    : {}
-        }));
-        if (!trigger.explicitlyAddressed && lease !== undefined && !lease.current())
+        const lease = options.coordinate?.(event, activeRun === undefined ? trigger.explicitlyAddressed : activeRun.admission === 'queue');
+        if (options.coordinate !== undefined && lease === null)
             return;
-        const delivered = await completeProactive(options, event, prepared, envelope);
-        sent = delivered;
-        if (delivered && candidate !== null) {
-            try {
-                options.participation?.replied(candidate);
+        try {
+            const envelope = await options.agent.handleEphemeral({
+                event,
+                prepared,
+                systemInstructions: Object.freeze([
+                    proactiveSystemInstruction(policy, retaliation),
+                    ...(activeRun?.instructions ?? [])
+                ]),
+                enableGroupContext: true,
+                thinkingMode: policy.thinkingMode,
+                reasoningEffort: policy.reasoningEffort,
+                ...(activeRun === undefined ? {} : { participation: activeRun })
+            });
+            recordDiagnostic(options.diagnostics, createChatRequestLog({
+                mode: 'api',
+                stream: false,
+                prompt: prepared.evidence.prompt,
+                correlation: Object.freeze({
+                    runRef: envelope.runRef,
+                    terminalObservationId: 'not_attempted'
+                })
+            }));
+            if (envelope.kind === 'paused') {
+                paused = true;
+                return;
             }
-            catch { }
+            if (activeRun?.admission === 'immediate' && envelope.kind !== 'completed') {
+                await options.completionCoordinator.complete({ envelope, present: async () => Object.freeze({
+                        schemaVersion: 1, outcome: 'skipped', deliveries: Object.freeze([])
+                    }) });
+                return;
+            }
+            recordDiagnostic(options.diagnostics, createChatResponseLog({
+                mode: 'api',
+                correlation: Object.freeze({
+                    runRef: envelope.runRef,
+                    terminalObservationId: envelope.runRef === 'unavailable'
+                        ? 'not_attempted'
+                        : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+                }),
+                response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+                    ? { text: envelope.completion.text }
+                    : envelope.kind === 'failed'
+                        ? { error: true }
+                        : {}
+            }));
+            const direct = activeRun === undefined ? trigger.explicitlyAddressed : activeRun.admission === 'queue';
+            if (!direct && lease !== undefined && !lease.current())
+                return;
+            const delivered = await completeProactive(options, event, prepared, envelope);
+            sent = delivered && envelope.kind === 'completed' && envelope.completion.kind === 'reply_text';
+            if (delivered && candidate !== null) {
+                try {
+                    options.participation?.replied(candidate);
+                }
+                catch { }
+            }
+        }
+        finally {
+            await lease?.finish(sent);
         }
     }
     finally {
-        await lease?.finish(sent);
+        if (!paused)
+            activeRun?.finish(sent);
     }
 }
 export function createYunzaiBymController(options) {

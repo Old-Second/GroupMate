@@ -63,7 +63,8 @@ test('shadow only projects bounded statistics and tolerates journal errors', asy
   shadow.close()
   assert.equal(shadow.state.stats().scopes, 0)
   assert.equal(normalizeGuobaConfigValue('participationMode', 'shadow'), 'shadow')
-  assert.throws(() => normalizeGuobaConfigValue('participationMode', 'active'))
+  assert.equal(normalizeGuobaConfigValue('participationMode', 'active'), 'active')
+  assert.throws(() => normalizeGuobaConfigValue('participationMode', 'invalid'))
   // This component has no authority ports and cannot start extra model or business work.
   const source = await readFile('src/runtime/participation/ParticipationShadow.ts', 'utf8')
   assert.doesNotMatch(source, /import.*(?:model|tools|memory|outbound|agent-service)/)

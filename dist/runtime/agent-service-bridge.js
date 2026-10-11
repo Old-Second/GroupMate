@@ -923,6 +923,7 @@ export class YunzaiAgentServiceBridge {
             }
             const result = requestKind === 'proactive_chat'
                 ? await this.#bridge.handleEphemeral(request, {
+                    ...(options.participation === undefined ? {} : { participation: options.participation }),
                     requestObservationContext,
                     ...(options.presentationLifecycle === undefined
                         ? {}

@@ -31,5 +31,5 @@ export function isTrustedParticipationEvent(event) {
     return trustedEvents.has(event);
 }
 export function participationMode(value) {
-    return value === 'shadow' ? 'shadow' : 'legacy';
+    return value === 'shadow' || value === 'active' ? value : 'legacy';
 }

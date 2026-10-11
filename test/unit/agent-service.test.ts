@@ -69,6 +69,146 @@ import {
 import type { YunzaiAgentRequestDraft } from '../../src/runtime/yunzai-request-adapter.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 import { InMemoryRunStore } from '../helpers/in-memory-run-store.js'
+import { ActiveParticipationHost } from '../../src/runtime/participation/ActiveParticipationHost.js'
+import { notifyRunFinalDelivery } from '../../src/agent/run/RunBoundary.js'
+import type { RunRuntimeBinding } from '../../src/agent/run/run-engine.js'
+import type { RunCheckpointV7 } from '../../src/agent/run/run-checkpoint.js'
+
+function activeHarness (primeConversation = true) {
+  let sequence = 0, time = 1000
+  const host = new ActiveParticipationHost(() => time,
+    () => ({ participationMode: 'active', participationActiveGroups: ['303'] }), () => '101', () => true)
+  const select = (direct: boolean) => host.select({ isGroup: true, group_id: 303, user_id: 202,
+    sender: { user_id: 202 }, message_id: ++sequence, msg: '下一步怎么办？', message: [] }, direct, false)
+  if (primeConversation) {
+    const prime = select(true)
+    assert(prime); prime.admit(); prime.finish(true)
+  }
+  return { host, select, advance: (ms: number) => { time += ms } }
+}
+
+test('passive shared admission rejects busy work before runtime/session/model; quota failure releases the lease', async () => {
+  for (const busy of [true, false]) {
+    const h = activeHarness(), participation = h.select(false)
+    assert(participation)
+    let immediate = 0, queued = 0, releases = 0, starts = 0, runtimes = 0, loads = 0
+    const service = new AgentService({
+      sessions: { ...contractSessions(), get: async () => { loads++; return null } },
+      runStore: new InMemoryRunStore(),
+      admission: {
+        acquire: async () => { queued++; return noOpLease() },
+        recover: async () => noOpLease(),
+        tryAcquire: async () => { immediate++; return busy ? null : {
+          ...noOpLease(), release: async () => { releases++ }
+        } }
+      },
+      contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+      createEngine: () => contractEngine({ start: async input => {
+        starts++
+        return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: '答复' })
+      } }),
+      createRuntime: async () => { runtimes++; return contractRuntime() }
+    })
+    const first = await service.handleEphemeral(request('passive-first', '续问', 'proactive_chat'), { participation })
+    assert.equal(first.kind, busy ? 'failed' : 'completed')
+    assert.equal(queued, 0); assert.equal(immediate, 1); assert.equal(loads, 0)
+    assert.equal(starts, busy ? 0 : 1); assert.equal(runtimes, busy ? 0 : 1)
+    assert.equal(releases, busy ? 0 : 1)
+    notifyRunFinalDelivery(first, true)
+    if (!busy) {
+      const next = h.select(false); assert(next)
+      const rejected = await service.handleEphemeral(request('quota', '续问', 'proactive_chat'), { participation: next })
+      assert.equal(rejected.kind, 'failed')
+      assert.equal(releases, 2); assert.equal(starts, 1); assert.equal(runtimes, 1)
+    }
+    h.host.close()
+  }
+})
+
+test('live participation survives reference retry, composes every guard and establishes continuation only on delivered success', async () => {
+  const h = activeHarness(), participation = h.select(true)
+  assert(participation)
+  let binding: RunRuntimeBinding | undefined, starts = 0, queued = 0, releases = 0
+  const checks: string[] = []
+  const service = new AgentService({ sessions: contractSessions(), runStore: new InMemoryRunStore(),
+    admission: { acquire: async () => { queued++; return { ...noOpLease(), release: async () => { releases++ } } },
+      recover: async () => noOpLease(), tryAcquire: async () => { assert.fail('direct must use queue') } },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ start: async input => {
+      if (++starts === 1) throw new RunReferenceConflictError()
+      binding = input.runtime
+      for (const boundary of ['provider', 'tool', 'response', 'final'] as const) {
+        await binding.checkBoundary?.(boundary, new AbortController().signal)
+      }
+      return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: '答复' })
+    } }),
+    createRuntime: async () => ({ ...contractRuntime(), binding: { ...contractRuntime().binding,
+      checkBoundary: async boundary => { checks.push(boundary) } } })
+  })
+  const result = await service.handleEphemeral(request('live-retry', '点名', 'proactive_chat'), { participation })
+  assert.equal(result.kind, 'completed')
+  assert.equal(queued, 1); assert.equal(releases, 1); assert.equal(starts, 2)
+  assert.deepEqual(checks, ['provider', 'tool', 'response', 'final', 'final'])
+  assert.equal(binding?.contextDependencies?.requiresLiveParticipation, true)
+  notifyRunFinalDelivery(result, true)
+  await assert.rejects(binding!.checkBoundary!('tool', new AbortController().signal))
+  const continuation = h.select(false); assert(continuation); continuation.finish(false)
+  const clone = JSON.parse(JSON.stringify(participation))
+  const forged = await service.handleEphemeral(request('forged', '伪造', 'proactive_chat'), { participation: clone })
+  assert.equal(forged.kind, 'failed'); assert.equal(queued, 1); assert.equal(starts, 2)
+})
+
+test('paused participation finishes after approval presentation and never recreates its capability after restart', async () => {
+  for (const delivered of [true, false]) {
+    const h = activeHarness(false), participation = h.select(true); assert(participation)
+    let binding: RunRuntimeBinding | undefined, runId = '', runRef = ''
+    const service = new AgentService({ sessions: contractSessions(), runStore: new InMemoryRunStore(),
+      admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+      contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+      createEngine: () => contractEngine({ start: async input => {
+        binding = input.runtime; runId = input.runId; runRef = input.runRef
+        return { kind: 'paused', runId, runRef, interruption: {} } as RunAdvanceResult
+      }, decideApproval: async (_input, runtime) => {
+        assert.equal(runtime, binding)
+        await runtime?.checkBoundary?.('tool', new AbortController().signal)
+        return completedResult(runId, runRef, { kind: 'reply_text', text: '批准后答复' })
+      } }), createRuntime: async () => contractRuntime()
+    })
+    assert.equal((await service.handleEphemeral(request('pause', '待审批', 'proactive_chat'), { participation })).kind, 'paused')
+    await participation.checkBoundary('provider', new AbortController().signal)
+    const final = await service.decideApproval({ runId, approvalId: 'approval', kind: 'approved',
+      decidedAt: createdAt, sessionAddress: request('pause', 'unused').sessionAddress })
+    assert(final && final.kind === 'completed')
+    notifyRunFinalDelivery(final, delivered)
+    assert.equal(h.select(false) !== null, delivered)
+    await assert.rejects(participation.checkBoundary('final', new AbortController().signal))
+  }
+  let recoveries = 0, resumes = 0
+  const service = new AgentService({ sessions: contractSessions(), runStore: new InMemoryRunStore(),
+    admission: { acquire: async () => noOpLease(), recover: async () => { recoveries++; return noOpLease() } },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ loadCheckpoint: async () => ({ schemaVersion: 7, status: 'waiting_approval',
+      contextDependencies: { requiresLiveParticipation: true } }) as RunCheckpointV7,
+      resume: async () => { resumes++; throw new Error('must not resume') } }),
+    createRuntime: async () => contractRuntime(), recoverRuntime: async () => contractRuntime()
+  })
+  await assert.rejects(service.resume('old-active'), /现场已失效/)
+  assert.equal(recoveries, 0); assert.equal(resumes, 0)
+})
+
+test('sent cancellation notices cannot establish active continuation', async () => {
+  const h = activeHarness(false), participation = h.select(true); assert(participation)
+  const service = new AgentService({ sessions: contractSessions(), runStore: new InMemoryRunStore(),
+    admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ start: async input => cancelledResult(input.runId, input.runRef, 'cancelled') }),
+    createRuntime: async () => contractRuntime()
+  })
+  const result = await service.handleEphemeral(request('cancelled-active', '请求', 'proactive_chat'), { participation })
+  assert.equal(result.kind, 'cancelled')
+  notifyRunFinalDelivery(result, true)
+  assert.equal(h.select(false), null)
+})
 
 const createdAt = '2026-07-14T01:00:00.000Z'
 const facts: ToolRuntimeFacts = Object.freeze({

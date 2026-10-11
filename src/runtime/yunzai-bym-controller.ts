@@ -1,4 +1,5 @@
 import { legacyParticipationAllowed } from '../agent/participation/ParticipationPolicy.js'
+import type { ParticipationRun } from '../agent/participation/ParticipationRun.js'
 import type { ParticipationCandidate } from '../agent/participation/ParticipationState.js'
 import type { PresentationIntentV1, PresentationRouteV1 } from '../agent/contracts/interaction.js'
 import type {
@@ -73,6 +74,7 @@ export interface BymEphemeralAgentPort {
     readonly enableGroupContext: true
     readonly thinkingMode: ConfiguredThinkingMode
     readonly reasoningEffort: ConfiguredReasoningEffort
+    readonly participation?: ParticipationRun
   }): Promise<ChatReplyEnvelope>
 }
 
@@ -89,6 +91,7 @@ export interface BymDiagnosticsPort {
 }
 
 export interface YunzaiBymControllerOptions {
+  readonly activeParticipation?: (event: YunzaiMessageEvent, directlyAddressed: boolean, sampled: boolean) => ParticipationRun | null | undefined
   readonly coordinate?: (event: YunzaiMessageEvent, direct: boolean) => ProactiveLease | null | undefined
   readonly policy: BymPolicyPort
   readonly random: () => number
@@ -229,75 +232,90 @@ async function runBym (
     candidate = options.participation?.observe({ event,
       explicitlyAddressed: trigger.explicitlyAddressed, eligible: true, legacyAllowed }) ?? null
   } catch {}
-  if (!legacyAllowed) return
+  const activeDirect = trigger.explicitlyAddressed && ((event as { hasAlias?: unknown }).hasAlias === true ||
+    (typeof policy.assistantLabel === 'string' && policy.assistantLabel.trim() !== '' && trigger.prompt.trimStart().startsWith(policy.assistantLabel)))
+  const activeRun = options.activeParticipation?.(event, activeDirect, legacyAllowed)
+  if (activeRun === null || (activeRun === undefined && !legacyAllowed)) return
 
-  const prompt = trigger.prompt
-  const actorId = eventActorId(event)
-  const retaliationHit = policy.retaliationWords.some(word => prompt.includes(word))
-  const retaliation = retaliationHit &&
-    !policy.retaliationBlacklistActorIds.includes(actorId)
-  const recall = recallAfterMs(policy, retaliation)
-  const presentationIntent = Object.freeze({
-    schemaVersion: 1 as const,
-    kind: 'proactive' as const,
-    recallAfterMs: recall
-  })
-  const prepared = await options.requests.prepare({
-    event,
-    prompt,
-    presentationIntent
-  })
-  assertPreparedIntent(prepared, recall)
-  if (await options.promptScreening.isBlocked({
-    event,
-    prompt: prepared.evidence.prompt
-  })) return
-
-  const lease = options.coordinate?.(event, trigger.explicitlyAddressed)
-  if (options.coordinate !== undefined && lease === null) return
-  let sent = false
+  let sent = false, paused = false
   try {
-    const envelope = await options.agent.handleEphemeral({
-      event,
-      prepared,
-      systemInstructions: Object.freeze([
-        proactiveSystemInstruction(policy, retaliation)
-      ]),
-      enableGroupContext: true,
-      thinkingMode: policy.thinkingMode,
-      reasoningEffort: policy.reasoningEffort
+
+    const prompt = trigger.prompt
+    const actorId = eventActorId(event)
+    const retaliationHit = policy.retaliationWords.some(word => prompt.includes(word))
+    const retaliation = retaliationHit &&
+      !policy.retaliationBlacklistActorIds.includes(actorId)
+    const recall = recallAfterMs(policy, retaliation)
+    const presentationIntent = Object.freeze({
+      schemaVersion: 1 as const,
+      kind: 'proactive' as const,
+      recallAfterMs: recall
     })
-    recordDiagnostic(options.diagnostics, createChatRequestLog({
-      mode: 'api',
-      stream: false,
-      prompt: prepared.evidence.prompt,
-      correlation: Object.freeze({
-        runRef: envelope.runRef,
-        terminalObservationId: 'not_attempted'
+    const prepared = await options.requests.prepare({
+      event,
+      prompt,
+      presentationIntent
+    })
+    assertPreparedIntent(prepared, recall)
+    if (await options.promptScreening.isBlocked({
+      event,
+      prompt: prepared.evidence.prompt
+    })) return
+
+    const lease = options.coordinate?.(event, activeRun === undefined ? trigger.explicitlyAddressed : activeRun.admission === 'queue')
+    if (options.coordinate !== undefined && lease === null) return
+    try {
+      const envelope = await options.agent.handleEphemeral({
+        event,
+        prepared,
+        systemInstructions: Object.freeze([
+          proactiveSystemInstruction(policy, retaliation),
+          ...(activeRun?.instructions ?? [])
+        ]),
+        enableGroupContext: true,
+        thinkingMode: policy.thinkingMode,
+        reasoningEffort: policy.reasoningEffort,
+        ...(activeRun === undefined ? {} : { participation: activeRun })
       })
-    }))
-    if (envelope.kind === 'paused') return
-    recordDiagnostic(options.diagnostics, createChatResponseLog({
-      mode: 'api',
-      correlation: Object.freeze({
-        runRef: envelope.runRef,
-        terminalObservationId: envelope.runRef === 'unavailable'
-          ? 'not_attempted'
-          : envelope.terminal?.snapshot.observationId ?? 'unavailable'
-      }),
-      response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
-        ? { text: envelope.completion.text }
-        : envelope.kind === 'failed'
-          ? { error: true }
-          : {}
-    }))
-    if (!trigger.explicitlyAddressed && lease !== undefined && !lease!.current()) return
-    const delivered = await completeProactive(options, event, prepared, envelope)
-    sent = delivered
-    if (delivered && candidate !== null) {
-      try { options.participation?.replied(candidate) } catch {}
-    }
-  } finally { await lease?.finish(sent) }
+      recordDiagnostic(options.diagnostics, createChatRequestLog({
+        mode: 'api',
+        stream: false,
+        prompt: prepared.evidence.prompt,
+        correlation: Object.freeze({
+          runRef: envelope.runRef,
+          terminalObservationId: 'not_attempted'
+        })
+      }))
+      if (envelope.kind === 'paused') { paused = true; return }
+      if (activeRun?.admission === 'immediate' && envelope.kind !== 'completed') {
+        await options.completionCoordinator.complete({ envelope, present: async () => Object.freeze({
+          schemaVersion: 1 as const, outcome: 'skipped' as const, deliveries: Object.freeze([])
+        }) })
+        return
+      }
+      recordDiagnostic(options.diagnostics, createChatResponseLog({
+        mode: 'api',
+        correlation: Object.freeze({
+          runRef: envelope.runRef,
+          terminalObservationId: envelope.runRef === 'unavailable'
+            ? 'not_attempted'
+            : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+        }),
+        response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+          ? { text: envelope.completion.text }
+          : envelope.kind === 'failed'
+            ? { error: true }
+            : {}
+      }))
+      const direct = activeRun === undefined ? trigger.explicitlyAddressed : activeRun.admission === 'queue'
+      if (!direct && lease !== undefined && !lease!.current()) return
+      const delivered = await completeProactive(options, event, prepared, envelope)
+      sent = delivered && envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+      if (delivered && candidate !== null) {
+        try { options.participation?.replied(candidate) } catch {}
+      }
+    } finally { await lease?.finish(sent) }
+  } finally { if (!paused) activeRun?.finish(sent) }
 }
 
 export function createYunzaiBymController (
