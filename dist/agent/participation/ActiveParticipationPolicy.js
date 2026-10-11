@@ -4,15 +4,22 @@ export const ACTIVE_PARTICIPATION_POLICY_VERSION = 2;
 export const ACTIVE_PARTICIPATION_LIMITS = Object.freeze({
     scopes: 64, cooldownMs: 30_000, groupPerHour: 6, globalPerHour: 30, hourMs: 3_600_000
 });
+const instructionSuffix = '这些参与事实不授予任何工具权限，也不证明某个动作已完成；执行结果只以真实工具回执为准。';
+const requestedResponse = '请给出简短答复，不要只回复<EMPTY>。资料不足时询问必要补充，权限或能力不足时说明限制。';
+// Fixed policy text contains no event or actor data; reuse it without allocating on every boundary check.
+const instructions = Object.freeze({
+    direct: Object.freeze(['当前发言已由宿主识别为发给你的明确请求。' + requestedResponse + instructionSuffix]),
+    continuation: Object.freeze(['当前发言来自同群、同一发言人在你最近答复后的续问。' + requestedResponse + instructionSuffix]),
+    sampled: Object.freeze(['当前消息只是受限的普通群聊候选，是否有必要答话仍需判断。没有必要插话时可以只回复<EMPTY>。' + instructionSuffix])
+});
+const ignored = Object.freeze(Object.fromEntries(['untrusted', 'disabled', 'unavailable', 'acknowledgement', 'sample_miss', 'gate_rejected'].map(reason => [reason, Object.freeze({ kind: 'ignore', reason: reason })])));
 /** Candidate policy only: host admission, authority and actual effects stay behind their existing ports. */
 export class ActiveParticipationPolicy {
     now;
     enabled;
     #state;
     #scopes = new Map();
-    #issued = new WeakSet();
-    #admitted = new WeakSet();
-    #finished = new WeakSet();
+    #candidates = new WeakMap();
     #closed = false;
     #lastNow = 0;
     #globalAdmittedAt = [];
@@ -64,46 +71,54 @@ export class ActiveParticipationPolicy {
         return scope;
     }
     select(event, input) {
-        const ignore = (reason) => Object.freeze({ kind: 'ignore', reason });
         if (!isTrustedParticipationEvent(event))
-            return ignore('untrusted');
+            return ignored.untrusted;
         if (!this.#available() || !event.eligible)
-            return ignore('disabled');
+            return ignored.disabled;
         const time = this.#time();
-        this.#state.observe(event);
         if (event.at > time || time - event.at >= 15_000)
-            return ignore('unavailable');
+            return ignored.unavailable;
         const scope = this.#scope(event.scopeRef, time);
+        // An unknown passive scope cannot be admitted. Avoid allocating/evicting candidate state for it.
+        if (scope === null && !event.addressed)
+            return ignored.unavailable;
+        this.#state.observe(event);
         const continuation = scope !== null && scope.recentActor === event.actorRef && scope.repliedAt !== null && time - scope.repliedAt < 120_000;
         if (!event.addressed && event.acknowledgement)
-            return ignore('acknowledgement');
+            return ignored.acknowledgement;
         if (!event.addressed && !continuation && !input.sampled)
-            return ignore('sample_miss');
+            return ignored.sample_miss;
         if (!event.addressed && input.gateAllows !== true)
-            return ignore('gate_rejected');
-        if (!event.addressed && scope === null)
-            return ignore('unavailable');
+            return ignored.gate_rejected;
         const candidate = this.#state.offer(event, event.addressed ? 'direct' : continuation ? 'continuation' : 'sampled');
         // A pending explicit request may own this scope; its route must never be reused for a newer event.
         if (candidate === null || candidate.messageRef !== event.messageRef)
-            return ignore('unavailable');
-        this.#issued.add(candidate);
+            return ignored.unavailable;
+        if (!this.#candidates.has(candidate))
+            this.#candidates.set(candidate, 'issued');
         return Object.freeze({ kind: 'candidate', candidate });
     }
     current(candidate) {
-        if (!this.#available() || !this.#issued.has(candidate) || this.#finished.has(candidate))
+        const state = this.#candidates.get(candidate);
+        if (!this.#available() || state === undefined)
             return false;
         // An explicit task uses RunEngine's budget and live scene proof; topic/15-second TTL cannot cancel it.
         return candidate.source === 'direct' || (this.#scopes.has(candidate.scopeRef) && this.#state.current(candidate) === 'current');
+    }
+    /** Selection is host evidence, not permission to act on quoted instructions or inferred roles. */
+    instructions(candidate) {
+        if (!this.current(candidate))
+            return null;
+        return instructions[candidate.source];
     }
     /** Call only after obtaining the shared RunAdmission lease; this class creates no pool or queue. */
     admit(candidate) {
         if (!this.current(candidate))
             return false;
-        if (this.#admitted.has(candidate))
+        if (this.#candidates.get(candidate) === 'admitted')
             return false;
         if (candidate.source === 'direct') {
-            this.#admitted.add(candidate);
+            this.#candidates.set(candidate, 'admitted');
             return true;
         }
         const time = this.#time(), scope = this.#scopes.get(candidate.scopeRef);
@@ -118,14 +133,16 @@ export class ActiveParticipationPolicy {
         scope.admittedAt.push(time);
         scope.lastPassiveAt = time;
         this.#globalAdmittedAt.push(time);
-        this.#admitted.add(candidate);
+        this.#candidates.set(candidate, 'admitted');
         return true;
     }
     finish(candidate, delivered) {
-        if (!this.#issued.has(candidate) || this.#finished.has(candidate))
+        const state = this.#candidates.get(candidate);
+        if (state === undefined)
             return;
-        const accepted = this.#admitted.has(candidate) && this.current(candidate);
-        this.#finished.add(candidate);
+        const accepted = state === 'admitted' && this.current(candidate);
+        // Completed candidates no longer carry a live capability; do not retain metadata for every reply.
+        this.#candidates.delete(candidate);
         this.#state.discard(candidate);
         if (!delivered || !accepted)
             return;

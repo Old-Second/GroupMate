@@ -84,6 +84,25 @@ test('a new direct route never acquires an earlier direct event candidate', () =
   assert.equal(h.policy.admit(first), true)
 })
 
+test('only live issued candidates project trusted participation facts into model instructions', () => {
+  const h = harness(), direct = h.select(h.event({ addressed: true }))
+  assert.equal(h.policy.instructions(JSON.parse(JSON.stringify(direct))), null)
+  const instructions = h.policy.instructions(direct)
+  assert.ok(instructions?.[0].startsWith('当前发言已由宿主识别为发给你的明确请求。'))
+  assert.equal(Object.isFrozen(instructions), true)
+  h.advance(20_000)
+  assert.deepEqual(h.policy.instructions(direct), instructions)
+  h.policy.finish(direct, false)
+  assert.equal(h.policy.instructions(direct), null)
+  const passive = h.select(h.event())
+  assert.ok(h.policy.instructions(passive)?.[0].includes('是否有必要答话仍需判断'))
+  h.advance(15_000)
+  assert.equal(h.policy.instructions(passive), null)
+  const next = h.select(h.event({ addressed: true }))
+  h.disable()
+  assert.equal(h.policy.instructions(next), null)
+})
+
 test('delivered direct replies establish only same actor/scope bounded continuation', () => {
   const h = harness(), direct = h.select(h.event({ addressed: true }))
   assert.equal(h.policy.admit(direct), true)
@@ -177,4 +196,18 @@ test('scope pressure cannot reset charged group quotas and remains bounded', () 
   assert.equal(h.policy.stats().scopes, 64)
   assert.ok(h.policy.stats().candidates <= 32)
   assert.ok(h.policy.stats().bytes < 512 * 1024)
+})
+
+test('unknown passive scopes fail closed without evicting known work; direct requests keep priority', () => {
+  const h = harness(), known = h.select(h.event())
+  assert.equal(h.policy.admit(known), true)
+  for (let n = 0; n < 63; n++) h.policy.select(h.event({ scopeRef: ref(`known-${n}`) }), { sampled: false, gateAllows: null })
+  for (let n = 0; n < 300; n++) {
+    assert.equal(h.policy.select(h.event({ scopeRef: ref(`unknown-${n}`) }), { sampled: true, gateAllows: true }).kind, 'ignore')
+  }
+  assert.equal(h.policy.current(known), true)
+  const direct = h.select(h.event({ scopeRef: ref('unknown-direct'), addressed: true }))
+  assert.equal(h.policy.admit(direct), true)
+  assert.equal(h.policy.stats().scopes, 64)
+  assert.equal(h.policy.stats().globalAdmitted, 1)
 })
