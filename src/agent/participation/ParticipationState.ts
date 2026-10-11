@@ -126,6 +126,14 @@ export class ParticipationState {
     this.#candidateCount--
   }
 
+  /** Release only this exact candidate; a late completion must not erase a newer route. */
+  discard (candidate: ParticipationCandidate): void {
+    const scope = this.#scopes.get(candidate.scopeRef)
+    if (scope?.candidate !== candidate) return
+    scope.candidate = null
+    this.#candidateCount--
+  }
+
   stats (): Readonly<{ scopes: number; candidates: number; bytes: number }> {
     this.#prune(this.#time())
     return Object.freeze({ scopes: this.#scopes.size,
