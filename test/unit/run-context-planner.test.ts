@@ -455,6 +455,36 @@ test('ordinary history compacts into provenance-linked untrusted excerpts with b
   assert.deepEqual(corrected.messages.slice(0, -1), first.messages)
 })
 
+test('a read tool can follow a compacted normal history plan without changing its prefix', async () => {
+  const store = new RecordingArtifactStore()
+  const history = Array.from({ length: 125 }, (_, index) => {
+    const original = ordinarySpan(`continuation-${index}`, 'runtime_fact', 'user', `${index}: ${'历史事实。'.repeat(160)}`)
+    const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
+    return createContextSpanV1(Object.freeze({ ...draft, source: 'group_context', trust: 'untrusted',
+      priority: 'normal', semanticOrder: index + 4,
+      provenance: Object.freeze({ ...draft.provenance, kind: 'group_snapshot' }) }))
+  })
+  const capability = Object.freeze({ ...plannerCheckpoint().modelCapability, contextWindowTokens: 1_048_576 })
+  const planner = createRunContextPlanner({ namespaceRef: runRef,
+    initialSpans: Object.freeze([...baseSpans, ...history]), artifactStore: store })
+  const first = await planner.planModelTurn(plannerCheckpoint({ modelCapability: capability }),
+    { kind: 'normal', transition: 'normal' }, new AbortController().signal)
+  assert.equal(first.plan.mode, 'normal')
+  assert.ok(first.artifactRefs.length > 0)
+  const pending = protocol(0, 'after-compacted-history')
+  const next = await planner.planModelTurn(plannerCheckpoint({ modelCapability: capability,
+    contextPlan: first.plan, messages: first.messages, contextArtifactRefs: first.artifactRefs,
+    pendingContextMessages: Object.freeze([pending.assistant, pending.tool]),
+    toolLedgers: Object.freeze([pending.ledger]) }),
+  { kind: 'normal', transition: 'normal' }, new AbortController().signal)
+  assert.deepEqual(next.messages, [...first.messages, pending.assistant, pending.tool])
+  const corrected = await planner.planModelTurn(plannerCheckpoint({ modelCapability: capability,
+    contextPlan: next.plan, messages: next.messages, contextArtifactRefs: next.artifactRefs,
+    toolLedgers: Object.freeze([pending.ledger]) }),
+  { kind: 'correction', transition: 'normal' }, new AbortController().signal)
+  assert.deepEqual(corrected.messages.slice(0, -1), next.messages)
+})
+
 test('planner commits model evidence, reuses it without a call and rejects recovered source authority', async () => {
   const original = ordinarySpan('semantic-history', 'runtime_fact', 'user',
     '甲说乙不喜欢咖啡。' + '旧背景。'.repeat(120) + '后来乙改为喜欢茶。')

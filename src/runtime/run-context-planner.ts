@@ -535,8 +535,16 @@ export function createRunContextPlanner (
         const coveredSpanIds = new Set(retainedArtifacts.flatMap(span => (
           artifacts.get(span.spanId)?.sourceSpanIds ?? []
         )))
+        const retainedSourceIds = previousPlan?.mode === 'normal' && request.transition === 'normal'
+          ? new Set(previousPlan.included.map(entry => entry.spanId))
+          : null
         spans = [
-          ...sourceSpans.filter(span => !coveredSpanIds.has(span.spanId)),
+          // Capacity trimming happens before the plan records omissions. Once
+          // compaction frees slots, those discarded sources must not reappear
+          // ahead of the committed prefix on the next tool or correction turn.
+          ...sourceSpans.filter(span => !coveredSpanIds.has(span.spanId) &&
+            (retainedSourceIds === null || span.requirement === 'mandatory' ||
+              retainedSourceIds.has(span.spanId))),
           ...retainedArtifacts,
           ...projectedToolSpans.filter(span => !coveredSpanIds.has(span.spanId))
         ]
