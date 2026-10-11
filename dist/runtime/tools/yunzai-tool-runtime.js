@@ -1,6 +1,7 @@
 import { currentGroupMember } from '../CurrentGroupMember.js';
 import { AgentError } from '../../agent/contracts/error.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { ToolExecutor } from '../../agent/tools/tool-executor.js';
 import { intentActionForToolCapability, ToolPolicyEngine } from '../../agent/tools/policy-engine.js';
 import { extractIntentEvidence } from './intent-evidence.js';
@@ -584,6 +585,11 @@ async function importFirst(specifiers) {
     }
     throw new Error('external plugin is unavailable');
 }
+const paintingDirectory = new URL('../../../../ap-plugin/apps/', import.meta.url);
+const gameEntries = [
+    new URL('../../../../miao-plugin/apps/profile/ProfileDetail.js', import.meta.url).href,
+    new URL('../../../../miao-plugin/apps/profile/ProfileList.js', import.meta.url).href
+];
 async function generateWithApPlugin(event, prompt, signal) {
     throwIfAborted(signal);
     const captured = createExternalPluginEventFacade(event);
@@ -591,6 +597,7 @@ async function generateWithApPlugin(event, prompt, signal) {
         captured.event.at = null;
     captured.event.atBot = false;
     captured.event.msg = `#绘图${prompt}`;
+    // Keep the import allowlist literal for the production dependency audit.
     const module = await importFirst([
         new URL('../../../../ap-plugin/apps/aiPainting.js', import.meta.url).href,
         new URL('../../../../ap-plugin/apps/ai_painting.js', import.meta.url).href
@@ -804,7 +811,8 @@ function visibleServices(options, event, policyFetch, botId) {
             return options.synthesizeAudio(event, text, voice, signal);
         },
         resolveVideo: async (id, signal) => resolveBilibiliVideo(policyFetch, id, downloadVideo, signal),
-        drawingAvailable: true,
+        drawingAvailable: options.generateImage !== undefined || ['aiPainting.js', 'ai_painting.js']
+            .some(file => existsSync(new URL(file, paintingDirectory))),
         pictureProcessingAvailable: processImage !== undefined,
         ttsAvailable,
         videoDownloadEnabled: downloadVideo,
@@ -979,6 +987,7 @@ export function createYunzaiToolRuntimeBridge(options) {
             }
         });
         const visible = createVisibleToolDefinitions(visibleToolServices);
+        const captionAvailable = pictureProcessor(policyFetch, configText(options.config, 'extraUrl')) !== undefined;
         const management = createManagementToolDefinitions(managementCapabilities(event));
         const { definitions, registry } = createToolRuntimeRegistry(query.definitions, visible, management);
         const enabledTools = definitions
@@ -987,6 +996,14 @@ export function createYunzaiToolRuntimeBridge(options) {
                 return visibleToolServices.drawingAvailable;
             if (definition.name === 'processPicture')
                 return visibleToolServices.pictureProcessingAvailable;
+            if (definition.name === 'imageCaption') {
+                return captionAvailable;
+            }
+            if (definition.name === 'weather')
+                return configText(options.config, 'amapKey') !== '';
+            if (definition.name === 'queryGenshin' || definition.name === 'queryStarRail') {
+                return options.queryGame !== undefined || gameEntries.every(path => existsSync(new URL(path)));
+            }
             if (definition.name === 'sendAudioMessage') {
                 return options.synthesizeAudio !== undefined && [
                     'ttsSpace', 'azureTTSKey', 'voicevoxSpace'

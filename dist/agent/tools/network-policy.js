@@ -16,6 +16,9 @@ const errorMessages = Object.freeze({
     content_type_denied: '网络响应类型不受支持。',
     response_too_large: '网络响应内容过大。'
 });
+export function isNetworkPolicyErrorCode(value) {
+    return typeof value === 'string' && Object.hasOwn(errorMessages, value);
+}
 export class NetworkPolicyError extends Error {
     code;
     userMessage;

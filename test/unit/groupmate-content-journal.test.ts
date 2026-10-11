@@ -1008,11 +1008,17 @@ test('model and network diagnostics keep a typed projection when callers include
   journal.recordRunEvent(diagnostic)
   journal.recordRunEvent({ ...diagnostic, config: 'fixture-secret' } as RunContentJournalEvent)
   journal.recordNetworkDiagnostic?.({ tag: 'image_fetch', phase: 'body', result: 'timeout',
-    durationMs: 8000, timeoutMs: 8000, redirects: 1, Authorization: 'fixture-secret'
+    durationMs: 8000, timeoutMs: 8000, redirects: 1, httpStatus: 200, errorCode: 'network_timeout', Authorization: 'fixture-secret'
   } as Parameters<NonNullable<GroupMateContentJournal['recordNetworkDiagnostic']>>[0])
   assert.equal(events[0]?.type, 'model.resolution')
   assert.equal(events[1]?.type, 'groupmate.content_journal.projection_failure')
   assert.equal(events[2]?.type, 'tool.network')
+  assert.match(JSON.stringify(events[2]), /"httpStatus":200/)
+  assert.match(JSON.stringify(events[2]), /"errorCode":"network_timeout"/)
+  journal.recordNetworkDiagnostic?.({ tag: 'other', phase: 'headers', result: 'failure',
+    durationMs: 0, timeoutMs: 100, redirects: 0, httpStatus: 999, errorCode: 'fixture-secret'
+  } as unknown as Parameters<NonNullable<GroupMateContentJournal['recordNetworkDiagnostic']>>[0])
+  assert.doesNotMatch(JSON.stringify(events[3]), /errorCode|httpStatus/)
   assert.doesNotMatch(JSON.stringify(events), /fixture-secret|Authorization|config/)
 })
 

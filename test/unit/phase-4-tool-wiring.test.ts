@@ -218,6 +218,26 @@ test('Yunzai runtime exposes strict schemas and executes through the native two-
   assert.equal(outcome.result?.status, 'success')
 })
 
+test('runtime discovery excludes missing optional capabilities and preserves injected adapters', async () => {
+  const event = { isGroup: false, user_id: 7, sender: { user_id: 7, nickname: 'fixture' },
+    bot: { pickFriend: () => ({ sendMsg: async () => {} }) }, message: [] }
+  for (const injected of [false, true]) {
+    const bridge = createYunzaiToolRuntimeBridge({
+      config: config({ extraUrl: 'invalid-url' }), redis: new FakeRedis(),
+      getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}),
+      ...(injected ? {
+        generateImage: async () => ({ kind: 'buffer' as const, data: Buffer.from('x'), byteLength: 1, mimeType: 'image/png' }),
+        queryGame: async () => ({ kind: 'buffer' as const, data: Buffer.from('x'), byteLength: 1, mimeType: 'image/png' })
+      } : {})
+    })
+    const run = await bridge.prepareAgentRun({ event, prompt: '发一张图片' })
+    const names = run.snapshot.modelTools.map(tool => tool.function.name)
+    for (const name of ['draw', 'queryGenshin', 'queryStarRail']) assert.equal(names.includes(name), injected, name)
+    for (const name of ['weather', 'imageCaption', 'processPicture']) assert.equal(names.includes(name), false, name)
+    for (const name of ['sendPicture', 'sendAvatar', 'website']) assert.equal(names.includes(name), true, name)
+  }
+})
+
 test('Yunzai runtime creates one native snapshot and no legacy execution surface', async () => {
   const bridge = createYunzaiToolRuntimeBridge({
     config: config({ toolPolicyProfile: 'safe' }),

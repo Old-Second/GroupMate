@@ -320,6 +320,34 @@ test('game query tools pass only normalized input and trusted current actor defa
   assert.deepEqual((sent[0] as { target: unknown }).target, { kind: 'group', groupId: '9' })
 })
 
+test('music search accepts endpoint JSON labelled text/plain and rejects plain error pages', async () => {
+  for (const [body, expected] of [
+    [JSON.stringify({ code: 200, result: { songs: [{ id: 1, name: 'song', artists: [{ name: 'artist' }] }] } }), 'success'],
+    ['upstream-error-with-private-details', 'failed']
+  ] as const) {
+    const fixture = policyFetchFixture(() => response(body, { contentType: 'text/plain' }))
+    const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(item => item.name === 'searchMusic')!
+    const result = await tool.execute({ keyword: 'song', limit: 1 }, context)
+    assert.equal(result.status, expected)
+    assert.doesNotMatch(JSON.stringify(result), /private-details/)
+    assert.equal(fixture.calls.length, 1)
+  }
+})
+
+test('game image dispatch exceptions remain unknown while query failures stay definite', async () => {
+  const fixture = policyFetchFixture(() => response({}))
+  let attempts = 0
+  const created = createQueryToolRuntime({ ...runtimeOptions(fixture.policyFetch),
+    queryGame: async () => ({ kind: 'buffer', data: Buffer.from('game'), mimeType: 'image/png', byteLength: 4 }),
+    sendGameImage: async () => { attempts++; throw new Error('acknowledgement lost') }
+  })
+  const tool = created.definitions.find(item => item.name === 'queryGenshin')!
+  const result = await tool.execute({ userId: '', uid: '123', character: '' }, { ...context, target: { kind: 'group', groupId: '9' } })
+  assert.equal(result.status, 'indeterminate')
+  assert.equal(result.retryable, false)
+  assert.equal(attempts, 1)
+})
+
 test('image caption reads a public image then calls only the configured fixed origin', async () => {
   const fixture = policyFetchFixture(request => request.url.hostname === 'image.example'
     ? response('image-bytes', { contentType: 'image/png' })
@@ -357,6 +385,20 @@ test('query tool abort is returned as a typed cancellation without upstream deta
   assert.equal(result.status, 'failed')
   if (result.status === 'failed') assert.equal(result.errorCode, 'tool_cancelled')
   assert.doesNotMatch(JSON.stringify(result), /secret|token|value/)
+})
+
+test('invalid optional image service configuration does not disable unrelated tools', async () => {
+  const fixture = policyFetchFixture(() => response('ok', { contentType: 'text/plain' }))
+  for (const extraUrl of ['not-a-url', 'http://127.0.0.1:8080', 'https://caption.example.com/path']) {
+    const created = runtime({ policyFetch: fixture.policyFetch, extraUrl })
+    const caption = created.definitions.find(tool => tool.name === 'imageCaption')!
+    const result = await caption.execute({ imageUrl: '', userId: '7', question: '' }, context)
+    assert.equal(result.status, 'failed')
+    if (result.status === 'failed') assert.equal(result.errorCode, 'configuration_missing')
+    const website = created.definitions.find(tool => tool.name === 'website')!
+    assert.equal((await website.execute({ url: 'https://example.com' }, context)).status, 'success')
+  }
+  assert.equal(fixture.calls.length, 3)
 })
 
 test('empty query strings are denied before any network request', async () => {

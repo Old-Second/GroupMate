@@ -2,8 +2,8 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { configurationFailure, invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
-  backgroundResourceResult, cancelledResult, executionFailure, resourceFromBytes,
-  validResource, visibleDefinition, type VisibleToolServices
+  cancelledResult, executionFailure, indeterminateResult, resourceFromBytes,
+  sessionAddressForTarget, validResource, visibleDefinition, visibleDeliveryResult, type VisibleToolServices
 } from './visible-tool-support.js'
 
 const inputSchema = {
@@ -16,7 +16,7 @@ const inputSchema = {
 
 export function createProcessPictureTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
-    name: 'processPicture', description: '处理图片并返回可供后续发送的图片资源。',
+    name: 'processPicture', description: '处理图片并将处理结果发送到当前会话。',
     inputSchema, network: 'open_http', resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       if (!services.pictureProcessingAvailable) return configurationFailure('图片处理服务尚未配置。')
@@ -29,14 +29,20 @@ export function createProcessPictureTool (services: VisibleToolServices): ToolDe
       })
       if (isToolResult(fetched)) return fetched
       if (fetched.status < 200 || fetched.status >= 300) return executionFailure('图片暂时无法读取。')
+      let dispatching = false
       try {
         const output = await services.processImage(
           resourceFromBytes(fetched.body, fetched.contentType),
           input.type === 'scribble' ? 'scribble' : 'hed', context.signal
         )
         if (!validResource(output)) return executionFailure()
-        return backgroundResourceResult(output, context.callId)
+        const target = sessionAddressForTarget(context.facts.botId, context.target)
+        if (target === null) return executionFailure('图片发送失败。')
+        dispatching = true
+        const delivery = await services.qq.sendImage(target, output, context.signal)
+        return visibleDeliveryResult(delivery, '处理后的图片已发送。', '图片发送失败。')
       } catch {
+        if (dispatching) return indeterminateResult()
         return context.signal.aborted ? cancelledResult() : executionFailure('图片处理暂时失败。')
       }
     }

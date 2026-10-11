@@ -6,6 +6,8 @@ import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
 import type { CrossChannelAccess } from '../agent/tools/cross-channel-access.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import type { DeliveryResult } from '../runtime/presentation/presentation-result.js'
+import type { AuthorizedToolContext } from '../agent/tools/tool-context.js'
+import { isToolResult, openImagePolicy, request } from './query-tool-support.js'
 import {
   crossChannelResourceKeys,
   currentChannelResourceKeys
@@ -150,6 +152,18 @@ export function visibleDeliveryResult (
   return executionFailure(failureMessage)
 }
 
+export async function dispatchVisible (
+  dispatch: () => Promise<DeliveryResult>,
+  successMessage: string,
+  failureMessage: string
+): Promise<ToolResult> {
+  try {
+    return visibleDeliveryResult(await dispatch(), successMessage, failureMessage)
+  } catch {
+    return indeterminateResult()
+  }
+}
+
 export function visibleDefinition (input: {
   readonly name: string
   readonly description: string
@@ -198,6 +212,65 @@ export function crossChannelDefinition (input: {
 
 export function resourceFromBytes (body: Uint8Array, mimeType: string): ToolResource {
   return Object.freeze({ kind: 'buffer', data: body, mimeType, byteLength: body.byteLength })
+}
+
+/** Download failures are definite; a dispatched QQ operation is never replayed. */
+export async function sendRemoteImages (
+  services: VisibleToolServices,
+  urls: readonly string[],
+  context: AuthorizedToolContext,
+  label: '图片' | '头像'
+): Promise<ToolResult> {
+  const target = sessionAddressForTarget(context.facts.botId, context.target)
+  if (target === null) return executionFailure(`${label}发送失败。`)
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  context.signal.addEventListener('abort', abort, { once: true })
+  if (context.signal.aborted) abort()
+  // Covers both downloading and dispatch, leaving time to commit before 30s.
+  const deadline = Date.now() + 25_000
+  const timer = setTimeout(abort, 25_000)
+  let sent = 0
+  let dispatching = false
+  let lastFailure: ToolResult = executionFailure(`${label}暂时无法读取。`)
+  const unit = label === '头像' ? '个' : '张'
+  const confirmed = (): ToolResult => visibleResult(sent === urls.length
+    ? `已发送 ${sent} ${unit}${label}。`
+    : `已发送 ${sent} ${unit}${label}，其余${label}暂时无法发送。`)
+  try {
+    for (const url of urls) {
+      if (controller.signal.aborted || Date.now() >= deadline) return sent > 0 ? confirmed() : cancelledResult()
+      const fetched = await request(services.policyFetch, {
+        url, policy: openImagePolicy, timeoutMs: Math.max(100, Math.min(8_000, deadline - Date.now())),
+        signal: controller.signal, diagnosticTag: 'image_fetch'
+      })
+      if (isToolResult(fetched)) {
+        lastFailure = fetched
+        continue
+      }
+      if (fetched.status < 200 || fetched.status >= 300) {
+        lastFailure = executionFailure(`${label}暂时无法读取。`)
+        continue
+      }
+      if (controller.signal.aborted) return sent > 0 ? confirmed() : cancelledResult()
+      dispatching = true
+      const delivery = await services.qq.sendImage(
+        target, resourceFromBytes(fetched.body, fetched.contentType), controller.signal
+      )
+      dispatching = false
+      if (delivery.kind === 'outcome_unknown') return indeterminateResult()
+      if (delivery.kind === 'failed_definite') return sent > 0 ? confirmed() : executionFailure(`${label}发送失败。`)
+      sent += 1
+    }
+    return sent > 0 ? confirmed() : lastFailure
+  } catch {
+    if (dispatching) return indeterminateResult()
+    if (sent > 0) return confirmed()
+    return context.signal.aborted ? cancelledResult() : executionFailure(`${label}发送失败。`)
+  } finally {
+    clearTimeout(timer)
+    context.signal.removeEventListener('abort', abort)
+  }
 }
 
 export function validResource (resource: ToolResource, maxBytes = 8 * 1024 * 1024): boolean {

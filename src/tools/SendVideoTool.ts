@@ -4,7 +4,7 @@ import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments, isToolResult, request } from './query-tool-support.js'
 import {
   cancelledResult, executionFailure, resourceFromBytes, sessionAddressForTarget,
-  visibleDefinition, visibleDeliveryResult,
+  dispatchVisible, visibleDefinition,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -26,8 +26,8 @@ export function createSendVideoTool (services: VisibleToolServices): ToolDefinit
         if (target === null) return executionFailure('视频发送失败。')
         const video = await services.resolveVideo(id, context.signal)
         if (!services.videoDownloadEnabled || video.videoUrl === undefined) {
-          const delivery = await services.qq.sendText(target, video.shareText.slice(0, 4_000), context.signal)
-          return visibleDeliveryResult(delivery, '视频信息已发送。', '视频发送失败。')
+          return await dispatchVisible(() => services.qq.sendText(target, video.shareText.slice(0, 4_000), context.signal),
+            '视频信息已发送。', '视频发送失败。')
         }
         const maxBytes = Math.min(Math.max(Math.trunc(services.videoMaxBytes), 1), 8 * 1024 * 1024)
         const policy: NetworkRequestPolicy = {
@@ -38,10 +38,9 @@ export function createSendVideoTool (services: VisibleToolServices): ToolDefinit
         })
         if (isToolResult(fetched)) return fetched
         if (fetched.status < 200 || fetched.status >= 300) return executionFailure('视频暂时无法下载。')
-        const delivery = await services.qq.sendVideo(
+        return await dispatchVisible(() => services.qq.sendVideo(
           target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
-        )
-        return visibleDeliveryResult(delivery, '视频已发送。', '视频发送失败。')
+        ), '视频已发送。', '视频发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('视频发送失败。')
       }

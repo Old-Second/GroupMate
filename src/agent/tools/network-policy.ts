@@ -64,6 +64,10 @@ const errorMessages: Readonly<Record<NetworkPolicyErrorCode, string>> = Object.f
   response_too_large: '网络响应内容过大。'
 })
 
+export function isNetworkPolicyErrorCode (value: unknown): value is NetworkPolicyErrorCode {
+  return typeof value === 'string' && Object.hasOwn(errorMessages, value)
+}
+
 export class NetworkPolicyError extends Error {
   readonly code: NetworkPolicyErrorCode
   readonly userMessage: string

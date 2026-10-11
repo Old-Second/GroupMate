@@ -1,6 +1,7 @@
 import { currentGroupMember } from '../CurrentGroupMember.js'
 import { AgentError } from '../../agent/contracts/error.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import type { ToolAuditEvent, ToolAuditSink } from '../../agent/tools/audit.js'
 import type { SessionAddress } from '../../agent/contracts/identity.js'
 import type {
@@ -723,6 +724,12 @@ async function importFirst (specifiers: readonly string[]): Promise<YunzaiRecord
   throw new Error('external plugin is unavailable')
 }
 
+const paintingDirectory = new URL('../../../../ap-plugin/apps/', import.meta.url)
+const gameEntries = [
+  new URL('../../../../miao-plugin/apps/profile/ProfileDetail.js', import.meta.url).href,
+  new URL('../../../../miao-plugin/apps/profile/ProfileList.js', import.meta.url).href
+] as const
+
 async function generateWithApPlugin (
   event: YunzaiRecord,
   prompt: string,
@@ -733,6 +740,7 @@ async function generateWithApPlugin (
   if (captured.event.at === captured.event.bot?.uin) captured.event.at = null
   captured.event.atBot = false
   captured.event.msg = `#绘图${prompt}`
+  // Keep the import allowlist literal for the production dependency audit.
   const module = await importFirst([
     new URL('../../../../ap-plugin/apps/aiPainting.js', import.meta.url).href,
     new URL('../../../../ap-plugin/apps/ai_painting.js', import.meta.url).href
@@ -961,7 +969,8 @@ function visibleServices (
       return options.synthesizeAudio(event, text, voice, signal)
     },
     resolveVideo: async (id, signal) => resolveBilibiliVideo(policyFetch, id, downloadVideo, signal),
-    drawingAvailable: true,
+    drawingAvailable: options.generateImage !== undefined || ['aiPainting.js', 'ai_painting.js']
+      .some(file => existsSync(new URL(file, paintingDirectory))),
     pictureProcessingAvailable: processImage !== undefined,
     ttsAvailable,
     videoDownloadEnabled: downloadVideo,
@@ -1187,6 +1196,7 @@ export function createYunzaiToolRuntimeBridge (
       }
     })
     const visible = createVisibleToolDefinitions(visibleToolServices)
+    const captionAvailable = pictureProcessor(policyFetch, configText(options.config, 'extraUrl')) !== undefined
     const management = createManagementToolDefinitions(managementCapabilities(event))
     const { definitions, registry } = createToolRuntimeRegistry(
       query.definitions,
@@ -1197,6 +1207,13 @@ export function createYunzaiToolRuntimeBridge (
       .filter(definition => {
         if (definition.name === 'draw') return visibleToolServices.drawingAvailable
         if (definition.name === 'processPicture') return visibleToolServices.pictureProcessingAvailable
+        if (definition.name === 'imageCaption') {
+          return captionAvailable
+        }
+        if (definition.name === 'weather') return configText(options.config, 'amapKey') !== ''
+        if (definition.name === 'queryGenshin' || definition.name === 'queryStarRail') {
+          return options.queryGame !== undefined || gameEntries.every(path => existsSync(new URL(path)))
+        }
         if (definition.name === 'sendAudioMessage') {
           return options.synthesizeAudio !== undefined && [
             'ttsSpace', 'azureTTSKey', 'voicevoxSpace'

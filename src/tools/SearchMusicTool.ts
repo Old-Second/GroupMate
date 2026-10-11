@@ -14,7 +14,8 @@ const inputSchema = {
 } as const
 
 export function createSearchMusicTool (options: SearchMusicToolOptions): ToolDefinition {
-  const api = fixedOriginPolicy('https://music.163.com', ['/api/search/get/web'])
+  // This endpoint serves JSON with text/plain; still require strict JSON parsing.
+  const api = fixedOriginPolicy('https://music.163.com', ['/api/search/get/web'], ['application/json', 'text/plain'])
   return readOnlyDefinition({
     name: 'searchMusic', description: '按歌曲名或歌手搜索网易云音乐公开曲目。',
     inputSchema, network: 'fixed_hosts', retrySafe: true,

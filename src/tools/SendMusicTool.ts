@@ -2,7 +2,7 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, sessionAddressForTarget, visibleDefinition, visibleDeliveryResult,
+  cancelledResult, dispatchVisible, executionFailure, sessionAddressForTarget, visibleDefinition,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -21,8 +21,8 @@ export function createSendMusicTool (services: VisibleToolServices): ToolDefinit
       try {
         const target = sessionAddressForTarget(context.facts.botId, context.target)
         if (target === null) return executionFailure('音乐发送失败。')
-        const delivery = await services.qq.sendMusic(target, { provider: '163', id }, context.signal)
-        return visibleDeliveryResult(delivery, '音乐已发送。', '音乐发送失败。')
+        return await dispatchVisible(() => services.qq.sendMusic(target, { provider: '163', id }, context.signal),
+          '音乐已发送。', '音乐发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('音乐发送失败。')
       }

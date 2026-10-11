@@ -164,17 +164,18 @@ test('visible media tools call the QQ capability and return visible only after s
   }
 })
 
-test('processPicture returns background resource without sending QQ output', async () => {
+test('processPicture delivers the processed resource without an unusable URL handoff', async () => {
   const { definitions, calls } = fixture()
   const result = await byName(definitions, 'processPicture').execute({
     type: 'hed', imageUrl: 'https://image.example/cat.png', userId: ''
   }, context)
   assert.equal(result.status, 'success')
   if (result.status === 'success') {
-    assert.equal(result.effect, 'background')
-    assert.equal(result.content[0]?.type, 'resource_ref')
+    assert.equal(result.effect, 'visible')
+    assert.match(JSON.stringify(result.content), /处理后的图片已发送/)
   }
-  assert.equal(calls.length, 0)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]?.kind, 'image')
 })
 
 test('sendDice clamps count to five and uses only the authorized target', async () => {
@@ -344,7 +345,7 @@ test('picture dispatch exceptions stay unknown and stop before the next image', 
   assert.equal(dispatches, 1)
 })
 
-test('a second download failure preserves the confirmed picture result without replaying it', async () => {
+test('a broken download is skipped while other pictures are delivered once', async () => {
   let downloads = 0
   const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
   const services = visibleOptions(calls)
@@ -364,9 +365,9 @@ test('a second download failure preserves the confirmed picture result without r
   assert.equal(result.status, 'success')
   if (result.status !== 'success') return
   assert.equal(result.effect, 'visible')
-  assert.match(JSON.stringify(result.content), /已发送 1 张图片/)
-  assert.equal(downloads, 2)
-  assert.equal(calls.length, 1)
+  assert.match(JSON.stringify(result.content), /已发送 2 张图片/)
+  assert.equal(downloads, 3)
+  assert.equal(calls.length, 2)
   assert.equal(result.retryable, false)
 })
 
@@ -477,9 +478,9 @@ test('multi-part visible tools never replay a confirmed prefix after definite fa
       ? { ...services.qq, sendImage: async () => next() as DeliveryResult<'picture'> }
       : { ...services.qq, sendDice: async () => next() as DeliveryResult<'dice'> }
     const result = await byName(createVisibleToolDefinitions({ ...services, qq }), name).execute(input, context)
-    assert.equal(result.status, name === 'sendPicture' ? 'success' : 'indeterminate', name)
-    if (name === 'sendPicture' && result.status === 'success') {
-      assert.match(JSON.stringify(result.content), /已发送 1 张/)
+    assert.equal(result.status, name === 'sendDice' ? 'indeterminate' : 'success', name)
+    if (name !== 'sendDice' && result.status === 'success') {
+      assert.match(JSON.stringify(result.content), /已发送 1 (?:张|个)/)
     }
     if (result.status === 'indeterminate') assert.equal(result.retryable, false, name)
     assert.equal(attempts, 2, name)
@@ -494,6 +495,89 @@ test('multi-part visible tools never replay a confirmed prefix after definite fa
     if (firstFailure.status === 'failed') {
       assert.equal(firstFailure.errorCode, 'tool_execution_failed', `${name} first failure`)
     }
+  }
+})
+
+test('picture and avatar downloads reject HTTP errors and continue to the usable candidate', async () => {
+  for (const name of ['sendPicture', 'sendAvatar']) {
+    const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+    let downloads = 0
+    const services = visibleOptions(calls, {
+      policyFetch: new PolicyFetch({
+        networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+        transport: { request: async () => ++downloads === 1
+          ? { ...response('error', 'image/png'), status: 404 }
+          : response('image', 'image/png') }
+      })
+    })
+    const input = name === 'sendPicture'
+      ? { urls: ['https://image.example/missing.png', 'https://image.example/ok.png'] }
+      : { userIds: ['7', '8'] }
+    const result = await byName(createVisibleToolDefinitions(services), name).execute(input, context)
+    assert.equal(result.status, 'success', name)
+    assert.match(JSON.stringify(result), /已发送 1 (?:张|个)/)
+    assert.equal(downloads, 2)
+    assert.equal(calls.length, 1)
+    assert.equal(Buffer.from((calls[0]?.value as Extract<ToolResource, { kind: 'buffer' }>).data).toString(), 'image')
+  }
+})
+
+test('avatar dispatch acknowledgement loss is unknown even on the first image', async () => {
+  let attempts = 0
+  const services = visibleOptions([])
+  const tool = byName(createVisibleToolDefinitions({ ...services, qq: { ...services.qq,
+    sendImage: async () => { attempts++; throw new Error('acknowledgement lost') }
+  } }), 'sendAvatar')
+  assert.equal((await tool.execute({ userIds: ['7', '8'] }, context)).status, 'indeterminate')
+  assert.equal(attempts, 1)
+})
+
+test('processed buffer and local resources are sent directly and unknown delivery is not retried', async () => {
+  for (const resource of [
+    { kind: 'buffer' as const, data: Buffer.from('processed'), byteLength: 9, mimeType: 'image/png' },
+    { kind: 'local_path' as const, path: '/owned/processed.png', byteLength: 9, mimeType: 'image/png' }
+  ]) {
+    const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+    const services = visibleOptions(calls, { processImage: async () => resource })
+    const tool = byName(createVisibleToolDefinitions(services), 'processPicture')
+    const input = { type: 'hed', imageUrl: 'https://image.example/cat.png', userId: '' }
+    const result = await tool.execute(input, context)
+    assert.equal(result.status, 'success')
+    assert.equal(result.effect, 'visible')
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.value, resource)
+    let attempts = 0
+    const uncertain = byName(createVisibleToolDefinitions({ ...services, qq: { ...services.qq,
+      sendImage: async () => { attempts++; throw new Error('dispatched') }
+    } }), 'processPicture')
+    assert.equal((await uncertain.execute(input, context)).status, 'indeterminate')
+    assert.equal(attempts, 1)
+  }
+})
+
+test('all visible media keep dispatch exceptions unknown without a second operation', async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['draw', { prompt: 'cat' }], ['sendPicture', { urls: ['https://image.example/cat.png'] }],
+    ['processPicture', { type: 'hed', imageUrl: 'https://image.example/cat.png', userId: '' }],
+    ['sendAvatar', { userIds: ['7'] }], ['sendAudioMessage', { text: 'hello', voice: '' }],
+    ['sendMusic', { id: '1' }], ['sendVideo', { id: 'BV1' }], ['sendDice', { count: 2 }],
+    ['sendRPS', { value: 1 }]
+  ]
+  for (const [name, input] of cases) {
+    let attempts = 0
+    const lost = async (): Promise<never> => { attempts++; throw new Error('acknowledgement lost') }
+    const services = visibleOptions([], { qq: {
+      sendText: lost, sendImage: lost, sendAudio: lost, sendMusic: lost,
+      sendVideo: lost, sendDice: lost, sendRps: lost
+    }, videoDownloadEnabled: true, policyFetch: new PolicyFetch({
+      networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+      transport: { request: async request => response('media', request.url.pathname.endsWith('.mp4') ? 'video/mp4' : 'image/png') }
+    }) })
+    const result = await byName(createVisibleToolDefinitions(services), name).execute(input, context)
+    assert.equal(result.status, 'indeterminate', name)
+    assert.equal(result.effect, 'possible', name)
+    assert.equal(result.retryable, false, name)
+    assert.equal(attempts, 1, name)
   }
 })
 

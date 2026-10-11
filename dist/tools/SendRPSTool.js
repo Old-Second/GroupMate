@@ -1,6 +1,6 @@
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { invalidArguments } from './query-tool-support.js';
-import { cancelledResult, executionFailure, sessionAddressForTarget, visibleDefinition, visibleDeliveryResult } from './visible-tool-support.js';
+import { cancelledResult, dispatchVisible, executionFailure, sessionAddressForTarget, visibleDefinition } from './visible-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { value: { type: 'integer', enum: [1, 2, 3] } },
     required: ['value'], additionalProperties: false
@@ -17,8 +17,8 @@ export function createSendRPSTool(services) {
                 const target = sessionAddressForTarget(context.facts.botId, context.target);
                 if (target === null)
                     return executionFailure('石头剪刀布发送失败。');
-                const delivery = await services.qq.sendRps(target, input.value, context.signal);
-                return visibleDeliveryResult(delivery, '石头剪刀布已发送。', '石头剪刀布发送失败。');
+                const value = input.value;
+                return await dispatchVisible(() => services.qq.sendRps(target, value, context.signal), '石头剪刀布已发送。', '石头剪刀布发送失败。');
             }
             catch {
                 return context.signal.aborted ? cancelledResult() : executionFailure('石头剪刀布发送失败。');

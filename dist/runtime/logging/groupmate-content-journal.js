@@ -1,3 +1,4 @@
+import { isNetworkPolicyErrorCode } from '../../agent/tools/network-policy.js';
 import { projectOutboundJournalEvent } from './content-journal-outbound-projector.js';
 import { projectParticipationObservation } from './content-journal-projection.js';
 import { projectRequestJournalEvent, projectRunJournalEvent } from './content-journal-request-run-projector.js';
@@ -43,7 +44,10 @@ export function createGroupMateContentJournal(diskLog) {
                 return;
             safeRecordEvent(Object.freeze({ type: 'tool.network', payload: Object.freeze({
                     tag: event.tag, phase: event.phase, result: event.result,
-                    durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects
+                    durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects,
+                    ...(typeof event.httpStatus === 'number' && Number.isSafeInteger(event.httpStatus) && event.httpStatus >= 100 && event.httpStatus <= 599
+                        ? { httpStatus: event.httpStatus } : {}),
+                    ...(isNetworkPolicyErrorCode(event.errorCode) ? { errorCode: event.errorCode } : {})
                 }) }));
         },
         async drain() {

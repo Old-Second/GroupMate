@@ -77,8 +77,26 @@ test('network diagnostics report success and header/body deadlines without expos
     assert.equal(event.result, stage === 'complete' ? 'success' : 'timeout')
     assert.equal(event.tag, 'image_fetch')
     assert.equal(typeof event.durationMs, 'number')
+    assert.equal(event.httpStatus, stage === 'headers' ? undefined : 200)
+    assert.equal(event.errorCode, stage === 'complete' ? undefined : 'network_timeout')
     assert.doesNotMatch(JSON.stringify(event), /secret|Authorization|example/)
   }
+})
+
+test('network diagnostics distinguish HTTP rejection from transport failure without response content', async () => {
+  const diagnostics: unknown[] = []
+  const client = new PolicyFetch({
+    networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+    transport: { request: async () => ({ ...response(), status: 403, headers: { 'content-type': 'text/html' } }) },
+    onDiagnostic: event => diagnostics.push(event)
+  })
+  await assert.rejects(client.request({ url: 'https://example.test/private?token=secret',
+    policy: { kind: 'open_http', maxBytes: 1024, allowedContentTypes: ['image/*'] }, timeoutMs: 100 }),
+  error => error instanceof NetworkPolicyError && error.code === 'content_type_denied')
+  const event = diagnostics[0] as Record<string, unknown>
+  assert.equal(event.httpStatus, 403)
+  assert.equal(event.errorCode, 'content_type_denied')
+  assert.doesNotMatch(JSON.stringify(event), /secret|private|token|example/)
 })
 
 test('URL authorization rejects alternate loopback forms and unsafe URL syntax', async () => {

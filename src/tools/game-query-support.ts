@@ -2,7 +2,7 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import type { ToolTarget } from '../agent/tools/tool-context.js'
 import { invalidArguments } from './query-tool-support.js'
 import {
-  cancelledResult, executionFailure, validResource, visibleDefinition, visibleResult,
+  cancelledResult, executionFailure, indeterminateResult, validResource, visibleDefinition, visibleResult,
   type ToolResource
 } from './visible-tool-support.js'
 
@@ -48,12 +48,15 @@ export function createGameQueryTool (
       if (!/^\d{1,20}$/.test(userId) || (uid !== '' && !/^\d{1,20}$/.test(uid))) {
         return invalidArguments('游戏查询参数无效。')
       }
+      let dispatching = false
       try {
         const resource = await options.queryGame({ game, userId, uid, character }, context.signal)
         if (!validResource(resource)) return executionFailure('游戏面板返回了无效图片。')
+        dispatching = true
         await options.sendImage(resource, context.target, context.signal)
         return visibleResult('游戏资料已发送。')
       } catch {
+        if (dispatching) return indeterminateResult()
         return context.signal.aborted
           ? cancelledResult()
           : executionFailure('游戏资料暂时不可用。')

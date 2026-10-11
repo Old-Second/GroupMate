@@ -12,12 +12,15 @@ export function createSendDiceTool(services) {
             const count = typeof input.count === 'number' && Number.isFinite(input.count)
                 ? Math.min(Math.max(Math.trunc(input.count), 1), 5) : 1;
             let sent = 0;
+            let dispatching = false;
             try {
                 const target = sessionAddressForTarget(context.facts.botId, context.target);
                 if (target === null)
                     return executionFailure('骰子发送失败。');
                 for (let index = 0; index < count; index += 1) {
+                    dispatching = true;
                     const delivery = await services.qq.sendDice(target, context.signal);
+                    dispatching = false;
                     if (delivery.kind === 'outcome_unknown')
                         return indeterminateResult();
                     if (delivery.kind === 'failed_definite') {
@@ -28,7 +31,7 @@ export function createSendDiceTool(services) {
                 return visibleResult(`已投掷 ${count} 枚骰子。`);
             }
             catch {
-                if (sent > 0)
+                if (dispatching || sent > 0)
                     return indeterminateResult();
                 return context.signal.aborted ? cancelledResult() : executionFailure('骰子发送失败。');
             }

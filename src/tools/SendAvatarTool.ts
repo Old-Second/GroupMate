@@ -1,11 +1,7 @@
 import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
-import { invalidArguments, isToolResult, openImagePolicy, request } from './query-tool-support.js'
-import {
-  cancelledResult, executionFailure, indeterminateResult, resourceFromBytes,
-  sessionAddressForTarget, visibleDefinition, visibleResult,
-  type VisibleToolServices
-} from './visible-tool-support.js'
+import { invalidArguments } from './query-tool-support.js'
+import { sendRemoteImages, visibleDefinition, type VisibleToolServices } from './visible-tool-support.js'
 
 const inputSchema = {
   type: 'object', properties: { userIds: { type: 'array', items: { type: 'string' } } },
@@ -20,30 +16,9 @@ export function createSendAvatarTool (services: VisibleToolServices): ToolDefini
       const userIds = Array.isArray(input.userIds)
         ? input.userIds.map(String).filter(value => /^\d{1,20}$/.test(value)).slice(0, 4) : []
       if (userIds.length === 0) return invalidArguments('没有有效的用户账号。')
-      let sent = 0
-      try {
-        const target = sessionAddressForTarget(context.facts.botId, context.target)
-        if (target === null) return executionFailure('头像发送失败。')
-        for (const userId of userIds) {
-          const fetched = await request(services.policyFetch, {
-            url: `https://q1.qlogo.cn/g?b=qq&s=160&nk=${encodeURIComponent(userId)}`,
-            policy: openImagePolicy, timeoutMs: 15_000, signal: context.signal
-          })
-          if (isToolResult(fetched)) return sent > 0 ? indeterminateResult() : fetched
-          const delivery = await services.qq.sendImage(
-            target, resourceFromBytes(fetched.body, fetched.contentType), context.signal
-          )
-          if (delivery.kind === 'outcome_unknown') return indeterminateResult()
-          if (delivery.kind === 'failed_definite') {
-            return sent > 0 ? indeterminateResult() : executionFailure('头像发送失败。')
-          }
-          sent += 1
-        }
-        return visibleResult(`已发送 ${userIds.length} 个头像。`)
-      } catch {
-        if (sent > 0) return indeterminateResult()
-        return context.signal.aborted ? cancelledResult() : executionFailure('头像发送失败。')
-      }
+      return await sendRemoteImages(services, userIds.map(userId =>
+        `https://q1.qlogo.cn/g?b=qq&s=160&nk=${encodeURIComponent(userId)}`
+      ), context, '头像')
     }
   })
 }

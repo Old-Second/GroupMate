@@ -125,6 +125,8 @@ export class PolicyFetch {
         const startedAt = performance.now();
         let phase = 'dns';
         let result = 'failure';
+        let httpStatus;
+        let errorCode;
         try {
             while (true) {
                 phase = 'dns';
@@ -151,6 +153,7 @@ export class PolicyFetch {
                         throw error;
                     throw new NetworkPolicyError('network_failed');
                 }
+                httpStatus = transportResponse.status;
                 if (redirectStatuses.has(transportResponse.status)) {
                     const location = header(transportResponse.headers, 'location');
                     transportResponse.cancel?.();
@@ -235,6 +238,8 @@ export class PolicyFetch {
         }
         catch (error) {
             result = timedOut ? 'timeout' : cancelled(request.signal) ? 'cancelled' : 'failure';
+            errorCode = timedOut ? 'network_timeout' : cancelled(request.signal) ? 'network_cancelled'
+                : error instanceof NetworkPolicyError ? error.code : 'network_failed';
             if (error instanceof NetworkPolicyError) {
                 if (error.code === 'network_cancelled' && timedOut)
                     throw new NetworkPolicyError('network_timeout');
@@ -255,7 +260,9 @@ export class PolicyFetch {
                 this.#onDiagnostic?.(Object.freeze({
                     tag: request.diagnosticTag ?? 'other', phase, result,
                     durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-                    timeoutMs: request.timeoutMs, redirects
+                    timeoutMs: request.timeoutMs, redirects,
+                    ...(httpStatus === undefined ? {} : { httpStatus }),
+                    ...(errorCode === undefined ? {} : { errorCode })
                 }));
             }
             catch { }

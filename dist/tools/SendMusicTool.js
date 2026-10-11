@@ -1,6 +1,6 @@
 import { currentChannelResourceKeys } from '../agent/tools/resource-key.js';
 import { invalidArguments } from './query-tool-support.js';
-import { cancelledResult, executionFailure, sessionAddressForTarget, visibleDefinition, visibleDeliveryResult } from './visible-tool-support.js';
+import { cancelledResult, dispatchVisible, executionFailure, sessionAddressForTarget, visibleDefinition } from './visible-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { id: { type: 'string' } },
     required: ['id'], additionalProperties: false
@@ -17,8 +17,7 @@ export function createSendMusicTool(services) {
                 const target = sessionAddressForTarget(context.facts.botId, context.target);
                 if (target === null)
                     return executionFailure('音乐发送失败。');
-                const delivery = await services.qq.sendMusic(target, { provider: '163', id }, context.signal);
-                return visibleDeliveryResult(delivery, '音乐已发送。', '音乐发送失败。');
+                return await dispatchVisible(() => services.qq.sendMusic(target, { provider: '163', id }, context.signal), '音乐已发送。', '音乐发送失败。');
             }
             catch {
                 return context.signal.aborted ? cancelledResult() : executionFailure('音乐发送失败。');

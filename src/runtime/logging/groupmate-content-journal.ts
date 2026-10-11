@@ -1,5 +1,6 @@
 import type { RunContentJournalEvent } from '../../agent/run/run-content-journal.js'
 import type { PolicyNetworkDiagnostic } from '../tools/policy-fetch.js'
+import { isNetworkPolicyErrorCode } from '../../agent/tools/network-policy.js'
 import type { YunzaiAgentRequestDraft } from '../yunzai-request-adapter.js'
 import {
   projectOutboundJournalEvent,
@@ -76,7 +77,10 @@ export function createGroupMateContentJournal (
         ![event.durationMs, event.timeoutMs, event.redirects].every(value => Number.isSafeInteger(value) && value >= 0)) return
       safeRecordEvent(Object.freeze({ type: 'tool.network', payload: Object.freeze({
         tag: event.tag, phase: event.phase, result: event.result,
-        durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects
+        durationMs: event.durationMs, timeoutMs: event.timeoutMs, redirects: event.redirects,
+        ...(typeof event.httpStatus === 'number' && Number.isSafeInteger(event.httpStatus) && event.httpStatus >= 100 && event.httpStatus <= 599
+          ? { httpStatus: event.httpStatus } : {}),
+        ...(isNetworkPolicyErrorCode(event.errorCode) ? { errorCode: event.errorCode } : {})
       }) }))
     },
     async drain (): Promise<void> {

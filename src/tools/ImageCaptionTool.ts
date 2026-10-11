@@ -29,12 +29,13 @@ function multipart (image: Uint8Array, contentType: string, boundary: string): U
 }
 
 export function createImageCaptionTool (options: ImageCaptionToolOptions): ToolDefinition {
-  const api = options.apiBaseUrl === '' ? null : fixedOriginPolicy(
-    options.apiBaseUrl,
-    ['/image-captioning', '/visual-qa'],
-    ['text/plain', 'application/json'],
-    64 * 1024
-  )
+  let api: ReturnType<typeof fixedOriginPolicy> | null = null
+  try {
+    if (options.apiBaseUrl !== '') api = fixedOriginPolicy(
+      options.apiBaseUrl, ['/image-captioning', '/visual-qa'],
+      ['text/plain', 'application/json'], 64 * 1024
+    )
+  } catch { /* An unavailable optional service must not break other tools. */ }
   return readOnlyDefinition({
     name: 'imageCaption', description: '识别公开图片内容或回答有关图片的问题。',
     inputSchema, network: 'open_http', timeoutMs: 20_000, retrySafe: false,

@@ -3,7 +3,7 @@ import { currentChannelResourceKeys } from '../agent/tools/resource-key.js'
 import { configurationFailure, invalidArguments } from './query-tool-support.js'
 import {
   cancelledResult, executionFailure, sessionAddressForTarget, validResource,
-  visibleDefinition, visibleDeliveryResult,
+  dispatchVisible, visibleDefinition,
   type VisibleToolServices
 } from './visible-tool-support.js'
 
@@ -26,8 +26,8 @@ export function createSendAudioMessageTool (services: VisibleToolServices): Tool
         if (!validResource(resource)) return executionFailure()
         const target = sessionAddressForTarget(context.facts.botId, context.target)
         if (target === null) return executionFailure('语音发送失败。')
-        const delivery = await services.qq.sendAudio(target, resource, context.signal)
-        return visibleDeliveryResult(delivery, '语音已发送。', '语音发送失败。')
+        return await dispatchVisible(() => services.qq.sendAudio(target, resource, context.signal),
+          '语音已发送。', '语音发送失败。')
       } catch {
         return context.signal.aborted ? cancelledResult() : executionFailure('语音发送失败。')
       }
