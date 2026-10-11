@@ -126,6 +126,8 @@ import {
 } from './run-trace.js'
 import { appendRunReasoningSegment } from './run-reasoning-segment.js'
 import { recordRunUsage } from './run-usage.js'
+import { SEMANTIC_SUMMARY_LIMITS, type SummaryModelCall } from '../context/SemanticSummaryPort.js'
+import { estimateModelMessagesTokens } from '../context/context-token-estimator.js'
 import { calculateModelCost, type ModelCost } from '../model/model-cost.js'
 import { buildPresentationTrace } from './presentation-trace-builder.js'
 import {
@@ -163,9 +165,11 @@ export interface PlannedRunContext extends PreparedRunContext {
 export interface RunContextPlanningRequest {
   readonly kind: ProviderGenerationKindV1
   readonly transition: 'normal' | 'recovery_prefix_reset'
+  readonly summarize?: SummaryModelCall
 }
 
 export interface RunRuntimeBinding {
+  readonly semanticSummaryAllowed?: () => boolean
   readonly checkBoundary?: RunBoundaryGuard
   readonly contextDependencies?: ContextDependencyProof
   readonly snapshot: ToolSnapshot
@@ -1869,32 +1873,148 @@ export class RunEngine {
     if (runtime.planModelTurn === undefined) {
       throw new TypeError('generation planner runtime is unavailable')
     }
-    const planned = await this.#raceAbort(
-      runtime.planModelTurn(checkpoint, request, signal),
-      signal
-    )
-    this.#validatePlannedContext(checkpoint, planned)
-    this.#recordContentJournal(() => Object.freeze({
-      type: 'context.planned', occurredAt: this.#timestamp(), runRef: checkpoint.runRef,
-      requestRef: checkpoint.requestRef, plan: planned.plan
-    }))
-    return await this.#commit(checkpoint, 'preparing', {
-      messages: Object.freeze([...planned.messages]),
-      estimatedInputTokens: planned.estimatedInputTokens,
-      contextPlan: planned.plan,
-      contextArtifactRefs: Object.freeze([...planned.artifactRefs]),
-      pendingContextMessages: Object.freeze([]),
-      providerGeneration: null
-    }, [
-      ...leadingDrafts,
-      {
-        type: 'context.prepared',
-        payload: {
-          messageCount: planned.messages.length,
-          estimatedInputTokens: planned.estimatedInputTokens
+    let current = checkpoint
+    let summaryAttempted = false
+    const planningRequest: RunContextPlanningRequest = runtime.semanticSummaryAllowed?.() === true && request.kind === 'normal' && checkpoint.budgetCounters.modelTurns === 0
+      ? Object.freeze({
+        ...request, summarize: async (messages: readonly ModelMessage[], summarySignal: AbortSignal) => {
+          if (summaryAttempted) return null
+          summaryAttempted = true
+          const result = await this.#callSemanticSummary(current, messages, summarySignal, stored => { current = stored })
+          current = result.checkpoint
+          return result.turn
         }
+      }) : request
+    try {
+      const planned = await this.#raceAbort(
+        runtime.planModelTurn(checkpoint, planningRequest, signal),
+        signal
+      )
+      if (isTerminalRunStatus(current.status)) return current
+      this.#validatePlannedContext(current, planned)
+      this.#recordContentJournal(() => Object.freeze({
+        type: 'context.planned', occurredAt: this.#timestamp(), runRef: checkpoint.runRef,
+        requestRef: checkpoint.requestRef, plan: planned.plan
+      }))
+      return await this.#commit(current, 'preparing', {
+        messages: Object.freeze([...planned.messages]),
+        estimatedInputTokens: planned.estimatedInputTokens,
+        contextPlan: planned.plan,
+        contextArtifactRefs: Object.freeze([...planned.artifactRefs]),
+        pendingContextMessages: Object.freeze([]),
+        providerGeneration: null
+      }, [
+        ...leadingDrafts,
+        {
+          type: 'context.prepared',
+          payload: {
+            messageCount: planned.messages.length,
+            estimatedInputTokens: planned.estimatedInputTokens
+          }
+        }
+      ])
+    } catch (error) {
+      if (current === checkpoint || error instanceof ConcurrentTerminalError ||
+        error instanceof ModelSuccessPersistenceError || isAbortError(error) || signal.aborted) throw error
+      return await this.#fail(current, asAgentError(error))
+    }
+  }
+
+  async #callSemanticSummary (
+    checkpoint: RunCheckpoint,
+    messages: readonly ModelMessage[],
+    signal: AbortSignal,
+    onCheckpoint: (checkpoint: RunCheckpoint) => void
+  ): Promise<Readonly<{ checkpoint: RunCheckpoint; turn: ModelTurn | null }>> {
+    const runtime = this.#runtime(checkpoint.runId)
+    const estimatedInputTokens = estimateModelMessagesTokens(messages) * 2
+    const maxOutputTokens = Math.min(SEMANTIC_SUMMARY_LIMITS.outputTokens, checkpoint.model.maxOutputTokens, checkpoint.modelCapability.maxOutputTokens)
+    if (runtime.semanticSummaryAllowed?.() !== true || checkpoint.budgetCounters.modelTurns !== 0 ||
+      estimatedInputTokens > SEMANTIC_SUMMARY_LIMITS.inputTokens ||
+      estimatedInputTokens + maxOutputTokens + 1024 > checkpoint.modelCapability.contextWindowTokens) {
+      return Object.freeze({ checkpoint, turn: null })
+    }
+    this.#assertNotAborted(signal)
+    await runtime.checkBoundary?.('provider', signal)
+    const budget = this.#runBudget(checkpoint)
+    let counters = budget.reserveModelTurn(checkpoint.budgetCounters, { kind: 'normal', estimatedInputTokens, maxOutputTokens })
+    const timeoutMs = Math.min(SEMANTIC_SUMMARY_LIMITS.timeoutMs, this.#providerTimeout(checkpoint, counters))
+    const priorUsage = checkpoint.usage
+    const priorObservations = checkpoint.observationCounters
+    // The reservation survives a crash. Recovery never receives a summary callback;
+    // unresolved dispatch remains missing usage, never a zero-cost successful call.
+    let current = await this.#commit(checkpoint, 'preparing', {
+      budgetCounters: counters,
+      usage: recordRunUsage(priorUsage, undefined, calculateModelCost(undefined, undefined)),
+      observationCounters: Object.freeze({
+        ...priorObservations,
+        providerAttempts: incrementObservation(priorObservations.providerAttempts),
+        providerInputTokens: 'unavailable', providerOutputTokens: 'unavailable', providerTotalTokens: 'unavailable',
+        providerActiveDurationMs: 'unavailable'
+      })
+    }, [{ type: 'model.started', payload: { kind: 'normal', turn: counters.modelTurns, purpose: 'semantic_summary' } }])
+    onCheckpoint(current)
+    if (isTerminalRunStatus(current.status)) return Object.freeze({ checkpoint: current, turn: null })
+    this.#assertNotAborted(signal)
+    await runtime.checkBoundary?.('provider', signal)
+    const request: ModelRequest = Object.freeze({
+      model: checkpoint.model.model, messages,
+      tools: Object.freeze([]), toolMode: 'disabled', streaming: false, maxOutputTokens,
+      reasoning: Object.freeze({ enabled: false }),
+      temperature: 0,
+      ...(runtime.providerRequestMetadata === undefined ? {} : { metadata: runtime.providerRequestMetadata })
+    })
+    const ordinal = this.#providerAttemptOrdinal(current)
+    const startedAt = this.#safeMonotonicNow()
+    const startedAtWall = this.#timestamp()
+    this.#recordContentJournal(() => ({
+      type: 'provider.request', occurredAt: startedAtWall,
+      runRef: current.runRef, requestRef: current.requestRef, ordinal, attemptKind: 'primary', request: snapshotModelRequestForJournal(request)
+    }))
+    let turn: ModelTurn | null = null
+    let failure: AgentError | null = null
+    try {
+      turn = snapshotModelTurnForJournal(await this.#providerCall(request, signal, timeoutMs))
+    } catch (error) { failure = asAgentError(error) }
+    const occurredAt = this.#timestamp()
+    const durationMs = boundedMonotonicDurationMs(startedAt, this.#safeMonotonicNow())
+    const usage = turn === null ? undefined : detachModelUsage(turn.usage)
+    const startPrice = this.#profile.resolveModelPrice(checkpoint.model.model, new Date(startedAtWall))
+    const endPrice = this.#profile.resolveModelPrice(checkpoint.model.model, new Date(occurredAt))
+    const price = startPrice === undefined || endPrice === undefined ? undefined
+      : endPrice.outputPicoYuanPerMillionTokens > startPrice.outputPicoYuanPerMillionTokens ? endPrice : startPrice
+    const calculated = calculateModelCost(price, usage)
+    const cost: ModelCost = startPrice?.catalogVersion !== endPrice?.catalogVersion && calculated.kind === 'exact'
+      ? Object.freeze({ ...calculated, kind: 'upper_bound' }) : calculated
+    const accounted = this.#recordProviderUsage(budget, counters, durationMs, usage?.totalTokens ?? 0)
+    counters = accounted.counters
+    current = await this.#commit(current, 'preparing', {
+      budgetCounters: counters,
+      usage: recordRunUsage(priorUsage, usage, cost),
+      observationCounters: Object.freeze({
+        ...current.observationCounters,
+        providerInputTokens: mergedProviderUsage(priorObservations.providerInputTokens, usage?.inputTokens),
+        providerOutputTokens: mergedProviderUsage(priorObservations.providerOutputTokens, usage?.outputTokens),
+        providerTotalTokens: mergedProviderUsage(priorObservations.providerTotalTokens, usage?.totalTokens),
+        providerActiveDurationMs: knownObservation(priorObservations.providerActiveDurationMs, counters.usedActiveRuntimeMs)
+      })
+    }, [{
+      type: 'model.attempted', payload: {
+        observationSchemaVersion: 1, attemptKind: 'primary',
+        outcome: turn === null ? (signal.aborted ? 'cancelled' : 'failed') : 'succeeded', durationMs, errorCode: failure?.code ?? null
       }
-    ])
+    }, ...(turn === null ? [] : [{ type: 'model.completed' as const, payload: { kind: 'normal', finishReason: turn.finishReason, toolCallCount: turn.toolCalls.length } }])])
+    onCheckpoint(current)
+    this.#recordContentJournal(() => turn === null
+      ? {
+        type: 'provider.failure', occurredAt, runRef: current.runRef, requestRef: current.requestRef,
+        ordinal, attemptKind: 'primary', error: serializeAgentError(failure ?? asAgentError(new Error('summary_failed')))
+      }
+      : { type: 'provider.response', occurredAt, runRef: current.runRef, requestRef: current.requestRef, ordinal, attemptKind: 'primary', turn })
+    this.#assertNotAborted(signal)
+    await runtime.checkBoundary?.('response', signal)
+    if (accounted.budgetError !== null) throw accounted.budgetError
+    return Object.freeze({ checkpoint: current, turn: isTerminalRunStatus(current.status) ? null : turn })
   }
 
   async #reserveNormalTurn (checkpoint: RunCheckpoint): Promise<RunCheckpoint> {

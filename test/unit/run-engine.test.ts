@@ -775,6 +775,7 @@ function execution (): ToolExecutionContext {
 }
 
 interface HarnessOptions {
+  readonly semanticSummaryAllowed?: StartRunInput['runtime']['semanticSummaryAllowed']
   readonly checkBoundary?: StartRunInput['runtime']['checkBoundary']
   readonly profile?: typeof standardOpenAIProfile
   readonly providerRequestMetadata?: ProviderRequestMetadata
@@ -866,6 +867,7 @@ function harness (
     runtime: Object.freeze({
       snapshot: snapshot(),
       ...(options.checkBoundary === undefined ? {} : { checkBoundary: options.checkBoundary }),
+      ...(options.semanticSummaryAllowed === undefined ? {} : { semanticSummaryAllowed: options.semanticSummaryAllowed }),
       ...(options.providerRequestMetadata === undefined
         ? {}
         : { providerRequestMetadata: options.providerRequestMetadata }),
@@ -4793,4 +4795,167 @@ test('response authority denial preserves provider usage and blocks derived tool
   }
   assert.deepEqual(h.tools.startedCalls, [])
   assert.equal(h.adapter.requests.length, 1)
+})
+
+
+test('semantic summary reserves before dispatch, shares run usage and cannot call twice', async () => {
+  let attempts = 0
+  const journal: RunContentJournalEvent[] = []
+  const store = new TerminalCaptureStore()
+  const fixture = harness([
+    Object.freeze({ ...modelText('summary selection'), usage: Object.freeze({ inputTokens: 100, outputTokens: 20, totalTokens: 120, inputCache: Object.freeze({ hitTokens: 80, missTokens: 20 }) }) }),
+    Object.freeze({ ...modelText('final answer'), usage: Object.freeze({ inputTokens: 200, outputTokens: 30, totalTokens: 230, inputCache: Object.freeze({ hitTokens: 150, missTokens: 50 }) }) })
+  ], {
+    store, semanticSummaryAllowed: () => true, contentJournal: { record: event => journal.push(event) }, planModelTurn: async (checkpoint, planning, signal) => {
+      const messages = Object.freeze([Object.freeze({ role: 'user' as const, content: 'old conversation data' })])
+      assert.ok(planning.summarize)
+      const first = await planning.summarize(messages, signal)
+      assert.equal(first?.text, 'summary selection')
+      assert.equal(await planning.summarize(messages, signal), null)
+      attempts++
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user' as const, content: 'current request' })]))
+    }
+  })
+  const result = await fixture.engine.start(fixture.input)
+  assert.equal(result.kind, 'completed', JSON.stringify(result))
+  assert.equal(attempts, 1)
+  assert.equal(fixture.adapter.requests.length, 2)
+  assert.equal(fixture.adapter.requests[0]?.toolMode, 'disabled')
+  assert.deepEqual(fixture.adapter.requests[0]?.tools, [])
+  assert.equal(fixture.adapter.requests[0]?.reasoning.enabled, false)
+  const checkpoint = store.terminalCheckpoint
+  assert.equal(checkpoint?.budgetCounters.modelTurns, 2)
+  assert.equal(checkpoint?.budgetCounters.providerReportedTokens, 350)
+  assert.equal(checkpoint?.usage.totalTokens, 350)
+  assert.equal(checkpoint?.usage.turnsWithUsage, 2)
+  assert.equal(checkpoint?.usage.turnsWithoutUsage, 0)
+  assert.equal(checkpoint?.usage.availability, 'complete')
+  assert.equal(checkpoint?.observationCounters.providerAttempts, 2)
+  assert.equal(checkpoint?.observationCounters.modelTurns, 2)
+  assert.deepEqual(journal.filter(e => e.type === 'provider.request').map(e => e.ordinal), [1, 2])
+  assert.equal(fixture.tools.executions, 0)
+})
+
+test('summary provider failure consumes its attempt and retains missing usage while normal reply succeeds', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([new ModelProviderError({ code: 'provider_timeout', stage: 'model.response', retryable: true, userMessage: 'timeout' }),
+    Object.freeze({ ...modelText('fallback reply'), usage: Object.freeze({ inputTokens: 200, outputTokens: 30, totalTokens: 230 }) })], {
+    store, semanticSummaryAllowed: () => true, planModelTurn: async (checkpoint, planning, signal) => {
+      const messages = Object.freeze([Object.freeze({ role: 'user' as const, content: 'old data' })])
+      assert.equal(await planning.summarize?.(messages, signal), null)
+      assert.equal(await planning.summarize?.(messages, signal), null)
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user' as const, content: 'reply with deterministic excerpts' })]))
+    }
+  })
+  const result = await fixture.engine.start(fixture.input)
+  assert.equal(result.kind, 'completed', JSON.stringify(result))
+  const checkpoint = store.terminalCheckpoint
+  assert.equal(fixture.adapter.requests.length, 2)
+  assert.equal(checkpoint?.budgetCounters.providerRetries, 0)
+  assert.equal(checkpoint?.usage.availability, 'partial')
+  assert.equal(checkpoint?.usage.turnsWithoutUsage, 1)
+  assert.equal(checkpoint?.usage.totalTokens, 230)
+  assert.equal(checkpoint?.usage.cost?.kind, 'unavailable')
+})
+
+test('default-off planner receives no summary capability and creates no extra provider request', async () => {
+  const fixture = harness([modelText('normal')], {
+    planModelTurn: async (checkpoint, planning) => {
+      assert.equal(planning.summarize, undefined)
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user' as const, content: 'normal request' })]))
+    }
+  })
+  assert.equal((await fixture.engine.start(fixture.input)).kind, 'completed')
+  assert.equal(fixture.adapter.requests.length, 1)
+})
+
+test('summary response revocation fails with the latest persisted usage and no normal request', async () => {
+  const store = new TerminalCaptureStore()
+  const fixture = harness([Object.freeze({
+    ...modelText('selection'),
+    usage: Object.freeze({ inputTokens: 100, outputTokens: 20, totalTokens: 120 })
+  })], {
+    store, semanticSummaryAllowed: () => true,
+    checkBoundary: async boundary => {
+      if (boundary === 'response') throw new AgentError({
+        code: 'authorization_changed',
+        stage: 'summary.source', retryable: false, userMessage: '来源失效'
+      })
+    },
+    planModelTurn: async (checkpoint, planning, signal) => {
+      await planning.summarize!(Object.freeze([Object.freeze({ role: 'user', content: 'old data' })]), signal)
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user', content: 'current' })]))
+    }
+  })
+  const result = await fixture.engine.start(fixture.input)
+  assert.equal(result.kind, 'failed')
+  if (result.kind === 'failed') assert.equal(result.error.code, 'authorization_changed')
+  assert.equal(fixture.adapter.requests.length, 1)
+  assert.equal(store.terminalCheckpoint?.usage.totalTokens, 120)
+  assert.equal(store.terminalCheckpoint?.budgetCounters.modelTurns, 1)
+})
+
+test('summary times out within five seconds, has no retry and ignores a late result', async () => {
+  const store = new TerminalCaptureStore()
+  const late = deferred<ModelTurn>()
+  let summarySignal: AbortSignal | undefined
+  const fixture = harness([async (_request, signal) => { summarySignal = signal; return await late.promise },
+  Object.freeze({ ...modelText('fallback'), usage: Object.freeze({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }) })], {
+    store, semanticSummaryAllowed: () => true, planModelTurn: async (checkpoint, planning, signal) => {
+      assert.equal(await planning.summarize!(Object.freeze([Object.freeze({ role: 'user', content: 'old' })]), signal), null)
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user', content: 'current' })]))
+    }
+  })
+  const keepAlive = setInterval(() => { }, 1000)
+  const started = performance.now()
+  try {
+    assert.equal((await fixture.engine.start(fixture.input)).kind, 'completed')
+    assert.ok(performance.now() - started >= 4900)
+    assert.ok(performance.now() - started < 6500)
+    assert.equal(summarySignal?.aborted, true)
+    assert.equal(store.terminalCheckpoint?.usage.turnsWithoutUsage, 1)
+    assert.equal(store.terminalCheckpoint?.budgetCounters.providerRetries, 0)
+    const saved = JSON.stringify(store.terminalCheckpoint)
+    late.resolve(modelText('late selection'))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(JSON.stringify(store.terminalCheckpoint), saved)
+    assert.equal(fixture.adapter.requests.length, 2)
+  } finally { clearInterval(keepAlive) }
+})
+
+test('restart after summary reservation never dispatches another summary or loses missing usage', async () => {
+  const entered = deferred<void>()
+  const late = deferred<ModelTurn>()
+  const live = harness([async () => { entered.resolve(); return await late.promise }], {
+    semanticSummaryAllowed: () => true, planModelTurn: async (checkpoint, planning, signal) => {
+      await planning.summarize!(Object.freeze([Object.freeze({ role: 'user', content: 'old' })]), signal)
+      return generationPlan(checkpoint, Object.freeze([Object.freeze({ role: 'user', content: 'current' })]))
+    }
+  })
+  const running = live.engine.start(live.input)
+  await entered.promise
+  const reserved = await live.engine.loadCheckpoint('run-1')
+  assert.ok(reserved)
+  assert.equal(reserved.budgetCounters.modelTurns, 1)
+  assert.equal(reserved.usage.turnsWithoutUsage, 1)
+  await live.engine.cancel('run-1', 'process_shutdown')
+  assert.equal((await running).kind, 'cancelled')
+  late.resolve(modelText('late'))
+  const store = new TerminalCaptureStore()
+  store.seedLoadedCheckpoint(reserved)
+  const recovered = harness([], {
+    store, semanticSummaryAllowed: () => true,
+    planModelTurn: async (_checkpoint, planning) => {
+      assert.equal(planning.summarize, undefined)
+      throw new AgentError({
+        code: 'checkpoint_invalid', stage: 'summary.recovery',
+        retryable: false, userMessage: '来源不可重建'
+      })
+    }
+  })
+  const result = await recovered.engine.resume('run-1', recovered.input.runtime)
+  assert.equal(result.kind, 'failed')
+  assert.equal(recovered.adapter.requests.length, 0)
+  assert.equal(store.terminalCheckpoint?.usage.turnsWithoutUsage, 1)
+  assert.equal(store.terminalCheckpoint?.budgetCounters.modelTurns, 1)
 })

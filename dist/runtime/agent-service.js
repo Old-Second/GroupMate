@@ -1,6 +1,7 @@
 import { bindRunBoundaryGuard, bindRunFinalDelivery, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js';
 import { isParticipationRun } from '../agent/participation/ParticipationRun.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { createSemanticSummaryPort } from '../agent/context/SemanticSummaryPort.js';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { agentMessageText } from '../agent/contracts/content-projection.js';
 import { parseRunAdvanceResult } from '../agent/contracts/result.js';
@@ -92,6 +93,7 @@ export function projectFinalPresentation(envelope) {
     }
     return Object.freeze({ result, sessionPersistence: persistence });
 }
+const ownSummarySourceCommits = new WeakMap();
 function isApprovalRecoveryDeferred(value) {
     return 'kind' in value && value.kind === 'approval_deferred';
 }
@@ -947,7 +949,7 @@ export class AgentService {
                 const participation = options.participation;
                 if (participation === undefined)
                     return base;
-                return Object.freeze({ ...base,
+                const qualified = Object.freeze({ ...base,
                     contextDependencies: Object.freeze({
                         schemaVersion: 1, memories: Object.freeze([]), authorityStamp: null,
                         ...base.contextDependencies, requiresLiveParticipation: true
@@ -956,6 +958,10 @@ export class AgentService {
                         await base.checkBoundary?.(boundary, signal);
                         await participation.checkBoundary(boundary, signal);
                     } });
+                const ownCommit = ownSummarySourceCommits.get(base);
+                if (ownCommit !== undefined)
+                    ownSummarySourceCommits.set(qualified, ownCommit);
+                return qualified;
             };
             let binding = createBinding();
             const presentationLifecycle = options.presentationLifecycle ??
@@ -1156,9 +1162,22 @@ export class AgentService {
             });
         };
         const initialInput = sourceInput(false);
+        const summaryAllowed = runtime.binding.semanticSummaryAllowed;
+        const summaryEnabled = session !== null && !runtime.discardSessionHistory &&
+            this.#sessions.saveIfUnchanged !== undefined && summaryAllowed?.() === true;
+        const sessionHash = (record) => createHash('sha256')
+            .update(JSON.stringify([record.sessionId, record.updatedAt, record.turnCount, record.state])).digest('hex');
+        let expectedSessionHash = summaryEnabled ? sessionHash(session) : null;
+        const summarySourcesFresh = async (signal) => {
+            if (signal.aborted || summaryAllowed?.() !== true || expectedSessionHash === null)
+                return false;
+            const current = await this.#sessions.get(request.sessionAddress, { signal });
+            return !signal.aborted && current !== null && sessionHash(current) === expectedSessionHash;
+        };
         const planner = createRunContextPlanner({
             namespaceRef: request.runRef,
             initialSpans: this.#contextEngine.projectSourceSpans(initialInput, request.runRef),
+            ...(summaryEnabled ? { semanticSummary: { port: createSemanticSummaryPort(), isFresh: summarySourcesFresh } } : {}),
             ...(this.#contextArtifactStore === undefined
                 ? {}
                 : { artifactStore: this.#contextArtifactStore })
@@ -1172,8 +1191,9 @@ export class AgentService {
                 estimatedInputTokens: snapshot.estimatedInputTokens
             });
         };
-        return Object.freeze({
+        const binding = Object.freeze({
             snapshot: runtime.binding.snapshot,
+            ...(summaryAllowed === undefined ? {} : { semanticSummaryAllowed: summaryAllowed }),
             ...(runtime.binding.providerRequestMetadata === undefined
                 ? {}
                 : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
@@ -1181,13 +1201,29 @@ export class AgentService {
             planModelTurn: planner.planModelTurn,
             recoverContext: async (_checkpoint, _error, signal) => await prepare(true, signal),
             ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
-            ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
+            ...(summaryEnabled ? { checkBoundary: async (boundary, signal) => {
+                    await runtime.binding.checkBoundary?.(boundary, signal);
+                    if (!await summarySourcesFresh(signal))
+                        throw new AgentError({ code: 'authorization_changed',
+                            stage: 'context.summary.source', retryable: false, userMessage: '任务的历史来源已失效，请重新发起。' });
+                } } : runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
             prepareToolContext: runtime.binding.prepareToolContext,
             contextFor: runtime.binding.contextFor,
             ...(runtime.binding.approvalControlContext === undefined
                 ? {}
                 : { approvalControlContext: runtime.binding.approvalControlContext })
         });
+        if (summaryEnabled)
+            ownSummarySourceCommits.set(binding, async (record, options) => {
+                // Advance only after this run's own successful append, never an external change.
+                if (!await this.#sessions.saveIfUnchanged(session, record, options))
+                    throw new AgentError({
+                        code: 'authorization_changed', stage: 'context.summary.source', retryable: false,
+                        userMessage: '任务的历史来源已失效，请重新发起。'
+                    });
+                expectedSessionHash = sessionHash(record);
+            });
+        return binding;
     }
     async #recoverPending(runId, signal) {
         const checkpoint = await this.#engine.loadCheckpoint(runId);
@@ -1324,12 +1360,17 @@ export class AgentService {
                         : Object.freeze({ schemaVersion: 1, memories: pending.binding.contextDependencies.memories,
                             authorityStamp: pending.binding.contextDependencies.authorityStamp,
                             ...(pending.binding.contextDependencies.scene === undefined ? {} : { scene: pending.binding.contextDependencies.scene }) }));
-                    await this.#sessions.save(next, {
+                    const saveOptions = {
                         signal: undefined,
                         ...(pending.request.sessionTtlSeconds === undefined
                             ? {}
                             : { ttlSeconds: pending.request.sessionTtlSeconds })
-                    });
+                    };
+                    const ownCommit = ownSummarySourceCommits.get(pending.binding);
+                    if (ownCommit === undefined)
+                        await this.#sessions.save(next, saveOptions);
+                    else
+                        await ownCommit(next, saveOptions);
                     sessionPersistence = 'saved';
                 }
                 catch {

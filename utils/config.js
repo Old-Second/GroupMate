@@ -163,6 +163,7 @@ const defaultConfig = {
   personalMemoryMode: 'automatic',
   personalMemoryGroupAllowlist: [],
   groupCultureGroups: [],
+  semanticSummaryGroups: [],
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1200,
   personalMemoryRecallTimeoutMs: 150,

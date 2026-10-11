@@ -7,6 +7,15 @@ import {
   PERSONAL_MEMORY_CONFIG_DEFAULTS
 } from '../../src/runtime/guoba-config.js'
 
+test('semantic summary scope is a strict bounded explicit group list requiring restart', () => {
+  assert.deepEqual(normalizeGuobaConfigValue('semanticSummaryGroups', []), [])
+  assert.deepEqual(normalizeGuobaConfigValue('semanticSummaryGroups', ['123456']), ['123456'])
+  for (const value of ['123456', [123456], ['0'], ['01'], ['123456', '123456'], Array(65).fill('123456')]) {
+    assert.throws(() => normalizeGuobaConfigValue('semanticSummaryGroups', value))
+  }
+  assert.match(guobaConfigSaveMessage(['semanticSummaryGroups']), /重启/)
+})
+
 test('normalizes editable Guoba list fields into unique trimmed values', () => {
   assert.deepEqual(
     normalizeGuobaConfigValue('bymFuckList', ' 骂,你妈；骂 | 艹 '),

@@ -7,6 +7,13 @@ import { legacySessionCodec } from './legacy-session-codec.js';
 export const AGENT_SESSION_NAMESPACE = 'GROUPMATE:SESSION:v2:';
 const V1_NAMESPACE = 'GROUPMATE:SESSION:v1:';
 const LEGACY_PATTERN = 'CHATGPT:CONVERSATIONS:*';
+export const AGENT_SESSION_CAS_MARKER = '-- GROUPMATE_AGENT_SESSION_CAS_V1';
+const APPEND_IF_UNCHANGED = `${AGENT_SESSION_CAS_MARKER}
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if tonumber(ARGV[3]) > 0 then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+else redis.call('SET', KEYS[1], ARGV[2]) end
+return 1`;
 function cancelled() {
     return new AgentError({
         code: 'cancelled', stage: 'agent.session', retryable: false,
@@ -132,6 +139,31 @@ export class RedisAgentSessionStore {
         assertNotAborted(options.signal);
         const ttlSeconds = this.#validTtl(options.ttlSeconds);
         await this.#writeV2(value, ttlSeconds, 'agent.session.save');
+    }
+    async saveIfUnchanged(expected, value, options = {}) {
+        assertNotAborted(options.signal);
+        const ttl = this.#validTtl(options.ttlSeconds);
+        const address = { botId: value.botId, scope: value.scope };
+        if (expected.sessionId !== value.sessionId ||
+            agentSessionKey(expected) !== agentSessionKey(address))
+            throw new TypeError('conditional session address changed');
+        if (this.#redis.eval === undefined)
+            return false;
+        const before = agentSessionCodec.encode(expected), after = agentSessionCodec.encode(value);
+        try {
+            const result = await this.#redis.eval(APPEND_IF_UNCHANGED, {
+                keys: [agentSessionKey(address)], arguments: [before, after, String(ttl ?? 0)]
+            });
+            assertNotAborted(options.signal);
+            if (result !== 0 && result !== 1)
+                throw new TypeError('conditional session result invalid');
+            return result === 1;
+        }
+        catch (error) {
+            if (error instanceof AgentError)
+                throw error;
+            throw storageError('agent.session.save', 'conditional_append', error);
+        }
     }
     async delete(address, options = {}) {
         assertNotAborted(options.signal);

@@ -343,6 +343,13 @@ export class FakeRedis implements RedisSessionClient, RedisRunClient {
     arguments: string[]
   }): Promise<unknown> {
     const marker = script.split('\n', 1)[0] ?? ''
+    if (marker === '-- GROUPMATE_AGENT_SESSION_CAS_V1') {
+      const key = options.keys[0]!, [expected, next, ttl] = options.arguments
+      this.purgeExpired(key)
+      if (this.entries.get(key)?.value !== expected) return 0
+      this.entries.set(key, { value: next!, ...(Number(ttl) > 0 ? { expiresAtMs: this.now() + Number(ttl) * 1000 } : {}) })
+      return 1
+    }
     const operation = options.arguments[0] ?? ''
     this.evalCalls.push({
       marker,

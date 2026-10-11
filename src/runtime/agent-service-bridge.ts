@@ -1864,6 +1864,13 @@ export function createYunzaiAgentServiceBridge (
         discardSessionHistory,
         binding: Object.freeze({
           ...runtime.run.binding,
+          semanticSummaryAllowed: () => {
+            const groups = options.config.semanticSummaryGroups
+            const scope = request.sessionAddress.scope
+            return scope.kind === 'group_user' && Array.isArray(groups) && groups.length <= 64 &&
+              groups.every(value => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value)) &&
+              groups.includes(scope.groupId)
+          },
           ...(proof === undefined ? { checkBoundary: combineBoundaries(membershipGuard, memoryContextBoundary(memoryContext, async boundarySignal =>
             await loadPersonalMemoryContext(memoryRecall, options, request, runtime, boundarySignal, true))) } : {
             contextDependencies: proof, checkBoundary: combineBoundaries(membershipGuard, provenMemoryContextBoundary(proof, authority))

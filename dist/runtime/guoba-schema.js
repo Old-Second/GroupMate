@@ -106,6 +106,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         }),
         field('personalMemoryGroupAllowlist', '长期记忆试点群', '只有这些群可以读取或写入个人记忆；空列表表示群聊全部不允许。自动模式下用户默认参与，手动关闭的用户不会被重新开启。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
         field('groupCultureGroups', '群文化提案试点群', '空列表表示关闭新文化提案；需同时属于长期记忆试点群，最多64群。仅文字描述、成员提案和另一位管理员审核，不代表全群共识。', 'GTags', { allowAdd: true, closable: true }),
+        field('semanticSummaryGroups', '历史摘要试点群', '空列表表示关闭，最多64群，仅按用户隔离的群会话。上下文不足时选择历史原文证据，每轮至多增加一次模型请求；来源失效时拒绝，摘要失败时使用节选。修改后需重启。', 'GTags', { allowAdd: true, closable: true }),
         field('personalMemoryRecallMaxItems', '单次召回条数上限', '每次请求最多注入的个人记忆条数，范围 1 到 12；默认 6。修改后需重启。', 'InputNumber', { min: 1, max: 12, step: 1 }),
         field('personalMemoryRecallMaxTokens', '单次召回 Token 上限', '每次请求中个人记忆正文的独立 Token 预算，范围 1 到 2400；默认 1200，仍受总上下文预算约束。修改后需重启。', 'InputNumber', { min: 1, max: 2_400, step: 1 }),
         field('personalMemoryRecallTimeoutMs', '单次召回超时毫秒', '个人记忆检索超时，范围 1 到 500 毫秒；默认 150，超时会无记忆继续普通回复。群成员身份核验走宿主接口，有独立预算，不占用这里的时间。修改后需重启。', 'InputNumber', { min: 1, max: 500, step: 1 }),

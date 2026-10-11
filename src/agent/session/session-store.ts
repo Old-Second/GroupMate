@@ -5,6 +5,8 @@ import type { SessionRecord, SessionSummary } from './session-record.js'
 export interface SessionStore<TState> {
   get(address: SessionAddress, options?: AbortOptions): Promise<SessionRecord<TState> | null>
   save(record: SessionRecord<TState>, options?: SaveOptions): Promise<void>
+  /** Atomic source-preserving append. False never creates or replaces a changed session. */
+  saveIfUnchanged?(expected: SessionRecord<TState>, record: SessionRecord<TState>, options?: SaveOptions): Promise<boolean>
   delete(address: SessionAddress, options?: AbortOptions): Promise<boolean>
   list(query: { readonly botId: string }, options?: ListOptions): AsyncIterable<SessionSummary>
   deleteAll(query: { readonly botId: string }, options?: AbortOptions): Promise<number>

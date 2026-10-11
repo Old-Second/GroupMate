@@ -60,6 +60,26 @@ function v1Record () {
   }
 }
 
+test('conditional append preserves deleted, expired and concurrently changed summary sources', async () => {
+  let now = Date.parse(timestamp)
+  const redis = new FakeRedis(() => now)
+  const store = new RedisAgentSessionStore({ redis })
+  const original = v2Record()
+  const next = { ...original, turnCount: 2, state: v2Record('new terminal').state }
+  await store.save(original)
+  assert.equal(await store.saveIfUnchanged(original, next, { ttlSeconds: 10 }), true)
+  assert.equal((await store.get(address))?.turnCount, 2)
+  assert.equal(await store.saveIfUnchanged(original, next), false)
+  assert.equal((await store.get(address))?.turnCount, 2)
+  await store.delete(address)
+  assert.equal(await store.saveIfUnchanged(original, next), false)
+  assert.equal(await store.get(address), null)
+  await store.save(original, { ttlSeconds: 1 })
+  now += 1001
+  assert.equal(await store.saveIfUnchanged(original, next), false)
+  assert.equal(await store.get(address), null)
+})
+
 test('v2 session wins without rewriting the preserved v1 source', async () => {
   const redis = new FakeRedis(() => Date.parse(timestamp))
   await redis.set(agentSessionKey(address), agentSessionCodec.encode(v2Record()))

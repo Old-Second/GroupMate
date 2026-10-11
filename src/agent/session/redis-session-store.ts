@@ -13,6 +13,7 @@ import type { SessionCodec, SessionRecord, SessionSummary } from './session-reco
 import type { SessionStore } from './session-store.js'
 
 export interface RedisSessionClient {
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>
   get(key: string): Promise<string | null>
   set(key: string, value: string, options?: { EX?: number }): Promise<unknown>
   del(key: string | readonly string[]): Promise<number>

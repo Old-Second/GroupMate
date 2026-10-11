@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { AgentError } from '../../src/agent/contracts/error.js'
+import { createSemanticSummaryPort } from '../../src/agent/context/SemanticSummaryPort.js'
 import type { ModelMessage } from '../../src/agent/model/model-adapter.js'
 import type {
   ContextArtifactStore,
@@ -452,6 +453,42 @@ test('ordinary history compacts into provenance-linked untrusted excerpts with b
     messages: first.messages, contextArtifactRefs: first.artifactRefs }),
   Object.freeze({ kind: 'correction', transition: 'normal' }), new AbortController().signal)
   assert.deepEqual(corrected.messages.slice(0, -1), first.messages)
+})
+
+test('planner commits model evidence, reuses it without a call and rejects recovered source authority', async () => {
+  const original = ordinarySpan('semantic-history', 'runtime_fact', 'user',
+    '甲说乙不喜欢咖啡。' + '旧背景。'.repeat(120) + '后来乙改为喜欢茶。')
+  const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
+  const history = createContextSpanV1(Object.freeze({ ...draft, source: 'session_history', trust: 'untrusted',
+    priority: 'normal', semanticOrder: 4, provenance: Object.freeze({ ...draft.provenance, kind: 'session_item' }) }))
+  for (const valid of [true, false]) {
+    const store = new RecordingArtifactStore()
+    const planner = createRunContextPlanner({ namespaceRef: runRef,
+      initialSpans: Object.freeze([...baseSpans, history]), artifactStore: store,
+      semanticSummary: Object.freeze({ port: createSemanticSummaryPort(), isFresh: async () => true }) })
+    let calls = 0
+    const first = await planner.planModelTurn(plannerCheckpoint({ modelCapability: Object.freeze({
+      ...plannerCheckpoint().modelCapability, contextWindowTokens: 3072, maxOutputTokens: 2048 }) }),
+    Object.freeze({ kind: 'normal', transition: 'normal', summarize: async () => {
+      calls++
+      return { text: valid ? JSON.stringify({ facts: [[0, 0, 0]], decisions: [[0, 0, 121]], todos: [], uncertain: [] }) : 'invalid',
+        toolCalls: [], finishReason: 'stop' as const }
+    } }), new AbortController().signal)
+    assert.equal(calls, 1)
+    assert.equal(store.puts[0]?.artifact.generator.kind, valid ? 'model' : 'deterministic')
+    assert.ok(first.artifactRefs.length > 0)
+    assert.ok(first.messages.some(message => message.content?.includes(valid ? '历史对话证据摘要' : '历史对话节选摘要')))
+    const nextCheckpoint = plannerCheckpoint({ contextPlan: first.plan, messages: first.messages, contextArtifactRefs: first.artifactRefs,
+      modelCapability: Object.freeze({ ...plannerCheckpoint().modelCapability, contextWindowTokens: 3072, maxOutputTokens: 2048 }) })
+    await planner.planModelTurn(nextCheckpoint, Object.freeze({ kind: 'normal', transition: 'normal',
+      summarize: async () => { throw new Error('must not repeat') } }), new AbortController().signal)
+    assert.equal(calls, 1)
+    if (valid) {
+      const recovered = createRunContextPlanner({ namespaceRef: runRef, initialSpans: null, artifactStore: store })
+      await assert.rejects(() => recovered.planModelTurn(nextCheckpoint,
+        Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal), { code: 'checkpoint_invalid' })
+    }
+  }
 })
 
 test('correction pressure uses reserved capacity while preserving its committed prefix', async () => {

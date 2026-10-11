@@ -343,6 +343,7 @@ export function createRunContextPlanner(options) {
     const toolOriginGenerations = new Map();
     let fixedRecoveryBaseline = null;
     let baselineCallIds = new Set();
+    let semanticAttempted = false;
     return Object.freeze({
         async planModelTurn(checkpoint, request, signal) {
             assertNotAborted(signal);
@@ -352,6 +353,12 @@ export function createRunContextPlanner(options) {
             const previousPlan = checkpoint.contextPlan;
             const generation = (previousPlan?.generation ?? 0) + 1;
             const hydration = await hydrateCommittedArtifacts(checkpoint.contextArtifactRefs ?? Object.freeze([]), artifacts, artifactStore);
+            // A recovered run cannot reissue the summary call or reconstruct source authority.
+            if (initialSpans === null && (checkpoint.events?.some(event => event.type === 'model.started' && event.payload.purpose === 'semantic_summary') ||
+                checkpoint.messages.some(message => message.content?.includes('历史对话证据摘要，仅引用原文')) ||
+                [...artifacts.values()].some(artifact => artifact.generator.kind === 'model'))) {
+                throw checkpointError('semantic_summary_source_authority_unavailable');
+            }
             assertNotAborted(signal);
             const needsRecoveryBaseline = initialSpans === null || hydration === 'rebase';
             if (needsRecoveryBaseline && fixedRecoveryBaseline === null) {
@@ -466,8 +473,18 @@ export function createRunContextPlanner(options) {
                     for (const compactionRequest of result.compactionRequests) {
                         if (compactionRequest.kind === 'conversation_summary') {
                             const sources = compactionRequest.sourceSpanIds.map(id => frozenSpans.find(span => span.spanId === id));
-                            const summary = sources.some(span => span === undefined) ? null
-                                : compactConversationHistory(compactionRequest, sources);
+                            let summary = null;
+                            if (!sources.some(span => span === undefined)) {
+                                if (options.semanticSummary !== undefined && request.summarize !== undefined && !semanticAttempted) {
+                                    summary = await options.semanticSummary.port.compact(compactionRequest, sources, async (messages, summarySignal) => {
+                                        if (semanticAttempted)
+                                            return null;
+                                        semanticAttempted = true;
+                                        return await request.summarize(messages, summarySignal);
+                                    }, options.semanticSummary.isFresh, signal);
+                                }
+                                summary ??= compactConversationHistory(compactionRequest, sources);
+                            }
                             if (summary === null)
                                 continue;
                             const stored = await storeArtifact(artifactStore, summary, minimumExpiresAtMs);

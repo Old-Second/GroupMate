@@ -1,7 +1,8 @@
 import type { ContextDependencyProof } from '../agent/context/ContextDependency.js'
-import { bindRunBoundaryGuard, bindRunFinalDelivery, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js'
+import { bindRunBoundaryGuard, bindRunFinalDelivery, transferRunBoundaryGuard, type RunBoundary } from '../agent/run/RunBoundary.js'
 import { isParticipationRun, type ParticipationRun } from '../agent/participation/ParticipationRun.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { createSemanticSummaryPort } from '../agent/context/SemanticSummaryPort.js'
 import {
   AgentError,
   serializeAgentError
@@ -213,11 +214,14 @@ export interface AgentServiceRequestOptions extends RunControlOptions {
   readonly presentationLifecycle?: RunPresentationLifecycle
 }
 
+const ownSummarySourceCommits = new WeakMap<RunRuntimeBinding,
+  (record: SessionRecord<AgentSessionState>, options: Parameters<SessionStore<AgentSessionState>['save']>[1]) => Promise<void>>()
+
 export interface AgentServiceRunRuntime {
   readonly discardSessionHistory?: boolean
   readonly binding: Readonly<Pick<
     RunRuntimeBinding,
-    'snapshot' | 'providerRequestMetadata' | 'contextDependencies' | 'checkBoundary' | 'prepareToolContext' | 'contextFor' |
+    'snapshot' | 'semanticSummaryAllowed' | 'providerRequestMetadata' | 'contextDependencies' | 'checkBoundary' | 'prepareToolContext' | 'contextFor' |
     'approvalControlContext'
   >>
   readonly progress?: ProgressDelivery
@@ -1349,7 +1353,7 @@ export class AgentService {
         const base = this.#bindingFor(runId, request, session, runtime, hostImageLinks)
         const participation = options.participation
         if (participation === undefined) return base
-        return Object.freeze<RunRuntimeBinding>({ ...base,
+        const qualified = Object.freeze<RunRuntimeBinding>({ ...base,
           contextDependencies: Object.freeze({
             schemaVersion: 1 as const, memories: Object.freeze([]), authorityStamp: null,
             ...base.contextDependencies, requiresLiveParticipation: true as const
@@ -1359,6 +1363,9 @@ export class AgentService {
             await participation.checkBoundary(boundary, signal)
           }
         })
+        const ownCommit = ownSummarySourceCommits.get(base)
+        if (ownCommit !== undefined) ownSummarySourceCommits.set(qualified, ownCommit)
+        return qualified
       }
       let binding = createBinding()
       const presentationLifecycle = options.presentationLifecycle ??
@@ -1595,9 +1602,21 @@ export class AgentService {
       })
     }
     const initialInput = sourceInput(false)
+    const summaryAllowed = runtime.binding.semanticSummaryAllowed
+    const summaryEnabled = session !== null && !runtime.discardSessionHistory &&
+      this.#sessions.saveIfUnchanged !== undefined && summaryAllowed?.() === true
+    const sessionHash = (record: SessionRecord<AgentSessionState>) => createHash('sha256')
+      .update(JSON.stringify([record.sessionId, record.updatedAt, record.turnCount, record.state])).digest('hex')
+    let expectedSessionHash = summaryEnabled ? sessionHash(session!) : null
+    const summarySourcesFresh = async (signal: AbortSignal): Promise<boolean> => {
+      if (signal.aborted || summaryAllowed?.() !== true || expectedSessionHash === null) return false
+      const current = await this.#sessions.get(request.sessionAddress, { signal })
+      return !signal.aborted && current !== null && sessionHash(current) === expectedSessionHash
+    }
     const planner = createRunContextPlanner({
       namespaceRef: request.runRef,
       initialSpans: this.#contextEngine.projectSourceSpans(initialInput, request.runRef),
+      ...(summaryEnabled ? { semanticSummary: { port: createSemanticSummaryPort(), isFresh: summarySourcesFresh } } : {}),
       ...(this.#contextArtifactStore === undefined
         ? {}
         : { artifactStore: this.#contextArtifactStore })
@@ -1617,8 +1636,9 @@ export class AgentService {
         estimatedInputTokens: snapshot.estimatedInputTokens
       })
     }
-    return Object.freeze({
+    const binding = Object.freeze<RunRuntimeBinding>({
       snapshot: runtime.binding.snapshot,
+      ...(summaryAllowed === undefined ? {} : { semanticSummaryAllowed: summaryAllowed }),
       ...(runtime.binding.providerRequestMetadata === undefined
         ? {}
         : { providerRequestMetadata: runtime.binding.providerRequestMetadata }),
@@ -1630,13 +1650,25 @@ export class AgentService {
         signal: AbortSignal
       ) => await prepare(true, signal),
       ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
-      ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
+      ...(summaryEnabled ? { checkBoundary: async (boundary: RunBoundary, signal: AbortSignal) => {
+        await runtime.binding.checkBoundary?.(boundary, signal)
+        if (!await summarySourcesFresh(signal)) throw new AgentError({ code: 'authorization_changed',
+          stage: 'context.summary.source', retryable: false, userMessage: '任务的历史来源已失效，请重新发起。' })
+      } } : runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
       prepareToolContext: runtime.binding.prepareToolContext,
       contextFor: runtime.binding.contextFor,
       ...(runtime.binding.approvalControlContext === undefined
         ? {}
         : { approvalControlContext: runtime.binding.approvalControlContext })
     })
+    if (summaryEnabled) ownSummarySourceCommits.set(binding, async (record, options) => {
+      // Advance only after this run's own successful append, never an external change.
+      if (!await this.#sessions.saveIfUnchanged!(session!, record, options)) throw new AgentError({
+        code: 'authorization_changed', stage: 'context.summary.source', retryable: false,
+        userMessage: '任务的历史来源已失效，请重新发起。' })
+      expectedSessionHash = sessionHash(record)
+    })
+    return binding
   }
 
   async #recoverPending (
@@ -1776,12 +1808,15 @@ export class AgentService {
                   authorityStamp: pending.binding.contextDependencies.authorityStamp,
                   ...(pending.binding.contextDependencies.scene === undefined ? {} : { scene: pending.binding.contextDependencies.scene }) })
           )
-          await this.#sessions.save(next, {
+          const saveOptions = {
             signal: undefined,
             ...(pending.request.sessionTtlSeconds === undefined
               ? {}
               : { ttlSeconds: pending.request.sessionTtlSeconds })
-          })
+          }
+          const ownCommit = ownSummarySourceCommits.get(pending.binding)
+          if (ownCommit === undefined) await this.#sessions.save(next, saveOptions)
+          else await ownCommit(next, saveOptions)
           sessionPersistence = 'saved'
         } catch {
           sessionPersistence = 'failed'

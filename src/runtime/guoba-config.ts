@@ -10,7 +10,7 @@ const IDENTIFIER_LIST_FIELDS = new Set([
 ])
 
 const GROUP_IDENTIFIER_LIST_FIELDS = new Set([
-  'personalMemoryGroupAllowlist', 'groupCultureGroups'
+  'personalMemoryGroupAllowlist', 'groupCultureGroups', 'semanticSummaryGroups'
 ])
 
 const QQ_SCOPE_FIELDS = new Set([
@@ -64,6 +64,7 @@ export const RESTART_REQUIRED_CONFIG_FIELDS: ReadonlySet<string> = new Set([
   'personalMemoryMode',
   'personalMemoryGroupAllowlist',
   'groupCultureGroups',
+  'semanticSummaryGroups',
   'personalMemoryRecallMaxItems',
   'personalMemoryRecallMaxTokens',
   'personalMemoryRecallTimeoutMs',
@@ -157,7 +158,7 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
     if (value !== 'legacy' && value !== 'shadow' && value !== 'active') throw new TypeError('群参与模式配置无效。')
     return value
   }
-  if (key === 'participationActiveGroups' || key === 'groupCultureGroups') {
+  if (key === 'participationActiveGroups' || key === 'groupCultureGroups' || key === 'semanticSummaryGroups') {
     if (!Array.isArray(value) || value.length > 64 || value.some(group => typeof group !== 'string' || !/^[1-9]\d{0,19}$/.test(group)) ||
       new Set(value).size !== value.length) throw new TypeError('受控参与群列表配置无效。')
     return Object.freeze([...value])

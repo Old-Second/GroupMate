@@ -1,3 +1,7 @@
+import { runBoundaryGuard } from '../../src/agent/run/RunBoundary.js'
+import { AgentError } from '../../src/agent/contracts/error.js'
+import { parseAgentSessionState } from '../../src/agent/session/agent-session-state.js'
+import type { SessionRecord } from '../../src/agent/session/session-record.js'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test } from 'node:test'
@@ -2208,4 +2212,88 @@ test('AgentService cancellation releases a paused run and shutdown waits for app
     afterShutdown.kind === 'cancelled' ? afterShutdown.reason : null,
     'process_shutdown'
   )
+})
+
+
+test('summary session authority rejects deletion at every boundary and accepts only this run own committed append', async () => {
+  for (const boundary of ['provider', 'tool', 'response', 'final'] as const) {
+    const draft = request(`summary-source-${boundary}`, 'current request')
+    const original: SessionRecord<AgentSessionState> = Object.freeze({
+      schemaVersion: 1, sessionId: 'summary-source-session',
+      botId: draft.sessionAddress.botId, scope: draft.sessionAddress.scope, startedBy: Object.freeze({ userId: 'actor-1' }),
+      createdAt, updatedAt: createdAt, turnCount: 1, state: parseAgentSessionState({ schemaVersion: 1, messages: [{ kind: 'message', message: request('past', '甲说乙不喜欢咖啡。后来改为茶。').message }] })
+    })
+    let current: SessionRecord<AgentSessionState> | null = original, enabled = true
+    let binding: RunRuntimeBinding | undefined
+    const calls: string[] = []
+    const service = new AgentService({
+      sessions: {
+        ...contractSessions(), get: async () => current, save: async record => { current = record },
+        saveIfUnchanged: async (expected, record) => { if (current !== expected) return false; current = record; return true }
+      },
+      runStore: new InMemoryRunStore(), admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+      contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(), now: () => new Date(createdAt),
+      createRuntime: async () => { const base = contractRuntime(); return { ...base, binding: { ...base.binding, semanticSummaryAllowed: () => enabled, checkBoundary: async b => { calls.push(b) } } } },
+      createEngine: () => contractEngine({
+        start: async input => {
+          binding = input.runtime
+          await binding.checkBoundary?.(boundary, new AbortController().signal)
+          current = null
+          await assert.rejects(() => binding!.checkBoundary!(boundary, new AbortController().signal), error => error instanceof AgentError && error.code === 'authorization_changed')
+          current = original
+          return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: 'normal final' })
+        }
+      })
+    })
+    const result = await service.handle(draft)
+    assert.equal(result.kind, 'completed', JSON.stringify(result))
+    if (result.kind !== 'completed') throw new Error('unexpected result')
+    assert.equal(result.sessionPersistence, 'saved')
+    assert.equal(current!.turnCount, 2)
+    const finalGuard = runBoundaryGuard(result)
+    assert.ok(finalGuard)
+    await finalGuard('final', new AbortController().signal)
+    current = Object.freeze({ ...current!, turnCount: current!.turnCount + 1 })
+    await assert.rejects(() => finalGuard('final', new AbortController().signal), error => error instanceof AgentError && error.code === 'authorization_changed')
+    enabled = false
+    await assert.rejects(() => binding!.checkBoundary!('provider', new AbortController().signal))
+    assert.ok(calls.includes(boundary))
+  }
+})
+
+test('real session codec accepts own append and conditional save never restores a source deleted after final check', async () => {
+  for (const race of [false, true]) {
+    const draft = request(`summary-atomic-${race}`, 'current request')
+    const redis = new FakeRedis(() => Date.parse(createdAt))
+    const sessions = new RedisAgentSessionStore({ redis })
+    await sessions.save({ schemaVersion: 1, sessionId: 'summary-atomic-source', botId: draft.sessionAddress.botId,
+      scope: draft.sessionAddress.scope, startedBy: { userId: 'actor-1' }, createdAt, updatedAt: createdAt, turnCount: 1,
+      state: parseAgentSessionState({ schemaVersion: 1, messages: [{ kind: 'message', message: request('past', '历史原文。').message }] }) })
+    const originalEval = redis.eval.bind(redis)
+    redis.eval = async (script, options) => {
+      if (race && script.startsWith('-- GROUPMATE_AGENT_SESSION_CAS_V1')) await sessions.delete(draft.sessionAddress)
+      return originalEval(script, options)
+    }
+    const service = new AgentService({ sessions, runStore: new InMemoryRunStore(),
+      admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() }, contextEngine: contractContextEngine(),
+      progressPresenter: new RunProgressPresenter(), now: () => new Date(createdAt),
+      createRuntime: async () => { const base = contractRuntime(); return { ...base,
+        binding: { ...base.binding, semanticSummaryAllowed: () => true } } },
+      createEngine: () => contractEngine({ start: async input => completedResult(input.runId, input.runRef, { kind: 'reply_text', text: 'normal' }) })
+    })
+    const result = await service.handle(draft)
+    assert.equal(result.kind, 'completed')
+    if (result.kind !== 'completed') throw new Error('unexpected result')
+    const guard = runBoundaryGuard(result)
+    assert.ok(guard)
+    if (race) {
+      assert.equal(result.sessionPersistence, 'failed')
+      assert.equal(await sessions.get(draft.sessionAddress), null)
+      await assert.rejects(() => guard('final', new AbortController().signal), { code: 'authorization_changed' })
+    } else {
+      assert.equal(result.sessionPersistence, 'saved')
+      assert.equal((await sessions.get(draft.sessionAddress))?.turnCount, 2)
+      await guard('final', new AbortController().signal)
+    }
+  }
 })
