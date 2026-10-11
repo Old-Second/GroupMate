@@ -1,3 +1,5 @@
+import { canonicalMemoryAuthorityStamp, validateCanonicalMemoryDependencies } from './CanonicalMemoryBoundary.js';
+import { parseContextDependencyProof } from '../agent/context/ContextDependency.js';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, statSync } from 'node:fs';
 import { open, rename, unlink } from 'node:fs/promises';
@@ -533,10 +535,12 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             control,
             export: exportPort
         });
+        const boundaryDatabase = canonical.database;
         const source = createPersonalMemoryRecallSourceV1({
             deploymentMode: options.deploymentMode,
             groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
             participants: createYunzaiSceneParticipantDirectoryV1(),
+            validateDependencies: async (request, refs, signal) => await validateCanonicalMemoryDependencies(boundaryDatabase, request, refs, signal),
             enrollment,
             retriever: createLexicalMemoryRetrieverV2({
                 index: lexicalIndex,
@@ -612,6 +616,50 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
         retention.start();
         return Object.freeze({
             recallSource: Object.freeze({
+                authority: async (input, refs, signal) => {
+                    try {
+                        if (closed || signal.aborted || refs.length > 12)
+                            return null;
+                        parseContextDependencyProof({ schemaVersion: 1, memories: refs, authorityStamp: null });
+                        const typed = input;
+                        const personalRefs = [];
+                        const groupRefs = [];
+                        const targets = new Set();
+                        for (const ref of refs) {
+                            const row = boundaryDatabase.prepare('SELECT namespace_wire FROM namespaces WHERE namespace_ref = ?').get(ref.namespaceRef);
+                            if (typeof row?.namespace_wire !== 'string')
+                                return null;
+                            const namespace = JSON.parse(row.namespace_wire);
+                            if (namespace.scope.kind === 'personal') {
+                                personalRefs.push(ref);
+                                targets.add(namespace.scope.subjectUserId);
+                            }
+                            else if (namespace.scope.kind === 'group')
+                                groupRefs.push(ref);
+                            else
+                                return null;
+                        }
+                        if (targets.size > 4)
+                            return null;
+                        const fresh = { ...typed, freshAuthority: true, strictTargetUserIds: [...targets] };
+                        if (personalRefs.length > 0) {
+                            const result = parseMemoryRetrievalResultV2(await recallSource.recall({ ...fresh, dependencyCheck: personalRefs }, signal));
+                            if (result.status !== 'completed')
+                                return null;
+                        }
+                        if (groupRefs.length > 0) {
+                            const result = await groupMemory.recall({ ...fresh, dependencyCheck: groupRefs }, signal);
+                            if (result.status !== 'completed')
+                                return null;
+                        }
+                        return canonicalMemoryAuthorityStamp(boundaryDatabase, refs, {
+                            mode: options.deploymentMode(), allowlist: [...configuredGroupAllowlist(options.groupAllowlist)].sort()
+                        });
+                    }
+                    catch {
+                        return null;
+                    }
+                },
                 recall: async (input, signal) => {
                     const typed = input;
                     const personal = parseMemoryRetrievalResultV2(await recallSource.recall(typed, signal));

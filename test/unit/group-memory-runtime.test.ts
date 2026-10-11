@@ -41,10 +41,35 @@ async function fixture (t: { after: (fn: () => unknown) => void }) {
         currentMessageId: e.message_id, quotedMessageId: null, hasReply: false, replyResolved: true,
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] } }) as any
   }
-  return { runtime, db, send, recall, setRole: (value: string) => { role = value },
+  const authority = async (refs: any[], groupId = '40004') => {
+    const e = event(groupId)
+    return await runtime.recallSource.authority!({ request: { createdAt: new Date().toISOString(), sessionAddress: { botId: '10001' } },
+      event: e, queryText: '与检索排名无关的边界校验', messageEvidence: { schemaVersion: 1, prompt: '新问题', imageUrls: [],
+        currentMessageId: e.message_id, quotedMessageId: null, hasReply: false } }, refs, new AbortController().signal)
+  }
+  return { runtime, db, send, recall, authority, setRole: (value: string) => { role = value },
     setJoined: (value: number) => { joined = value }, refreshCount: () => refreshed,
     stopLookup: () => { lookupAvailable = false }, directory }
 }
+
+test('group dependency authority preserves valid heads and rejects correction, wrong group and bot rejoin', async t => {
+  const f = await fixture(t)
+  await f.send('#群记忆 记住 规则 本群禁止刷屏')
+  const recalled = await f.recall('刷屏')
+  const refs = recalled.candidates.map((candidate: any) => ({ namespaceRef: candidate.namespaceRef,
+    memoryId: candidate.memoryId, revision: candidate.revision, revisionHash: candidate.revisionHash }))
+  assert.equal(refs.length, 1)
+  const stamp = await f.authority(refs)
+  assert.match(stamp!, /^[a-f0-9]{64}$/)
+  assert.equal(await f.authority(refs, '50005'), null)
+  f.setJoined(1700000200)
+  assert.equal(await f.authority(refs), null)
+  f.setJoined(1700000000)
+  const list = await f.send('#群记忆 列表')
+  const id = /@[0-9a-f]{8}/u.exec(list)![0]
+  await f.send(`#群记忆 更正 ${id} 本群禁止重复刷屏`)
+  assert.equal(await f.authority(refs), null)
+})
 
 test('group memory CRUD, renewal and physical deletion preserve another group', async t => {
   const f = await fixture(t)

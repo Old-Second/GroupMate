@@ -1,3 +1,4 @@
+import type { MemoryDependency } from '../context/ContextDependency.js'
 import {
   createMemoryAccessCapabilityIssuerV1,
   issueMemoryAccessCapabilityV1
@@ -37,6 +38,7 @@ export interface PersonalMemoryParticipantDirectoryV1<TInput> {
 }
 
 export interface PersonalMemoryRecallInputV1<TParticipantInput> {
+  readonly dependencyCheck?: readonly MemoryDependency[]
   readonly botInstanceId: string
   readonly accountId: string
   readonly participantInput: TParticipantInput
@@ -58,6 +60,7 @@ export interface CreatePersonalMemoryRecallSourceOptionsV1<TParticipantInput> {
   readonly groupAllowlist: () => readonly string[]
   readonly participants: PersonalMemoryParticipantDirectoryV1<TParticipantInput>
   readonly enrollment: PersonalMemoryEnrollmentPortV1
+  readonly validateDependencies?: (request: import('./memory-retrieval.js').MemoryRetrievalRequestV2, refs: readonly MemoryDependency[], signal: AbortSignal) => Promise<boolean>
   readonly retriever: MemoryRetrievalAdapterV2
   readonly now?: () => Date
   readonly timeoutMs?: number
@@ -361,6 +364,11 @@ export function createPersonalMemoryRecallSourceV1<TParticipantInput> (
             }))
           } catch {
             return unavailable('policy_unavailable')
+          }
+          if (input.dependencyCheck !== undefined) {
+            if (options.validateDependencies === undefined || !await options.validateDependencies(request, input.dependencyCheck, signal)) return unavailable('canonical_unavailable')
+            return Object.freeze({ schemaVersion: 2 as const, status: 'completed' as const, mode: 'none' as const, candidates: Object.freeze([]),
+              index: Object.freeze({ lexical: 'disabled' as const, vector: 'disabled' as const, watermark: null }) })
           }
           return await retrieveMemoryV2(options.retriever, request, { signal, now })
         }, callerSignal, now, timeoutMs) as MemoryRetrievalResultV2

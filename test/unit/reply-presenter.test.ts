@@ -1,3 +1,4 @@
+import { bindRunBoundaryGuard } from '../../src/agent/run/RunBoundary.js'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { CompletionDisposition } from '../../src/agent/contracts/completion.js'
@@ -1437,4 +1438,17 @@ test('ReplyPresenter bypasses picture for proactive and recovered legacy profile
   assert.equal(legacy.ttsCalls.length, 0)
   assert.equal(legacy.pictureCalls.length, 0)
   assert.deepEqual(legacy.calls.map(call => call.part.media), ['text'])
+})
+
+
+test('final boundary blocks text and reasoning after postprocessing authority changes', async () => {
+  let valid = true
+  const result = bindRunBoundaryGuard(completed({ kind: 'reply_text', text: 'private derived answer' }), async () => {
+    if (!valid) throw new Error('authority changed')
+  })
+  const f = fixture({ hooks: { postprocess: async ({ text }) => { valid = false; return { text } } } })
+  const delivered = await f.presenter.present(input(result, { hooks: f.hooks }))
+  assert.equal(f.calls.length, 0)
+  assert.equal(delivered.outcome, 'failed')
+  assert.equal(delivered.deliveries[0]?.kind, 'failed_definite')
 })

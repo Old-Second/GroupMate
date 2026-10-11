@@ -1,6 +1,18 @@
 import { canonicalSessionKey, parseCanonicalSessionKey } from '../../agent/session/conversation-scope.js';
 import { normalizeYunzaiHostDispatchResult, normalizeYunzaiHostRecallResult } from '../yunzai-host-result.js';
 const runtimeDeliveryReceiptBrand = Symbol('groupmate.runtimeDeliveryReceipt');
+const hostRecordParts = new WeakSet();
+/** QQ's existing Silk adapter returns encoded host metadata, not an audio URL. Never accept it from JSON. */
+export function createHostRecordPart(record) {
+    if (typeof record !== 'string' || record.length > 1024 * 1024 || !/^protobuf:\/\/[A-Za-z0-9+/]+={0,2}$/.test(record)) {
+        throw new TypeError('encoded host voice record is invalid');
+    }
+    const data = Buffer.from(record.slice('protobuf://'.length), 'base64');
+    const part = Object.freeze({ media: 'voice', hostRecord: record,
+        resource: Object.freeze({ kind: 'buffer', data, byteLength: data.byteLength, mimeType: 'application/x-qq-ptt' }) });
+    hostRecordParts.add(part);
+    return part;
+}
 export const OUTBOUND_DELIVERY_TIMEOUT_MS = 30_000;
 export const OUTBOUND_RECALL_TIMEOUT_MS = 10_000;
 const invalidTarget = Object.freeze({
@@ -134,6 +146,10 @@ function validPartRecord(value) {
             (!hasButtons || validButtons(ownData(value, 'buttons')?.value));
     }
     if (media === 'picture' || media === 'voice' || media === 'video') {
+        if (media === 'voice' && Object.hasOwn(value, 'hostRecord')) {
+            return hostRecordParts.has(value) && exactDataRecord(value, ['media', 'resource', 'hostRecord']) &&
+                validResource(ownData(value, 'resource')?.value);
+        }
         return exactDataRecord(value, ['media', 'resource']) && validResource(ownData(value, 'resource')?.value);
     }
     if (media === 'forward') {

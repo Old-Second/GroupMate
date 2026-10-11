@@ -191,7 +191,7 @@ function projectOutboundPart (
     }
   }
   if (input.media === 'picture' || input.media === 'voice' || input.media === 'video') {
-    exactKeys(input, ['media', 'resource'], ['media', 'resource'], 'outbound media part')
+    exactKeys(input, input.media === 'voice' ? ['media', 'resource', 'hostRecord'] : ['media', 'resource'], ['media', 'resource'], 'outbound media part')
     return { media: input.media, resource: projectResource(input.resource, budget) }
   }
   if (input.media === 'forward') {

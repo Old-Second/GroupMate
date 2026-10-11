@@ -988,6 +988,28 @@ test('RunEngine clears a crashed waiting-approval activity reservation without s
   assert.equal(recoveryRuntime.executions, 0)
 })
 
+test('background admission shares two slots and never creates a queued greeting', async () => {
+  const redis = new FakeRedis(() => Date.parse(timestamp))
+  let generated = 0
+  const admission = new RunAdmission({ client: redis, generateId: () => `background-${++generated}` })
+  const addressFor = (id: string): SessionAddress => ({ botId: 'bot', scope: { kind: 'private', userId: id } })
+  const first = await admission.acquire(addressFor('a'))
+  const second = await admission.acquire(addressFor('b'))
+  assert.equal(await admission.tryAcquire(addressFor('cron')), null)
+  assert.equal(admission.queuedCount, 0)
+  const waiting = admission.acquire(addressFor('direct'))
+  await first.release()
+  const direct = await waiting
+  assert.equal(await admission.tryAcquire(addressFor('cron')), null)
+  await second.release()
+  const cron = await admission.tryAcquire(addressFor('cron'))
+  assert.ok(cron)
+  assert.equal(admission.activeCount, 2)
+  await cron.release()
+  await direct.release()
+  assert.equal(admission.activeCount, 0)
+})
+
 test('RunAdmission enforces global two, per-session one and a FIFO queue of three', async () => {
   const redis = new FakeRedis(() => Date.parse(timestamp))
   let generated = 0

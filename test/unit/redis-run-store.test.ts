@@ -1325,3 +1325,23 @@ test('RedisRunStore counts orphan references during bounded namespace reconcile'
     error instanceof AgentError && error.code === 'run_budget_exceeded'
   ))
 })
+test('startup inventory reads at most sixteen checkpoints and never mutates or resumes them', async () => {
+  const redis = new FakeRedis()
+  const store = new RedisRunStore({ client: redis })
+  for (let index = 0; index < 16; index++) await store.create(checkpoint(`inventory-${index}`))
+  const scan = redis.scan.bind(redis)
+  redis.scan = async (cursor, options) => {
+    const page = await scan(cursor, options)
+    return { ...page, keys: [...page.keys, ...page.keys.slice(0, 4)] }
+  }
+  const writes = redis.setCalls.length
+  const evals = redis.evalCalls.length
+  const inspected = await store.inspectStartupPage()
+  assert.equal(inspected.status, 'ready')
+  assert.ok(inspected.inspected <= 16)
+  assert.equal(inspected.invalid, 0)
+  assert.equal(inspected.truncated, true)
+  assert.equal(redis.setCalls.length, writes)
+  assert.ok(redis.evalCalls.slice(evals).every(call => call.operation === 'load'))
+  for (let index = 0; index < 16; index++) assert.equal((await store.load(`inventory-${index}`))?.status, 'created')
+})

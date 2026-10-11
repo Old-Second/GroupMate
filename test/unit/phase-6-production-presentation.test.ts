@@ -532,9 +532,13 @@ function hostFixture (): HostFixture {
   for (const actor of [
     'actor-text', 'actor-picture', 'actor-tts', 'actor-dice',
     'actor-silence', 'actor-split', 'actor-failed', 'actor-cancel',
+    'actor-dice-unknown', 'actor-text-save-failure', 'actor-dice-save-failure', 'actor-silence-save-failure',
     'actor-block-0', 'actor-block-1', 'actor-block-2', 'actor-block-3', 'actor-block-4'
   ]) {
     members.set(actor, Object.freeze({ user_id: actor, role: 'member', nickname: actor }))
+  }
+  for (const actor of ['actor-cancel', 'actor-clock', 'actor-dice', 'actor-dice-save-failure', 'actor-dice-unknown', 'actor-disk-failure', 'actor-failed', 'actor-journal', 'actor-picture', 'actor-quoted', 'actor-silence', 'actor-silence-save-failure', 'actor-split', 'actor-text', 'actor-text-save-failure', 'actor-throwing-journal', 'actor-tts', 'actor-wrapper-failure']) {
+    members.set(actor, Object.freeze({ user_id: actor, role: 'member' }))
   }
   const group = Object.freeze({
     getMemberMap: async () => members,
@@ -559,6 +563,10 @@ function hostFixture (): HostFixture {
   })
   const bot = Object.freeze({
     uin: 'bot-1',
+    getGroupMemberInfo: async (_groupId: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      return members.get(userId) ?? members.get(Number(userId))
+    },
     pickGroup: () => group,
     pickFriend: () => friend,
     getFriendList: async () => Object.freeze(['actor-approval']),
@@ -1383,7 +1391,7 @@ test('production approval survives graceful shutdown, defers under pressure, and
     const store = new RedisRunStore({ client: redis })
     const paused = await store.load(reference.runId)
     assert.ok(paused !== null)
-    if (paused.schemaVersion !== 6) assert.fail('approval checkpoint must use schema v6')
+    if (paused.schemaVersion !== 7) assert.fail('approval checkpoint must use schema v7')
     assert.equal(paused.status, 'waiting_approval')
     assert.equal(paused.completion, null)
     assert.equal(paused.output, null)
@@ -1398,7 +1406,7 @@ test('production approval survives graceful shutdown, defers under pressure, and
     assert.equal(await initial.graph.shutdown('process_shutdown'), 1)
     const preserved = await store.load(reference.runId)
     assert.ok(preserved !== null)
-    if (preserved.schemaVersion !== 6) assert.fail('preserved checkpoint must use schema v6')
+    if (preserved.schemaVersion !== 7) assert.fail('preserved checkpoint must use schema v7')
     assert.equal(preserved.status, 'waiting_approval')
     assert.equal(JSON.stringify(preserved.presentationRoute?.presentationIntent), intentBytes)
     assert.equal(await store.loadTombstone(reference.runId), null)
@@ -1453,7 +1461,7 @@ test('production approval survives graceful shutdown, defers under pressure, and
     )
     const deferred = await store.load(reference.runId)
     assert.ok(deferred !== null)
-    if (deferred.schemaVersion !== 6) assert.fail('deferred checkpoint must use schema v6')
+    if (deferred.schemaVersion !== 7) assert.fail('deferred checkpoint must use schema v7')
     assert.equal(JSON.stringify(deferred.presentationRoute?.presentationIntent), intentBytes)
     assert.equal(deferred.completion, null)
 

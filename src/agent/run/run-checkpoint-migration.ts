@@ -230,13 +230,15 @@ export function upgradeRunCheckpointV5 (
       contextPlan = upgradeLegacyContextPlanV1(contextPlan, checkpoint.messages)
     }
   }
-  return parseRunCheckpoint({
+  const parsed = parseRunCheckpoint({
     ...state,
     contextPlan,
     ...LEGACY_CONTEXT_RUNTIME,
     schemaVersion: 6,
     revision: checkpoint.revision + 1
   })
+  if (parsed.schemaVersion !== 6) throw new TypeError('legacy upgrade must produce V6')
+  return parsed
 }
 
 export function validateExactRunCheckpointMigration (

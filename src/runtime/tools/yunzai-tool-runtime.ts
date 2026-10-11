@@ -1,3 +1,5 @@
+import { currentGroupMember } from '../CurrentGroupMember.js'
+import { AgentError } from '../../agent/contracts/error.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { ToolAuditEvent, ToolAuditSink } from '../../agent/tools/audit.js'
 import type { SessionAddress } from '../../agent/contracts/identity.js'
@@ -302,7 +304,8 @@ async function sourceFor (
     botId: string
     actorId: string
     scope: SessionAddress['scope']
-  }>
+  }>,
+  boundarySignal?: AbortSignal
 ): Promise<ToolRuntimeFactsSource> {
   const botId = trustedIdentity?.botId ?? identifier(options.getBotId(event), 'bot ID')
   const actorId = trustedIdentity?.actorId ?? identifier(
@@ -313,11 +316,18 @@ async function sourceFor (
     ? event.isGroup === true ? identifier(event.group_id, 'group ID') : null
     : trustedIdentity.scope.kind === 'private' ? null : trustedIdentity.scope.groupId
   let members: Map<unknown, YunzaiRecord> | null = null
-  if (groupId !== null) {
+  if (groupId !== null && boundarySignal === undefined) {
     try { members = await memberMap(event, groupId) } catch {}
   }
-  const actorMember = members === null ? undefined : memberFromMap(members, actorId)
-  const botMember = members === null ? undefined : memberFromMap(members, botId)
+  const [actorMember, botMember] = boundarySignal !== undefined && groupId !== null
+    ? await Promise.all([currentGroupMember(event.bot, groupId, actorId, boundarySignal),
+      currentGroupMember(event.bot, groupId, botId, boundarySignal)])
+    : [members === null ? undefined : memberFromMap(members, actorId),
+      members === null ? undefined : memberFromMap(members, botId)]
+  if (boundarySignal !== undefined && groupId !== null && (actorMember == null || botMember == null)) {
+    throw new AgentError({ code: 'authorization_changed', stage: 'tool.authority', retryable: false,
+      userMessage: '当前群成员权限无法核实，请重新发起。' })
+  }
   const actorRole = role(actorMember?.role ?? event.sender?.role)
   const botRole = groupId === null ? 'none' : role(botMember?.role)
   const displayName = [event.sender?.card, event.sender?.nickname]
@@ -365,6 +375,10 @@ async function sourceFor (
         } catch { return { exists: false, role: 'none' } }
       }
       try {
+        if (boundarySignal !== undefined) {
+          const member = await currentGroupMember(event.bot, target.groupId, target.userId, signal)
+          return { exists: member !== null, role: member?.role ?? 'none' }
+        }
         const targetMembers = await memberMap(event, target.groupId)
         const member = memberFromMap(targetMembers, target.userId)
         return { exists: member !== undefined, role: member?.role ?? 'none' }
@@ -506,7 +520,7 @@ async function outboundMessage (
     return atoms.length === 1 ? atoms[0] : atoms
   }
   if (part.media === 'picture') return segment.image(resourceValue(part.resource))
-  if (part.media === 'voice') return segment.record(resourceValue(part.resource))
+  if (part.media === 'voice') return segment.record(part.hostRecord ?? resourceValue(part.resource))
   if (part.media === 'video') return segment.video(resourceValue(part.resource))
   if (part.media === 'music') return segment.music(part.provider, part.id)
   if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
@@ -1150,7 +1164,8 @@ export function createYunzaiToolRuntimeBridge (
         options,
         event,
         await options.getMasterIds(),
-        trustedIdentity
+        trustedIdentity,
+        signal
       )
       return resolveToolRuntimeFacts(currentSource, target, signal)
     }

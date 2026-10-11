@@ -123,47 +123,59 @@ async function runBym(options, event) {
         prompt: prepared.evidence.prompt
     }))
         return;
-    const envelope = await options.agent.handleEphemeral({
-        event,
-        prepared,
-        systemInstructions: Object.freeze([
-            proactiveSystemInstruction(policy, retaliation)
-        ]),
-        enableGroupContext: true,
-        thinkingMode: policy.thinkingMode,
-        reasoningEffort: policy.reasoningEffort
-    });
-    recordDiagnostic(options.diagnostics, createChatRequestLog({
-        mode: 'api',
-        stream: false,
-        prompt: prepared.evidence.prompt,
-        correlation: Object.freeze({
-            runRef: envelope.runRef,
-            terminalObservationId: 'not_attempted'
-        })
-    }));
-    if (envelope.kind === 'paused')
+    const lease = options.coordinate?.(event, trigger.explicitlyAddressed);
+    if (options.coordinate !== undefined && lease === null)
         return;
-    recordDiagnostic(options.diagnostics, createChatResponseLog({
-        mode: 'api',
-        correlation: Object.freeze({
-            runRef: envelope.runRef,
-            terminalObservationId: envelope.runRef === 'unavailable'
-                ? 'not_attempted'
-                : envelope.terminal?.snapshot.observationId ?? 'unavailable'
-        }),
-        response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
-            ? { text: envelope.completion.text }
-            : envelope.kind === 'failed'
-                ? { error: true }
-                : {}
-    }));
-    const delivered = await completeProactive(options, event, prepared, envelope);
-    if (delivered && candidate !== null) {
-        try {
-            options.participation?.replied(candidate);
+    let sent = false;
+    try {
+        const envelope = await options.agent.handleEphemeral({
+            event,
+            prepared,
+            systemInstructions: Object.freeze([
+                proactiveSystemInstruction(policy, retaliation)
+            ]),
+            enableGroupContext: true,
+            thinkingMode: policy.thinkingMode,
+            reasoningEffort: policy.reasoningEffort
+        });
+        recordDiagnostic(options.diagnostics, createChatRequestLog({
+            mode: 'api',
+            stream: false,
+            prompt: prepared.evidence.prompt,
+            correlation: Object.freeze({
+                runRef: envelope.runRef,
+                terminalObservationId: 'not_attempted'
+            })
+        }));
+        if (envelope.kind === 'paused')
+            return;
+        recordDiagnostic(options.diagnostics, createChatResponseLog({
+            mode: 'api',
+            correlation: Object.freeze({
+                runRef: envelope.runRef,
+                terminalObservationId: envelope.runRef === 'unavailable'
+                    ? 'not_attempted'
+                    : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+            }),
+            response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+                ? { text: envelope.completion.text }
+                : envelope.kind === 'failed'
+                    ? { error: true }
+                    : {}
+        }));
+        if (!trigger.explicitlyAddressed && lease !== undefined && !lease.current())
+            return;
+        const delivered = await completeProactive(options, event, prepared, envelope);
+        sent = delivered;
+        if (delivered && candidate !== null) {
+            try {
+                options.participation?.replied(candidate);
+            }
+            catch { }
         }
-        catch { }
+    }
+    finally {
+        await lease?.finish(sent);
     }
 }
 export function createYunzaiBymController(options) {

@@ -272,6 +272,12 @@ export function createPersonalMemoryRecallSourceV1(options) {
                     catch {
                         return unavailable('policy_unavailable');
                     }
+                    if (input.dependencyCheck !== undefined) {
+                        if (options.validateDependencies === undefined || !await options.validateDependencies(request, input.dependencyCheck, signal))
+                            return unavailable('canonical_unavailable');
+                        return Object.freeze({ schemaVersion: 2, status: 'completed', mode: 'none', candidates: Object.freeze([]),
+                            index: Object.freeze({ lexical: 'disabled', vector: 'disabled', watermark: null }) });
+                    }
                     return await retrieveMemoryV2(options.retriever, request, { signal, now });
                 }, callerSignal, now, timeoutMs);
             }

@@ -1,3 +1,4 @@
+import { runBoundaryGuard } from '../../agent/run/RunBoundary.js';
 import { getChatErrorPresentation } from '../chat-error-presentation.js';
 import { EMPTY_PRESENTATION_TRACE } from '../../agent/contracts/presentation-trace.js';
 import { aggregatePresentationResults } from './presentation-result.js';
@@ -252,7 +253,30 @@ export class ReplyPresenter {
     async present(input) {
         const startedAt = this.#readMonotonic();
         const decision = this.#createDecisionDraft(input);
-        const result = await this.#present(input, decision);
+        const guard = runBoundaryGuard(input.result);
+        let result;
+        if (guard === undefined || input.result.kind !== 'completed') {
+            result = await this.#present(input, decision);
+        }
+        else {
+            const outboundFactory = {
+                forTarget: async (target) => {
+                    const port = await this.#dependencies.outboundFactory.forTarget(target);
+                    return Object.freeze({ ...port, deliver: async (part, attempt, options = {}) => {
+                            try {
+                                await guard('final', options.signal ?? new AbortController().signal);
+                            }
+                            catch {
+                                return Object.freeze({ kind: 'failed_definite', media: part.media, attempt,
+                                    code: 'authorization_changed' });
+                            }
+                            return await port.deliver(part, attempt, options);
+                        } });
+                }
+            };
+            const guarded = new ReplyPresenter({ ...this.#dependencies, outboundFactory });
+            result = await guarded.#present(input, decision);
+        }
         this.#completeDeliveryDecision(decision, result);
         this.#publishObservation(input, result, decision, startedAt);
         return result;

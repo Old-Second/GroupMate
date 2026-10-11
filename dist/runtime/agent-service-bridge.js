@@ -1,3 +1,5 @@
+import { captureSceneDependency, sceneBoundary, combineBoundaries } from './SceneBoundary.js';
+import { memoryContextBoundary, changedContextError, captureMemoryContextProof, provenMemoryContextBoundary } from './MemoryContextBoundary.js';
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { ContextEngine } from '../agent/context/context-engine.js';
@@ -168,14 +170,15 @@ function personalMemoryQueryText(evidence) {
         return evidence.prompt;
     }
 }
-async function loadPersonalMemoryContext(source, options, request, runtime, signal) {
+async function loadPersonalMemoryContext(source, options, request, runtime, signal, freshAuthority = false) {
     return await resolveYunzaiPersonalMemoryContextV1(Object.freeze({
         source,
         recallInput: Object.freeze({
             request,
             event: runtime.event,
             messageEvidence: runtime.messageEvidence,
-            queryText: personalMemoryQueryText(runtime.messageEvidence)
+            queryText: personalMemoryQueryText(runtime.messageEvidence),
+            ...(freshAuthority ? { freshAuthority: true } : {})
         }),
         onDiagnostic: code => { reportPersonalMemoryDiagnostic(options, code); }
     }), signal);
@@ -337,8 +340,8 @@ async function outboundValue(receiver, segment, part) {
     }
     if (part.media === 'voice') {
         return typeof segment.record === 'function'
-            ? Reflect.apply(segment.record, segment, [outboundResource(part.resource)])
-            : { type: 'record', file: outboundResource(part.resource) };
+            ? Reflect.apply(segment.record, segment, [part.hostRecord ?? outboundResource(part.resource)])
+            : { type: 'record', file: part.hostRecord ?? outboundResource(part.resource) };
     }
     if (part.media === 'video') {
         return typeof segment.video === 'function'
@@ -1196,6 +1199,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             throw providerConfigurationError('provider_isolation_unavailable');
         }
     };
+    const memoryRecall = dependencies.personalMemoryRecallSource;
     const now = options.now ?? (() => new Date());
     const generateId = options.generateId ?? randomUUID;
     const prepared = new Map();
@@ -1314,7 +1318,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                 }
             }
         }),
-        createRuntime: async (request, signal) => {
+        createRuntime: async (request, signal, inherited, legacyHistory) => {
             const providerRequestMetadata = await providerMetadataFor(request.sessionAddress);
             const runtime = prepared.get(request.requestId);
             if (runtime === undefined) {
@@ -1323,10 +1327,47 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
                     userMessage: '运行环境已失效，请重新发起。'
                 });
             }
-            const memoryContext = await loadPersonalMemoryContext(dependencies.personalMemoryRecallSource, options, request, runtime, signal);
+            const memoryContext = await loadPersonalMemoryContext(memoryRecall, options, request, runtime, signal);
+            const authorityInput = { request, event: runtime.event, messageEvidence: runtime.messageEvidence,
+                queryText: personalMemoryQueryText(runtime.messageEvidence), freshAuthority: true };
+            const authority = memoryRecall?.authority === undefined ? undefined : async (refs, boundarySignal) => await memoryRecall.authority(authorityInput, refs, boundarySignal);
+            let retained = inherited;
+            let discardSessionHistory = legacyHistory === true && memoryRecall !== undefined;
+            if (retained !== undefined) {
+                try {
+                    if (retained.scene !== undefined)
+                        await sceneBoundary(runtime.event.bot ?? {}, retained.scene)('provider', signal);
+                    await provenMemoryContextBoundary(retained, authority)('provider', signal);
+                }
+                catch {
+                    retained = undefined;
+                    discardSessionHistory = true;
+                }
+            }
+            let proof;
+            if (authority !== undefined || memoryContext.length === 0) {
+                try {
+                    proof = await captureMemoryContextProof(memoryContext, authority, signal, retained);
+                }
+                catch {
+                    if (retained === undefined)
+                        throw changedContextError();
+                    discardSessionHistory = true;
+                    proof = await captureMemoryContextProof(memoryContext, authority, signal);
+                }
+            }
+            const scope = request.sessionAddress.scope;
+            const scene = scope.kind === 'private' ? undefined : await captureSceneDependency(runtime.event.bot ?? {}, request.sessionAddress.botId, scope.groupId, request.actor.userId, signal);
+            if (proof !== undefined && scene !== undefined)
+                proof = Object.freeze({ ...proof, scene });
+            const membershipGuard = scene === undefined ? undefined : sceneBoundary(runtime.event.bot ?? {}, scene);
             const value = Object.freeze({
+                discardSessionHistory,
                 binding: Object.freeze({
                     ...runtime.run.binding,
+                    ...(proof === undefined ? { checkBoundary: combineBoundaries(membershipGuard, memoryContextBoundary(memoryContext, async (boundarySignal) => await loadPersonalMemoryContext(memoryRecall, options, request, runtime, boundarySignal, true))) } : {
+                        contextDependencies: proof, checkBoundary: combineBoundaries(membershipGuard, provenMemoryContextBoundary(proof, authority))
+                    }),
                     ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
                 }),
                 runtimeFacts: runtime.runtimeFacts,
@@ -1351,6 +1392,27 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
             return Object.freeze({
                 binding: Object.freeze({
                     ...recovered.binding,
+                    ...(checkpoint.schemaVersion === 7 ? {
+                        contextDependencies: checkpoint.contextDependencies,
+                        checkBoundary: combineBoundaries(checkpoint.contextDependencies.scene === undefined ? undefined : sceneBoundary(bot, checkpoint.contextDependencies.scene), provenMemoryContextBoundary(checkpoint.contextDependencies, memoryRecall?.authority === undefined ? undefined : async (refs, signal) => {
+                            const actorId = checkpoint.presentationRoute?.actorId ??
+                                (checkpoint.sessionAddress.scope.kind === 'group' ? '' : checkpoint.sessionAddress.scope.userId);
+                            const scope = checkpoint.sessionAddress.scope;
+                            const event = { bot, self_id: checkpoint.sessionAddress.botId, user_id: actorId, sender: { user_id: actorId },
+                                isGroup: scope.kind !== 'private', ...(scope.kind === 'private' ? {} : { group_id: scope.groupId }) };
+                            const messageEvidence = { schemaVersion: 1, prompt: '恢复任务', currentMessageId: 'recovery',
+                                hasReply: false, quotedMessageId: null, imageUrls: [], ocrTexts: [] };
+                            return await memoryRecall.authority({ request: { sessionAddress: checkpoint.sessionAddress },
+                                event, messageEvidence, queryText: '恢复任务', freshAuthority: true }, refs, signal);
+                        }))
+                    } : {
+                        checkBoundary: async () => {
+                            // Old ordinary text is recoverable; unproven memory/artifact derivatives are not.
+                            if (checkpoint.messages.some(message => message.content?.includes('memory_record')) ||
+                                (memoryRecall !== undefined && (checkpoint.budgetCounters.modelTurns > 0 || checkpoint.contextArtifactRefs.length > 0)))
+                                throw changedContextError();
+                        }
+                    }),
                     ...(providerRequestMetadata === undefined ? {} : { providerRequestMetadata })
                 })
             });

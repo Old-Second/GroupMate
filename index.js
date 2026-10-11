@@ -282,8 +282,8 @@ async function outboundMessage (receiver, part) {
   }
   if (part.media === 'voice') {
     return typeof segment.record === 'function'
-      ? segment.record(resourceValue(part.resource))
-      : { type: 'record', file: resourceValue(part.resource) }
+      ? segment.record(part.hostRecord ?? resourceValue(part.resource))
+      : { type: 'record', file: part.hostRecord ?? resourceValue(part.resource) }
   }
   if (part.media === 'video') {
     return typeof segment.video === 'function'
@@ -1442,7 +1442,7 @@ try {
     code: 'construction_failed'
   }))
 }
-initializeProductionYunzaiAgent({
+const productionAgent = initializeProductionYunzaiAgent({
   bridge: Object.freeze({
     config: Config,
     redis: redisClient,
@@ -1479,6 +1479,9 @@ initializeProductionYunzaiAgent({
   modelFactory: () => modelPort,
   ...(personalMemoryRuntime === null ? {} : { personalMemoryRuntime })
 })
+
+const startupInventory = await productionAgent.inspectStartupInventory()
+runtimeLogger.info(Object.freeze({ event: 'groupmate.run.startup_inventory', ...startupInventory }))
 
 const files = fs.readdirSync(resolvePluginPath('apps')).filter(file => file.endsWith('.js'))
 const loaded = await Promise.allSettled(files.map(async file => await import(`./apps/${file}`)))

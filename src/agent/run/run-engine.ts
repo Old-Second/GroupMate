@@ -1,3 +1,5 @@
+import type { ContextDependencyProof } from '../context/ContextDependency.js'
+import type { RunBoundaryGuard } from './RunBoundary.js'
 import { Buffer } from 'node:buffer'
 import { performance } from 'node:perf_hooks'
 import type { AgentMessage } from '../contracts/content.js'
@@ -163,6 +165,8 @@ export interface RunContextPlanningRequest {
 }
 
 export interface RunRuntimeBinding {
+  readonly checkBoundary?: RunBoundaryGuard
+  readonly contextDependencies?: ContextDependencyProof
   readonly snapshot: ToolSnapshot
   readonly providerRequestMetadata?: ProviderRequestMetadata
   prepareContext(signal: AbortSignal): Promise<PreparedRunContext>
@@ -1044,7 +1048,7 @@ export class RunEngine {
 
   async loadCheckpoint (runId: string): Promise<RunCheckpoint | null> {
     const loaded = await this.#store.load(runId)
-    if (loaded === null || loaded.schemaVersion === 6) return loaded
+    if (loaded === null || (loaded.schemaVersion === 6 || loaded.schemaVersion === 7)) return loaded
     if (isTerminalRunStatus(loaded.status)) {
       throw new TypeError('terminal active checkpoint cannot be migrated')
     }
@@ -1399,6 +1403,7 @@ export class RunEngine {
       capabilitySource: modelCapability.source, priceStatus: modelPrice === null ? 'missing_or_expired' : 'available'
     }))
     const checkpoint = createInitialRunCheckpoint({
+      ...(input.runtime.contextDependencies === undefined ? {} : { contextDependencies: input.runtime.contextDependencies }),
       profileId: this.#profile.id,
       profileVersion: this.#profile.version,
       runId: input.runId,
@@ -2173,7 +2178,9 @@ export class RunEngine {
       )
     }
     if ('terminal' in attempted) return attempted.checkpoint
-    return await this.#evaluateModelTurn(attempted.checkpoint, attempted, correction)
+    let authorityError: AgentError | undefined
+    try { await this.#runtime(checkpoint.runId).checkBoundary?.('response', signal) } catch (error) { authorityError = asAgentError(error) }
+    return await this.#evaluateModelTurn(attempted.checkpoint, attempted, correction, authorityError)
   }
 
   async #reserveProviderDispatch (
@@ -2269,6 +2276,7 @@ export class RunEngine {
 
     try {
       while (true) {
+        await runtime.checkBoundary?.('provider', signal)
         const request = this.#buildModelRequest(
           current,
           Object.freeze({ kind: reserved.kind, maxOutputTokens }),
@@ -2537,7 +2545,8 @@ export class RunEngine {
   async #evaluateModelTurn (
     checkpoint: RunCheckpoint,
     attempted: ModelAttemptResult,
-    correction: boolean
+    correction: boolean,
+    authorityError?: AgentError
   ): Promise<RunCheckpoint> {
     const attemptedEvent: EventDraft = {
       type: 'model.attempted',
@@ -2612,7 +2621,10 @@ export class RunEngine {
           throw new TypeError('model turn usage changed during detachment')
         }
         journalTurn = detachedTurn
-        if (budgetError !== null) {
+        if (authorityError !== undefined) {
+          plan = Object.freeze({ kind: 'fail', error: authorityError, changes: common,
+            drafts: Object.freeze([attemptedEvent]) })
+        } else if (budgetError !== null) {
           plan = Object.freeze({
             kind: 'fail',
             error: budgetError,
@@ -3045,6 +3057,7 @@ export class RunEngine {
     const execution = await this.#raceAbort(this.#scheduler.execute(batch, {
       snapshot: runtime.snapshot,
       contextFor: async capability => {
+        await runtime.checkBoundary?.('tool', signal)
         const context = await runtime.contextFor(capability, checkpoint, signal)
         this.#assertNotAborted(signal)
         const approved = checkpoint.approvalHistory.find(item => (

@@ -14,6 +14,7 @@ import { createMemoryLifecyclePortV1 } from '../../src/agent/memory/memory-lifec
 import { memoryNamespaceRefV1, parseMemoryNamespaceV1 } from '../../src/agent/memory/memory-namespace.js'
 import { openSqliteMemoryDatabaseV3 } from '../../src/agent/memory/sqlite-memory-database.js'
 import { createSqliteMemoryLifecycleAdapterV1 } from '../../src/agent/memory/sqlite-memory-lifecycle.js'
+import type { MemoryDependency } from '../../src/agent/context/ContextDependency.js'
 
 function options (storageDirectory: string) {
   return Object.freeze({
@@ -40,6 +41,34 @@ function privateSender (runtime: Awaited<ReturnType<typeof createProductionPerso
     return replies[0]!
   }
 }
+
+test('production authority validates original canonical heads without lexical query matches and fences opt-out', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-authority-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const runtime = await createProductionPersonalMemoryRuntimeV1(options(directory))
+  t.after(async () => await runtime.close())
+  const send = privateSender(runtime, 'authority')
+  await send('#长期记忆 开启')
+  await send('#长期记忆 记住 我喜欢周末读科幻小说')
+  const recalled = await recallPrivate(runtime, '科幻小说', 1)
+  assert.equal(recalled.candidates.length, 1)
+  const refs: MemoryDependency[] = recalled.candidates.map((candidate: any) => ({ namespaceRef: candidate.namespaceRef,
+    memoryId: candidate.memoryId, revision: candidate.revision, revisionHash: candidate.revisionHash }))
+  const input = { request: { createdAt: new Date().toISOString(), sessionAddress: { botId: '10001' } },
+    event: { isGroup: false, user_id: '20002', sender: { user_id: '20002' } },
+    queryText: '本轮查询故意完全不匹配原始资料', messageEvidence: { schemaVersion: 1, prompt: '另一个问题', hasReply: false,
+      imageUrls: [], currentMessageId: 'authority-check', quotedMessageId: null } }
+  const signal = new AbortController().signal
+  const stamp = await runtime.recallSource.authority!(input, refs, signal)
+  assert.match(stamp!, /^[a-f0-9]{64}$/)
+  assert.equal(await runtime.recallSource.authority!(input, refs, signal), stamp)
+  await send('#长期记忆 关闭')
+  assert.equal(await runtime.recallSource.authority!(input, refs, signal), null)
+  await send('#长期记忆 开启')
+  assert.notEqual(await runtime.recallSource.authority!(input, refs, signal), stamp)
+  await send('#长期记忆 删除全部 确认')
+  assert.equal(await runtime.recallSource.authority!(input, refs, signal), null)
+})
 
 async function legacyLogicalDelete (directory: string): Promise<void> {
   const now = (): string => new Date().toISOString()

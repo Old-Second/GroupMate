@@ -11,7 +11,9 @@ import { translate, translateLangSupports } from '../dist/runtime/translation-se
 import AzureTTS from '../utils/tts/microsoft-azure.js'
 import VoiceVoxTTS from '../utils/tts/voicevox.js'
 import { URL } from 'node:url'
-import { listYunzaiBots, sendYunzaiGroupMessage as sendGroupMessage } from '../dist/runtime/yunzai-bot-registry.js'
+import { listYunzaiBots } from '../dist/runtime/yunzai-bot-registry.js'
+import { runScheduledGreetings, sendScheduledGroupMessage } from '../dist/runtime/ScheduledGreeting.js'
+import { getProductionYunzaiAgent } from '../dist/runtime/production-yunzai-agent.js'
 import { resolvePluginPath } from '../dist/runtime/plugin-context.js'
 
 let useSilk = false
@@ -388,88 +390,70 @@ ${translateLangLabels}
   }
 
   async sendRandomMessage () {
-    if (Config.debug) {
-      logger.info('开始处理：ChatGPT随机打招呼。')
-    }
-    let toSend = Config.initiativeChatGroups || []
-    for (const element of toSend) {
-      if (!element) {
-        continue
-      }
-      let groupId = parseInt(element)
-      let bots = this.e ? [this.e.bot] : listYunzaiBots()
-      for (let bot of bots) {
-        if (bot.gl?.get(groupId)) {
-          // 打招呼概率
-          if (Math.floor(Math.random() * 100) < Config.helloProbability) {
-            let message = await generateHello()
-            logger.info(`打招呼给群聊${groupId}：` + message)
-            if (Config.defaultUseTTS) {
-              let audio
-              const [defaultVitsTTSRole, defaultAzureTTSRole, defaultVoxTTSRole] = [Config.defaultTTSRole, Config.azureTTSSpeaker, Config.voicevoxTTSSpeaker]
-              let ttsSupportKinds = []
-              if (Config.azureTTSKey) ttsSupportKinds.push(1)
-              if (Config.ttsSpace) ttsSupportKinds.push(2)
-              if (Config.voicevoxSpace) ttsSupportKinds.push(3)
-              if (!ttsSupportKinds.length) {
-                logger.warn('没有配置任何语音服务！')
-                return false
-              }
-              const randomIndex = Math.floor(Math.random() * ttsSupportKinds.length)
-              switch (ttsSupportKinds[randomIndex]) {
-                case 1 : {
-                  const isEn = AzureTTS.supportConfigurations.find(config => config.code === defaultAzureTTSRole)?.language.includes('en')
-                  if (isEn) {
-                    message = (await translate(message, '英')).replace('\n', '')
-                  }
-                  audio = await AzureTTS.generateAudio(message, {
-                    defaultAzureTTSRole
-                  })
-                  break
-                }
-                case 2 : {
-                  if (Config.autoJapanese) {
-                    try {
-                      message = await translate(message, '日')
-                    } catch (err) {
-                      logger.error(err)
-                    }
-                  }
-                  try {
-                    audio = await generateVitsAudio(message, defaultVitsTTSRole, '中日混合（中文用[ZH][ZH]包裹起来，日文用[JA][JA]包裹起来）')
-                  } catch (err) {
-                    logger.error(err)
-                  }
-                  break
-                }
-                case 3 : {
-                  message = (await translate(message, '日')).replace('\n', '')
-                  try {
-                    audio = await VoiceVoxTTS.generateAudio(message, {
-                      speaker: defaultVoxTTSRole
-                    })
-                  } catch (err) {
-                    logger.error(err)
-                  }
-                  break
-                }
-              }
-              if (useSilk) {
-                await sendGroupMessage(bot, groupId, await uploadRecord(audio))
-              } else {
-                await sendGroupMessage(bot, groupId, segment.record(audio))
-              }
-            } else {
-              await sendGroupMessage(bot, groupId, message)
-            }
-          } else {
-            logger.info(`时机未到，这次就不打招呼给群聊${groupId}了`)
+    // Yunzai callback and existing TTS adapters remain host glue; the bounded loop and send port are TypeScript.
+    return await runScheduledGreetings({
+      claim: (bot, groupId) => getProductionYunzaiAgent().claimScheduledGreeting(bot, groupId),
+      groups: Config.initiativeChatGroups || [],
+      probability: Config.helloProbability,
+      bots: this.e ? [this.e.bot] : listYunzaiBots(),
+      generate: generateHello,
+      render: async message => {
+        if (Config.defaultUseTTS) {
+          let audio
+          const [defaultVitsTTSRole, defaultAzureTTSRole, defaultVoxTTSRole] = [Config.defaultTTSRole, Config.azureTTSSpeaker, Config.voicevoxTTSSpeaker]
+          let ttsSupportKinds = []
+          if (Config.azureTTSKey) ttsSupportKinds.push(1)
+          if (Config.ttsSpace) ttsSupportKinds.push(2)
+          if (Config.voicevoxSpace) ttsSupportKinds.push(3)
+          if (!ttsSupportKinds.length) {
+            logger.warn('没有配置任何语音服务！')
+            return null
           }
-        } else {
-          logger.warn('机器人不在要发送的群组里，忽略群。同时建议检查配置文件修改要打招呼的群号。' + groupId)
+          const randomIndex = Math.floor(Math.random() * ttsSupportKinds.length)
+          switch (ttsSupportKinds[randomIndex]) {
+            case 1 : {
+              const isEn = AzureTTS.supportConfigurations.find(config => config.code === defaultAzureTTSRole)?.language.includes('en')
+              if (isEn) {
+                message = (await translate(message, '英')).replace('\n', '')
+              }
+              audio = await AzureTTS.generateAudio(message, {
+                defaultAzureTTSRole
+              })
+              break
+            }
+            case 2 : {
+              if (Config.autoJapanese) {
+                try {
+                  message = await translate(message, '日')
+                } catch (err) {
+                  logger.warn('打招呼语音生成失败。')
+                }
+              }
+              try {
+                audio = await generateVitsAudio(message, defaultVitsTTSRole, '中日混合（中文用[ZH][ZH]包裹起来，日文用[JA][JA]包裹起来）')
+              } catch (err) {
+                logger.warn('打招呼语音生成失败。')
+              }
+              break
+            }
+            case 3 : {
+              message = (await translate(message, '日')).replace('\n', '')
+              try {
+                audio = await VoiceVoxTTS.generateAudio(message, {
+                  speaker: defaultVoxTTSRole
+                })
+              } catch (err) {
+                logger.warn('打招呼语音生成失败。')
+              }
+              break
+            }
+          }
+          return useSilk ? await uploadRecord(audio) : segment.record(audio)
         }
-      }
-    }
+        return message
+      },
+      send: sendScheduledGroupMessage
+    })
   }
 
   async handleSentMessage (e) {

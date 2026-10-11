@@ -1,3 +1,5 @@
+import type { MemoryDependency } from '../agent/context/ContextDependency.js'
+import { currentGroupMember } from './CurrentGroupMember.js'
 import type { YunzaiAgentRequestDraft, YunzaiRequestEvent } from './yunzai-request-adapter.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from './message-input.js'
 import {
@@ -20,13 +22,16 @@ export interface YunzaiSceneParticipantDirectoryInputV1 {
   readonly strictTargetUserIds?: readonly string[]
   /** Group governance must refresh the current role, never trust an event's cached role. */
   readonly refreshCurrentRole?: boolean
+  readonly freshAuthority?: boolean
 }
 
 export interface YunzaiPersonalMemoryRecallInputV1 {
+  readonly dependencyCheck?: readonly MemoryDependency[]
   readonly request: YunzaiAgentRequestDraft
   readonly event: YunzaiRequestEvent
   readonly messageEvidence: PreparedYunzaiMessageEvidenceV1
   readonly queryText: string
+  readonly freshAuthority?: boolean
   readonly strictTargetUserIds?: readonly string[]
 }
 
@@ -310,7 +315,10 @@ YunzaiSceneParticipantDirectoryInputV1
 
       const groupId = qqId(event.group_id)
       if (groupId === null) return null
-      const botMember = await refreshBotMember(event, groupId, accountId, signal)
+      const authoritativeBot = input.freshAuthority ? await currentGroupMember(event.bot, groupId, accountId, signal) : null
+      const botMember = input.freshAuthority
+        ? authoritativeBot === null ? null : { user_id: authoritativeBot.userId, role: authoritativeBot.role, join_time: authoritativeBot.joinedAt }
+        : await refreshBotMember(event, groupId, accountId, signal)
       if (botMember === null) return null
       const lifecycle = groupLifecycleId(groupId, botMember)
       if (lifecycle === null) return null
@@ -320,10 +328,10 @@ YunzaiSceneParticipantDirectoryInputV1
         groupLifecycleId: lifecycle,
         groupName: text(event.group?.name ?? event.group_name)
       })
-      const refreshed = input.refreshCurrentRole === true
-        ? await refreshMember(event, groupId, currentUserId, signal)
-        : null
-      if (input.refreshCurrentRole === true && refreshed === null) return null
+      const refreshed = input.freshAuthority === true
+        ? await currentGroupMember(event.bot, groupId, currentUserId, signal).then(member => member === null ? null : { user_id: member.userId, role: member.role })
+        : input.refreshCurrentRole === true ? await refreshMember(event, groupId, currentUserId, signal) : null
+      if ((input.refreshCurrentRole === true || input.freshAuthority === true) && refreshed === null) return null
       const current = createSceneParticipantV1(Object.freeze({
         identity: identityInput(refreshed ?? event.sender ?? {}, currentUserId,
           refreshed === null ? 'current_event' : 'member_refresh'),
@@ -364,7 +372,9 @@ YunzaiSceneParticipantDirectoryInputV1
         if (seen.has(candidate.userId)) continue
         if (references.length >= MEMORY_RETRIEVAL_RESOURCE_LIMITS_V2.subjects - 1) break
         seen.add(candidate.userId)
-        const member = await refreshMember(event, groupId, candidate.userId, signal)
+        const member = input.freshAuthority === true
+          ? await currentGroupMember(event.bot, groupId, candidate.userId, signal).then(value => value === null ? null : { user_id: value.userId, role: value.role })
+          : await refreshMember(event, groupId, candidate.userId, signal)
         throwIfAborted(signal)
         if (member === null) continue
         const participant = createSceneParticipantV1(Object.freeze({
@@ -390,13 +400,15 @@ export function bindYunzaiPersonalMemoryRecallSourceV1 (input: {
   return Object.freeze({
     async recall (value: YunzaiPersonalMemoryRecallInputV1, signal?: AbortSignal) {
       return await input.source.recall(Object.freeze({
+        ...(value.dependencyCheck === undefined ? {} : { dependencyCheck: value.dependencyCheck }),
         botInstanceId: input.botInstanceId,
         accountId: value.request.sessionAddress.botId,
         participantInput: Object.freeze({
           event: value.event,
           messageEvidence: value.messageEvidence,
           accountId: value.request.sessionAddress.botId,
-          observedAt: value.request.createdAt,
+          observedAt: value.freshAuthority ? new Date().toISOString() : value.request.createdAt,
+          ...(value.freshAuthority ? { freshAuthority: true } : {}),
           ...(value.strictTargetUserIds === undefined
             ? {}
             : { strictTargetUserIds: value.strictTargetUserIds })

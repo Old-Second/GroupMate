@@ -1,3 +1,4 @@
+import type { MemoryDependency } from '../agent/context/ContextDependency.js'
 import { types as utilTypes } from 'node:util'
 import type { PersonalMemoryCommandPortV1 } from './personal-memory-command.js'
 import type { MemoryCandidateModelV1 } from '../agent/memory/OpenAiMemoryCandidateExtractor.js'
@@ -6,6 +7,7 @@ import type { PostReplyMemoryCandidatePortV1, ShadowMemoryAdmissionDiagnosticV1 
 export type ProductionPersonalMemoryModeV1 = 'off' | 'explicit' | 'shadow' | 'automatic'
 
 export interface ProductionPersonalMemoryRecallSourceV1 {
+  readonly authority?: (input: unknown, refs: readonly MemoryDependency[], signal: AbortSignal) => Promise<string | null>
   readonly recall: (input: unknown, signal?: AbortSignal) => Promise<unknown>
 }
 

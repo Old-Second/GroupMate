@@ -9,6 +9,7 @@ import {
 } from '../../src/agent/run/run-budget.js'
 import {
   RunCheckpointCodec,
+  parseRunCheckpoint,
   type RunCheckpointV1,
   type RunCheckpointV2,
   type RunCheckpointV3,
@@ -96,6 +97,24 @@ test('checkpoint codec preserves exact tool argument text in messages and ledger
   assert.equal(loaded.toolLedgers[0]?.calls[0]?.argumentsText, argumentsText)
 })
 const legacyBudgetLimits = createLegacyRunBudgetLimits(budget.limits)
+
+test('V7 round trip retains dependency proof, approval ledger and consumed budget while V6 remains readable', () => {
+  const legacy = legacyCheckpoint({ status: 'waiting_approval', ...pendingApprovalState() })
+  const v6 = upgradeRunCheckpointV1(legacy, { runRef, requestRef })
+  const v7 = parseRunCheckpoint({ ...v6, schemaVersion: 7 as const, contextDependencies: {
+    schemaVersion: 1 as const, memories: [], authorityStamp: null
+  } })
+  const codec = new RunCheckpointCodec()
+  const encoded = codec.encode(v7)
+  const decoded = codec.decode(encoded.checkpoint, encoded.events)
+  assert.deepEqual(decoded, v7)
+  assert.deepEqual(decoded.budgetCounters, v6.budgetCounters)
+  assert.deepEqual(decoded.toolLedgers, v6.toolLedgers)
+  const old = codec.encode(v6)
+  assert.deepEqual(codec.decode(old.checkpoint, old.events), v6)
+  assert.throws(() => parseRunCheckpoint({ ...v7, contextDependencies: undefined }))
+  assert.throws(() => parseRunCheckpoint({ ...v7, schemaVersion: 8 }))
+})
 
 function runEvent (type: AgentEvent['type'] = 'run.created'): AgentEvent {
   return Object.freeze({

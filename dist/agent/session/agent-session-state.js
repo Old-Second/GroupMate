@@ -1,3 +1,4 @@
+import { parseContextDependencyProof } from '../context/ContextDependency.js';
 import { parseAgentMessage } from '../contracts/content.js';
 import { jsonByteLength, parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
@@ -141,8 +142,8 @@ export function parseAgentSessionState(value) {
         maxNodes: 32_768
     });
     const state = record(cloned, 'agent session state');
-    exact(state, ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state');
-    if (state.schemaVersion !== 1 || !Array.isArray(state.messages) || state.messages.length > 128) {
+    exact(state, state.schemaVersion === 2 ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies'] : ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state');
+    if ((state.schemaVersion !== 1 && state.schemaVersion !== 2) || !Array.isArray(state.messages) || state.messages.length > 128) {
         throw new TypeError('agent session state is invalid');
     }
     const ids = new Set();
@@ -171,7 +172,8 @@ export function parseAgentSessionState(value) {
         ? undefined
         : parseMigratedFrom(state.migratedFrom);
     return Object.freeze({
-        schemaVersion: 1,
+        schemaVersion: state.schemaVersion,
+        ...(state.schemaVersion === 2 ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) } : {}),
         messages: Object.freeze(messages),
         ...(migratedFrom === undefined ? {} : { migratedFrom })
     });

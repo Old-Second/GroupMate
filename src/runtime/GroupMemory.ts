@@ -1,3 +1,4 @@
+import { validateCanonicalMemoryDependencies } from './CanonicalMemoryBoundary.js'
 import { createHash } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { createMemoryAccessCapabilityIssuerV1, issueMemoryAccessCapabilityV1 } from '../agent/memory/memory-access-gate.js'
@@ -84,13 +85,13 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
   const issuer = createMemoryAccessCapabilityIssuerV1(() => true)
   const root = createMemoryLifecycleAuthorityRootV1(() => true)
   const authorize = async (event: any, text: string, messageId: string, signal: AbortSignal,
-    refreshCurrentRole = true) => {
+    refreshCurrentRole = true, freshAuthority = false) => {
     if (!options.enabled() || event?.isGroup !== true ||
       !options.groupAllowlist().includes(String(event.group_id))) throw new GroupMemoryError('当前场景未启用群记忆。')
     const accountId = String(event.self_id ?? event.bot?.uin ?? '')
     const now = options.now()
     const snapshot = await abortable(participants.resolve({ event, accountId, observedAt: now,
-      refreshCurrentRole,
+      refreshCurrentRole, freshAuthority,
       messageEvidence: { schemaVersion: 1, prompt: text, imageUrls: [], currentMessageId: messageId,
         quotedMessageId: null, hasReply: false, replyResolved: true,
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] } }, signal), signal)
@@ -293,16 +294,25 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
       callerSignal?.addEventListener('abort', onAbort, { once: true })
       if (callerSignal?.aborted) onAbort()
       const requestedAt = options.now()
-      const timeoutMs = options.recallTimeoutMs()
+      const timeoutMs = input.freshAuthority === true ? 2_000 : options.recallTimeoutMs()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
         const auth = await authorize(input.event, input.queryText,
-          input.messageEvidence.currentMessageId ?? 'group-memory-recall', controller.signal, false)
+          input.messageEvidence.currentMessageId ?? 'group-memory-recall', controller.signal, false, input.freshAuthority === true)
+        // The issued capability must not appear to come from the future when authorization crosses a clock tick.
+        const retrievalAt = auth.now
+        const retrievalMs = Math.min(500, options.recallTimeoutMs())
+        const deadlineAt = new Date(Date.parse(input.freshAuthority === true ? retrievalAt : requestedAt) + retrievalMs).toISOString()
+        if (Date.parse(deadlineAt) <= Date.parse(retrievalAt)) return { schemaVersion: 2, status: 'unavailable', reason: 'deadline_exceeded' }
         const request = parseMemoryRetrievalRequestV2({ schemaVersion: 2, capability: auth.access,
           subjects: [{ namespaceRef: auth.namespaceRef, reason: 'current_actor' }],
           query: { text: input.queryText, languageHint: null },
-          limits: options.recallLimits(), requestedAt,
-          deadlineAt: new Date(Date.parse(requestedAt) + timeoutMs).toISOString() })
+          limits: options.recallLimits(), requestedAt: retrievalAt,
+          deadlineAt })
+        if (input.dependencyCheck !== undefined) {
+          if (!await validateCanonicalMemoryDependencies(options.database, request, input.dependencyCheck, controller.signal)) return { schemaVersion: 2, status: 'unavailable', reason: 'canonical_unavailable' }
+          return { schemaVersion: 2, status: 'completed', mode: 'none', candidates: [], index: { lexical: 'disabled', vector: 'disabled', watermark: null } }
+        }
         return await retrieveMemoryV2(options.retriever, request, { signal: controller.signal })
       } catch {
         return { schemaVersion: 2, status: 'unavailable', reason: 'policy_unavailable' }

@@ -7,7 +7,7 @@ import type { RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
 import type { ToolResult } from '../../src/agent/tools/tool-result.js'
 import {
   createExternalPluginEventFacade,
-  createYunzaiToolRuntimeBridge,
+  createYunzaiToolRuntimeBridge as createBridge,
   type YunzaiAgentToolRun,
   type YunzaiToolRuntimeBridge
 } from '../../src/runtime/tools/yunzai-tool-runtime.js'
@@ -16,6 +16,56 @@ import {
   type OutboundPart
 } from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
+
+function createYunzaiToolRuntimeBridge (options: Parameters<typeof createBridge>[0]): YunzaiToolRuntimeBridge {
+  const bridge = createBridge(options)
+  const adapt = (event: any): any => {
+    if (event.isGroup && event.bot && !event.bot.getGroupMemberInfo && !event.bot.sendApi) {
+      event.bot.getGroupMemberInfo = async (groupId: number, userId: number, noCache: boolean) => {
+        assert.equal(noCache, true)
+        const group = String(groupId) === String(event.group_id) ? event.group : await event.bot.pickGroup?.(groupId)
+        const members = await group?.getMemberMap?.()
+        return members?.get(userId) ?? members?.get(String(userId)) ?? null
+      }
+    }
+    return event
+  }
+  return { ...bridge,
+    prepareAgentRun: async input => await bridge.prepareAgentRun({ ...input, event: adapt(input.event) }),
+    recoverAgentRun: async input => {
+      const bot = input.bot as any
+      if (!bot.getGroupMemberInfo && !bot.sendApi) bot.getGroupMemberInfo = async (groupId: number, userId: number, noCache: boolean) => {
+        assert.equal(noCache, true)
+        const members = await (await bot.pickGroup?.(groupId))?.getMemberMap?.()
+        return members?.get(userId) ?? members?.get(String(userId)) ?? null
+      }
+      return await bridge.recoverAgentRun(input)
+    }
+  }
+}
+
+test('stale cached bot admin is denied by authoritative member role before any management effect', async () => {
+  let muteCalls = 0
+  const cached = new Map<unknown, Record<string, unknown>>([
+    [7, { user_id: 7, role: 'owner' }], [8, { user_id: 8, role: 'member' }],
+    [10000, { user_id: 10000, role: 'admin' }]
+  ])
+  const group = { getMemberMap: async () => cached, muteMember: async () => { muteCalls++ } }
+  const event = { isGroup: true, group_id: 9, self_id: 10000, user_id: 7,
+    sender: { user_id: 7, role: 'owner' }, group, message: [],
+    bot: { pickGroup: () => group, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      return { user_id: userId, role: String(userId) === '7' ? 'owner' : 'member' }
+    } } }
+  const bridge = createYunzaiToolRuntimeBridge({ config: config(), redis: new FakeRedis(),
+    getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
+  const run = await bridge.prepareAgentRun({ event, prompt: '禁言 QQ:8 60 秒' })
+  const outcome = await executeNativeTool(bridge, run, { runId: 'stale-role', callId: 'stale-role-call',
+    requestedName: 'jinyan', arguments: { userId: '8', seconds: 60 } })
+  assert.equal(muteCalls, 0)
+  assert.equal(outcome.result?.status, 'denied')
+  assert.equal(cached.get(10000)?.role, 'admin')
+})
 
 const root = process.cwd()
 

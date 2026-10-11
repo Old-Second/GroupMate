@@ -9,6 +9,7 @@ import type { YunzaiMessageEvent } from './agent-service-bridge.js'
 import { decideBymTrigger } from './bym-trigger.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from './message-input.js'
 import { proactiveProfile } from './presentation/presentation-profile.js'
+import type { ProactiveLease } from './participation/ProactiveCoordination.js'
 import type { ReplyPresenter } from './presentation/reply-presenter.js'
 import type { PresentationSettingsPort } from './presentation/presentation-settings.js'
 import type { PresentationCompletionCoordinator } from './request-observation-completion.js'
@@ -88,6 +89,7 @@ export interface BymDiagnosticsPort {
 }
 
 export interface YunzaiBymControllerOptions {
+  readonly coordinate?: (event: YunzaiMessageEvent, direct: boolean) => ProactiveLease | null | undefined
   readonly policy: BymPolicyPort
   readonly random: () => number
   readonly promptScreening: BymPromptScreeningPort
@@ -251,44 +253,51 @@ async function runBym (
     prompt: prepared.evidence.prompt
   })) return
 
-  const envelope = await options.agent.handleEphemeral({
-    event,
-    prepared,
-    systemInstructions: Object.freeze([
-      proactiveSystemInstruction(policy, retaliation)
-    ]),
-    enableGroupContext: true,
-    thinkingMode: policy.thinkingMode,
-    reasoningEffort: policy.reasoningEffort
-  })
-  recordDiagnostic(options.diagnostics, createChatRequestLog({
-    mode: 'api',
-    stream: false,
-    prompt: prepared.evidence.prompt,
-    correlation: Object.freeze({
-      runRef: envelope.runRef,
-      terminalObservationId: 'not_attempted'
+  const lease = options.coordinate?.(event, trigger.explicitlyAddressed)
+  if (options.coordinate !== undefined && lease === null) return
+  let sent = false
+  try {
+    const envelope = await options.agent.handleEphemeral({
+      event,
+      prepared,
+      systemInstructions: Object.freeze([
+        proactiveSystemInstruction(policy, retaliation)
+      ]),
+      enableGroupContext: true,
+      thinkingMode: policy.thinkingMode,
+      reasoningEffort: policy.reasoningEffort
     })
-  }))
-  if (envelope.kind === 'paused') return
-  recordDiagnostic(options.diagnostics, createChatResponseLog({
-    mode: 'api',
-    correlation: Object.freeze({
-      runRef: envelope.runRef,
-      terminalObservationId: envelope.runRef === 'unavailable'
-        ? 'not_attempted'
-        : envelope.terminal?.snapshot.observationId ?? 'unavailable'
-    }),
-    response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
-      ? { text: envelope.completion.text }
-      : envelope.kind === 'failed'
-        ? { error: true }
-        : {}
-  }))
-  const delivered = await completeProactive(options, event, prepared, envelope)
-  if (delivered && candidate !== null) {
-    try { options.participation?.replied(candidate) } catch {}
-  }
+    recordDiagnostic(options.diagnostics, createChatRequestLog({
+      mode: 'api',
+      stream: false,
+      prompt: prepared.evidence.prompt,
+      correlation: Object.freeze({
+        runRef: envelope.runRef,
+        terminalObservationId: 'not_attempted'
+      })
+    }))
+    if (envelope.kind === 'paused') return
+    recordDiagnostic(options.diagnostics, createChatResponseLog({
+      mode: 'api',
+      correlation: Object.freeze({
+        runRef: envelope.runRef,
+        terminalObservationId: envelope.runRef === 'unavailable'
+          ? 'not_attempted'
+          : envelope.terminal?.snapshot.observationId ?? 'unavailable'
+      }),
+      response: envelope.kind === 'completed' && envelope.completion.kind === 'reply_text'
+        ? { text: envelope.completion.text }
+        : envelope.kind === 'failed'
+          ? { error: true }
+          : {}
+    }))
+    if (!trigger.explicitlyAddressed && lease !== undefined && !lease!.current()) return
+    const delivered = await completeProactive(options, event, prepared, envelope)
+    sent = delivered
+    if (delivered && candidate !== null) {
+      try { options.participation?.replied(candidate) } catch {}
+    }
+  } finally { await lease?.finish(sent) }
 }
 
 export function createYunzaiBymController (

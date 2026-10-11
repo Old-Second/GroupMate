@@ -905,6 +905,36 @@ export class RedisRunStore implements RunStore {
     }
   }
 
+  /** One read-only page, one reader, no recovery, migration, deletion or outbound action. */
+  async inspectStartupPage (cursor = 0): Promise<Readonly<{
+    status: 'ready' | 'unavailable'; nextCursor: number; inspected: number; truncated: boolean;
+    expired: number; waiting: number; recoverable: number; indeterminate: number; invalid: number
+  }>> {
+    const report = { status: 'ready' as 'ready' | 'unavailable', nextCursor: 0, inspected: 0,
+      truncated: false, expired: 0, waiting: 0, recoverable: 0, indeterminate: 0, invalid: 0 }
+    try {
+      if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError('invalid inventory cursor')
+      const page = await this.#client.scan(cursor, { MATCH: `${RUN_STORE_NAMESPACE}checkpoint:*`, COUNT: 16 })
+      if (!Number.isSafeInteger(page.cursor) || page.cursor < 0 || !Array.isArray(page.keys)) throw new TypeError('invalid inventory page')
+      report.nextCursor = page.cursor
+      report.truncated = page.keys.length > 16 || page.cursor !== 0
+      for (const key of page.keys.slice(0, 16)) {
+        if (typeof key !== 'string' || !key.startsWith(`${RUN_STORE_NAMESPACE}checkpoint:`)) { report.invalid++; continue }
+        report.inspected++
+        try {
+          const checkpoint = await this.load(key.slice(`${RUN_STORE_NAMESPACE}checkpoint:`.length))
+          if (checkpoint === null) continue
+          if (checkpoint.toolLedgers.some(ledger => ledger.calls.some(call =>
+            call.status === 'running' || call.status === 'indeterminate'))) report.indeterminate++
+          else if (Date.parse(checkpoint.deadlineAt) <= Date.now()) report.expired++
+          else if (checkpoint.status === 'waiting_approval') report.waiting++
+          else report.recoverable++
+        } catch { report.invalid++ }
+      }
+    } catch { report.status = 'unavailable' }
+    return Object.freeze(report)
+  }
+
   async upgrade (
     expected: RunCheckpointV1 | RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5,
     next: RunCheckpointV6
@@ -1152,7 +1182,7 @@ export class RedisRunStore implements RunStore {
     checkpoint: LoadedRunCheckpoint,
     operation: string
   ): EncodedRunCheckpoint {
-    if (checkpoint.schemaVersion === 6) return this.#encode(checkpoint, operation)
+    if ((checkpoint.schemaVersion === 6 || checkpoint.schemaVersion === 7)) return this.#encode(checkpoint, operation)
     try {
       const { events, ...state } = checkpoint
       const encoded = Object.freeze({

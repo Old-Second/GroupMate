@@ -636,7 +636,7 @@ export class RunEngine {
     }
     async loadCheckpoint(runId) {
         const loaded = await this.#store.load(runId);
-        if (loaded === null || loaded.schemaVersion === 6)
+        if (loaded === null || (loaded.schemaVersion === 6 || loaded.schemaVersion === 7))
             return loaded;
         if (isTerminalRunStatus(loaded.status)) {
             throw new TypeError('terminal active checkpoint cannot be migrated');
@@ -941,6 +941,7 @@ export class RunEngine {
             capabilitySource: modelCapability.source, priceStatus: modelPrice === null ? 'missing_or_expired' : 'available'
         }));
         const checkpoint = createInitialRunCheckpoint({
+            ...(input.runtime.contextDependencies === undefined ? {} : { contextDependencies: input.runtime.contextDependencies }),
             profileId: this.#profile.id,
             profileVersion: this.#profile.version,
             runId: input.runId,
@@ -1621,7 +1622,14 @@ export class RunEngine {
         }
         if ('terminal' in attempted)
             return attempted.checkpoint;
-        return await this.#evaluateModelTurn(attempted.checkpoint, attempted, correction);
+        let authorityError;
+        try {
+            await this.#runtime(checkpoint.runId).checkBoundary?.('response', signal);
+        }
+        catch (error) {
+            authorityError = asAgentError(error);
+        }
+        return await this.#evaluateModelTurn(attempted.checkpoint, attempted, correction, authorityError);
     }
     async #reserveProviderDispatch(checkpoint) {
         const previousUsage = Object.freeze({
@@ -1676,6 +1684,7 @@ export class RunEngine {
         let knownProviderFailure = null;
         try {
             while (true) {
+                await runtime.checkBoundary?.('provider', signal);
                 const request = this.#buildModelRequest(current, Object.freeze({ kind: reserved.kind, maxOutputTokens }), correction, messages);
                 if (current.contextRuntimeMode === 'generation_planner') {
                     const frozen = current.providerGeneration;
@@ -1891,7 +1900,7 @@ export class RunEngine {
             }, knownProviderFailure);
         }
     }
-    async #evaluateModelTurn(checkpoint, attempted, correction) {
+    async #evaluateModelTurn(checkpoint, attempted, correction, authorityError) {
         const attemptedEvent = {
             type: 'model.attempted',
             payload: Object.freeze({
@@ -1947,7 +1956,11 @@ export class RunEngine {
                     throw new TypeError('model turn usage changed during detachment');
                 }
                 journalTurn = detachedTurn;
-                if (budgetError !== null) {
+                if (authorityError !== undefined) {
+                    plan = Object.freeze({ kind: 'fail', error: authorityError, changes: common,
+                        drafts: Object.freeze([attemptedEvent]) });
+                }
+                else if (budgetError !== null) {
                     plan = Object.freeze({
                         kind: 'fail',
                         error: budgetError,
@@ -2309,6 +2322,7 @@ export class RunEngine {
         const execution = await this.#raceAbort(this.#scheduler.execute(batch, {
             snapshot: runtime.snapshot,
             contextFor: async (capability) => {
+                await runtime.checkBoundary?.('tool', signal);
                 const context = await runtime.contextFor(capability, checkpoint, signal);
                 this.#assertNotAborted(signal);
                 const approved = checkpoint.approvalHistory.find(item => (item.callId === capability.callId && item.step === checkpoint.step &&

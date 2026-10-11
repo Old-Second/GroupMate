@@ -775,6 +775,7 @@ function execution (): ToolExecutionContext {
 }
 
 interface HarnessOptions {
+  readonly checkBoundary?: StartRunInput['runtime']['checkBoundary']
   readonly profile?: typeof standardOpenAIProfile
   readonly providerRequestMetadata?: ProviderRequestMetadata
   readonly maxOutputTokens?: number
@@ -864,6 +865,7 @@ function harness (
       : { modelCapabilityOverride: options.modelCapabilityOverride }),
     runtime: Object.freeze({
       snapshot: snapshot(),
+      ...(options.checkBoundary === undefined ? {} : { checkBoundary: options.checkBoundary }),
       ...(options.providerRequestMetadata === undefined
         ? {}
         : { providerRequestMetadata: options.providerRequestMetadata }),
@@ -4718,4 +4720,29 @@ test('RunEngine does not call an unstarted side effect indeterminate on cancella
   freshContext.resolve(execution())
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(fixture.tools.executions, 0)
+})
+
+
+test('provider boundary denial does not dispatch or reset consumed run budget', async () => {
+  const h = harness([modelText('should never run')], { checkBoundary: async () => {
+    throw new AgentError({ code: 'authorization_changed', stage: 'test.authority', retryable: false, userMessage: '权限变化' })
+  } })
+  const result = await h.engine.start(h.input)
+  assert.equal(result.kind, 'failed')
+  if (result.kind === 'failed') assert.equal(result.error.code, 'authorization_changed')
+  assert.equal(h.adapter.requests.length, 0)
+})
+
+test('response authority denial preserves provider usage and blocks derived tool execution', async () => {
+  const h = harness([modelTools([toolCall(0, 'fresh-denied', 'sideEffect')])], { checkBoundary: async boundary => {
+    if (boundary === 'response') throw new AgentError({ code: 'authorization_changed', stage: 'test.authority', retryable: false, userMessage: '权限变化' })
+  } })
+  const result = await h.engine.start(h.input)
+  assert.equal(result.kind, 'failed')
+  if (result.kind === 'failed') {
+    assert.equal(result.error.code, 'authorization_changed')
+    assert.equal(result.terminal?.snapshot.counters.providerAttempts, 1)
+  }
+  assert.deepEqual(h.tools.startedCalls, [])
+  assert.equal(h.adapter.requests.length, 1)
 })

@@ -4,6 +4,7 @@ import type { SessionAddress } from '../../src/agent/contracts/identity.js'
 import type { DeliveryResult } from '../../src/runtime/presentation/presentation-result.js'
 import {
   createYunzaiOutboundPortFactory,
+  createHostRecordPart,
   deliverWithDefiniteRetry,
   type OutboundPart,
   type RuntimeDeliveryReceipt,
@@ -18,6 +19,16 @@ const groupUserTarget: SessionAddress = Object.freeze({
 const textPart: OutboundPart = Object.freeze({
   media: 'text',
   atoms: Object.freeze([{ kind: 'text' as const, text: 'hello' }])
+})
+
+test('host encoded Silk records use the shared port and JSON copies never gain host authority', async () => {
+  const host = hostTarget([{ message_id: 'voice-1' }])
+  const port = await createYunzaiOutboundPortFactory({ forTarget: async () => host.target }).forTarget(groupUserTarget)
+  const part = createHostRecordPart('protobuf://YWJj')
+  assert.equal((await port.deliver(part, 1)).kind, 'sent')
+  assert.equal((await port.deliver({ ...part }, 1)).kind, 'failed_definite')
+  assert.equal(host.dispatches.length, 1)
+  assert.throws(() => createHostRecordPart('https://fixture.invalid/file'))
 })
 
 type HostResult = unknown | (() => unknown | Promise<unknown>)

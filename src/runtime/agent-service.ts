@@ -1,3 +1,5 @@
+import type { ContextDependencyProof } from '../agent/context/ContextDependency.js'
+import { bindRunBoundaryGuard, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js'
 import { randomUUID } from 'node:crypto'
 import {
   AgentError,
@@ -158,7 +160,7 @@ export function projectRunAdvanceResult (
 export function projectFinalPresentation (
   envelope: FinalChatReplyEnvelope
 ): FinalPresentationProjection {
-  const result = projectRunAdvanceResult(envelope)
+  const result = transferRunBoundaryGuard(envelope, projectRunAdvanceResult(envelope))
   if (result.kind === 'paused') {
     throw new TypeError('final presentation cannot project a paused run')
   }
@@ -210,9 +212,10 @@ export interface AgentServiceRequestOptions extends RunControlOptions {
 }
 
 export interface AgentServiceRunRuntime {
+  readonly discardSessionHistory?: boolean
   readonly binding: Readonly<Pick<
     RunRuntimeBinding,
-    'snapshot' | 'providerRequestMetadata' | 'prepareToolContext' | 'contextFor' |
+    'snapshot' | 'providerRequestMetadata' | 'contextDependencies' | 'checkBoundary' | 'prepareToolContext' | 'contextFor' |
     'approvalControlContext'
   >>
   readonly progress?: ProgressDelivery
@@ -245,7 +248,9 @@ export interface AgentServiceOptions {
   readonly createEngine: (observer: (event: AgentEvent) => void) => RunEngine
   readonly createRuntime: (
     request: YunzaiAgentRequest,
-    signal: AbortSignal
+    signal: AbortSignal,
+    inherited?: ContextDependencyProof,
+    legacyHistory?: boolean
   ) => Promise<AgentServiceRunRuntime>
   readonly recoverRuntime?: (checkpoint: RunCheckpoint) => Promise<AgentServiceRunRuntime>
   readonly createPresentationLifecycle?: (
@@ -871,7 +876,8 @@ function appendTerminalTurn (
   record: SessionRecord<AgentSessionState>,
   request: YunzaiAgentRequest,
   result: Extract<RunAdvanceResult, { readonly kind: 'completed' }>,
-  updatedAt: string
+  updatedAt: string,
+  dependencies?: ContextDependencyProof
 ): SessionRecord<AgentSessionState> {
   const existing = [...record.state.messages]
   const appended: CanonicalConversationItem[] = []
@@ -891,7 +897,8 @@ function appendTerminalTurn (
   while (state === undefined) {
     try {
       state = parseAgentSessionState({
-        schemaVersion: 1,
+        schemaVersion: dependencies === undefined ? 1 : 2,
+        ...(dependencies === undefined ? {} : { contextDependencies: dependencies }),
         messages,
         ...(record.state.migratedFrom === undefined
           ? {}
@@ -1310,7 +1317,9 @@ export class AgentService {
         }
       }
       if (linked.signal.aborted) throw new Error('run start was cancelled')
-      const runtime = await this.#createRuntime(request, linked.signal)
+      const runtime = await this.#createRuntime(request, linked.signal, session?.state.contextDependencies,
+        session?.state.schemaVersion === 1 && session.state.messages.some(item => item.kind === 'provider_protocol_span' || item.message.role === 'assistant'))
+      if (runtime.discardSessionHistory && session !== null) session = Object.freeze({ ...session, state: Object.freeze({ schemaVersion: 1 as const, messages: Object.freeze([]) }) })
       if (linked.signal.aborted) throw new Error('run start was cancelled')
       const sessionId = session?.sessionId ?? this.#generateId()
       const hostImageLinks = await this.#resolveHostImageLinks(
@@ -1585,6 +1594,8 @@ export class AgentService {
         _error: ModelProviderError,
         signal: AbortSignal
       ) => await prepare(true, signal),
+      ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
+      ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
       prepareToolContext: runtime.binding.prepareToolContext,
       contextFor: runtime.binding.contextFor,
       ...(runtime.binding.approvalControlContext === undefined
@@ -1643,6 +1654,8 @@ export class AgentService {
         }),
         planModelTurn: planner.planModelTurn,
         recoverContext: async () => undefined,
+        ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
+        ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
         prepareToolContext: runtime.binding.prepareToolContext,
         contextFor: runtime.binding.contextFor,
         ...(runtime.binding.approvalControlContext === undefined
@@ -1704,18 +1717,21 @@ export class AgentService {
         this.#reportObserverFailure()
       }
     }
+    let contextCurrent = true
+    try { await pending.binding.checkBoundary?.('final', new AbortController().signal) } catch { contextCurrent = false }
     let sessionPersistence: SessionPersistenceOutcome = 'not_attempted'
     let sessionSaveDurationMs: number | 'unavailable' | 'not_attempted' = 'not_attempted'
     try {
       if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
-        result.kind === 'completed') {
+        result.kind === 'completed' && contextCurrent) {
         const sessionSaveStarted = readMonotonic(this.#monotonicNow)
         try {
           const next = appendTerminalTurn(
             pending.session,
             pending.request,
             result,
-            this.#now().toISOString()
+            this.#now().toISOString(),
+            pending.binding.contextDependencies
           )
           await this.#sessions.save(next, {
             signal: undefined,
@@ -1738,12 +1754,12 @@ export class AgentService {
       this.#pending.delete(pending.runId)
       await pending.lease.release().catch(() => undefined)
     }
-    return activeFinalEnvelope(
+    return bindRunBoundaryGuard(activeFinalEnvelope(
       result,
       pending.requestObservationContext,
       sessionPersistence,
       sessionSaveDurationMs
-    )
+    ), pending.binding.checkBoundary)
   }
 
   async #abortPending (

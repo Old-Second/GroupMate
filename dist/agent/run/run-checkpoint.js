@@ -1,3 +1,4 @@
+import { parseContextDependencyProof } from '../context/ContextDependency.js';
 import { createHash } from 'node:crypto';
 import { parseAgentMessage } from '../contracts/content.js';
 import { completionFromTerminalOutput, parseCompletionDisposition } from '../contracts/completion.js';
@@ -102,6 +103,7 @@ const CHECKPOINT_V6_KEYS = Object.freeze([
     ...CHECKPOINT_V5_KEYS,
     'contextRuntimeMode', 'pendingContextMessages', 'providerGeneration', 'terminalProviderState'
 ]);
+const CHECKPOINT_V7_KEYS = Object.freeze([...CHECKPOINT_V6_KEYS, 'contextDependencies']);
 const MODEL_KEYS = Object.freeze([
     'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
 ]);
@@ -496,7 +498,7 @@ function validateContextPlanState(parsed) {
     }
     let plan = null;
     if (parsed.contextPlan !== null) {
-        if (parsed.schemaVersion === 6) {
+        if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
             plan = parseContextPlanV1(parsed.contextPlan);
         }
         else {
@@ -529,7 +531,7 @@ function validateContextPlanState(parsed) {
         plan.artifactRefs.some((ref, index) => ref !== parsed.contextArtifactRefs[index])) {
         throw new TypeError('run context plan is inconsistent');
     }
-    const currentPlan = parsed.schemaVersion === 6
+    const currentPlan = (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
         ? plan
         : null;
     if (currentPlan !== null && currentPlan.included.some(entry => (contextWireHash(Object.freeze(parsed.messages.slice(entry.wireStart, entry.wireStart + entry.wireCount))) !== entry.wireHash))) {
@@ -577,9 +579,11 @@ function parseLoadedRunCheckpoint(value) {
                     ? CHECKPOINT_V4_KEYS
                     : unparsed.schemaVersion === 5
                         ? CHECKPOINT_V5_KEYS
-                        : unparsed.schemaVersion === 6
-                            ? CHECKPOINT_V6_KEYS
-                            : undefined;
+                        : unparsed.schemaVersion === 7
+                            ? CHECKPOINT_V7_KEYS
+                            : unparsed.schemaVersion === 6
+                                ? CHECKPOINT_V6_KEYS
+                                : undefined;
     if (checkpointKeys === undefined)
         throw new TypeError('run checkpoint schema version is invalid');
     exactKeys(unparsed, checkpointKeys, checkpointKeys.filter(key => key !== 'terminalProviderState'), 'checkpoint');
@@ -590,7 +594,7 @@ function parseLoadedRunCheckpoint(value) {
     }
     const parsed = unparsed;
     const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4 ||
-        parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+        parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
         ? parseRunReasoningSegments(parsed.reasoningSegments)
         : undefined;
     const split = splitCheckpoint(parsed);
@@ -647,7 +651,7 @@ function parseLoadedRunCheckpoint(value) {
     if (parsed.interruption !== null && approvalIds.has(parsed.interruption.approvalId)) {
         throw new TypeError('active run approval is already in history');
     }
-    validateBudgets(parsed.budgetLimits, parsed.budgetCounters, parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+    validateBudgets(parsed.budgetLimits, parsed.budgetCounters, parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
         ? parsed.modelLoopPolicy
         : undefined);
     if (typeof parsed.recoveryUsed !== 'boolean' || typeof parsed.forceCorrection !== 'boolean' ||
@@ -679,7 +683,7 @@ function parseLoadedRunCheckpoint(value) {
     else {
         validateCheckpointV2OrLater(parsed);
     }
-    if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5 || parsed.schemaVersion === 6) {
+    if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)) {
         const capability = parseModelCapabilitySnapshot(parsed.modelCapability);
         const price = parsed.modelPrice === null ? null : parseModelPriceSnapshot(parsed.modelPrice);
         parseRunUsageSummary(parsed.usage);
@@ -688,15 +692,15 @@ function parseLoadedRunCheckpoint(value) {
             throw new TypeError('run model price catalog is inconsistent');
         }
     }
-    const contextPlan = parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+    const contextPlan = parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
         ? validateContextPlanState(parsed)
         : null;
-    const currentContextPlan = parsed.schemaVersion === 6
+    const currentContextPlan = (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
         ? contextPlan
         : null;
     let pendingContextMessages;
     let providerGeneration;
-    if (parsed.schemaVersion === 6) {
+    if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
         if (parsed.terminalProviderState !== undefined) {
             const state = parseProviderTurnState(parsed.terminalProviderState);
             if (parsed.status !== 'completed' || parsed.output === null ||
@@ -752,7 +756,7 @@ function parseLoadedRunCheckpoint(value) {
         (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
         throw new TypeError('run approval checkpoint state is invalid');
     }
-    if (parsed.schemaVersion === 6) {
+    if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
         return Object.freeze({
             ...parsed,
             reasoningSegments,
@@ -768,7 +772,8 @@ function parseLoadedRunCheckpoint(value) {
             contextPlan: currentContextPlan,
             contextArtifactRefs: Object.freeze([...parsed.contextArtifactRefs]),
             pendingContextMessages: pendingContextMessages,
-            providerGeneration
+            providerGeneration,
+            ...(parsed.schemaVersion === 7 ? { contextDependencies: parseContextDependencyProof(parsed.contextDependencies) } : {})
         });
     }
     if (parsed.schemaVersion === 5) {
@@ -805,8 +810,8 @@ function parseLoadedRunCheckpoint(value) {
 }
 export function parseRunCheckpoint(value) {
     const parsed = parseLoadedRunCheckpoint(value);
-    if (parsed.schemaVersion !== 6) {
-        throw new TypeError('runtime run checkpoint must use schema version 6');
+    if (parsed.schemaVersion !== 6 && parsed.schemaVersion !== 7) {
+        throw new TypeError('runtime run checkpoint must use schema version 6 or 7');
     }
     return parsed;
 }
@@ -870,7 +875,8 @@ export function createInitialRunCheckpoint(input) {
     timestamp(input.createdAt, 'run creation time');
     validateEvents([input.event], 0, input.runId, input.sessionId);
     return freezeCheckpoint({
-        schemaVersion: 6,
+        schemaVersion: input.contextDependencies === undefined ? 6 : 7,
+        ...(input.contextDependencies === undefined ? {} : { contextDependencies: input.contextDependencies }),
         kernelVersion: 1,
         profileId: input.profileId,
         profileVersion: input.profileVersion,
@@ -948,6 +954,7 @@ const CHECKPOINT_V3_STATE_KEYS = Object.freeze(CHECKPOINT_V3_KEYS.filter(key => 
 const CHECKPOINT_V4_STATE_KEYS = Object.freeze(CHECKPOINT_V4_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V5_STATE_KEYS = Object.freeze(CHECKPOINT_V5_KEYS.filter(key => key !== 'events'));
 const CHECKPOINT_V6_STATE_KEYS = Object.freeze(CHECKPOINT_V6_KEYS.filter(key => key !== 'events'));
+const CHECKPOINT_V7_STATE_KEYS = Object.freeze(CHECKPOINT_V7_KEYS.filter(key => key !== 'events'));
 const EVENT_ENVELOPE_KEYS = Object.freeze([
     'schemaVersion', 'revision', 'events'
 ]);
@@ -967,7 +974,7 @@ export class RunCheckpointCodec {
         const parsed = parseRunCheckpoint(value);
         const split = splitCheckpoint(parsed);
         const envelope = Object.freeze({
-            schemaVersion: 6,
+            schemaVersion: parsed.schemaVersion,
             revision: parsed.revision,
             events: split.events
         });
@@ -993,9 +1000,11 @@ export class RunCheckpointCodec {
                         ? CHECKPOINT_V4_STATE_KEYS
                         : state.schemaVersion === 5
                             ? CHECKPOINT_V5_STATE_KEYS
-                            : state.schemaVersion === 6
-                                ? CHECKPOINT_V6_STATE_KEYS
-                                : undefined;
+                            : state.schemaVersion === 7
+                                ? CHECKPOINT_V7_STATE_KEYS
+                                : state.schemaVersion === 6
+                                    ? CHECKPOINT_V6_STATE_KEYS
+                                    : undefined;
         if (checkpointKeys === undefined) {
             throw new TypeError('run checkpoint schema version is invalid');
         }

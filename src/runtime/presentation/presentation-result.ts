@@ -8,6 +8,7 @@ export type OutboundMedia =
   | 'rps'
 
 export type DeliveryErrorCode =
+  | 'authorization_changed'
   | 'invalid_target'
   | 'invalid_part'
   | 'aborted_before_dispatch'

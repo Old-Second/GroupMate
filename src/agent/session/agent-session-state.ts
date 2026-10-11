@@ -1,3 +1,4 @@
+import { parseContextDependencyProof, type ContextDependencyProof } from '../context/ContextDependency.js'
 import { parseAgentMessage, type AgentMessage } from '../contracts/content.js'
 import type { ModelMessage } from '../model/model-adapter.js'
 import {
@@ -28,7 +29,8 @@ export interface ProviderProtocolSpan {
 export type CanonicalConversationItem = SemanticConversationMessage | ProviderProtocolSpan
 
 export interface AgentSessionState {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 1 | 2
+  readonly contextDependencies?: ContextDependencyProof
   readonly messages: readonly CanonicalConversationItem[]
   readonly migratedFrom?: Readonly<{
     readonly kind: 'legacy'
@@ -187,8 +189,8 @@ export function parseAgentSessionState (value: unknown): AgentSessionState {
     maxNodes: 32_768
   })
   const state = record(cloned, 'agent session state')
-  exact(state, ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state')
-  if (state.schemaVersion !== 1 || !Array.isArray(state.messages) || state.messages.length > 128) {
+  exact(state, state.schemaVersion === 2 ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies'] : ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state')
+  if ((state.schemaVersion !== 1 && state.schemaVersion !== 2) || !Array.isArray(state.messages) || state.messages.length > 128) {
     throw new TypeError('agent session state is invalid')
   }
   const ids = new Set<string>()
@@ -215,7 +217,8 @@ export function parseAgentSessionState (value: unknown): AgentSessionState {
     ? undefined
     : parseMigratedFrom(state.migratedFrom)
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: state.schemaVersion,
+    ...(state.schemaVersion === 2 ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) } : {}),
     messages: Object.freeze(messages),
     ...(migratedFrom === undefined ? {} : { migratedFrom })
   })

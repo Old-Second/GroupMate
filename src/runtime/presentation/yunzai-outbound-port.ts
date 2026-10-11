@@ -32,7 +32,7 @@ export interface SafeForwardNode {
 export type OutboundPart =
   | { readonly media: 'text'; readonly atoms: readonly SafeTextAtom[]; readonly buttons?: TrustedButtonRequest }
   | { readonly media: 'picture'; readonly resource: ToolResource }
-  | { readonly media: 'voice'; readonly resource: ToolResource }
+  | { readonly media: 'voice'; readonly resource: ToolResource; readonly hostRecord?: string }
   | { readonly media: 'forward'; readonly title: string; readonly nodes: readonly SafeForwardNode[] }
   | { readonly media: 'video'; readonly resource: ToolResource }
   | { readonly media: 'music'; readonly provider: '163'; readonly id: string }
@@ -71,6 +71,19 @@ export interface YunzaiOutboundPort {
 
 export interface YunzaiOutboundPortFactory {
   forTarget(target: SessionAddress): Promise<YunzaiOutboundPort>
+}
+
+const hostRecordParts = new WeakSet<object>()
+/** QQ's existing Silk adapter returns encoded host metadata, not an audio URL. Never accept it from JSON. */
+export function createHostRecordPart (record: string): Extract<OutboundPart, { media: 'voice' }> {
+  if (typeof record !== 'string' || record.length > 1024 * 1024 || !/^protobuf:\/\/[A-Za-z0-9+/]+={0,2}$/.test(record)) {
+    throw new TypeError('encoded host voice record is invalid')
+  }
+  const data = Buffer.from(record.slice('protobuf://'.length), 'base64')
+  const part = Object.freeze({ media: 'voice' as const, hostRecord: record,
+    resource: Object.freeze({ kind: 'buffer' as const, data, byteLength: data.byteLength, mimeType: 'application/x-qq-ptt' }) })
+  hostRecordParts.add(part)
+  return part
 }
 
 export const OUTBOUND_DELIVERY_TIMEOUT_MS = 30_000
@@ -219,6 +232,10 @@ function validPartRecord (value: unknown): value is OutboundPart {
       (!hasButtons || validButtons(ownData(value, 'buttons')?.value))
   }
   if (media === 'picture' || media === 'voice' || media === 'video') {
+    if (media === 'voice' && Object.hasOwn(value, 'hostRecord')) {
+      return hostRecordParts.has(value) && exactDataRecord(value, ['media', 'resource', 'hostRecord']) &&
+        validResource(ownData(value, 'resource')?.value)
+    }
     return exactDataRecord(value, ['media', 'resource']) && validResource(ownData(value, 'resource')?.value)
   }
   if (media === 'forward') {

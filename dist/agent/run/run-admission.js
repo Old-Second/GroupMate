@@ -64,6 +64,18 @@ export class RunAdmission {
     get queuedCount() {
         return this.#queue.length;
     }
+    /** Background greetings share the same capacity, but never queue ahead of user requests. */
+    async tryAcquire(address, signal) {
+        if (signal?.aborted === true || this.#queue.length > 0)
+            return null;
+        const normalized = this.#normalizeAddress(address);
+        const lease = await this.#tryStart(normalized, redisAdmissionKey(normalized));
+        if (Boolean(signal?.aborted) && lease !== null) {
+            await lease.release();
+            return null;
+        }
+        return lease;
+    }
     async acquire(address, signal) {
         if (signal?.aborted === true)
             throw cancelled();

@@ -134,6 +134,7 @@ const DELIVERY_OUTCOMES = new Set([
     'sent', 'failed_definite', 'outcome_unknown'
 ]);
 const DELIVERY_ERROR_CODES = new Set([
+    'authorization_changed',
     'invalid_target',
     'invalid_part',
     'aborted_before_dispatch',

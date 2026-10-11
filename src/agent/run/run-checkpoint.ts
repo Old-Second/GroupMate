@@ -1,3 +1,4 @@
+import { parseContextDependencyProof, type ContextDependencyProof } from '../context/ContextDependency.js'
 import { createHash } from 'node:crypto'
 import { parseAgentMessage, type AgentMessage } from '../contracts/content.js'
 import {
@@ -203,6 +204,11 @@ RunCheckpointV5,
   readonly terminalProviderState?: ProviderTurnState
 }
 
+export interface RunCheckpointV7 extends Omit<RunCheckpointV6, 'schemaVersion'> {
+  readonly schemaVersion: 7
+  readonly contextDependencies: ContextDependencyProof
+}
+
 export type LoadedRunCheckpoint =
   | RunCheckpointV1
   | RunCheckpointV2
@@ -210,9 +216,11 @@ export type LoadedRunCheckpoint =
   | RunCheckpointV4
   | RunCheckpointV5
   | RunCheckpointV6
-export type RunCheckpoint = RunCheckpointV6
+  | RunCheckpointV7
+export type RunCheckpoint = RunCheckpointV6 | RunCheckpointV7
 
 export interface CreateRunCheckpointInput {
+  readonly contextDependencies?: ContextDependencyProof
   readonly profileId: string
   readonly profileVersion: number
   readonly runId: string
@@ -355,6 +363,8 @@ const CHECKPOINT_V6_KEYS = Object.freeze([
   ...CHECKPOINT_V5_KEYS,
   'contextRuntimeMode', 'pendingContextMessages', 'providerGeneration', 'terminalProviderState'
 ])
+const CHECKPOINT_V7_KEYS = Object.freeze([...CHECKPOINT_V6_KEYS, 'contextDependencies'])
+
 const MODEL_KEYS = Object.freeze([
   'model', 'streaming', 'maxOutputTokens', 'reasoning', 'temperature', 'topP'
 ])
@@ -723,7 +733,7 @@ function validateObservationState (
 }
 
 function validateCheckpointV2OrLater (
-  parsed: RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5 | RunCheckpointV6
+  parsed: RunCheckpointV2 | RunCheckpointV3 | RunCheckpointV4 | RunCheckpointV5 | RunCheckpointV6 | RunCheckpointV7
 ): void {
   if (!RUN_REF_PATTERN.test(parsed.runRef) || !RUN_REF_PATTERN.test(parsed.requestRef)) {
     throw new TypeError('run checkpoint reference is invalid')
@@ -778,7 +788,7 @@ function validateCheckpointV2OrLater (
 }
 
 function validateContextPlanState (
-  parsed: RunCheckpointV5 | RunCheckpointV6
+  parsed: RunCheckpointV5 | RunCheckpointV6 | RunCheckpointV7
 ): ContextPlanV1 | LegacyContextPlanV1 | null {
   const modelLoopPolicy = parseRunModelLoopPolicyV1(parsed.modelLoopPolicy)
   const toolWireSnapshot = parsed.toolWireSnapshot === null
@@ -789,7 +799,7 @@ function validateContextPlanState (
   }
   let plan: ContextPlanV1 | LegacyContextPlanV1 | null = null
   if (parsed.contextPlan !== null) {
-    if (parsed.schemaVersion === 6) {
+    if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
       plan = parseContextPlanV1(parsed.contextPlan)
     } else {
       try {
@@ -819,7 +829,7 @@ function validateContextPlanState (
     plan.artifactRefs.some((ref, index) => ref !== parsed.contextArtifactRefs[index])) {
     throw new TypeError('run context plan is inconsistent')
   }
-  const currentPlan = parsed.schemaVersion === 6
+  const currentPlan = (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
     ? plan as ContextPlanV1 | null
     : null
   if (currentPlan !== null && currentPlan.included.some(entry => (
@@ -878,8 +888,10 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
           ? CHECKPOINT_V4_KEYS
           : unparsed.schemaVersion === 5
             ? CHECKPOINT_V5_KEYS
-            : unparsed.schemaVersion === 6
-              ? CHECKPOINT_V6_KEYS
+            : unparsed.schemaVersion === 7
+              ? CHECKPOINT_V7_KEYS
+              : unparsed.schemaVersion === 6
+                ? CHECKPOINT_V6_KEYS
           : undefined
   if (checkpointKeys === undefined) throw new TypeError('run checkpoint schema version is invalid')
   exactKeys(unparsed, checkpointKeys, checkpointKeys.filter(key => key !== 'terminalProviderState'), 'checkpoint')
@@ -889,7 +901,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   }
   const parsed = unparsed as unknown as LoadedRunCheckpoint
   const reasoningSegments = parsed.schemaVersion === 3 || parsed.schemaVersion === 4 ||
-    parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+    parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
     ? parseRunReasoningSegments(parsed.reasoningSegments)
     : undefined
   const split = splitCheckpoint(parsed)
@@ -949,7 +961,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   validateBudgets(
     parsed.budgetLimits,
     parsed.budgetCounters,
-    parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+    parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
       ? parsed.modelLoopPolicy
       : undefined
   )
@@ -979,7 +991,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   } else {
     validateCheckpointV2OrLater(parsed)
   }
-  if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5 || parsed.schemaVersion === 6) {
+  if (parsed.schemaVersion === 4 || parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)) {
     const capability = parseModelCapabilitySnapshot(parsed.modelCapability)
     const price = parsed.modelPrice === null ? null : parseModelPriceSnapshot(parsed.modelPrice)
     parseRunUsageSummary(parsed.usage)
@@ -988,15 +1000,15 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
       throw new TypeError('run model price catalog is inconsistent')
     }
   }
-  const contextPlan = parsed.schemaVersion === 5 || parsed.schemaVersion === 6
+  const contextPlan = parsed.schemaVersion === 5 || (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
     ? validateContextPlanState(parsed)
     : null
-  const currentContextPlan = parsed.schemaVersion === 6
+  const currentContextPlan = (parsed.schemaVersion === 6 || parsed.schemaVersion === 7)
     ? contextPlan as ContextPlanV1 | null
     : null
   let pendingContextMessages: readonly ModelMessage[] | undefined
   let providerGeneration: FrozenProviderGenerationV1 | null | undefined
-  if (parsed.schemaVersion === 6) {
+  if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
     if (parsed.terminalProviderState !== undefined) {
       const state = parseProviderTurnState(parsed.terminalProviderState)
       if (parsed.status !== 'completed' || parsed.output === null ||
@@ -1055,7 +1067,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
     (parsed.status === 'waiting_approval' && parsed.preparedBatch === null)) {
     throw new TypeError('run approval checkpoint state is invalid')
   }
-  if (parsed.schemaVersion === 6) {
+  if (parsed.schemaVersion === 6 || parsed.schemaVersion === 7) {
     return Object.freeze({
       ...parsed,
       reasoningSegments,
@@ -1071,8 +1083,9 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
       contextPlan: currentContextPlan,
       contextArtifactRefs: Object.freeze([...parsed.contextArtifactRefs]),
       pendingContextMessages: pendingContextMessages as readonly ModelMessage[],
-      providerGeneration
-    }) as RunCheckpointV6
+      providerGeneration,
+      ...(parsed.schemaVersion === 7 ? { contextDependencies: parseContextDependencyProof(parsed.contextDependencies) } : {})
+    }) as RunCheckpoint
   }
   if (parsed.schemaVersion === 5) {
     return Object.freeze({
@@ -1107,15 +1120,17 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
     : parsed
 }
 
+export function parseRunCheckpoint<T extends RunCheckpoint> (value: T): T
+export function parseRunCheckpoint (value: unknown): RunCheckpoint
 export function parseRunCheckpoint (value: unknown): RunCheckpoint {
   const parsed = parseLoadedRunCheckpoint(value)
-  if (parsed.schemaVersion !== 6) {
-    throw new TypeError('runtime run checkpoint must use schema version 6')
+  if (parsed.schemaVersion !== 6 && parsed.schemaVersion !== 7) {
+    throw new TypeError('runtime run checkpoint must use schema version 6 or 7')
   }
   return parsed
 }
 
-function freezeCheckpoint (value: RunCheckpoint): RunCheckpoint {
+function freezeCheckpoint (value: unknown): RunCheckpoint {
   return parseRunCheckpoint(value)
 }
 
@@ -1186,7 +1201,8 @@ export function createInitialRunCheckpoint (
   timestamp(input.createdAt, 'run creation time')
   validateEvents([input.event], 0, input.runId, input.sessionId)
   return freezeCheckpoint({
-    schemaVersion: 6,
+    schemaVersion: input.contextDependencies === undefined ? 6 : 7,
+    ...(input.contextDependencies === undefined ? {} : { contextDependencies: input.contextDependencies }),
     kernelVersion: 1,
     profileId: input.profileId,
     profileVersion: input.profileVersion,
@@ -1288,6 +1304,7 @@ const CHECKPOINT_V5_STATE_KEYS = Object.freeze(
 const CHECKPOINT_V6_STATE_KEYS = Object.freeze(
   CHECKPOINT_V6_KEYS.filter(key => key !== 'events')
 )
+const CHECKPOINT_V7_STATE_KEYS = Object.freeze(CHECKPOINT_V7_KEYS.filter(key => key !== 'events'))
 const EVENT_ENVELOPE_KEYS = Object.freeze([
   'schemaVersion', 'revision', 'events'
 ])
@@ -1298,7 +1315,7 @@ export interface EncodedRunCheckpoint {
 }
 
 interface RunEventEnvelope {
-  readonly schemaVersion: 1 | 2 | 3 | 4 | 5 | 6
+  readonly schemaVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7
   readonly revision: number
   readonly events: readonly AgentEvent[]
 }
@@ -1319,7 +1336,7 @@ export class RunCheckpointCodec {
     const parsed = parseRunCheckpoint(value)
     const split = splitCheckpoint(parsed)
     const envelope: RunEventEnvelope = Object.freeze({
-      schemaVersion: 6,
+      schemaVersion: parsed.schemaVersion,
       revision: parsed.revision,
       events: split.events
     })
@@ -1349,7 +1366,9 @@ export class RunCheckpointCodec {
             ? CHECKPOINT_V4_STATE_KEYS
             : state.schemaVersion === 5
               ? CHECKPOINT_V5_STATE_KEYS
-              : state.schemaVersion === 6
+              : state.schemaVersion === 7
+                ? CHECKPOINT_V7_STATE_KEYS
+                : state.schemaVersion === 6
                 ? CHECKPOINT_V6_STATE_KEYS
             : undefined
     if (checkpointKeys === undefined) {

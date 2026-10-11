@@ -4,6 +4,8 @@ import { projectYunzaiParticipation } from './participation/YunzaiParticipationA
 import type { ModelAdapter } from '../agent/model/model-adapter.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
+import { ProactiveCoordination, type ProactiveLease } from './participation/ProactiveCoordination.js'
+import { currentGroupMember } from './CurrentGroupMember.js'
 import { RedisRunStore } from '../agent/run/redis-run-store.js'
 import type { TraceCandidateProjectionFailureCode, TraceCandidateV1 } from '../agent/run/run-trace.js'
 import {
@@ -169,6 +171,8 @@ const RECOVERED_LEGACY_SETTINGS: PresentationSettings = Object.freeze({
 export interface ProductionModelPort extends ModelAdapter, SuggestionGenerationPort {}
 
 export interface ProductionYunzaiAgent {
+  readonly claimScheduledGreeting: (bot: Record<string, any>, groupId: number) => Promise<ProactiveLease | null>
+  readonly inspectStartupInventory: () => ReturnType<RedisRunStore['inspectStartupPage']>
   readonly bridge: YunzaiAgentServiceBridge
   readonly outboundFactory: YunzaiOutboundPortFactory
   readonly presenter: ReplyPresenter
@@ -713,6 +717,7 @@ export function createProductionYunzaiAgent (
   const monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()))
   const runStore = new RedisRunStore({ client: options.bridge.redis })
   const admission = new RunAdmission({ client: options.bridge.redis })
+  const proactiveCoordination = new ProactiveCoordination(() => now().getTime())
   const observability = new ProductionObservabilityRuntime({
     redis: options.bridge.redis,
     runStore,
@@ -944,6 +949,8 @@ export function createProductionYunzaiAgent (
     contentJournal?.recordParticipation?.(entry)
   })
   const bymController = createYunzaiBymController({
+    coordinate: (event, direct) => event.group_id === undefined ? undefined : proactiveCoordination.begin(
+      String(options.bridge.getBotId(event)), String(event.group_id), 'bym', direct),
     participation: {
       observe: input => {
         if (participationMode(options.bridge.config.participationMode) !== 'shadow') return null
@@ -1009,6 +1016,24 @@ export function createProductionYunzaiAgent (
     shutdownPromise: null
   }
   const graph: ProductionYunzaiAgent = Object.freeze({
+    claimScheduledGreeting: async (bot: Record<string, any>, groupId: number) => {
+      const botId = String(bot.uin ?? bot.self_id ?? '')
+      const ticket = proactiveCoordination.begin(botId, String(groupId), 'cron')
+      if (ticket === null) return null
+      let lease: Awaited<ReturnType<RunAdmission['tryAcquire']>> = null
+      try {
+        const signal = AbortSignal.timeout(2_000)
+        if (await currentGroupMember(bot, String(groupId), botId, signal) === null) {
+          await ticket.finish(false)
+          return null
+        }
+        lease = await admission.tryAcquire({ botId, scope: { kind: 'group', groupId: String(groupId) } }, signal)
+        if (lease === null) { await ticket.finish(false); return null }
+        return Object.freeze({ current: ticket.current,
+          finish: async (sent: boolean) => { try { await ticket.finish(sent) } finally { await lease!.release() } } })
+      } catch (error) { await ticket.finish(false); await lease?.release(); throw error }
+    },
+    inspectStartupInventory: async () => await runStore.inspectStartupPage(),
     bridge,
     outboundFactory,
     presenter,
@@ -1034,6 +1059,7 @@ export function createProductionYunzaiAgent (
           return await bridge.shutdown(reason)
         } finally {
           participation.close()
+          proactiveCoordination.close()
           try {
             await contentJournal?.drain()
           } catch {}

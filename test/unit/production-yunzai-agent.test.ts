@@ -273,7 +273,7 @@ test('production initializer owns one complete graph and rejects every reinitial
     code: 'construction_failed'
   })])
   assert.deepEqual(Reflect.ownKeys(graph), [
-    'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
+    'claimScheduledGreeting', 'inspectStartupInventory', 'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
     'buttonPolicy', 'chatController', 'bymController', 'approvalController',
     'diagnosticsController',
@@ -368,6 +368,11 @@ test('ordinary chat proceeds when the host group history reader never settles', 
   Reflect.set(bridge, 'groupHistoryTimeoutMs', 10)
   const graph = createProductionYunzaiAgent({ ...baseOptions, bridge })
   const event = {
+    bot: { uin: 'bot', getMsg: async () => null, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      if (!['bot', 'actor-1'].includes(String(userId))) return null
+      return { user_id: userId, role: 'member' }
+    } },
     isGroup: true,
     group_id: 'group-1',
     self_id: 'bot',
@@ -432,6 +437,11 @@ test('later chats do not multiply an unresolved host group history read', async 
   Reflect.set(bridge, 'groupHistoryTimeoutMs', 10)
   const graph = createProductionYunzaiAgent({ ...baseOptions, bridge })
   const event = {
+    bot: { uin: 'bot', getMsg: async () => null, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      if (!['bot', 'actor-1'].includes(String(userId))) return null
+      return { user_id: userId, role: 'member' }
+    } },
     isGroup: true,
     group_id: 'group-1',
     self_id: 'bot',
@@ -527,6 +537,11 @@ test('a stuck group history read does not remove context from another group', as
   })
   const handle = async (groupId: string): Promise<void> => {
     const event = {
+      bot: { uin: 'bot', getMsg: async () => null, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+        assert.equal(noCache, true)
+        if (String(userId) !== 'bot' && String(userId) !== `actor-${groupId}`) return null
+        return { user_id: userId, role: 'member' }
+      } },
       isGroup: true,
       group_id: groupId,
       self_id: 'bot',
@@ -630,6 +645,11 @@ test('adds trusted quote grounding after ordinary group history is loaded', asyn
     })
   })
   const event = {
+    bot: { uin: 'bot', getMsg: async () => null, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      if (!['bot', 'actor-1'].includes(String(userId))) return null
+      return { user_id: userId, role: 'member' }
+    } },
     isGroup: true,
     group_id: 'group-1',
     self_id: 'bot',
@@ -751,6 +771,11 @@ test('distinguishes a resolved quoted message from the current request', async (
     })
   })
   const event = {
+    bot: { uin: 'bot', getMsg: async () => null, getGroupMemberInfo: async (_group: unknown, userId: unknown, noCache: boolean) => {
+      assert.equal(noCache, true)
+      if (!['bot', 'actor-1'].includes(String(userId))) return null
+      return { user_id: userId, role: 'member' }
+    } },
     isGroup: true,
     group_id: 'group-1',
     self_id: 'bot',

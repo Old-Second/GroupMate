@@ -1,3 +1,4 @@
+import { runScheduledGreetings } from '../../src/runtime/ScheduledGreeting.js'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
@@ -33,10 +34,12 @@ test('legacy scheduled greetings retain group lists, interval and probability in
   const config = { debug: false, initiativeChatGroups: ['', '123', '456'], helloProbability: 25, defaultUseTTS: false }
   let generations = 0
   let sample = 0.24
-  const task = new Function('Config', 'Math', 'logger', 'listYunzaiBots', 'generateHello', 'sendGroupMessage',
+  const task = new Function('Config', 'Math', 'logger', 'listYunzaiBots', 'generateHello', 'sendScheduledGroupMessage', 'runScheduledGreetings', 'getProductionYunzaiAgent',
     `return ({${method}}).sendRandomMessage`)(config, { floor: Math.floor, random: () => sample },
     { info: () => {}, warn: () => {} }, () => [bot], async () => { generations++; return 'synthetic greeting' },
-    async (_: unknown, group: number, text: string) => { sent.push({ group, text }) })
+    async (_: unknown, group: number, text: string) => { sent.push({ group, text }) },
+    (ports: Parameters<typeof runScheduledGreetings>[0]) => runScheduledGreetings({ ...ports, random: () => sample }),
+    () => ({ claimScheduledGreeting: async () => ({ current: () => true, finish: async () => {} }) }))
   await task.call({})
   assert.deepEqual(sent, [{ group: 123, text: 'synthetic greeting' }])
   assert.equal(generations, 1)

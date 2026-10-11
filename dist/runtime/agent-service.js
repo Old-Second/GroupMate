@@ -1,3 +1,4 @@
+import { bindRunBoundaryGuard, transferRunBoundaryGuard } from '../agent/run/RunBoundary.js';
 import { randomUUID } from 'node:crypto';
 import { AgentError, serializeAgentError } from '../agent/contracts/error.js';
 import { agentMessageText } from '../agent/contracts/content-projection.js';
@@ -52,7 +53,7 @@ export function projectRunAdvanceResult(envelope) {
     }));
 }
 export function projectFinalPresentation(envelope) {
-    const result = projectRunAdvanceResult(envelope);
+    const result = transferRunBoundaryGuard(envelope, projectRunAdvanceResult(envelope));
     if (result.kind === 'paused') {
         throw new TypeError('final presentation cannot project a paused run');
     }
@@ -565,7 +566,7 @@ function activeFinalEnvelope(result, context, sessionPersistence, sessionSaveDur
         });
     return finalEnvelope(result, requestObservationDraft, sessionPersistence);
 }
-function appendTerminalTurn(record, request, result, updatedAt) {
+function appendTerminalTurn(record, request, result, updatedAt, dependencies) {
     const existing = [...record.state.messages];
     const appended = [];
     const ids = new Set(existing.map(item => (item.kind === 'message' ? item.message.id : item.id)));
@@ -582,7 +583,8 @@ function appendTerminalTurn(record, request, result, updatedAt) {
     while (state === undefined) {
         try {
             state = parseAgentSessionState({
-                schemaVersion: 1,
+                schemaVersion: dependencies === undefined ? 1 : 2,
+                ...(dependencies === undefined ? {} : { contextDependencies: dependencies }),
                 messages,
                 ...(record.state.migratedFrom === undefined
                     ? {}
@@ -915,7 +917,9 @@ export class AgentService {
             }
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
-            const runtime = await this.#createRuntime(request, linked.signal);
+            const runtime = await this.#createRuntime(request, linked.signal, session?.state.contextDependencies, session?.state.schemaVersion === 1 && session.state.messages.some(item => item.kind === 'provider_protocol_span' || item.message.role === 'assistant'));
+            if (runtime.discardSessionHistory && session !== null)
+                session = Object.freeze({ ...session, state: Object.freeze({ schemaVersion: 1, messages: Object.freeze([]) }) });
             if (linked.signal.aborted)
                 throw new Error('run start was cancelled');
             const sessionId = session?.sessionId ?? this.#generateId();
@@ -1140,6 +1144,8 @@ export class AgentService {
             prepareContext: async (signal) => await prepare(false, signal),
             planModelTurn: planner.planModelTurn,
             recoverContext: async (_checkpoint, _error, signal) => await prepare(true, signal),
+            ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
+            ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
             prepareToolContext: runtime.binding.prepareToolContext,
             contextFor: runtime.binding.contextFor,
             ...(runtime.binding.approvalControlContext === undefined
@@ -1197,6 +1203,8 @@ export class AgentService {
                 }),
                 planModelTurn: planner.planModelTurn,
                 recoverContext: async () => undefined,
+                ...(runtime.binding.contextDependencies === undefined ? {} : { contextDependencies: runtime.binding.contextDependencies }),
+                ...(runtime.binding.checkBoundary === undefined ? {} : { checkBoundary: runtime.binding.checkBoundary }),
                 prepareToolContext: runtime.binding.prepareToolContext,
                 contextFor: runtime.binding.contextFor,
                 ...(runtime.binding.approvalControlContext === undefined
@@ -1257,14 +1265,21 @@ export class AgentService {
                 this.#reportObserverFailure();
             }
         }
+        let contextCurrent = true;
+        try {
+            await pending.binding.checkBoundary?.('final', new AbortController().signal);
+        }
+        catch {
+            contextCurrent = false;
+        }
         let sessionPersistence = 'not_attempted';
         let sessionSaveDurationMs = 'not_attempted';
         try {
             if (!pending.ephemeral && pending.session !== null && pending.request !== null &&
-                result.kind === 'completed') {
+                result.kind === 'completed' && contextCurrent) {
                 const sessionSaveStarted = readMonotonic(this.#monotonicNow);
                 try {
-                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString());
+                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString(), pending.binding.contextDependencies);
                     await this.#sessions.save(next, {
                         signal: undefined,
                         ...(pending.request.sessionTtlSeconds === undefined
@@ -1286,7 +1301,7 @@ export class AgentService {
             this.#pending.delete(pending.runId);
             await pending.lease.release().catch(() => undefined);
         }
-        return activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs);
+        return bindRunBoundaryGuard(activeFinalEnvelope(result, pending.requestObservationContext, sessionPersistence, sessionSaveDurationMs), pending.binding.checkBoundary);
     }
     async #abortPending(pending, error) {
         let cancelled = null;

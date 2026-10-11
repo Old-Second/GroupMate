@@ -805,7 +805,8 @@ function hostFixture() {
                 user_id: 'phase6-resource-bot', role: 'owner', nickname: 'GroupMate'
             })],
         ['7', Object.freeze({ user_id: '7', role: 'owner', nickname: 'owner' })],
-        ['8', Object.freeze({ user_id: '8', role: 'member', nickname: 'member' })]
+        ['8', Object.freeze({ user_id: '8', role: 'member', nickname: 'member' })],
+        ...['single', 'dual-a', 'dual-b', 'visible', 'picture', 'trace', 'failed', 'cancelled'].map(userId => [userId, Object.freeze({ user_id: userId, role: 'member' })])
     ]);
     const group = Object.freeze({
         getMemberMap: async () => members,
@@ -828,6 +829,11 @@ function hostFixture() {
     });
     const bot = Object.freeze({
         uin: 'phase6-resource-bot',
+        getGroupMemberInfo: async (_groupId, userId, noCache) => {
+            if (noCache !== true)
+                throw new Error('expected current member authority');
+            return members.get(String(userId));
+        },
         pickGroup: () => group,
         pickFriend: () => friend,
         getFriendList: async () => Object.freeze(['7'])
