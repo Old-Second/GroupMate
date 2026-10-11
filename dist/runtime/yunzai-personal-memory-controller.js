@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { manualMemoryEnrollmentCommandRef } from './ManualMemoryEnrollment.js';
 import { createMemoryAccessCapabilityIssuerV1, issueMemoryAccessCapabilityV1 } from '../agent/memory/memory-access-gate.js';
 import { createMemorySourceV1 } from '../agent/memory/memory-domain.js';
 import { createMemoryExportCommandV1, memoryExportStableResultHashV1 } from '../agent/memory/memory-export-port.js';
@@ -248,6 +249,7 @@ function helpText() {
         '长期记忆命令：',
         '#长期记忆 状态',
         '#长期记忆 开启 / 关闭',
+        '#长期记忆 开启 仅手动（保留召回，只按明确命令保存）',
         '#长期记忆 记住 <内容>',
         '#长期记忆 列表 [页码]',
         '#长期记忆 更正 <@编号> <新内容>',
@@ -396,14 +398,16 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
             return false;
         }
     };
-    const handleEnrollment = async (request, auth, operation) => {
+    const handleEnrollment = async (request, auth, operation, manualOnly = false) => {
         const namespaceRef = memoryNamespaceRefV1(auth.namespace);
         const state = namespaceState(options.database, namespaceRef);
         const mode = currentMode(options.mode);
-        const candidateMode = operation === 'enrollment.optOut' || mode === 'explicit'
+        const candidateMode = operation === 'enrollment.optOut' || mode === 'explicit' || manualOnly
             ? 'off'
             : mode === 'shadow' ? 'shadow' : 'policy_approved';
-        const ref = commandRef(auth.source, operation);
+        const ref = manualOnly
+            ? manualMemoryEnrollmentCommandRef(namespaceRef, state?.generation ?? 1, (state?.policyGeneration ?? 0) + 1)
+            : commandRef(auth.source, operation);
         const result = await options.facade.execute(facadeRequest(operation, auth, Object.freeze({
             schemaVersion: 1,
             namespace: auth.namespace,
@@ -428,11 +432,13 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
         if (operation === 'enrollment.optOut')
             await options.clearCandidateJobs?.(auth.namespace);
         await request.replyText(operation === 'enrollment.optIn'
-            ? mode === 'automatic'
-                ? '个人长期记忆已开启。普通消息中明确陈述的稳定本人事实，可按授权策略自动保存；冲突或不确定内容只生成待确认候选。可随时发送“#长期记忆 关闭”停止。'
-                : mode === 'shadow'
-                    ? '个人长期记忆已开启。普通消息中的稳定本人事实只生成待确认候选；只有你明确要求记住的内容才会立即保存。'
-                    : '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
+            ? manualOnly
+                ? '个人长期记忆已开启，仅按明确命令保存。已有记忆仍可召回，普通消息不会生成候选或自动保存。可随时发送“#长期记忆 关闭”停止。'
+                : mode === 'automatic'
+                    ? '个人长期记忆已开启。普通消息中明确陈述的稳定本人事实，可按授权策略自动保存；冲突或不确定内容只生成待确认候选。可随时发送“#长期记忆 关闭”停止。'
+                    : mode === 'shadow'
+                        ? '个人长期记忆已开启。普通消息中的稳定本人事实只生成待确认候选；只有你明确要求记住的内容才会立即保存。'
+                        : '个人长期记忆已开启。之后只有你明确要求记住的内容才会立即保存。'
             : `个人长期记忆已关闭。${result.notices.join('')}`);
     };
     const handleRemember = async (request, auth, value) => {
@@ -771,8 +777,8 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
                     await request.replyText(helpText());
                     return true;
                 }
-                if (body === '开启') {
-                    await handleEnrollment(request, auth, 'enrollment.optIn');
+                if (body === '开启' || body === '开启 仅手动') {
+                    await handleEnrollment(request, auth, 'enrollment.optIn', body === '开启 仅手动');
                     return true;
                 }
                 if (body === '关闭') {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { manualMemoryEnrollmentCommandRef } from './ManualMemoryEnrollment.js'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import {
   createMemoryAccessCapabilityIssuerV1,
@@ -367,6 +368,7 @@ function helpText (): string {
     '长期记忆命令：',
     '#长期记忆 状态',
     '#长期记忆 开启 / 关闭',
+    '#长期记忆 开启 仅手动（保留召回，只按明确命令保存）',
     '#长期记忆 记住 <内容>',
     '#长期记忆 列表 [页码]',
     '#长期记忆 更正 <@编号> <新内容>',
@@ -540,15 +542,18 @@ export function createYunzaiPersonalMemoryControllerV1 (
   const handleEnrollment = async (
     request: PersonalMemoryCommandRequestV1,
     auth: PersonalMemoryAuthorizationV1,
-    operation: 'enrollment.optIn' | 'enrollment.optOut'
+    operation: 'enrollment.optIn' | 'enrollment.optOut',
+    manualOnly = false
   ): Promise<void> => {
     const namespaceRef = memoryNamespaceRefV1(auth.namespace)
     const state = namespaceState(options.database, namespaceRef)
     const mode = currentMode(options.mode)
-    const candidateMode = operation === 'enrollment.optOut' || mode === 'explicit'
+    const candidateMode = operation === 'enrollment.optOut' || mode === 'explicit' || manualOnly
       ? 'off' as const
       : mode === 'shadow' ? 'shadow' as const : 'policy_approved' as const
-    const ref = commandRef(auth.source, operation)
+    const ref = manualOnly
+      ? manualMemoryEnrollmentCommandRef(namespaceRef, state?.generation ?? 1, (state?.policyGeneration ?? 0) + 1)
+      : commandRef(auth.source, operation)
     const result = await options.facade.execute(facadeRequest(
       operation,
       auth,
@@ -576,7 +581,9 @@ export function createYunzaiPersonalMemoryControllerV1 (
     }
     if (operation === 'enrollment.optOut') await options.clearCandidateJobs?.(auth.namespace)
     await request.replyText(operation === 'enrollment.optIn'
-      ? mode === 'automatic'
+      ? manualOnly
+        ? '个人长期记忆已开启，仅按明确命令保存。已有记忆仍可召回，普通消息不会生成候选或自动保存。可随时发送“#长期记忆 关闭”停止。'
+        : mode === 'automatic'
         ? '个人长期记忆已开启。普通消息中明确陈述的稳定本人事实，可按授权策略自动保存；冲突或不确定内容只生成待确认候选。可随时发送“#长期记忆 关闭”停止。'
         : mode === 'shadow'
           ? '个人长期记忆已开启。普通消息中的稳定本人事实只生成待确认候选；只有你明确要求记住的内容才会立即保存。'
@@ -978,8 +985,8 @@ export function createYunzaiPersonalMemoryControllerV1 (
           await request.replyText(helpText())
           return true
         }
-        if (body === '开启') {
-          await handleEnrollment(request, auth, 'enrollment.optIn')
+        if (body === '开启' || body === '开启 仅手动') {
+          await handleEnrollment(request, auth, 'enrollment.optIn', body === '开启 仅手动')
           return true
         }
         if (body === '关闭') {

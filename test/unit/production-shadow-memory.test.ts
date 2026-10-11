@@ -72,6 +72,51 @@ async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' 
   return { directory, runtime, send, db, requests, usage, admissions }
 }
 
+for (const mode of ['shadow', 'automatic'] as const) {
+  test(`manual participation survives close/reopen in ${mode} without automatic extraction`, async t => {
+    const { directory, runtime, send, db, requests } = await setup(t, mode)
+    assert.match(await send('#长期记忆 开启 仅手动'), /仅按明确命令保存/)
+    assert.equal(db.prepare('SELECT candidate_mode FROM personal_memory_policies').get()?.candidate_mode, 'off')
+    assert.match(await send('#长期记忆 记住 我喜欢不加糖的红茶'), /已记住/)
+    const baseline = db.prepare('SELECT * FROM revision_payloads').all()
+    await runtime.postReplyCandidate!.enqueue(input('我喜欢下雨天散步'))
+    await runtime.waitForCandidateIdle!()
+    assert.equal(requests.length, 0)
+    assert.match(await send('#长期记忆 关闭'), /已关闭/)
+    assert.match(await send('#长期记忆 开启 仅手动'), /仅按明确命令保存/)
+    assert.equal(db.prepare('SELECT candidate_mode FROM personal_memory_policies').get()?.candidate_mode, 'off')
+    assert.match(await send('#长期记忆 列表'), /红茶/)
+    assert.deepEqual(db.prepare('SELECT * FROM revision_payloads').all(), baseline)
+    await runtime.postReplyCandidate!.enqueue(input('我喜欢下雨天散步'))
+    await runtime.waitForCandidateIdle!()
+    assert.equal(requests.length, 0)
+    // The existing plain opening command retains deployment-mode participation.
+    assert.match(await send('#长期记忆 开启'), /已开启/)
+    await runtime.postReplyCandidate!.enqueue(input('我喜欢下雨天散步'))
+    await runtime.waitForCandidateIdle!()
+    assert.equal(requests.length, 1)
+    assert.equal(db.prepare('SELECT candidate_mode FROM personal_memory_policies').get()?.candidate_mode,
+      mode === 'automatic' ? 'policy_approved' : 'shadow')
+    await send('#长期记忆 开启 仅手动')
+    await runtime.close()
+    let restartedRequests = 0
+    const restarted = await createProductionPersonalMemoryRuntimeV1({
+      botInstanceId: 'groupmate-production', storageDirectory: directory,
+      deploymentMode: () => mode, groupAllowlist: () => ['30003'],
+      recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
+      candidateModel: { model: () => 'test-model', adapter: { complete: async () => {
+        restartedRequests += 1
+        return turn('{"candidates":[]}')
+      } } }
+    })
+    t.after(async () => await restarted.close())
+    await restarted.postReplyCandidate!.enqueue(input('我喜欢晴天散步'))
+    await restarted.waitForCandidateIdle!()
+    assert.equal(restartedRequests, 0)
+    assert.equal(db.prepare('SELECT candidate_mode FROM personal_memory_policies').get()?.candidate_mode, 'off')
+  })
+}
+
 test('shadow production stores a sourced pending proposal, records separate usage and never recalls it', async t => {
   const { directory, runtime, send, db, requests, usage } = await setup(t)
   assert.equal(existsSync(path.join(directory, 'personal-memory-extraction.sqlite')), false)

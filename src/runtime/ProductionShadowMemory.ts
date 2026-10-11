@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isManualMemoryEnrollmentPolicy } from './ManualMemoryEnrollment.js'
 import { chmodSync, existsSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import type { MemoryCandidateModelV1 } from '../agent/memory/OpenAiMemoryCandidateExtractor.js'
@@ -288,7 +289,7 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
       const eligibleScene = scene.kind === 'private' || options.groupAllowlist().includes(scene.groupId)
       if (options.mode() === 'automatic' && eligibleScene && (enrollment.status === 'not_enrolled' ||
         (enrollment.status === 'found' && enrollment.policy.state === 'opted_in' &&
-          enrollment.policy.candidateMode !== 'policy_approved'))) {
+          enrollment.policy.candidateMode !== 'policy_approved' && !isManualMemoryEnrollmentPolicy(enrollment.policy)))) {
         // This is the deployment's default policy, evidenced by the triggering message, not a user approval.
         // An explicit opt-out is never upgraded, including across restarts and deployment changes.
         const namespaceRef = memoryNamespaceRefV1(namespace)
