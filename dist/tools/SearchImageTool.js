@@ -54,7 +54,8 @@ export function createSearchImageTool(options) {
                     url: `${tavily.origin}/search`, policy: tavily.policy, timeoutMs: 8_000, diagnosticTag: 'image_search',
                     signal: context.signal, method: 'POST',
                     headers: { authorization: `Bearer ${options.tavilyApiKey}`, 'content-type': 'application/json' },
-                    body: JSON.stringify({ query: q, max_results: limit, include_images: true, include_image_descriptions: true })
+                    // Sending images needs candidate URLs, not the additional description work.
+                    body: JSON.stringify({ query: q, max_results: limit, include_images: true, include_image_descriptions: false })
                 });
             }
             else if (options.backend === 'brave') {

@@ -334,6 +334,21 @@ test('music search accepts endpoint JSON labelled text/plain and rejects plain e
   }
 })
 
+test('image search requests URL candidates and normalizes the description-free response', async () => {
+  const fixture = policyFetchFixture(() => response({ images: ['https://image.example/one.png', 'https://image.example/two.png'] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch, imageSearchSource: 'tavily', tavilyApiKey: 'fixture-key' })
+    .definitions.find(item => item.name === 'searchImage')!
+  const result = await tool.execute({ q: '蓝天照片', limit: 1 }, context)
+  assert.equal(result.status, 'success')
+  if (result.status === 'success') assert.match(JSON.stringify(result.content), /one\.png/)
+  assert.doesNotMatch(JSON.stringify(result), /two\.png|fixture-key/)
+  const body = JSON.parse(String(fixture.calls[0]?.body))
+  assert.equal(body.include_images, true)
+  assert.equal(body.include_image_descriptions, false)
+  assert.equal(tool.retrySafe, false)
+  assert.equal(fixture.calls.length, 1)
+})
+
 test('game image dispatch exceptions remain unknown while query failures stay definite', async () => {
   const fixture = policyFetchFixture(() => response({}))
   let attempts = 0
