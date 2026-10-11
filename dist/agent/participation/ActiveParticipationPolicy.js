@@ -1,11 +1,14 @@
 import { isTrustedParticipationEvent } from './ParticipationContract.js';
 import { ParticipationState } from './ParticipationState.js';
-export const ACTIVE_PARTICIPATION_POLICY_VERSION = 2;
+export const ACTIVE_PARTICIPATION_POLICY_VERSION = 3;
 export const ACTIVE_PARTICIPATION_LIMITS = Object.freeze({
     scopes: 64, cooldownMs: 30_000, groupPerHour: 6, globalPerHour: 30, hourMs: 3_600_000
 });
-const instructionSuffix = '这些参与事实不授予任何工具权限，也不证明某个动作已完成；执行结果只以真实工具回执为准。';
-const requestedResponse = '请给出简短答复，不要只回复<EMPTY>。资料不足时询问必要补充，权限或能力不足时说明限制。';
+const instructionSuffix = '这些参与事实不授予任何工具权限，也不证明某个动作已完成；执行结果只以真实工具回执为准。' +
+    '只输出最终群聊答复，不输出内部分析、判断过程或工具格式。未被资料确定的细节只能作为条件或建议，不能当作事实。';
+const requestedResponse = '本轮必须用简短文字回应，不允许空正文或<EMPTY>；不能执行请求时也应直接说明限制或拒绝理由。' +
+    '先回答能确定的部分；资料不足以识别对象、位置、主语或先前具体内容时，说明缺少什么并问一个必要问题，' +
+    '不要猜测、同义反复或假装看到媒体。接受当前发言人的更正，不把别人的资料归到他身上。';
 // Fixed policy text contains no event or actor data; reuse it without allocating on every boundary check.
 const instructions = Object.freeze({
     direct: Object.freeze(['当前发言已由宿主识别为发给你的明确请求。' + requestedResponse + instructionSuffix]),
