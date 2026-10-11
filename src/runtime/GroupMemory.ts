@@ -1,3 +1,4 @@
+import { CULTURE_LABELS, CULTURE_TTL_DAYS, cultureKindV1, type CultureKindV1 } from '../agent/contracts/CultureRecord.js'
 import { validateCanonicalMemoryDependencies } from './CanonicalMemoryBoundary.js'
 import { createHash } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
@@ -23,6 +24,7 @@ interface GroupMemoryOptions {
   readonly database: DatabaseSync
   readonly enabled: () => boolean
   readonly groupAllowlist: () => readonly string[]
+  readonly cultureGroups?: () => readonly string[]
   readonly now: () => string
   readonly lifecycle: MemoryLifecyclePortV1
   readonly control: MemoryControlRepositoryPortV1
@@ -36,7 +38,7 @@ interface GroupMemoryOptions {
 }
 
 const ADMIN_ACTIONS: readonly MemoryLifecycleActorActionV1[] = [
-  'propose_create', 'list_safe', 'inspect_full', 'approve', 'correct', 'renew', 'forget'
+  'propose_create', 'list_safe', 'inspect_full', 'approve', 'reject', 'correct', 'renew', 'forget'
 ]
 const HELP = ['群记忆命令（仅在当前试点群）：',
   '#群记忆 列表 [页码]', '#群记忆 记住 <规则|共同偏好|文化|群体事实> <以本群或我们群开头的内容>',
@@ -71,7 +73,7 @@ async function abortable<T> (pending: Promise<T>, signal: AbortSignal): Promise<
 export function groupMemoryTextV1 (value: string): string {
   const text = value.normalize('NFC').replace(/\r\n?/g, '\n').trim()
   if (!memoryTextWithinLimits(text) || Buffer.byteLength(text) > 800 ||
-    !/^(?:本群|我们群|群内|全群)(?:禁止|不允许|允许|要求|约定|共同|习惯|每|成立于|偏好|喜欢|使用|活动|默认|鼓励|讨论|以|是一个|成员(?:都|共同|统一))/u.test(text) ||
+    !/^(?:本群|我们群|群内|全群)(?:禁止|不允许|允许|要求|约定|共同|习惯|主题偏好|语言约定|梗说明|每|成立于|偏好|喜欢|使用|活动|默认|鼓励|讨论|以|是一个|成员(?:都|共同|统一))/u.test(text) ||
     memoryCredentialRejectionReasonV1(text) !== null ||
     /(?:["“”「」『』]|\b\d{5,}\b|https?:|@|CQ:|手机号|电话|住址|身份证|病史|糖尿病|癌症|抑郁症|诊断|收入|工资|债务|银行卡|性取向|性生活|私聊|小明|某人|个人信息|我(?!们群)|你|他|她|转述|模型(?:输出|回答)|姓名|邮箱|微信|\b(?:salary|income|diagnosed|password|token)\b)/iu.test(text)) {
     throw new GroupMemoryError('群记忆只保存明确的群规则、共同偏好、稳定群文化和群体事实；请勿包含个人身份、转述或私密信息。')
@@ -113,7 +115,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     // An ordinary message proves current membership, never administrative authority.
     const role = refreshCurrentRole ? snapshot.current.identity.groupRole : 'member'
     if (role === 'unknown') throw new GroupMemoryError('无法核实当前群成员角色。')
-    const actions: readonly MemoryLifecycleActorActionV1[] = role === 'member' ? ['list_safe']
+    const actions: readonly MemoryLifecycleActorActionV1[] = role === 'member' ? ['list_safe', 'propose_create']
       : role === 'owner' ? [...ADMIN_ACTIONS, 'delete_namespace', 'export', 'claim_export'] : ADMIN_ACTIONS
     const actor = issueMemoryLifecycleActorCapabilityV1(root, { schemaVersion: 1,
       botInstanceId: options.botInstanceId, adapter: 'qq', accountId, namespace, namespaceRef,
@@ -155,7 +157,10 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
       throw new GroupMemoryError(result.status === 'conflict' ? '群记忆已发生变化，请重新查看后再操作。' : '群记忆操作未完成，请核实权限、容量和有效期。')
     }
     // Canonical receipts remain truthful even if the derived index is temporarily unavailable.
-    try { await options.rebuildLexical() } catch {}
+    // Pending/rejected proposals do not change recallable heads; avoid rebuilding the full FTS graph.
+    if (operation !== 'proposal.create' && operation !== 'proposal.reject') {
+      try { await options.rebuildLexical() } catch {}
+    }
   }
   const records = async (auth: Auth, page: number) => {
     let cursor: string | null = null
@@ -190,23 +195,131 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     if (result.status !== 'found' || result.operation !== 'revision.get') throw new GroupMemoryError('这条群记忆暂时不可修改。')
     return result.value
   }
+  const cultureEnabled = (groupId: string): boolean => {
+    try {
+      const groups = options.cultureGroups?.() ?? []
+      return groups.length <= 64 && groups.every(g => typeof g === 'string' && /^[1-9][0-9]{0,31}$/u.test(g)) &&
+        groups.includes(groupId)
+    } catch { return false }
+  }
+  const cultureProposal = async (auth: Auth, selector: string): Promise<MemoryProposalV2> => {
+    if (!/^@[0-9a-f]{8}$/u.test(selector)) throw new GroupMemoryError('请使用候选列表里的唯一 @编号。')
+    const matches = options.database.prepare(`SELECT proposal_id FROM proposals
+      WHERE namespace_ref = ? AND namespace_generation = ? AND state = 'pending'
+      AND substr(proposal_id, -8) = ? LIMIT 2`).all(auth.namespaceRef, auth.generation, selector.slice(1))
+    if (matches.length !== 1) throw new GroupMemoryError('候选不存在或编号不唯一。')
+    const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect',
+      proposalId: String(matches[0]!.proposal_id) })
+    if (result.status !== 'found' || result.operation !== 'proposal.inspect' ||
+      result.value.kind !== 'group_culture' || cultureKindV1(result.value.text) === null) {
+      throw new GroupMemoryError('这不是当前群可审核的文化候选。')
+    }
+    return result.value
+  }
+  const cultureCommand = async (auth: Auth, body: string, reply: (text: string) => Promise<void>): Promise<boolean> => {
+    let match = /^提议\s+(主题偏好|语言约定|梗说明)\s+([\s\S]+)$/u.exec(body)
+    if (match !== null) {
+      const kind = (Object.keys(CULTURE_LABELS) as CultureKindV1[]).find(k => CULTURE_LABELS[k] === match![1])!
+      const text = groupMemoryTextV1(`本群${CULTURE_LABELS[kind]}：${groupMemoryTextV1(match[2]!)}`)
+      if (/^(?:本群|我们群|群内|全群)(?:禁止|不允许|要求)/u.test(match[2]!)) throw new GroupMemoryError('文化提案保存描述，群规则请使用群记忆命令。')
+      // Descriptions enter pending, never automatic approval or a claim of consensus.
+      const proposal = buildMemoryProposalDraftV2({ commandRef: ref(auth, 'proposal.create'), operation: 'proposal.create',
+        namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation, initiatedByActorRef: auth.actorRef,
+        namespace: auth.namespace, proposedBy: { kind: 'user', actorRef: auth.actorRef }, intent: { kind: 'create' },
+        kind: 'group_culture', text, sources: [auth.source], observedAt: auth.now, proposedAt: auth.now,
+        confidence: 0.5, sensitivity: 'group', conflict: { state: 'none', relatedMemoryIds: [], note: null },
+        customTtlDays: CULTURE_TTL_DAYS[kind], consentRequirement: 'explicit', consentPolicyRef: null, consentPolicyGeneration: null })
+      await mutate(auth, 'proposal.create', proposal)
+      await reply(`已提交文化候选 @${proposal.proposalId.slice(-8)}，待另一位管理员审核；尚未保存为可召回记忆，也不代表群共识。`)
+      return true
+    }
+    if (body === '候选') {
+      requireAdmin(auth)
+      const rows = options.database.prepare(`SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+        AND namespace_generation = ? AND state = 'pending' AND json_extract(proposal_wire, '$.kind') = 'group_culture'
+        ORDER BY proposed_at_ms, proposal_id LIMIT 32`).all(auth.namespaceRef, auth.generation)
+      const items: string[] = []
+      for (const row of rows) {
+        const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect', proposalId: String(row.proposal_id) })
+        if (result.status === 'found' && result.operation === 'proposal.inspect' && cultureKindV1(result.value.text) !== null) {
+          items.push(`@${result.value.proposalId.slice(-8)} ${result.value.text}`)
+        }
+      }
+      await reply(items.length === 0 ? '当前群没有文化候选。' : items.join('\n'))
+      return true
+    }
+    match = /^(通过|拒绝)\s+(\S+)$/u.exec(body)
+    if (match !== null) {
+      requireAdmin(auth)
+      const proposal = await cultureProposal(auth, match[2]!)
+      if (match[1] === '拒绝') {
+        await mutate(auth, 'proposal.reject', null, proposal)
+        await reply('已拒绝当前群的文化候选。')
+        return true
+      }
+      if (proposal.initiatedByActorRef === auth.actorRef || proposal.sources.some(source => source.actor.userId === auth.source.actor.userId)) {
+        throw new GroupMemoryError('文化候选需要另一位当前管理员审核，不能自行通过。')
+      }
+      // One current description per subtype. Conflicting proposals stay pending until explicit correction/forget.
+      const rows = options.database.prepare(`SELECT p.revision_wire FROM heads h JOIN revision_payloads p
+        ON p.namespace_ref = h.namespace_ref AND p.namespace_generation = h.namespace_generation
+        AND p.memory_id = h.memory_id AND p.revision = h.current_revision
+        WHERE h.namespace_ref = ? AND h.namespace_generation = ? AND h.valid_until_ms > ?
+        AND json_extract(p.revision_wire, '$.record.kind') = 'group_culture' LIMIT 64`).all(
+        auth.namespaceRef, auth.generation, Date.parse(auth.now))
+      if (rows.some(row => cultureKindV1(JSON.parse(String(row.revision_wire)).record.text) === cultureKindV1(proposal.text))) {
+        throw new GroupMemoryError('该类别已有文化描述，候选保持待审核。请明确更正或遗忘旧描述后再审核，不能覆盖。')
+      }
+      const approval = buildMemoryProposalApprovalBundleV1({ commandRef: ref(auth, 'proposal.approve'), operation: 'proposal.approve',
+        namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation, proposal,
+        approvedByActorRef: auth.actorRef, freshNow: auth.now, evidenceSource: auth.source, reason: null })
+      await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal)
+      await reply('已保存当前群的文化描述；仅作参考，不代表全群共识或群规则。')
+      return true
+    }
+    return false
+  }
   const commands: PersonalMemoryCommandPortV1 = Object.freeze({
     async handle (request: PersonalMemoryCommandRequestV1): Promise<boolean> {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 8_000)
       try {
-        if (!/^#群记忆(?:\s|$)/u.test(request.text)) return false
+        if (!/^#群(?:记忆|文化)(?:\s|$)/u.test(request.text)) return false
+        const isCulture = /^#群文化(?:\s|$)/u.test(request.text)
+        if (isCulture && ((request.event as any)?.source || (request.event as any)?.message?.some?.((segment: any) =>
+          ['reply', 'forward', 'image', 'json', 'xml', 'record', 'video'].includes(segment.type)))) {
+          throw new GroupMemoryError('文化提案仅接受当前发言的纯文字，不接受引用、转发或媒体。')
+        }
         const event = request.event as any
         const messageId = String(event?.message_id ?? '')
         if (!/^[\x21-\x7e]{1,128}$/u.test(messageId)) throw new GroupMemoryError('无法核实当前消息编号。')
+        if (isCulture && !cultureEnabled(String(event?.group_id))) throw new GroupMemoryError('当前群未启用文化提案。')
         const auth = await authorize(event, request.text, messageId, controller.signal)
-        const body = request.text.replace(/^#群记忆\s*/u, '').trim()
+        const body = request.text.replace(/^#群(?:记忆|文化)\s*/u, '').trim()
+        if (isCulture && await cultureCommand(auth, body, request.replyText)) return true
+        if (isCulture && !/^(?:列表|更正|续期|遗忘|帮助|状态|$)/u.test(body)) {
+          await request.replyText('群文化命令：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号；列表；更正/续期/遗忘 @编号。仅文字描述，不代表群共识。')
+          return true
+        }
         if (body === '帮助' || body === '' || body === '状态') {
-          await request.replyText(HELP)
+          await request.replyText(isCulture ? '群文化：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号。已保存的描述可用列表、更正、续期、遗忘管理；不代表群共识。' : HELP)
         } else if (/^列表(?:\s+[1-9][0-9]{0,2})?$/u.test(body)) {
           const page = Number(body.split(/\s+/u)[1] ?? 1)
           if (page > MEMORY_RESOURCE_LIMITS.namespaceActiveRecords / 8) throw new GroupMemoryError('群记忆页码超出范围。')
-          const items = await records(auth, page)
+          let items = await records(auth, page)
+          if (isCulture) {
+            const culture = []
+            let cursor: string | null = null
+            for (let index = 0; index < Math.ceil(MEMORY_RESOURCE_LIMITS.namespaceActiveRecords / 64); index += 1) {
+              const result = await options.control.execute({ ...controlBase(auth), operation: 'record.listSafe',
+                cursor, limit: 64, maxWireBytes: MEMORY_RESOURCE_LIMITS.listPageWireBytes })
+              if (result.status !== 'page' || result.operation !== 'record.listSafe') throw new GroupMemoryError('文化列表暂时不可用。')
+              culture.push(...result.records.filter(record => record.kind === 'group_culture'))
+              if (result.nextCursor === null) break
+              cursor = result.nextCursor
+            }
+            items = culture.slice((page - 1) * 8, page * 8)
+          }
           await request.replyText(items.length === 0 ? (page === 1 ? '当前群还没有群记忆。' : '这一页没有群记忆。') :
             `当前群记忆（第 ${page} 页）：\n${items.map(r => `@${r.memoryId.slice(-8)} [${r.kind}] ${[...r.text].slice(0, 120).join('')}`).join('\n')}`)
         } else if (body === '导出') {
@@ -238,6 +351,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           let match = /^记住\s+(规则|共同偏好|文化|群体事实)\s+([\s\S]+)$/u.exec(body)
           if (match !== null) {
             const text = groupMemoryTextV1(match[2]!)
+            if (cultureKindV1(text) !== null) throw new GroupMemoryError('分类文化描述请使用群文化提议并由另一位管理员审核。')
             const kind: MemoryKindV1 = match[1] === '规则' ? 'group_rule' :
               match[1] === '文化' || match[1] === '共同偏好' ? 'group_culture' : 'other'
             const commandRef = ref(auth, 'proposal.create')
@@ -256,6 +370,8 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           } else if ((match = /^更正\s+(\S+)\s+([\s\S]+)$/u.exec(body)) !== null) {
             const text = groupMemoryTextV1(match[2]!)
             const before = await revision(auth, match[1]!)
+            if (isCulture && before.record.kind !== 'group_culture') throw new GroupMemoryError('群文化命令只能修改文化描述。')
+            if (cultureKindV1(before.record.text) !== null && cultureKindV1(text) !== cultureKindV1(before.record.text)) throw new GroupMemoryError('更正分类文化描述时请保留原类别前缀。')
             await mutate(auth, 'record.correct', buildMemoryCorrectionBundleV1({ commandRef: ref(auth, 'record.correct'),
               operation: 'record.correct', namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation,
               beforeRevision: before, changedByActorRef: auth.actorRef, freshNow: auth.now, text, confidence: 1,
@@ -267,6 +383,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
             const days = Number(match[2] ?? 30)
             if (!Number.isSafeInteger(days) || days < 1 || days > 1825) throw new GroupMemoryError('续期天数必须为 1 到 1825。')
             const before = await revision(auth, match[1]!)
+            if (isCulture && before.record.kind !== 'group_culture') throw new GroupMemoryError('群文化命令只能修改文化描述。')
             await mutate(auth, 'record.renew', buildMemoryRenewalBundleV1({ commandRef: ref(auth, 'record.renew'),
               operation: 'record.renew', namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation,
               beforeRevision: before, changedByActorRef: auth.actorRef, freshNow: auth.now,
@@ -276,7 +393,9 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
               reason: '群管理员续期群记忆' }), before)
             await request.replyText('当前群记忆已续期。')
           } else if ((match = /^遗忘\s+(\S+)$/u.exec(body)) !== null) {
-            await mutate(auth, 'record.forget', null, await revision(auth, match[1]!))
+            const before = await revision(auth, match[1]!)
+            if (isCulture && before.record.kind !== 'group_culture') throw new GroupMemoryError('群文化命令只能遗忘文化描述。')
+            await mutate(auth, 'record.forget', null, before)
             await request.replyText('已遗忘当前群的这条记忆。')
           } else await request.replyText(HELP)
         }
@@ -310,10 +429,22 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           limits: options.recallLimits(), requestedAt: retrievalAt,
           deadlineAt })
         if (input.dependencyCheck !== undefined) {
+          if (!cultureEnabled(String((input.event as any)?.group_id))) {
+            for (const dependency of input.dependencyCheck) {
+              const row = options.database.prepare(`SELECT revision_wire FROM revision_payloads WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ? AND revision = ?`).get(
+                auth.namespaceRef, auth.generation, dependency.memoryId, dependency.revision)
+              if (row !== undefined) {
+                const record = JSON.parse(String(row.revision_wire)).record
+                if (record.kind === 'group_culture' && cultureKindV1(record.text) !== null) return { schemaVersion: 2, status: 'unavailable', reason: 'policy_unavailable' }
+              }
+            }
+          }
           if (!await validateCanonicalMemoryDependencies(options.database, request, input.dependencyCheck, controller.signal)) return { schemaVersion: 2, status: 'unavailable', reason: 'canonical_unavailable' }
           return { schemaVersion: 2, status: 'completed', mode: 'none', candidates: [], index: { lexical: 'disabled', vector: 'disabled', watermark: null } }
         }
-        return await retrieveMemoryV2(options.retriever, request, { signal: controller.signal })
+        const result = await retrieveMemoryV2(options.retriever, request, { signal: controller.signal })
+        if (result.status !== 'completed' || cultureEnabled(String((input.event as any)?.group_id))) return result
+        return { ...result, candidates: result.candidates.filter(c => c.kind !== 'group_culture' || cultureKindV1(c.text) === null) }
       } catch {
         return { schemaVersion: 2, status: 'unavailable', reason: 'policy_unavailable' }
       } finally {

@@ -240,3 +240,12 @@ test('disk log saves require restart while ordinary live fields keep the normal 
     '保存成功；部分模型传输、运行入口、落盘日志或 Chromium 配置将在重启后生效~'
   )
 })
+
+
+test('culture pilots reject malformed, duplicate and oversized lists and require restart', () => {
+  assert.deepEqual(normalizeGuobaConfigValue('groupCultureGroups', ['123456']), ['123456'])
+  for (const value of [null, '123456', [123456], ['invalid'], ['123456', '123456'], Array.from({ length: 65 }, (_, i) => String(i + 1))]) {
+    assert.throws(() => normalizeGuobaConfigValue('groupCultureGroups', value))
+  }
+  assert.match(guobaConfigSaveMessage(['groupCultureGroups']), /重启/)
+})

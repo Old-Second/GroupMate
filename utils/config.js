@@ -162,6 +162,7 @@ const defaultConfig = {
   apiContextWindowTokens: 0,
   personalMemoryMode: 'automatic',
   personalMemoryGroupAllowlist: [],
+  groupCultureGroups: [],
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1200,
   personalMemoryRecallTimeoutMs: 150,

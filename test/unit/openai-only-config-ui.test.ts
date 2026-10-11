@@ -146,6 +146,7 @@ const requiredGuobaFields = [
   'conversationPreserveTime',
   'personalMemoryMode',
   'personalMemoryGroupAllowlist',
+  'groupCultureGroups',
   'personalMemoryRecallMaxItems',
   'personalMemoryRecallMaxTokens',
   'personalMemoryRecallTimeoutMs',
@@ -268,7 +269,7 @@ const expectedGuobaGroups = [
   {
     label: '长期记忆',
     fields: [
-      'personalMemoryMode', 'personalMemoryGroupAllowlist',
+      'personalMemoryMode', 'personalMemoryGroupAllowlist', 'groupCultureGroups',
       'personalMemoryRecallMaxItems', 'personalMemoryRecallMaxTokens',
       'personalMemoryRecallTimeoutMs', 'personalMemoryOperationsStatus',
       'personalMemoryMaintenanceAction'

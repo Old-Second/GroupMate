@@ -13,7 +13,7 @@ export class memory extends plugin {
       event: 'message',
       priority: 490,
       rule: [
-        { reg: '^#(?:长期记忆|群记忆)(?:\\s*.*)?$', fnc: 'personalMemory' }
+        { reg: '^#(?:长期记忆|群记忆|群文化)(?:\\s*.*)?$', fnc: 'personalMemory' }
       ]
     })
   }
@@ -27,7 +27,7 @@ export class memory extends plugin {
         await event.reply(text, true)
       },
       sendPrivateFile: async (filePath, fileName) => {
-        if (event?.isGroup === true && /^#群记忆/u.test(event?.msg ?? '')) {
+        if (event?.isGroup === true && /^#群(?:记忆|文化)/u.test(event?.msg ?? '')) {
           const friend = event?.bot?.pickFriend?.(event.user_id)
           if (typeof friend?.sendFile !== 'function') throw new TypeError('group memory private export is unavailable')
           await friend.sendFile(filePath, fileName)

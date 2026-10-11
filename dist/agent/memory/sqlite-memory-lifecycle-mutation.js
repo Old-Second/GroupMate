@@ -1,3 +1,4 @@
+import { culturePendingCapacityV1, cultureRecordCapacityV1, cultureSubtypeAvailableV1 } from './SqliteCultureLimits.js';
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
 import { memoryAccessCapabilityAllowsV1 } from './memory-access-gate.js';
@@ -1263,6 +1264,10 @@ function executeProposalCreate(database, envelope, wire, commandHash, freshNow) 
         const unchanged = storedResult('proposal.create', commandHash, proposal.proposalId, 1, proposalResultHash(proposalWire), 'unchanged');
         return commitStableResult(database, wire, commandHash, aggregateRef, unchanged, ZERO_DELTA, [], freshNow);
     }
+    if (proposal.namespace.scope.kind === 'group' && proposal.kind === 'group_culture' &&
+        !culturePendingCapacityV1(database, namespaceRef, wire.expectedNamespaceGeneration)) {
+        throw new LifecycleMutationCapacityErrorV1('pending_proposals');
+    }
     requireOneChange(database.prepare(`
     INSERT INTO proposals(
       namespace_ref, namespace_generation, proposal_id, revision, state,
@@ -1369,6 +1374,14 @@ function executeProposalDecision(database, envelope, wire, commandHash, freshNow
         }
         if (head !== null && head.revision.revision >= MEMORY_RESOURCE_LIMITS.memoryRetainedRevisions) {
             throw new LifecycleMutationCapacityErrorV1('retained_revisions');
+        }
+        if (head === null && proposal.kind === 'group_culture' &&
+            !cultureSubtypeAvailableV1(database, wire.namespaceRef, wire.expectedNamespaceGeneration, proposal.text, Date.parse(freshNow))) {
+            return resultFor(operation, commandHash, { status: 'conflict', category: 'revision' });
+        }
+        if (head === null && proposal.kind === 'group_culture' &&
+            !cultureRecordCapacityV1(database, wire.namespaceRef, wire.expectedNamespaceGeneration)) {
+            throw new LifecycleMutationCapacityErrorV1('active_records');
         }
         const bundle = head === null
             ? buildMemoryProposalApprovalBundleV1({

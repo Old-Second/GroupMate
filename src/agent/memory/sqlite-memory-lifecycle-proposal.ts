@@ -1,3 +1,4 @@
+import { cultureRecordCapacityV1 } from './SqliteCultureLimits.js'
 import { createHash } from 'node:crypto'
 import { types as utilTypes } from 'node:util'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
@@ -733,6 +734,10 @@ function executeCreateAndApprove (
   if (replay !== null) return replay
   if (Date.parse(wire.occurredAt) > Date.parse(freshNow)) {
     return denied(commandHash, 'authority')
+  }
+  if (bundle.record.namespace.scope.kind === 'group' && bundle.record.kind === 'group_culture' &&
+    !cultureRecordCapacityV1(database, wire.namespaceRef, wire.expectedNamespaceGeneration)) {
+    return resultFor(wire.operation, commandHash, { status: 'capacity', category: 'active_records' })
   }
   const globalBefore = loadGlobalUsage(database)
   const namespace = loadNamespaceState(database, bundle)

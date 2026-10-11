@@ -720,6 +720,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       ...(shadow === undefined ? {} : { clearCandidateJobs: shadow.clearNamespace })
     })
     const groupMemory = createGroupMemoryV1({
+      ...(options.cultureGroups === undefined ? {} : { cultureGroups: options.cultureGroups }),
       botInstanceId: options.botInstanceId, database: canonical.database,
       enabled: () => ['explicit', 'shadow', 'automatic'].includes(options.deploymentMode()),
       groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist), now: nowIso,
@@ -807,7 +808,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         )
       }),
       commands: Object.freeze({
-        handle: async (request: Parameters<typeof commands.handle>[0]) => /^#群记忆(?:\s|$)/u.test(request.text)
+        handle: async (request: Parameters<typeof commands.handle>[0]) => /^#群(?:记忆|文化)(?:\s|$)/u.test(request.text)
           ? await groupMemory.commands.handle(request) : await commands.handle(request)
       }),
       ...(shadow === undefined ? {} : {

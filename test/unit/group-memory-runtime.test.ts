@@ -4,14 +4,17 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
+import { projectMemoryRetrievalContextV2 } from '../../src/agent/memory/memory-context-projection.js'
+import { projectCultureRecordV1 } from '../../src/agent/contracts/CultureRecord.js'
 import { createProductionPersonalMemoryRuntimeV1 } from '../../src/runtime/production-personal-memory-runtime.js'
 
 async function fixture (t: { after: (fn: () => unknown) => void }) {
   const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-group-memory-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
+  let cultureGroups = ['40004']
   const runtime = await createProductionPersonalMemoryRuntimeV1({ botInstanceId: 'groupmate-production',
     storageDirectory: directory, deploymentMode: () => 'automatic', groupAllowlist: () => ['40004', '50005'],
-    recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150 })
+    cultureGroups: () => cultureGroups, recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150 })
   t.after(async () => await runtime.close())
   const db = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
   t.after(() => db.close())
@@ -28,9 +31,9 @@ async function fixture (t: { after: (fn: () => unknown) => void }) {
       if (!lookupAvailable) throw new Error('unavailable')
       return { user_id: input.user_id, role: String(input.user_id) === '10001' ? 'member' : role, join_time: joined }
     } } })
-  const send = async (text: string, groupId = '40004') => {
+  const send = async (text: string, groupId = '40004', userId = '20002', extras = {}) => {
     const replies: string[] = []
-    await runtime.commands.handle({ event: event(groupId), text,
+    await runtime.commands.handle({ event: { ...event(groupId, userId), ...extras }, text,
       replyText: async value => { replies.push(value) }, sendPrivateFile: async () => undefined })
     return replies.join('\n')
   }
@@ -47,7 +50,7 @@ async function fixture (t: { after: (fn: () => unknown) => void }) {
       event: e, queryText: '与检索排名无关的边界校验', messageEvidence: { schemaVersion: 1, prompt: '新问题', imageUrls: [],
         currentMessageId: e.message_id, quotedMessageId: null, hasReply: false } }, refs, new AbortController().signal)
   }
-  return { runtime, db, send, recall, authority, setRole: (value: string) => { role = value },
+  return { runtime, db, send, recall, authority, setCultureGroups: (groups: string[]) => { cultureGroups = groups }, setRole: (value: string) => { role = value },
     setJoined: (value: number) => { joined = value }, refreshCount: () => refreshed,
     stopLookup: () => { lookupAvailable = false }, directory }
 }
@@ -161,4 +164,121 @@ test('group owner export delivers a bounded canonical artifact while administrat
   assert.match(replies.join(''), /已私发导出/)
   assert.ok(file.endsWith('.jsonl'))
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM export_jobs WHERE state = 'delivered'").get()?.n, 1)
+})
+
+
+test('culture requires independent current admin review and remains descriptive untrusted data', async t => {
+  const f = await fixture(t)
+  f.setRole('member')
+  const proposed = await f.send('#群文化 提议 主题偏好 本群偏好讨论望远镜')
+  const proposal = /@[0-9a-f]{8}/u.exec(proposed)![0]
+  assert.match(proposed, /尚未保存/)
+  assert.equal((await f.recall('望远镜')).candidates?.length ?? 0, 0)
+  assert.match(await f.send(`#群文化 通过 ${proposal}`, '40004', '30003'), /只有当前群/)
+  f.setRole('admin')
+  assert.match(await f.send(`#群文化 通过 ${proposal}`), /不能自行通过/)
+  assert.match(await f.send('#群文化 候选'), /望远镜/)
+  assert.match(await f.send(`#群文化 通过 ${proposal}`, '40004', '30003'), /不代表全群共识/)
+  const recalled = await f.recall('望远镜')
+  assert.equal(recalled.candidates.length, 1)
+  const culture = projectCultureRecordV1(recalled.candidates[0])!
+  assert.equal(culture.kind, 'topic_preference')
+  assert.equal(culture.consensusVerified, false)
+  assert.equal(culture.descriptionOnly, true)
+  assert.equal(culture.sources.length, 1)
+  assert.ok(Date.parse(culture.validUntil) - Date.now() <= 30 * 86400000)
+  const memory = projectMemoryRetrievalContextV2(recalled)[0]!
+  assert.equal(memory.message.provenance.trust, 'untrusted')
+  assert.match(JSON.stringify(memory), /不证明全群共识/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM consent_evidence').get()?.n, 1)
+  assert.equal((await f.recall('望远镜', '50005')).candidates?.length ?? 0, 0)
+})
+
+test('culture conflict remains pending; explicit correction, renewal, forgetting and authority invalidation work', async t => {
+  const f = await fixture(t)
+  const propose = async (text: string) => /@[0-9a-f]{8}/u.exec(await f.send(`#群文化 提议 语言约定 ${text}`))![0]
+  const first = await propose('本群使用短句')
+  await f.send(`#群文化 通过 ${first}`, '40004', '30003')
+  const initial = await f.recall('短句')
+  const refs = initial.candidates.map((c: any) => ({ namespaceRef: c.namespaceRef, memoryId: c.memoryId,
+    revision: c.revision, revisionHash: c.revisionHash }))
+  assert.ok(await f.authority(refs))
+  const second = await propose('本群使用长句')
+  assert.match(await f.send(`#群文化 通过 ${second}`, '40004', '30003'), /保持待审核/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+  assert.match(await f.send('#群文化 候选'), /长句/)
+  assert.match(await f.send(`#群文化 拒绝 ${second}`, '40004', '30003'), /已拒绝/)
+  const memory = /@[0-9a-f]{8}/u.exec(await f.send('#群文化 列表'))![0]
+  assert.match(await f.send(`#群文化 更正 ${memory} 本群语言约定：本群使用简短句子`), /已更正/)
+  assert.equal(await f.authority(refs), null)
+  assert.match(await f.send(`#群文化 续期 ${memory} 2`), /已续期/)
+  assert.match(await f.send(`#群文化 遗忘 ${memory}`), /已遗忘/)
+  assert.equal((await f.recall('简短句子')).candidates?.length ?? 0, 0)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM revision_payloads').get()?.n, 0)
+})
+
+test('culture pilot, fresh role, scope, text source and sensitive content gates cannot be bypassed', async t => {
+  const f = await fixture(t)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '50005'), /未启用/)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '60006'), /未启用/)
+  for (const extras of [{ source: { seq: 1 } }, { message: [{ type: 'reply' }] }, { message: [{ type: 'image' }] }]) {
+    assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '40004', '20002', extras), /纯文字/)
+  }
+  for (const text of ['本群禁止刷屏', '本群要求讨论望远镜']) {
+    assert.match(await f.send(`#群文化 提议 主题偏好 ${text}`), /群规则/)
+  }
+  for (const text of ['小明喜欢喝茶', '本群共同偏好是我喜欢绿茶', '本群成员的手机号是12345678901']) {
+    assert.match(await f.send(`#群文化 提议 主题偏好 ${text}`), /只保存明确/)
+  }
+  await f.send('#群记忆 记住 规则 本群禁止刷屏')
+  const rule = /@[0-9a-f]{8}/u.exec(await f.send('#群记忆 列表'))![0]
+  assert.match(await f.send(`#群文化 遗忘 ${rule}`), /只能遗忘文化/)
+  f.stopLookup()
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗'), /无法核实/)
+  assert.equal(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 0)
+})
+
+test('culture pending and approved caps are atomic canonical limits without reducing group rule capacity', async t => {
+  const f = await fixture(t)
+  for (let i = 0; i < 32; i += 1) {
+    assert.match(await f.send(`#群文化 提议 梗说明 本群使用第${i}种星球梗`), /已提交/)
+  }
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用第32种星球梗'), /未完成/)
+  assert.equal(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 32)
+  const candidate = /@[0-9a-f]{8}/u.exec(await f.send('#群文化 候选'))![0]
+  assert.match(await f.send(`#群文化 拒绝 ${candidate}`), /已拒绝/)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用新星球梗'), /已提交/)
+  for (const row of f.db.prepare("SELECT proposal_id FROM proposals WHERE state = 'pending'").all()) {
+    await f.send(`#群文化 拒绝 @${String(row.proposal_id).slice(-8)}`)
+  }
+  for (let i = 0; i < 64; i += 1) {
+    // Existing manual admin assertions retain their semantics; they also obey the shared culture cap.
+    assert.match(await f.send(`#群记忆 记住 文化 本群每周读第${i}种科幻小说`), /已保存/)
+  }
+  assert.match(await f.send('#群记忆 记住 文化 本群每周读新科幻小说'), /未完成/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 64)
+  assert.match(await f.send('#群记忆 记住 规则 本群禁止刷屏'), /已保存/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 65)
+})
+
+
+test('culture disabled recall and live dependency authority fail closed while legacy culture remains', async t => {
+  const f = await fixture(t)
+  const proposal = /@[0-9a-f]{8}/u.exec(await f.send('#群文化 提议 主题偏好 本群喜欢讨论望远镜'))![0]
+  await f.send(`#群文化 通过 ${proposal}`, '40004', '30003')
+  await f.send('#群记忆 记住 文化 本群每周读科幻小说')
+  const initial = await f.recall('望远镜')
+  const refs = initial.candidates.map((c: any) => ({ namespaceRef: c.namespaceRef, memoryId: c.memoryId,
+    revision: c.revision, revisionHash: c.revisionHash }))
+  assert.ok(await f.authority(refs))
+  f.setCultureGroups([])
+  assert.equal((await f.recall('望远镜')).candidates?.length ?? 0, 0)
+  assert.equal(await f.authority(refs), null)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗'), /未启用/)
+  assert.equal((await f.recall('科幻小说')).candidates?.length, 1)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 2)
+  f.setCultureGroups(['40004'])
+  assert.ok(await f.authority(refs))
+  f.setJoined(1700000200)
+  assert.equal(await f.authority(refs), null)
 })

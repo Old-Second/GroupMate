@@ -8,7 +8,7 @@ const IDENTIFIER_LIST_FIELDS = new Set([
     'bymDisableGroup'
 ]);
 const GROUP_IDENTIFIER_LIST_FIELDS = new Set([
-    'personalMemoryGroupAllowlist'
+    'personalMemoryGroupAllowlist', 'groupCultureGroups'
 ]);
 const QQ_SCOPE_FIELDS = new Set([
     'whitelist',
@@ -55,6 +55,7 @@ export const RESTART_REQUIRED_CONFIG_FIELDS = new Set([
     'diskLogEnabled',
     'personalMemoryMode',
     'personalMemoryGroupAllowlist',
+    'groupCultureGroups',
     'personalMemoryRecallMaxItems',
     'personalMemoryRecallMaxTokens',
     'personalMemoryRecallTimeoutMs',
@@ -134,7 +135,7 @@ export function normalizeGuobaConfigValue(key, value) {
             throw new TypeError('群参与模式配置无效。');
         return value;
     }
-    if (key === 'participationActiveGroups') {
+    if (key === 'participationActiveGroups' || key === 'groupCultureGroups') {
         if (!Array.isArray(value) || value.length > 64 || value.some(group => typeof group !== 'string' || !/^[1-9]\d{0,19}$/.test(group)) ||
             new Set(value).size !== value.length)
             throw new TypeError('受控参与群列表配置无效。');

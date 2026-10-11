@@ -30,6 +30,7 @@ export interface ProductionPersonalMemoryRuntimeOptionsV1 {
   readonly storageDirectory: string
   readonly deploymentMode: () => ProductionPersonalMemoryModeV1
   readonly groupAllowlist: () => readonly string[]
+  readonly cultureGroups?: () => readonly string[]
   readonly recallMaxItems: () => number
   readonly recallMaxTokens: () => number
   readonly recallTimeoutMs: () => number
@@ -94,6 +95,7 @@ export async function initializeProductionPersonalMemoryRuntimeV1 (
     storageDirectory: options.storageDirectory,
     deploymentMode: options.deploymentMode,
     groupAllowlist: options.groupAllowlist,
+    ...(options.cultureGroups === undefined ? {} : { cultureGroups: options.cultureGroups }),
     recallMaxItems: options.recallMaxItems,
     recallMaxTokens: options.recallMaxTokens,
     recallTimeoutMs: options.recallTimeoutMs,
