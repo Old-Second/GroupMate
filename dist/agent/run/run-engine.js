@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
 import { completionFromTerminalOutput } from '../contracts/completion.js';
+import { hasInternalReplyBlock } from './FinalReplyPolicy.js';
 import { AgentError, serializeAgentError } from '../contracts/error.js';
 import { parseProviderAttemptEventPayload } from '../contracts/event.js';
 import { contextArtifactRefsRetainedOrCleared } from '../context/context-artifact-ref-transition.js';
@@ -2123,7 +2124,7 @@ export class RunEngine {
                 });
             }
             const normalizedText = text.normalize('NFC').trim();
-            if (finishReason === 'stop' && normalizedText.length > 0) {
+            if (finishReason === 'stop' && normalizedText.length > 0 && !hasInternalReplyBlock(normalizedText)) {
                 const output = this.#assistantMessage(checkpoint, normalizedText);
                 const completion = completionFromTerminalOutput({
                     requestKind: checkpoint.requestKind,

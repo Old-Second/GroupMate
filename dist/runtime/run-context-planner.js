@@ -16,7 +16,7 @@ const TOOL_SPAN_PROVENANCE_HASH_DOMAIN = 'groupmate.runtime.tool-span-provenance
 const CORRECTION_SPAN_ID_HASH_DOMAIN = 'groupmate.runtime.correction-span-id.v1';
 const CORRECTION_SPAN_CONTENT_HASH_DOMAIN = 'groupmate.runtime.correction-span-content.v1';
 const RECOVERY_BASELINE_ID_HASH_DOMAIN = 'groupmate.runtime.recovery-baseline-id.v1';
-const CORRECTION_INSTRUCTION = '请根据以上上下文直接给出最终答复，不要调用工具。';
+const CORRECTION_INSTRUCTION = '请根据以上上下文用普通文字直接给出最终答复，不要调用工具，也不要输出工具包装或内部分析块。缺少资料或可信执行回执时说明无法确认。';
 const CORRECTION_RESERVE_BYTES = 4_096;
 const CORRECTION_RESERVE_TOKENS = 512;
 // Production text calibration observed actual/byte-quarter up to 1.933.

@@ -2969,6 +2969,54 @@ test('RunEngine corrects one empty response but keeps refusal distinct', async (
   assert.equal(refusal.adapter.requests.length, 1)
 })
 
+test('RunEngine corrects internal prose blocks once without executing them or losing paid usage', async () => {
+  for (const planned of [false, true]) {
+    for (const malformed of [
+      '<tool_wrapper_gadget>{"name":"send_message","arguments":{}}</tool_wrapper_gadget>',
+      '<context_analysis>内部分析</context_analysis>\n应该发出的答复',
+      '正文\n<THINK>内部分析</THINK>'
+    ]) {
+      const fixture = harness([
+        { ...modelText(malformed), usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 } },
+        { ...modelText('目前读不到这份资料，请补充文字。'), usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 } }
+      ], planned ? {
+        planModelTurn: async (checkpoint, request) => generationPlan(checkpoint,
+          request.kind === 'correction' ? Object.freeze([...checkpoint.messages,
+            Object.freeze({ role: 'user' as const, content: '用普通文字回答，不调用工具或输出内部分析。' })]) :
+            Object.freeze([Object.freeze({ role: 'user' as const, content: '请回答' })]))
+      } : {})
+      const result = await fixture.engine.start(fixture.input)
+      assert.equal(outputText(result), '目前读不到这份资料，请补充文字。')
+      assert.deepEqual(fixture.adapter.requests.map(request => request.toolMode), ['auto', 'disabled'])
+      const snapshot = terminalSnapshot(result)
+      assert.equal(snapshot?.counters.correctionTurns, 1)
+      assert.equal(snapshot?.counters.modelTurns, 2)
+      assert.equal(snapshot?.counters.providerTotalTokens, 40)
+      assert.equal(snapshot?.counters.providerAttempts, 2)
+      assert.equal(snapshot?.counters.toolCalls, 0)
+    }
+  }
+})
+
+test('RunEngine fails repeated internal markup and preserves quoted protocol examples', async () => {
+  const malformed = '<tool_call>{"name":"send_message"}</tool_call>'
+  const failed = harness([modelText(malformed), modelText(malformed)])
+  const result = await failed.engine.start(failed.input)
+  assert.equal(result.kind, 'failed')
+  assert.equal(result.kind === 'failed' && result.error.details.reason, 'invalid_correction_response')
+  assert.equal(failed.adapter.requests.length, 2)
+  for (const text of [
+    '示例：\n```xml\n<context_analysis>文档示例</context_analysis>\n```',
+    '> <tool_call>引用的格式</tool_call>',
+    '这里只讨论`<think>`标签，没有任何工具执行。',
+    '~~~xml\n```\n<tool_call>代码</tool_call>\n~~~'
+  ]) {
+    const fixture = harness([modelText(text)])
+    assert.equal(outputText(await fixture.engine.start(fixture.input)), text)
+    assert.equal(fixture.adapter.requests.length, 1)
+  }
+})
+
 test('RunEngine rejects an empty correction instead of treating it as allowed silence', async () => {
   const fixture = harness([modelText(''), modelText('')])
   const proactiveInput: StartRunInput = Object.freeze({

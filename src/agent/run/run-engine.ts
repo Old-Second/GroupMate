@@ -4,6 +4,7 @@ import { Buffer } from 'node:buffer'
 import { performance } from 'node:perf_hooks'
 import type { AgentMessage } from '../contracts/content.js'
 import { completionFromTerminalOutput } from '../contracts/completion.js'
+import { hasInternalReplyBlock } from './FinalReplyPolicy.js'
 import {
   AgentError,
   serializeAgentError,
@@ -2815,7 +2816,7 @@ export class RunEngine {
       }
 
       const normalizedText = text.normalize('NFC').trim()
-      if (finishReason === 'stop' && normalizedText.length > 0) {
+      if (finishReason === 'stop' && normalizedText.length > 0 && !hasInternalReplyBlock(normalizedText)) {
         const output = this.#assistantMessage(checkpoint, normalizedText)
         const completion = completionFromTerminalOutput({
           requestKind: checkpoint.requestKind,
