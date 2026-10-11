@@ -78,3 +78,18 @@ test('active pilot configuration rejects wildcards, duplicates, overflow and coe
     assert.throws(()=>normalizeGuobaConfigValue('participationActiveGroups',invalid))
   }
 })
+
+test('ordinary and BYM selection share one message route before and after successful delivery', () => {
+  const h = harness(), e = h.event(), run = h.host.selectOrdinary(e)
+  assert(run)
+  assert.equal(h.host.select(e, true, true), null)
+  assert.equal(h.host.selectOrdinary(e), null)
+  // A new explicit message remains an ordinary queued request while an earlier candidate owns qualification.
+  const queued = h.event()
+  assert.equal(h.host.selectOrdinary(queued), undefined)
+  assert.equal(h.host.select(queued, true, true), null)
+  run.admit(); run.finish(true)
+  assert.equal(h.host.select(e, true, true), null)
+  const next = h.host.select(h.event(), false, false); assert(next); next.finish(false)
+  h.host.close()
+})

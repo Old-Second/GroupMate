@@ -210,6 +210,32 @@ test('sent cancellation notices cannot establish active continuation', async () 
   assert.equal(h.select(false), null)
 })
 
+test('ordinary direct replies share active qualification while persisted sessions retain only content dependencies', async () => {
+  const h = activeHarness(false), participation = h.select(true); assert(participation)
+  let saved: AgentSessionState | undefined, queued = 0, starts = 0
+  const service = new AgentService({ sessions: contractSessions(async record => { saved = record.state }),
+    runStore: new InMemoryRunStore(), admission: { acquire: async () => { queued++; return noOpLease() }, recover: async () => noOpLease() },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ start: async input => {
+      starts++
+      assert.equal(input.runtime.contextDependencies?.requiresLiveParticipation, true)
+      await input.runtime.checkBoundary?.('provider', new AbortController().signal)
+      return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: '普通点名答复' })
+    } }), createRuntime: async () => contractRuntime()
+  })
+  const result = await service.handle(request('ordinary-active', '点名'), { participation })
+  assert.equal(result.kind, 'completed')
+  if (result.kind !== 'completed') assert.fail('ordinary run failed')
+  assert.equal(result.sessionPersistence, 'saved')
+  assert(saved && saved.schemaVersion === 2)
+  assert(saved.contextDependencies)
+  assert.equal(Object.hasOwn(saved.contextDependencies, 'requiresLiveParticipation'), false)
+  notifyRunFinalDelivery(result, true)
+  const next = h.select(false); assert(next)
+  const invalid = await service.handle(request('ordinary-passive', '不合法入口'), { participation: next })
+  assert.equal(invalid.kind, 'failed'); assert.equal(queued, 1); assert.equal(starts, 1)
+})
+
 const createdAt = '2026-07-14T01:00:00.000Z'
 const facts: ToolRuntimeFacts = Object.freeze({
   botId: 'bot-1',

@@ -856,7 +856,8 @@ export class AgentService {
             requestKind: draft.requestKind,
             startedAtMonotonicMs
         });
-        if ((options.participation !== undefined && (!ephemeral || !isParticipationRun(options.participation))) ||
+        if ((options.participation !== undefined && (!isParticipationRun(options.participation) ||
+            (!ephemeral && options.participation.admission !== 'queue'))) ||
             draft.requestKind !== (ephemeral ? 'proactive_chat' : 'ordinary_chat') ||
             (options.requestObservationContext !== undefined &&
                 (options.requestObservationContext.requestRef !== draft.requestRef ||
@@ -1318,7 +1319,11 @@ export class AgentService {
                 result.kind === 'completed' && contextCurrent) {
                 const sessionSaveStarted = readMonotonic(this.#monotonicNow);
                 try {
-                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString(), pending.binding.contextDependencies);
+                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString(), pending.participation === undefined || pending.binding.contextDependencies === undefined
+                        ? pending.binding.contextDependencies
+                        : Object.freeze({ schemaVersion: 1, memories: pending.binding.contextDependencies.memories,
+                            authorityStamp: pending.binding.contextDependencies.authorityStamp,
+                            ...(pending.binding.contextDependencies.scene === undefined ? {} : { scene: pending.binding.contextDependencies.scene }) }));
                     await this.#sessions.save(next, {
                         signal: undefined,
                         ...(pending.request.sessionTtlSeconds === undefined

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { ActiveParticipationHost } from '../../src/runtime/participation/ActiveParticipationHost.js'
 import type { PresentationRouteV1 } from '../../src/agent/contracts/interaction.js'
 import type { ChatReplyEnvelope } from '../../src/runtime/agent-service.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../../src/runtime/message-input.js'
@@ -184,6 +185,7 @@ function fixture (input: Readonly<{
   settings?: PresentationSettings
   presentationResult?: PresentationResult
   candidateEnqueue?: (input: unknown) => Promise<void>
+  activeParticipation?: YunzaiChatControllerOptions['activeParticipation']
 }> = {}) {
   const calls: string[] = []
   const commandReplies: Array<{ message: string, quote: boolean }> = []
@@ -200,6 +202,7 @@ function fixture (input: Readonly<{
   let deleteCalls = 0
   const currentPolicy = input.policy ?? policy
   const options: YunzaiChatControllerOptions = {
+    activeParticipation: input.activeParticipation,
     policy: {
       entryMode: () => currentPolicy.toggleMode,
       snapshot: async () => currentPolicy,
@@ -255,11 +258,16 @@ function fixture (input: Readonly<{
       }
     },
     requests: {
-      prepare: async ({ prompt, presentationIntent }) => {
+      prepare: async ({ prompt, presentationIntent, event: current }) => {
         preparationCalls += 1
         calls.push('prepare')
         requestInputs.push({ prompt, presentationIntent })
-        return preparedRequest(prompt, presentationIntent.forcePicture)
+        const prepared = preparedRequest(prompt, presentationIntent.forcePicture)
+        if (input.activeParticipation === undefined) return prepared
+        const actor = String(current.sender?.user_id ?? current.user_id)
+        return { ...prepared, route: { ...prepared.route,
+          sessionAddress: { botId: String(current.self_id), scope: { kind: 'group_user', groupId: String(current.group_id), userId: actor } },
+          actorId: actor, requestMessageId: String(current.message_id) } }
       }
     },
     agent: {
@@ -286,6 +294,7 @@ function fixture (input: Readonly<{
       handle: async (currentEvent, evidence, handleOptions) => {
         calls.push('agent')
         agentInputs.push({ currentEvent, evidence, handleOptions })
+        handleOptions.participation?.admit()
         if (input.agentError !== undefined) throw input.agentError
         return input.envelope ?? completedEnvelope()
       }
@@ -684,4 +693,34 @@ test('typed chat controller presents fixed errors without session deletion or ra
     '处理请求时出现异常，请稍后重试'
   ])
   assert.equal(current.presentationInputs.length, 0)
+})
+
+test('ordinary at mode qualifies only successful delivered replies for the shared active continuation', async () => {
+  for (const sent of [true, false]) {
+    const host = new ActiveParticipationHost(() => 1000,
+      () => ({ participationMode: 'active', participationActiveGroups: ['303'] }), () => 'bot-1', () => true)
+    const f = fixture({ policy: { ...policy, toggleMode: 'at' },
+      presentationResult: sent ? sentPresentationResult : presentationResult,
+      activeParticipation: current => host.select(current, true, false) })
+    const current = event({ group_id: 303, msg: '请回答', atme: true, message: [{ type: 'at', qq: 'bot-1' }] })
+    await f.controller.chatgpt(current)
+    assert.equal(f.agentInputs.length, 1)
+    const options = (f.agentInputs[0] as { handleOptions: { systemInstructions: readonly string[], participation: unknown } }).handleOptions
+    assert(options.participation)
+    assert(options.systemInstructions.some(s => s.includes('明确请求')))
+    const next = host.select({ ...current, msg: '下一步怎么办？', message: [], message_id: 'message-2' }, false, false)
+    assert.equal(next !== null, sent)
+    next?.finish(false)
+    host.close()
+  }
+})
+
+test('duplicate ordinary host selection stays silent while unavailable qualification preserves the explicit request', async () => {
+  const duplicate = fixture({ activeParticipation: () => null })
+  await duplicate.controller.chatgpt1(event())
+  assert.equal(duplicate.agentInputs.length, 0)
+  assert.equal(duplicate.presentationInputs.length, 0)
+  const unavailable = fixture({ activeParticipation: () => undefined })
+  await unavailable.controller.chatgpt1(event())
+  assert.equal(unavailable.agentInputs.length, 1)
 })

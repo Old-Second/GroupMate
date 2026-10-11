@@ -246,6 +246,8 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
         return;
     let prepared;
     let requestDiagnosticRecorded = false;
+    let participation;
+    let paused = false, deliveredSuccess = false;
     let latestCorrelation = Object.freeze({
         runRef: 'unavailable',
         terminalObservationId: 'not_attempted'
@@ -316,16 +318,21 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
             ? augmentedPrompt.slice(prepared.evidence.prompt.length).trim()
             : augmentedPrompt.trim();
         const ttl = positiveTtl(policy.sessionTtlSeconds);
+        participation = options.activeParticipation?.(event);
+        if (participation === null)
+            return;
         const handleOptions = Object.freeze({
             presentationRoute: prepared.route,
             presentationLifecycle: lifecycle,
             systemInstructions: Object.freeze([
                 systemInstruction,
-                ...(feedbackInstruction === '' ? [] : [feedbackInstruction])
+                ...(feedbackInstruction === '' ? [] : [feedbackInstruction]),
+                ...(participation?.instructions ?? [])
             ]),
             enableGroupContext: policy.enableGroupContext,
             thinkingMode: policy.thinkingMode,
             reasoningEffort: policy.reasoningEffort,
+            ...(participation == null ? {} : { participation }),
             ...(ttl === undefined ? {} : { sessionTtlSeconds: ttl })
         });
         const envelope = await options.agent.handle(event, prepared.evidence, handleOptions);
@@ -339,8 +346,10 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
             })
         }));
         requestDiagnosticRecorded = true;
-        if (envelope.kind === 'paused')
+        if (envelope.kind === 'paused') {
+            paused = true;
             return;
+        }
         const responseCorrelation = Object.freeze({
             runRef: envelope.runRef,
             terminalObservationId: envelope.runRef === 'unavailable'
@@ -358,6 +367,8 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
                     : {}
         }));
         const presentation = await presentFinal(options, prepared, presentationSettings, profile, hooks, envelope);
+        deliveredSuccess = envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
+            presentation.deliveries.some(delivery => delivery.kind === 'sent');
         if (options.postReplyCandidate !== undefined &&
             envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
             presentation.deliveries.some(delivery => delivery.kind === 'sent')) {
@@ -399,6 +410,10 @@ async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
             message: presentation.message,
             quote: true
         });
+    }
+    finally {
+        if (!paused)
+            participation?.finish(deliveredSuccess);
     }
 }
 function modeFromSuffix(message) {

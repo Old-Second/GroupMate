@@ -983,9 +983,9 @@ function graphFixture(input) {
             })
         }),
         chatPolicy: Object.freeze({
-            entryMode: () => 'prefix',
+            entryMode: () => input.activeOrdinary ? 'at' : 'prefix',
             snapshot: async () => Object.freeze({
-                toggleMode: 'prefix',
+                toggleMode: input.activeOrdinary ? 'at' : 'prefix',
                 enablePrivateChat: true,
                 whitelist: Object.freeze([]),
                 blacklist: Object.freeze([]),
@@ -1155,6 +1155,7 @@ export async function runPhase6ResourceScenario(scenario, options = {}) {
         : new ScenarioModel(scenario);
     const primary = graphFixture({
         activeParticipation: options.activeParticipation,
+        activeOrdinary: options.activeOrdinary,
         scenario,
         redis,
         host,
@@ -1169,12 +1170,18 @@ export async function runPhase6ResourceScenario(scenario, options = {}) {
     const cpuStart = process.cpuUsage();
     const wallStart = performance.now();
     const runChat = async (actorId, marker, picture = false, graph = primary.graph) => {
-        const event = groupEvent(actorId, marker, host, { picture, ...(options.activeParticipation ? {
-                groupId: actorId === 'dual-b' ? '304' : '303', rawMessage: `GroupMate ${marker}`
+        const baseEvent = groupEvent(actorId, marker, host, { picture, ...(options.activeParticipation ? {
+                groupId: actorId === 'dual-b' ? '304' : '303',
+                rawMessage: options.activeOrdinary ? marker : `GroupMate ${marker}`,
+                ...(options.activeOrdinary ? { message: [{ type: 'at', qq: 'phase6-resource-bot' }, { type: 'text', text: marker }] } : {})
             } : {}) });
+        const event = options.activeOrdinary ? { ...baseEvent, atme: true } : baseEvent;
         if (options.activeParticipation) {
             const before = primary.dispatches.length;
-            await graph.bymController.bym(event);
+            if (options.activeOrdinary)
+                await graph.chatController.chatgpt(event);
+            else
+                await graph.bymController.bym(event);
             if (primary.dispatches.length <= before)
                 throw new Error('active production run was not delivered');
         }

@@ -930,6 +930,7 @@ export class YunzaiAgentServiceBridge {
                         : { presentationLifecycle: options.presentationLifecycle })
                 })
                 : await this.#bridge.handle(request, {
+                    ...(options.participation === undefined ? {} : { participation: options.participation }),
                     requestObservationContext,
                     ...(options.presentationLifecycle === undefined
                         ? {}

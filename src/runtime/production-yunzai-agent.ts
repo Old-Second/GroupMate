@@ -885,7 +885,18 @@ export function createProductionYunzaiAgent (
   const diagnostics: ChatDiagnosticsPort = Object.freeze({
     record: (entry: Readonly<Record<string, unknown>>) => options.bridge.logger?.info?.(entry)
   })
+  const activeParticipation = new ActiveParticipationHost(() => {
+    const time = monotonicNow()
+    if (time === 'unavailable') throw new TypeError('participation clock unavailable')
+    return time
+  }, () => ({ participationMode: options.bridge.config.participationMode,
+    participationActiveGroups: options.bridge.config.participationActiveGroups }),
+  event => options.bridge.getBotId(event), groupId => {
+    const policy = options.bymPolicy.snapshot()
+    return policy.enabled && !policy.disabledGroupIds.includes(groupId)
+  })
   const chatController = createYunzaiChatController({
+    activeParticipation: event => activeParticipation.selectOrdinary(event),
     policy: options.chatPolicy,
     preferences: options.chatPreferences,
     ttsAdministration: options.ttsAdministration,
@@ -950,16 +961,6 @@ export function createProductionYunzaiAgent (
   })
   const participation = new ParticipationShadow(() => now().getTime(), entry => {
     contentJournal?.recordParticipation?.(entry)
-  })
-  const activeParticipation = new ActiveParticipationHost(() => {
-    const time = monotonicNow()
-    if (time === 'unavailable') throw new TypeError('participation clock unavailable')
-    return time
-  }, () => ({ participationMode: options.bridge.config.participationMode,
-    participationActiveGroups: options.bridge.config.participationActiveGroups }),
-  event => options.bridge.getBotId(event), groupId => {
-    const policy = options.bymPolicy.snapshot()
-    return policy.enabled && !policy.disabledGroupIds.includes(groupId)
   })
   const bymController = createYunzaiBymController({
     activeParticipation: (event, direct, sampled) => activeParticipation.select(event, direct, sampled),

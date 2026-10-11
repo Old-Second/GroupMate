@@ -1,4 +1,5 @@
 import type { PresentationIntentV1, PresentationRouteV1 } from '../agent/contracts/interaction.js'
+import type { ParticipationRun } from '../agent/participation/ParticipationRun.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import type {
   ChatReplyEnvelope,
@@ -213,6 +214,7 @@ export interface YunzaiChatController {
 }
 
 export interface YunzaiChatControllerOptions {
+  readonly activeParticipation?: (event: YunzaiMessageEvent) => ParticipationRun | null | undefined
   readonly policy: ChatEntryPolicyPort
   readonly preferences: ChatPreferencePort
   readonly ttsAdministration: TtsAdministrationPort
@@ -532,6 +534,8 @@ async function runOrdinaryChat (
   if (!authorized(policy, event)) return
   let prepared: ValidatedPreparedChatRequest | undefined
   let requestDiagnosticRecorded = false
+  let participation: ParticipationRun | null | undefined
+  let paused = false, deliveredSuccess = false
   let latestCorrelation: RuntimeObservationCorrelationV1 = Object.freeze({
     runRef: 'unavailable' as const,
     terminalObservationId: 'not_attempted' as const
@@ -604,16 +608,20 @@ async function runOrdinaryChat (
       ? augmentedPrompt.slice(prepared.evidence.prompt.length).trim()
       : augmentedPrompt.trim()
     const ttl = positiveTtl(policy.sessionTtlSeconds)
+    participation = options.activeParticipation?.(event)
+    if (participation === null) return
     const handleOptions: YunzaiAgentHandleOptions = Object.freeze({
       presentationRoute: prepared.route,
       presentationLifecycle: lifecycle,
       systemInstructions: Object.freeze([
         systemInstruction,
-        ...(feedbackInstruction === '' ? [] : [feedbackInstruction])
+        ...(feedbackInstruction === '' ? [] : [feedbackInstruction]),
+        ...(participation?.instructions ?? [])
       ]),
       enableGroupContext: policy.enableGroupContext,
       thinkingMode: policy.thinkingMode,
       reasoningEffort: policy.reasoningEffort,
+      ...(participation == null ? {} : { participation }),
       ...(ttl === undefined ? {} : { sessionTtlSeconds: ttl })
     })
     const envelope = await options.agent.handle(event, prepared.evidence, handleOptions)
@@ -627,7 +635,7 @@ async function runOrdinaryChat (
       })
     }))
     requestDiagnosticRecorded = true
-    if (envelope.kind === 'paused') return
+    if (envelope.kind === 'paused') { paused = true; return }
     const responseCorrelation = Object.freeze({
       runRef: envelope.runRef,
       terminalObservationId: envelope.runRef === 'unavailable'
@@ -652,6 +660,8 @@ async function runOrdinaryChat (
       hooks,
       envelope
     )
+    deliveredSuccess = envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
+      presentation.deliveries.some(delivery => delivery.kind === 'sent')
     if (options.postReplyCandidate !== undefined &&
       envelope.kind === 'completed' && envelope.completion.kind === 'reply_text' &&
       presentation.deliveries.some(delivery => delivery.kind === 'sent')) {
@@ -692,7 +702,7 @@ async function runOrdinaryChat (
       message: presentation.message,
       quote: true
     })
-  }
+  } finally { if (!paused) participation?.finish(deliveredSuccess) }
 }
 
 function modeFromSuffix (message: string): TtsMode | null {

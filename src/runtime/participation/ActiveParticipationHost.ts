@@ -4,10 +4,14 @@ import { participationMode } from '../../agent/participation/ParticipationContra
 import type { YunzaiMessageEvent } from '../agent-service-bridge.js'
 import { projectYunzaiParticipation } from './YunzaiParticipationAdapter.js'
 
+const SEEN_LIMIT = 128
+const SEEN_TTL_MS = 600_000
+
 /** An empty pilot list enables no new group behavior; non-pilot groups retain legacy routing. */
 export class ActiveParticipationHost {
   #policy: ActiveParticipationPolicy | null = null
   #closed = false
+  readonly #seen = new Map<string, number>()
   constructor (
     readonly now: () => number,
     readonly config: () => Readonly<{ participationMode?: unknown; participationActiveGroups?: unknown }>,
@@ -20,6 +24,7 @@ export class ActiveParticipationHost {
     if (!enabled) {
       this.#policy?.close()
       this.#policy = null
+      this.#seen.clear()
     }
     return enabled
   }
@@ -31,24 +36,44 @@ export class ActiveParticipationHost {
   }
 
   select (event: YunzaiMessageEvent, explicitlyAddressed: boolean, sampled: boolean): ParticipationRun | null | undefined {
+    return this.#select(event, explicitlyAddressed, sampled, false)
+  }
+
+  /** Ordinary explicit requests keep their existing queue when qualification is unavailable. */
+  selectOrdinary (event: YunzaiMessageEvent): ParticipationRun | null | undefined {
+    return this.#select(event, true, false, true)
+  }
+
+  #remember (messageRef: string, now: number): void {
+    if (this.#seen.size >= SEEN_LIMIT) this.#seen.delete(this.#seen.keys().next().value!)
+    this.#seen.set(messageRef, now)
+  }
+
+  #select (event: YunzaiMessageEvent, explicitlyAddressed: boolean, sampled: boolean, ordinary: boolean): ParticipationRun | null | undefined {
     if (!this.#enabled()) return undefined
     const groupId = String(event.group_id)
     if (!this.#pilot(groupId)) return undefined
     const eligible = (): boolean => this.#enabled() && this.#pilot(groupId) && this.eligible(groupId)
     this.#policy ??= new ActiveParticipationPolicy(this.now, () => this.#enabled())
     const botId = this.botId(event)
-    const projected = projectYunzaiParticipation({ event, botId, now: this.now(), explicitlyAddressed, eligible: eligible() })
-    if (projected === null) return null
+    const now = this.now()
+    const projected = projectYunzaiParticipation({ event, botId, now, explicitlyAddressed, eligible: eligible() })
+    if (projected === null) return ordinary ? undefined : null
+    for (const [key, time] of this.#seen) if (now - time >= SEEN_TTL_MS) this.#seen.delete(key)
+    // Ordinary and BYM host rules may observe the same message. Selection belongs to only one route.
+    if (this.#seen.has(projected.messageRef)) return null
+    if (ordinary) this.#remember(projected.messageRef, now)
     // No cold sampled or model gatekeeper is enabled. Only a live same-actor continuation can pass.
     const elsewhere = Array.isArray(event.message) && event.message.some(part => part?.type === 'at' &&
       String(part.qq ?? part.data?.qq) !== String(botId))
     const selected = this.#policy.select(projected, { sampled, gateAllows: !elsewhere })
     // Cold sampled candidates remain disabled until their independent should-reply gate is approved.
-    if (selected.kind !== 'candidate') return null
+    if (selected.kind !== 'candidate') return ordinary ? undefined : null
     if (selected.candidate.source === 'sampled') {
       this.#policy.finish(selected.candidate, false)
       return null
     }
+    if (!ordinary) this.#remember(projected.messageRef, now)
     return createParticipationRun(this.#policy, selected.candidate, eligible)
   }
 
@@ -56,5 +81,6 @@ export class ActiveParticipationHost {
     this.#closed = true
     this.#policy?.close()
     this.#policy = null
+    this.#seen.clear()
   }
 }

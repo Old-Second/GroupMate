@@ -141,6 +141,7 @@ export interface Phase6ResourceSample {
 export interface Phase6ResourceScenarioOptions {
   /** Exercise the production active BYM path with synthetic pilot groups; default fixtures stay unchanged. */
   readonly activeParticipation?: boolean
+  readonly activeOrdinary?: boolean
   readonly settleMs?: number
   readonly gc?: () => void
   readonly memoryUsage?: () => NodeJS.MemoryUsage
@@ -1131,6 +1132,7 @@ interface GraphFixture {
 
 function graphFixture (input: {
   readonly activeParticipation?: boolean
+  readonly activeOrdinary?: boolean
   readonly scenario: Phase6ResourceScenarioName
   readonly redis: Phase6ResourceRedis
   readonly host: HostFixture
@@ -1195,9 +1197,9 @@ function graphFixture (input: {
       })
     }),
     chatPolicy: Object.freeze({
-      entryMode: () => 'prefix' as const,
+      entryMode: () => input.activeOrdinary ? 'at' as const : 'prefix' as const,
       snapshot: async () => Object.freeze({
-        toggleMode: 'prefix' as const,
+        toggleMode: input.activeOrdinary ? 'at' as const : 'prefix' as const,
         enablePrivateChat: true,
         whitelist: Object.freeze([]),
         blacklist: Object.freeze([]),
@@ -1375,6 +1377,7 @@ export async function runPhase6ResourceScenario (
     : new ScenarioModel(scenario)
   const primary = graphFixture({
     activeParticipation: options.activeParticipation,
+    activeOrdinary: options.activeOrdinary,
     scenario,
     redis,
     host,
@@ -1395,17 +1398,21 @@ export async function runPhase6ResourceScenario (
     picture = false,
     graph = primary.graph
   ): Promise<void> => {
-    const event = groupEvent(
+    const baseEvent = groupEvent(
       actorId,
       marker,
       host,
       { picture, ...(options.activeParticipation ? {
-        groupId: actorId === 'dual-b' ? '304' : '303', rawMessage: `GroupMate ${marker}`
+        groupId: actorId === 'dual-b' ? '304' : '303',
+        rawMessage: options.activeOrdinary ? marker : `GroupMate ${marker}`,
+        ...(options.activeOrdinary ? { message: [{ type: 'at', qq: 'phase6-resource-bot' }, { type: 'text', text: marker }] } : {})
       } : {}) }
     )
+    const event = options.activeOrdinary ? { ...baseEvent, atme: true } : baseEvent
     if (options.activeParticipation) {
       const before = primary.dispatches.length
-      await graph.bymController.bym(event)
+      if (options.activeOrdinary) await graph.chatController.chatgpt(event)
+      else await graph.bymController.bym(event)
       if (primary.dispatches.length <= before) throw new Error('active production run was not delivered')
     } else {
       const handled = await graph.chatController.chatgpt1(event)
