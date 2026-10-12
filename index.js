@@ -4,6 +4,9 @@ import { Config } from './utils/config.js'
 import { newFetch } from './utils/proxy.js'
 import { collectProcessors } from './utils/postprocessors/BasicProcessor.js'
 import { convertFaces } from './utils/face.js'
+import { materializeYunzaiMusicSegment } from './dist/runtime/presentation/yunzai-music-segment.js'
+import { selectToolVoice } from './dist/runtime/tools/tool-voice-selection.js'
+import { ttsTargetEncoding } from './dist/runtime/presentation/yunzai-tts-reply-port.js'
 import {
   convertSpeaker,
   generateVitsAudio,
@@ -291,9 +294,7 @@ async function outboundMessage (receiver, part) {
       : { type: 'video', file: resourceValue(part.resource) }
   }
   if (part.media === 'music') {
-    return typeof segment.music === 'function'
-      ? segment.music(part.provider, part.id)
-      : { type: 'music', platform: part.provider, id: part.id }
+    return materializeYunzaiMusicSegment(segment, part.provider, part.id)
   }
   if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
   if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
@@ -1233,7 +1234,7 @@ const ttsTargets = Object.freeze({
     const bot = await botPicker.pick(target.botId)
     if (bot === null) return 'unavailable'
     const adapter = String(bot.adapter?.name ?? bot.adapter ?? '').toLowerCase()
-    return adapter.includes('shamrock') ? 'shamrock_passthrough' : 'default'
+    return ttsTargetEncoding(adapter)
   }
 })
 
@@ -1325,6 +1326,10 @@ async function synthesizeTts (input, outerSignal) {
       }
       if (signal?.aborted === true) {
         return Object.freeze({ kind: 'outcome_unknown', code: 'synthesis_abort_after_dispatch' })
+      }
+      // OneBot owns upload/encoding; an OICQ PttStore packet is not portable.
+      if (input.recordEncoding === 'adapter_native') {
+        return Object.freeze({ kind: 'ready', audio: await audioResource(globalThis.segment.record(raw), raw, signal) })
       }
       const uploadRecord = (await import('./utils/uploadRecord.js')).default
       let sendable = await uploadRecord(
@@ -1451,11 +1456,16 @@ const productionAgent = initializeProductionYunzaiAgent({
     getBotId: configuredBotId,
     getImages: async event => eventImageUrls(event),
     synthesizeAudio: async (event, text, voice, signal) => {
+      const mode = ttsMode()
+      const settings = await presentationSettings.snapshot(eventActorId(event))
+      const selectedVoice = selectToolVoice({ requested: voice, mode,
+        activeVoice: settings.tts.activeVoice, vits: vitsSpeakers, azure: azureVoices, voicevox: voiceVoxVoices })
+      if (selectedVoice === null) throw new Error('unsupported tool voice')
       const result = await tts.synthesize({
         target: eventTarget(event),
         text,
-        mode: ttsMode(),
-        voice
+        mode,
+        voice: selectedVoice
       }, signal)
       if (result.kind !== 'ready') throw new Error(`tool audio unavailable: ${result.code}`)
       return result.audio

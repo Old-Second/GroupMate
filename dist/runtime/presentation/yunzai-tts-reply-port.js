@@ -1,3 +1,8 @@
+export function ttsTargetEncoding(adapter) {
+    if (/onebot|napcat/i.test(adapter))
+        return 'adapter_native';
+    return /shamrock/i.test(adapter) ? 'shamrock_passthrough' : 'default';
+}
 export const TTS_SYNTHESIS_TIMEOUT_MS = 120_000;
 const DEFINITE_CODES = new Set([
     'empty_after_filter',
@@ -225,7 +230,7 @@ export function createYunzaiTtsReplyPort(input) {
                 catch {
                     return definite('synthesis_rejected');
                 }
-                if (recordEncoding !== 'default' && recordEncoding !== 'shamrock_passthrough') {
+                if (recordEncoding !== 'default' && recordEncoding !== 'shamrock_passthrough' && recordEncoding !== 'adapter_native') {
                     return definite('synthesis_rejected');
                 }
                 if (isAborted(signal))

@@ -44,7 +44,12 @@ export interface TtsReplyPort {
   }, signal?: AbortSignal): Promise<TtsSynthesisResult>
 }
 
-export type TtsRecordEncodingV1 = 'default' | 'shamrock_passthrough'
+export type TtsRecordEncodingV1 = 'default' | 'shamrock_passthrough' | 'adapter_native'
+
+export function ttsTargetEncoding (adapter: string): TtsRecordEncodingV1 {
+  if (/onebot|napcat/i.test(adapter)) return 'adapter_native'
+  return /shamrock/i.test(adapter) ? 'shamrock_passthrough' : 'default'
+}
 
 export interface TtsTargetEncodingPort {
   forTarget(target: SessionAddress): Promise<TtsRecordEncodingV1 | 'unavailable'>
@@ -304,7 +309,7 @@ export function createYunzaiTtsReplyPort (input: {
         } catch {
           return definite('synthesis_rejected')
         }
-        if (recordEncoding !== 'default' && recordEncoding !== 'shamrock_passthrough') {
+        if (recordEncoding !== 'default' && recordEncoding !== 'shamrock_passthrough' && recordEncoding !== 'adapter_native') {
           return definite('synthesis_rejected')
         }
         if (isAborted(signal)) return definite('aborted_before_dispatch')

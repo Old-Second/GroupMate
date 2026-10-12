@@ -15,6 +15,7 @@ import { sessionAddressForTarget } from '../../tools/visible-tool-support.js';
 import { createYunzaiOutboundPortFactory } from '../presentation/yunzai-outbound-port.js';
 import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js';
 import { materializeYunzaiMagicSegment } from '../presentation/yunzai-magic-segment.js';
+import { materializeYunzaiMusicSegment } from '../presentation/yunzai-music-segment.js';
 export class ToolRuntimeConfigurationError extends Error {
     code = 'unknown_policy_profile';
     constructor() {
@@ -397,7 +398,7 @@ async function outboundMessage(receiver, segment, part) {
     if (part.media === 'video')
         return segment.video(resourceValue(part.resource));
     if (part.media === 'music')
-        return segment.music(part.provider, part.id);
+        return materializeYunzaiMusicSegment(segment, part.provider, part.id);
     if (part.media === 'dice')
         return materializeYunzaiMagicSegment(segment, 'dice');
     if (part.media === 'rps')

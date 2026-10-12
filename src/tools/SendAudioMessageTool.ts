@@ -14,7 +14,7 @@ const inputSchema = {
 
 export function createSendAudioMessageTool (services: VisibleToolServices): ToolDefinition {
   return visibleDefinition({
-    name: 'sendAudioMessage', description: '将短文本转换为语音并发送到当前会话。', inputSchema,
+    name: 'sendAudioMessage', description: '将短文本转换为语音并发送到当前会话；voice 留空使用用户当前默认角色，指定角色须由当前服务支持。', inputSchema,
     resourceKeys: currentChannelResourceKeys,
     execute: async (input, context) => {
       if (!services.ttsAvailable) return configurationFailure('语音服务尚未配置。')

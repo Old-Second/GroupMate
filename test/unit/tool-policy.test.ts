@@ -213,6 +213,7 @@ test('intent evidence recognizes only action-specific current-request evidence',
     ['发一张图片', 'image'],
     ['发一段视频', 'video'],
     ['分享这个视频 BV1xx411c7mD', 'video'],
+    ['找一个TypeScript入门的B站视频，用视频分享工具分享到当前群', 'video'],
     ['用语音回复', 'audio'],
     ['播放一首音乐', 'music'],
     ['掷两个骰子', 'dice'],
@@ -225,6 +226,7 @@ test('intent evidence recognizes only action-specific current-request evidence',
     ['搜一张风景壁纸给我看看', 'image'],
     ['把这张照片发给我', 'image'],
     ['给我看看头像', 'image'],
+    ['请把我自己的头像发到当前群，只发一张', 'image'],
     ['查询原神游戏面板', 'game']
   ] as const
 
@@ -234,6 +236,7 @@ test('intent evidence recognizes only action-specific current-request evidence',
   assert.equal(intent('介绍一下今天的天气').actions.includes('send'), false)
   assert.equal(intent('不要发送到其他群').actions.includes('send'), false)
   for (const [text, action] of [
+    ['不要把我的头像发到当前群', 'image'],
     ['不要分享这个视频', 'video'], ['不要用语音回复', 'audio'], ['别播放这首歌曲', 'music'],
     ['别掷骰子', 'dice'], ['不要玩石头剪刀布', 'rps']
   ] as const) assert.equal(intent(text).actions.includes(action), false, text)

@@ -62,6 +62,7 @@ import {
 } from '../presentation/yunzai-outbound-port.js'
 import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js'
 import { materializeYunzaiMagicSegment } from '../presentation/yunzai-magic-segment.js'
+import { materializeYunzaiMusicSegment } from '../presentation/yunzai-music-segment.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../message-input.js'
 
 type YunzaiValue = string | number
@@ -524,7 +525,7 @@ async function outboundMessage (
   if (part.media === 'picture') return segment.image(resourceValue(part.resource))
   if (part.media === 'voice') return segment.record(part.hostRecord ?? resourceValue(part.resource))
   if (part.media === 'video') return segment.video(resourceValue(part.resource))
-  if (part.media === 'music') return segment.music(part.provider, part.id)
+  if (part.media === 'music') return materializeYunzaiMusicSegment(segment, part.provider, part.id)
   if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
   if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
   return await materializeYunzaiForwardMessage(receiver, part)
