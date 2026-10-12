@@ -1,3 +1,7 @@
+export async function resolveToolVoice(input) {
+    const settings = await input.settings.load(input.actorId);
+    return selectToolVoice({ ...input, activeVoice: settings.tts.activeVoice });
+}
 export function selectToolVoice(input) {
     const requested = input.requested.trim();
     const voice = ['', '默认', 'default'].includes(requested.toLowerCase()) ? input.activeVoice : requested;

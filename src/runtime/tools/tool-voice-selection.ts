@@ -1,13 +1,25 @@
-import type { TtsMode } from '../presentation/presentation-settings.js'
+import type { PresentationSettingsPort, TtsMode } from '../presentation/presentation-settings.js'
 
-export function selectToolVoice (input: {
+type ToolVoiceInput = {
   readonly requested: string
   readonly mode: TtsMode
   readonly activeVoice: string
   readonly vits: readonly string[]
   readonly azure: readonly { readonly name: string; readonly code: string }[]
   readonly voicevox: readonly { readonly name: string; readonly styles: readonly { readonly name: string }[] }[]
-}): string | null {
+}
+
+export async function resolveToolVoice (
+  input: Omit<ToolVoiceInput, 'activeVoice'> & {
+    readonly actorId: string
+    readonly settings: PresentationSettingsPort
+  }
+): Promise<string | null> {
+  const settings = await input.settings.load(input.actorId)
+  return selectToolVoice({ ...input, activeVoice: settings.tts.activeVoice })
+}
+
+export function selectToolVoice (input: ToolVoiceInput): string | null {
   const requested = input.requested.trim()
   const voice = ['', '默认', 'default'].includes(requested.toLowerCase()) ? input.activeVoice : requested
   if (voice === '随机') return voice

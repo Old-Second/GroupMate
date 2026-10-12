@@ -5,7 +5,7 @@ import { newFetch } from './utils/proxy.js'
 import { collectProcessors } from './utils/postprocessors/BasicProcessor.js'
 import { convertFaces } from './utils/face.js'
 import { materializeYunzaiMusicSegment } from './dist/runtime/presentation/yunzai-music-segment.js'
-import { selectToolVoice } from './dist/runtime/tools/tool-voice-selection.js'
+import { resolveToolVoice } from './dist/runtime/tools/tool-voice-selection.js'
 import { ttsTargetEncoding } from './dist/runtime/presentation/yunzai-tts-reply-port.js'
 import {
   convertSpeaker,
@@ -1457,9 +1457,9 @@ const productionAgent = initializeProductionYunzaiAgent({
     getImages: async event => eventImageUrls(event),
     synthesizeAudio: async (event, text, voice, signal) => {
       const mode = ttsMode()
-      const settings = await presentationSettings.snapshot(eventActorId(event))
-      const selectedVoice = selectToolVoice({ requested: voice, mode,
-        activeVoice: settings.tts.activeVoice, vits: vitsSpeakers, azure: azureVoices, voicevox: voiceVoxVoices })
+      const selectedVoice = await resolveToolVoice({ requested: voice, mode,
+        actorId: eventActorId(event), settings: presentationSettings,
+        vits: vitsSpeakers, azure: azureVoices, voicevox: voiceVoxVoices })
       if (selectedVoice === null) throw new Error('unsupported tool voice')
       const result = await tts.synthesize({
         target: eventTarget(event),

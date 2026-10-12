@@ -1,11 +1,36 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { selectToolVoice } from '../../src/runtime/tools/tool-voice-selection.js'
+import { resolveToolVoice, selectToolVoice } from '../../src/runtime/tools/tool-voice-selection.js'
 import { createYunzaiTtsReplyPort, ttsTargetEncoding } from '../../src/runtime/presentation/yunzai-tts-reply-port.js'
+import { createPresentationSettingsPort } from '../../src/runtime/presentation/presentation-settings.js'
 
 const options = { requested: '', mode: 'vits-uma-genshin-honkai' as const, activeVoice: 'fixture-voice',
   vits: ['fixture-voice'], azure: [{ name: 'Azure voice', code: 'fixture-code' }],
   voicevox: [{ name: 'Vox voice', styles: [{ name: 'normal' }] }] }
+
+test('tool voice loads the actual presentation port and honors the current actor override', async () => {
+  const settings = createPresentationSettingsPort({
+    currentSafeConfig: () => ({
+      quoteReply: true, enableRobotAt: false, enableMd: false,
+      enableSuggestedResponses: false, forwardReasoning: false,
+      blockWords: [], promptBlockWords: [], defaultUsePicture: false, defaultUseTTS: false,
+      ttsMode: options.mode, defaultTTSRole: 'fixture-voice', azureTTSSpeaker: 'fixture-code',
+      voicevoxTTSSpeaker: 'Vox voice', alsoSendText: false, ttsAutoFallbackThreshold: 299,
+      ttsRegex: '', enhanceAzureTTSEmotion: false, autoUsePicture: false,
+      autoUsePictureThreshold: 1200, cloudDPR: 1, closeBrowserAfterRender: true,
+      showQRCode: false, live2d: false, live2dModel: '', live2dOption_scale: 1,
+      live2dOption_positionX: 0, live2dOption_positionY: 0, live2dOption_rotation: 0,
+      live2dOption_alpha: 1
+    }),
+    loadUserJson: async actorId => {
+      assert.equal(actorId, 'fixture-actor')
+      return JSON.stringify({ ttsRole: 'user-voice' })
+    }
+  })
+  assert.equal(await resolveToolVoice({ ...options, actorId: 'fixture-actor', settings,
+    vits: ['fixture-voice', 'user-voice'] }), 'user-voice')
+  assert.equal(await resolveToolVoice({ ...options, actorId: 'fixture-actor', settings }), null)
+})
 
 test('blank/default tool voice resolves to the active user preference before synthesis', () => {
   for (const requested of ['', '默认', 'default', 'Default']) assert.equal(selectToolVoice({ ...options, requested }), 'fixture-voice')
