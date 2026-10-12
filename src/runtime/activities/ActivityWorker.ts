@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { ACTIVITY_LIMITS, ActivityStore, pruneActivities, type GroupActivity } from './ActivityStore.js'
+import { ACTIVITY_LIMITS, activeActivity, ActivityStore, pruneActivities, type GroupActivity } from './ActivityStore.js'
 import { activityNotification } from './GroupActivityService.js'
 
 export interface ActivityDispatchLease {
@@ -53,12 +53,14 @@ export class ActivityWorker {
       for (const r of data.records) {
         if ((r.state === 'claimed' || r.state === 'dispatching') && r.leaseUntil <= now) {
           r.state = r.state === 'claimed' ? 'pending' : 'indeterminate'
+          if (!activeActivity(r)) r.remaining = 0
           r.updatedAt = now
           r.token = ''
         }
         if (r.kind === 'reminder' && r.state === 'pending' && r.dueAt < now - 86400000) {
           // Do not surprise a group with notifications more than a day old.
           r.state = 'expired'
+          r.remaining = 0
           r.updatedAt = now
         }
       }
@@ -124,6 +126,7 @@ export class ActivityWorker {
         nextState = r.remaining > 0 ? 'pending' : 'completed'
       } else if (nextState === 'completed') nextState = r.remaining === 0 ? 'cancelled' : 'completed'
       r.state = nextState
+      if (!activeActivity(r)) r.remaining = 0
       r.token = ''
       r.leaseUntil = 0
       r.updatedAt = this.#now()

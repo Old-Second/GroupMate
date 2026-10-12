@@ -169,6 +169,40 @@ test('cancel racing with membership authorization prevents the first dispatch', 
   assert.equal(w.messages.length, 0)
   assert.equal((await f.store.read()).records[0].state, 'cancelled')
 })
+test('completed one-time and final recurring notifications have zero future occurrences', async () => {
+  for (const occurrences of [1, 2]) {
+    const f = fixture()
+    const id = await f.created({ ...reminder, intervalSeconds: occurrences === 1 ? 0 : 60, occurrences })
+    f.advance(10000)
+    const w = worker(f)
+    assert.equal(await w.create().tick(), 1)
+    if (occurrences === 2) {
+      const first = await f.perform('reminder', { operation: 'status', id })
+      assert.equal(first.state, 'pending')
+      assert.equal(first.remaining, 1)
+      f.advance(60000)
+      assert.equal(await w.create().tick(), 1)
+    }
+    const summary = await f.perform('reminder', { operation: 'status', id })
+    assert.equal(summary.state, 'completed')
+    assert.equal(summary.remaining, 0)
+    assert.equal((await f.store.read()).records[0].remaining, 0)
+    assert.equal(await w.create().tick(), 0)
+    assert.equal(w.messages.length, occurrences)
+  }
+})
+test('older terminal snapshots do not show pending countdowns or future occurrences', async () => {
+  const f = fixture()
+  const id = await f.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
+  for (const state of ['completed', 'cancelled', 'expired', 'failed', 'indeterminate'] as const) {
+    await f.store.update(data => { data.records[0].state = state })
+    const summary = await f.perform('reminder', { operation: 'status', id })
+    assert.equal(summary.remaining, 0)
+    assert.equal(summary.secondsLeft, 0)
+    const list = await f.perform('reminder', { operation: 'list' })
+    assert.equal(list.activities[0].remaining, 0)
+  }
+})
 test('cancel during send does not promise recall and suppresses every later recurrence', async () => {
   const f = fixture()
   const id = await f.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })

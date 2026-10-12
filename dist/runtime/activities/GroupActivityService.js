@@ -15,7 +15,8 @@ function integer(value, min, max) {
 function counts(r) { return r.options.map((_, index) => Object.values(r.votes).filter(votes => votes.includes(index + 1)).length); }
 export function activitySummary(r, now) {
     return { id: r.id, kind: r.kind, state: r.state, content: r.content, dueAt: new Date(r.dueAt).toISOString(), timeZone: r.timeZone,
-        secondsLeft: Math.max(0, Math.ceil((r.dueAt - now) / 1000)), remaining: r.remaining, intervalSeconds: r.intervalMs / 1000,
+        secondsLeft: activeActivity(r) ? Math.max(0, Math.ceil((r.dueAt - now) / 1000)) : 0,
+        remaining: activeActivity(r) ? r.remaining : 0, intervalSeconds: r.intervalMs / 1000,
         ...(r.kind === 'poll' ? { multiple: r.multiple, options: r.options.map((text, index) => ({ number: index + 1, text, votes: counts(r)[index] })), voters: Object.keys(r.votes).length } : {}) };
 }
 export function activityNotification(r) {
