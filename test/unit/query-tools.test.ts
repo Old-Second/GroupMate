@@ -98,21 +98,21 @@ function runtime (options: {
   })
 }
 
-test('query tool runtime exposes eleven unique canonical definitions', () => {
+test('query and local utility runtime exposes twelve unique canonical definitions', () => {
   const { policyFetch } = policyFetchFixture(() => response({ data: [] }))
   const created = runtime({ policyFetch })
   assert.deepEqual(created.definitions.map(tool => tool.name), [
-    'search', 'website', 'weather', 'github', 'queryUserinfo', 'queryGenshin',
+    'search', 'randomChoice', 'website', 'weather', 'github', 'queryUserinfo', 'queryGenshin',
     'queryStarRail', 'searchImage', 'searchVideo', 'searchMusic', 'imageCaption'
   ])
-  assert.equal(new Set(created.definitions.map(tool => tool.name)).size, 11)
+  assert.equal(new Set(created.definitions.map(tool => tool.name)).size, 12)
   assert.ok(created.registry instanceof ToolRegistry)
   assert.equal(created.definitions.filter(tool => tool.name === 'search').length, 1)
   assert.equal(created.definitions.find(tool => tool.name === 'website')?.network, 'open_http')
   assert.equal(created.definitions.find(tool => tool.name === 'website')?.readOnly, true)
   for (const definition of created.definitions) {
     assert.equal(definition.executionClass, definition.effect)
-    assert.equal(definition.retrySafe, !['queryGenshin', 'queryStarRail', 'imageCaption'].includes(definition.name))
+    assert.equal(definition.retrySafe, !['queryGenshin', 'queryStarRail', 'imageCaption', 'randomChoice', 'searchVideo'].includes(definition.name))
   }
 })
 
@@ -279,7 +279,7 @@ test('image search uses only the selected fixed backend and returns bounded cand
 
 test('video and music query tools normalize successful fixture responses', async () => {
   const fixture = policyFetchFixture(request => request.url.hostname === 'api.bilibili.com'
-    ? response({ data: { result: [{ bvid: 'BV1', title: '<em>title</em>', author: 'up', play: 10, pubdate: 1 }] } })
+    ? response({ code: 0, data: { result: [{ bvid: 'BV1xx411c7mD', title: '<em>title</em>', author: 'up', play: 10, pubdate: 1 }] } })
     : response({ result: { songs: [{ id: 1, name: 'song', artists: [{ name: 'artist' }], alias: [] }] } }))
   const created = runtime({ policyFetch: fixture.policyFetch })
   const video = created.definitions.find(item => item.name === 'searchVideo')
@@ -291,6 +291,35 @@ test('video and music query tools normalize successful fixture responses', async
   assert.deepEqual(fixture.calls.map(call => call.url.origin), [
     'https://api.bilibili.com', 'https://music.163.com'
   ])
+})
+
+test('video search falls back to configured search and only accepts exact Bilibili video URLs', async () => {
+  const fixture = policyFetchFixture(request => request.url.hostname === 'api.bilibili.com'
+    ? response('<html>unavailable</html>', { contentType: 'text/html' })
+    : response({ results: [
+      { url: 'https://www.bilibili.com.evil.example/video/BV1xx411c7mD', title: 'spoof' },
+      { url: 'https://www.bilibili.com/video/BV1xx411c7mD?from=search', title: '<em>公开视频</em>' },
+      { url: 'https://www.bilibili.com/video/BV1xx411c7mD', title: 'duplicate' },
+      { url: 'https://user:password@www.bilibili.com/video/BV1xx411c7mD', title: 'credentials' }
+    ] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(item => item.name === 'searchVideo')!
+  const result = await tool.execute({ keyword: '公开视频', limit: 2 }, context)
+  assert.equal(result.status, 'success')
+  if (result.status !== 'success' || result.content[0].type !== 'text') assert.fail('missing result')
+  assert.deepEqual(JSON.parse(result.content[0].text), [{
+    id: 'BV1xx411c7mD', title: '公开视频', url: 'https://www.bilibili.com/video/BV1xx411c7mD', source: 'web_search'
+  }])
+  assert.equal(fixture.calls.length, 2)
+  assert.match(fixture.calls[1].url.searchParams.get('q') ?? '', /^site:bilibili\.com\/video\//)
+  assert.equal(tool.retrySafe, false)
+})
+
+test('cancelled video search never starts a fallback request', async () => {
+  const fixture = policyFetchFixture(() => response({ results: [] }))
+  const signal = AbortSignal.abort()
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(item => item.name === 'searchVideo')!
+  assert.equal((await tool.execute({ keyword: 'video', limit: 1 }, { ...context, signal })).status, 'failed')
+  assert.equal(fixture.calls.length, 0)
 })
 
 test('game query tools pass only normalized input and trusted current actor defaults', async () => {

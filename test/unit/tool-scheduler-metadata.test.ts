@@ -107,7 +107,8 @@ const validInputs: Readonly<Record<string, Readonly<Record<string, unknown>>>> =
   searchImage: { q: 'private image query', limit: 2 },
   searchVideo: { keyword: 'private video query', limit: 2 },
   searchMusic: { keyword: 'private music query', limit: 2 },
-  imageCaption: { imageUrl: 'https://image.example/private.png', userId: '', question: 'secret?' }
+  imageCaption: { imageUrl: 'https://image.example/private.png', userId: '', question: 'secret?' },
+  randomChoice: { items: ['A', 'B'], mode: 'pick', count: 1 }
 })
 
 function byName (name: string) {
@@ -118,7 +119,7 @@ function byName (name: string) {
 
 test('every production tool has explicit bounded scheduling metadata', () => {
   const definitions = productionDefinitions()
-  assert.equal(definitions.length, 26)
+  assert.equal(definitions.length, 27)
   for (const definition of definitions) {
     assert.ok(['read_only', 'visible_output', 'side_effect'].includes(definition.executionClass))
     assert.equal(typeof definition.retrySafe, 'boolean')

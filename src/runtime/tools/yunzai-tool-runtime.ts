@@ -36,6 +36,7 @@ import type { RedisToolClient } from './redis-tool-client.js'
 import { RedisIdempotencyStore } from './redis-idempotency-store.js'
 import { resolveToolRuntimeFacts, type ToolRuntimeFactsSource } from './runtime-facts.js'
 import { resolveCrossChannelAccess } from './cross-channel-policy.js'
+import { selectedTtsConfigured, toolAvailableInScene } from './tool-availability.js'
 import {
   createManagementToolDefinitions,
   createQueryToolRuntime,
@@ -895,16 +896,22 @@ async function resolveBilibiliVideo (
     maxBytes: 256 * 1024,
     allowedContentTypes: ['application/json']
   }
-  const view = await policyFetch.request({
-    url: `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(id)}`,
-    policy, timeoutMs: 10_000, signal,
-    headers: { referer: 'https://www.bilibili.com', 'user-agent': 'GroupMate/0.1' }
-  })
-  const parsed = JSON.parse(Buffer.from(view.body).toString('utf8')) as YunzaiRecord
-  const data = parsed.data
-  if (view.status < 200 || view.status >= 300 || data === null || typeof data !== 'object') {
-    throw new Error('video unavailable')
+  let parsed: YunzaiRecord
+  try {
+    const view = await policyFetch.request({
+      url: `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(id)}`,
+      policy, timeoutMs: 5_000, signal,
+      headers: { referer: 'https://www.bilibili.com', 'user-agent': 'GroupMate/0.1' }
+    })
+    parsed = JSON.parse(Buffer.from(view.body).toString('utf8')) as YunzaiRecord
+    if (view.status < 200 || view.status >= 300 || parsed.code !== 0 || parsed.data === null || typeof parsed.data !== 'object') {
+      throw new Error('video unavailable')
+    }
+  } catch {
+    throwIfAborted(signal)
+    return Object.freeze({ id, shareText: `视频链接（标题和简介暂时无法读取）\nhttps://www.bilibili.com/video/${id}` })
   }
+  const data = parsed.data
   const title = String(data.title ?? '').replace(/<[^>]+>/g, '').slice(0, 300)
   const author = String(data.owner?.name ?? '').slice(0, 100)
   const url = `https://www.bilibili.com/video/${encodeURIComponent(id)}`
@@ -950,9 +957,7 @@ function visibleServices (
   botId: string
 ): VisibleToolServices {
   const downloadVideo = configBoolean(options.config, 'enableToolVideoDownload')
-  const ttsAvailable = options.synthesizeAudio !== undefined && [
-    'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
-  ].some(key => configText(options.config, key) !== '')
+  const ttsAvailable = options.synthesizeAudio !== undefined && selectedTtsConfigured(options.config)
   const processImage = options.processImage ?? pictureProcessor(policyFetch, configText(options.config, 'extraUrl'))
   const crossChannelAccess = resolveCrossChannelAccess(options.config)
   return {
@@ -1205,6 +1210,7 @@ export function createYunzaiToolRuntimeBridge (
     )
     const enabledTools = definitions
       .filter(definition => {
+        if (!toolAvailableInScene(definition, initialFacts, options.config.disabledTools)) return false
         if (definition.name === 'draw') return visibleToolServices.drawingAvailable
         if (definition.name === 'processPicture') return visibleToolServices.pictureProcessingAvailable
         if (definition.name === 'imageCaption') {
@@ -1215,9 +1221,7 @@ export function createYunzaiToolRuntimeBridge (
           return options.queryGame !== undefined || gameEntries.every(path => existsSync(new URL(path)))
         }
         if (definition.name === 'sendAudioMessage') {
-          return options.synthesizeAudio !== undefined && [
-            'ttsSpace', 'azureTTSKey', 'voicevoxSpace'
-          ].some(key => configText(options.config, key) !== '')
+          return visibleToolServices.ttsAvailable
         }
         return true
       })

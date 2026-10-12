@@ -149,7 +149,7 @@ test('visible media tools call the QQ capability and return visible only after s
     ['draw', { prompt: 'cat' }, 'image'],
     ['sendPicture', { urls: ['https://image.example/cat.png'] }, 'image'],
     ['sendAvatar', { userIds: ['7'] }, 'image'],
-    ['sendVideo', { id: 'BV1' }, 'video'],
+    ['sendVideo', { id: 'BV1xx411c7mD' }, 'video'],
     ['sendMusic', { id: '1' }, 'music'],
     ['sendAudioMessage', { text: 'hello', voice: '' }, 'audio'],
     ['sendRPS', { value: 2 }, 'rps']
@@ -560,7 +560,7 @@ test('all visible media keep dispatch exceptions unknown without a second operat
     ['draw', { prompt: 'cat' }], ['sendPicture', { urls: ['https://image.example/cat.png'] }],
     ['processPicture', { type: 'hed', imageUrl: 'https://image.example/cat.png', userId: '' }],
     ['sendAvatar', { userIds: ['7'] }], ['sendAudioMessage', { text: 'hello', voice: '' }],
-    ['sendMusic', { id: '1' }], ['sendVideo', { id: 'BV1' }], ['sendDice', { count: 2 }],
+    ['sendMusic', { id: '1' }], ['sendVideo', { id: 'BV1xx411c7mD' }], ['sendDice', { count: 2 }],
     ['sendRPS', { value: 1 }]
   ]
   for (const [name, input] of cases) {

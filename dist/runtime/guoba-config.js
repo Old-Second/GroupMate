@@ -1,3 +1,4 @@
+import { CONFIGURABLE_TOOL_NAMES } from './tools/tool-availability.js';
 const CONTENT_LIST_FIELDS = new Set([
     'blockWords',
     'promptBlockWords',
@@ -131,6 +132,13 @@ export function buildGuobaConfigPatch(value, options) {
     return Object.freeze(patch);
 }
 export function normalizeGuobaConfigValue(key, value) {
+    if (key === 'disabledTools') {
+        if (!Array.isArray(value) || value.length > CONFIGURABLE_TOOL_NAMES.length ||
+            value.some(name => typeof name !== 'string' || !CONFIGURABLE_TOOL_NAMES.includes(name)) ||
+            new Set(value).size !== value.length)
+            throw new TypeError('隐藏工具列表无效，请选择工具的标准名称。');
+        return Object.freeze([...value]);
+    }
     if (key === 'participationMode') {
         if (value !== 'legacy' && value !== 'shadow' && value !== 'active')
             throw new TypeError('群参与模式配置无效。');

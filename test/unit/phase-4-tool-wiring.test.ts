@@ -16,6 +16,8 @@ import {
   type OutboundPart
 } from '../../src/runtime/presentation/yunzai-outbound-port.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
+import { PolicyFetch } from '../../src/runtime/tools/policy-fetch.js'
+import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
 
 function createYunzaiToolRuntimeBridge (options: Parameters<typeof createBridge>[0]): YunzaiToolRuntimeBridge {
   const bridge = createBridge(options)
@@ -236,6 +238,38 @@ test('runtime discovery excludes missing optional capabilities and preserves inj
     for (const name of ['weather', 'imageCaption', 'processPicture']) assert.equal(names.includes(name), false, name)
     for (const name of ['sendPicture', 'sendAvatar', 'website']) assert.equal(names.includes(name), true, name)
   }
+})
+
+test('video API error page degrades to one acknowledged link share without inventing metadata', async () => {
+  const sent: unknown[] = []
+  const policyFetch = new PolicyFetch({
+    networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+    transport: { request: async () => ({ status: 200, statusText: 'OK', headers: { 'content-type': 'text/html' },
+      body: (async function * () { yield Buffer.from('<html>private upstream diagnostic</html>') })() }) }
+  })
+  const bridge = createYunzaiToolRuntimeBridge({ config: config(), redis: new FakeRedis(), policyFetch,
+    getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
+  const event = { isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [],
+    bot: { pickFriend: () => ({ sendMsg: async (message: unknown) => { sent.push(message); return { message_id: 'synthetic-video' } } }) } }
+  const run = await bridge.prepareAgentRun({ event, prompt: '分享视频 BV1xx411c7mD' })
+  const outcome = await executeNativeTool(bridge, run, { runId: 'video-link', callId: 'video-link-call',
+    requestedName: 'sendVideo', arguments: { id: 'BV1xx411c7mD' } })
+  assert.equal(outcome.result?.status, 'success')
+  assert.equal(sent.length, 1)
+  assert.match(JSON.stringify(sent), /标题和简介暂时无法读取/)
+  assert.match(JSON.stringify(sent), /https:\/\/www\.bilibili\.com\/video\/BV1xx411c7mD/)
+  assert.doesNotMatch(JSON.stringify(sent), /private upstream diagnostic/)
+})
+
+test('disabled tools disappear from both model discovery and execution snapshot', async () => {
+  const bridge = createYunzaiToolRuntimeBridge({ config: config({ disabledTools: ['sendPicture', 'randomChoice'] }),
+    redis: new FakeRedis(), getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
+  const event = { isGroup: false, user_id: 7, sender: { user_id: 7 }, message: [], bot: {} }
+  const run = await bridge.prepareAgentRun({ event, prompt: '发一张图片' })
+  assert.equal(run.snapshot.toolNames.includes('sendPicture'), false)
+  assert.equal(run.snapshot.toolNames.includes('randomChoice'), false)
+  assert.equal(run.snapshot.toolNames.includes('website'), true)
+  assert.throws(() => run.snapshot.resolve('sendPicture'))
 })
 
 test('Yunzai runtime creates one native snapshot and no legacy execution surface', async () => {

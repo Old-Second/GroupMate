@@ -1,3 +1,5 @@
+import { CONFIGURABLE_TOOL_NAMES } from './tools/tool-availability.js'
+
 export interface GuobaSelectOption {
   label: string
   value: string
@@ -174,6 +176,9 @@ export function buildGuobaSchemas ({
 
     divider('工具与搜索'),
     field('smartMode', '开启工具调用', '允许模型使用搜索、图片、语音和授权群管理工具，会增加请求次数；权限仍由运行时校验。', 'Switch'),
+    field('disabledTools', '隐藏指定工具', '填入工具名，例如 searchVideo；下一次请求生效。用于停用故障服务或不需要的能力，移除后恢复发现。', 'Select', {
+      mode: 'multiple', options: CONFIGURABLE_TOOL_NAMES.map(value => ({ label: value, value }))
+    }),
     field('toolPolicyProfile', '工具权限策略', '兼容模式在通过运行时权限校验后执行；安全与严格模式中需要审批的操作会拒绝执行，不会生成旧口令；新的风险分级审批将在新运行引擎接入后启用。', 'Select', {
       options: [
         { label: '兼容', value: 'compatible' },

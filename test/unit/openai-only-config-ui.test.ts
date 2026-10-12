@@ -136,6 +136,7 @@ const requiredGuobaFields = [
   'forwardToolDetails',
   'smartMode',
   'toolPolicyProfile',
+  'disabledTools',
   'toolApprovalTtlSeconds',
   'enableGroupContext',
   'groupContextTip',
@@ -279,7 +280,7 @@ const expectedGuobaGroups = [
   {
     label: '工具与搜索',
     fields: [
-      'smartMode', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
+      'smartMode', 'disabledTools', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
       'toolPrivateSendPolicy', 'toolCrossGroupSendPolicy',
       'enableToolVideoDownload', 'toolVideoMaxMB', 'serpSource', 'tavilyApiKey',
       'azSerpKey', 'imageSearchSource', 'braveSearchApiKey', 'amapKey',

@@ -212,10 +212,12 @@ test('intent evidence recognizes only action-specific current-request evidence',
     ['取消这条精华消息', 'unset_essence'],
     ['发一张图片', 'image'],
     ['发一段视频', 'video'],
+    ['分享这个视频 BV1xx411c7mD', 'video'],
     ['用语音回复', 'audio'],
     ['播放一首音乐', 'music'],
     ['掷两个骰子', 'dice'],
     ['来一局石头剪刀布', 'rps'],
+    ['来一局石头、剪刀、布', 'rps'],
     ['帮我画图', 'image'],
     ['画一只猫', 'image'],
     ['找一张蓝天照片发给我', 'image'],
@@ -231,6 +233,10 @@ test('intent evidence recognizes only action-specific current-request evidence',
   }
   assert.equal(intent('介绍一下今天的天气').actions.includes('send'), false)
   assert.equal(intent('不要发送到其他群').actions.includes('send'), false)
+  for (const [text, action] of [
+    ['不要分享这个视频', 'video'], ['不要用语音回复', 'audio'], ['别播放这首歌曲', 'music'],
+    ['别掷骰子', 'dice'], ['不要玩石头剪刀布', 'rps']
+  ] as const) assert.equal(intent(text).actions.includes(action), false, text)
   assert.equal(intent('别禁言他').actions.includes('mute'), false)
   assert.equal(intent('不要踢出这个群友').actions.includes('kick'), false)
   assert.equal(intent('不要撤回这条消息').actions.includes('recall'), false)

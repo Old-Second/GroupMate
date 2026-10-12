@@ -7,13 +7,13 @@ const inputSchema = {
 };
 export function createSendVideoTool(services) {
     return visibleDefinition({
-        name: 'sendVideo', description: '向当前会话分享已搜索到的视频。',
-        inputSchema, network: services.videoDownloadEnabled ? 'open_http' : 'none',
+        name: 'sendVideo', description: '分享已查到的 B 站 BV 视频；默认发送链接，元数据不可用时仍可分享链接。',
+        inputSchema, network: services.videoDownloadEnabled ? 'open_http' : 'fixed_hosts',
         resourceKeys: currentChannelResourceKeys,
         execute: async (input, context) => {
             const id = String(input.id ?? '').trim();
-            if (!/^[A-Za-z0-9]{2,32}$/.test(id))
-                return invalidArguments('视频标识无效。');
+            if (!/^BV[A-Za-z0-9]{10}$/.test(id))
+                return invalidArguments('请提供完整的 B 站 BV 标识。');
             try {
                 const target = sessionAddressForTarget(context.facts.botId, context.target);
                 if (target === null)

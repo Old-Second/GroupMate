@@ -258,3 +258,12 @@ test('culture pilots reject malformed, duplicate and oversized lists and require
   }
   assert.match(guobaConfigSaveMessage(['groupCultureGroups']), /重启/)
 })
+test('disabled tools only accept distinct canonical names and preserve the caller list', () => {
+  const input = ['sendVideo', 'randomChoice']
+  const normalized = normalizeGuobaConfigValue('disabledTools', input)
+  assert.deepEqual(normalized, input)
+  assert.notEqual(normalized, input)
+  for (const value of ['sendVideo', ['sendVideo', 'sendVideo'], ['unknown'], [null], ['kick']]) {
+    assert.throws(() => normalizeGuobaConfigValue('disabledTools', value), /隐藏工具列表无效/)
+  }
+})

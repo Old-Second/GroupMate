@@ -25,6 +25,7 @@ import { createHandleMessageTool } from '../../tools/HandleMessageTool.js';
 import { createJinyanTool } from '../../tools/JinyanTool.js';
 import { createKickOutTool } from '../../tools/KickOutTool.js';
 import { createSetTitleTool } from '../../tools/SetTitleTool.js';
+import { createRandomChoiceTool } from '../../tools/RandomChoiceTool.js';
 export function createToolRuntimeRegistry(...definitionGroups) {
     const definitions = Object.freeze(definitionGroups.flatMap(group => [...group]));
     return Object.freeze({ definitions, registry: new ToolRegistry(definitions) });
@@ -54,13 +55,15 @@ export function createManagementToolDefinitions(capabilities) {
 }
 export function createQueryToolRuntime(options) {
     const common = { policyFetch: options.policyFetch };
+    const search = createSearchTool({
+        ...common, backend: options.config.searchSource,
+        publicSource: options.config.publicSearchSource,
+        tavilyApiKey: options.config.tavilyApiKey,
+        bingApiKey: options.config.bingApiKey
+    });
     const definitions = Object.freeze([
-        createSearchTool({
-            ...common, backend: options.config.searchSource,
-            publicSource: options.config.publicSearchSource,
-            tavilyApiKey: options.config.tavilyApiKey,
-            bingApiKey: options.config.bingApiKey
-        }),
+        search,
+        createRandomChoiceTool(),
         createWebsiteTool(common),
         createWeatherTool({
             ...common, apiKey: options.config.amapKey, apiBaseUrl: options.config.amapApiBaseUrl
@@ -76,7 +79,7 @@ export function createQueryToolRuntime(options) {
             tavilyApiKey: options.config.tavilyApiKey,
             braveApiKey: options.config.braveSearchApiKey
         }),
-        createSearchVideoTool(common),
+        createSearchVideoTool({ ...common, fallbackSearch: search }),
         createSearchMusicTool(common),
         createImageCaptionTool({ ...common, apiBaseUrl: options.config.extraUrl })
     ]);
