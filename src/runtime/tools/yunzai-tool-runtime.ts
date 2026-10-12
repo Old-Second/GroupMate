@@ -39,6 +39,7 @@ import { resolveCrossChannelAccess } from './cross-channel-policy.js'
 import { selectedTtsConfigured, toolAvailableInScene } from './tool-availability.js'
 import {
   createManagementToolDefinitions,
+  createGroupActivityDefinitions,
   createQueryToolRuntime,
   createToolRuntimeRegistry,
   createVisibleToolDefinitions,
@@ -64,6 +65,7 @@ import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-
 import { materializeYunzaiMagicSegment } from '../presentation/yunzai-magic-segment.js'
 import { materializeYunzaiMusicSegment } from '../presentation/yunzai-music-segment.js'
 import type { PreparedYunzaiMessageEvidenceV1 } from '../message-input.js'
+import type { GroupActivityService } from '../activities/GroupActivityService.js'
 
 type YunzaiValue = string | number
 type YunzaiRecord = Record<string, any>
@@ -71,6 +73,7 @@ type YunzaiRecord = Record<string, any>
 export interface YunzaiToolRuntimeBridgeOptions {
   readonly config: Readonly<Record<string, unknown>>
   readonly redis: RedisToolClient
+  readonly groupActivities?: GroupActivityService
   readonly policyFetch?: PolicyFetch
   readonly getMasterIds: () => Promise<readonly YunzaiValue[]>
   readonly getBotId: (event: unknown) => YunzaiValue
@@ -1207,11 +1210,13 @@ export function createYunzaiToolRuntimeBridge (
     const { definitions, registry } = createToolRuntimeRegistry(
       query.definitions,
       visible,
-      management
+      management,
+      createGroupActivityDefinitions(options.groupActivities)
     )
     const enabledTools = definitions
       .filter(definition => {
         if (!toolAvailableInScene(definition, initialFacts, options.config.disabledTools)) return false
+        if (definition.name === 'groupPoll' || definition.name === 'scheduledTask') return options.groupActivities !== undefined
         if (definition.name === 'draw') return visibleToolServices.drawingAvailable
         if (definition.name === 'processPicture') return visibleToolServices.pictureProcessingAvailable
         if (definition.name === 'imageCaption') {

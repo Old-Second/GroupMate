@@ -11,6 +11,7 @@ import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
 import type { PolicyFetch } from '../../src/runtime/tools/policy-fetch.js'
 import {
   createManagementToolDefinitions,
+  createGroupActivityDefinitions,
   createQueryToolRuntime,
   createVisibleToolDefinitions
 } from '../../src/runtime/tools/tool-runtime-factory.js'
@@ -81,6 +82,7 @@ function productionDefinitions () {
   return Object.freeze([
     ...createVisibleToolDefinitions(visibleServices),
     ...createManagementToolDefinitions(management),
+    ...createGroupActivityDefinitions(),
     ...query
   ])
 }
@@ -108,6 +110,10 @@ const validInputs: Readonly<Record<string, Readonly<Record<string, unknown>>>> =
   searchVideo: { keyword: 'private video query', limit: 2 },
   searchMusic: { keyword: 'private music query', limit: 2 },
   imageCaption: { imageUrl: 'https://image.example/private.png', userId: '', question: 'secret?' },
+  dateTime: { operation: 'now', value: '', other: '', timeZone: 'UTC', targetTimeZone: 'UTC', seconds: 0 },
+  unitConvert: { value: 1, from: 'm', to: 'cm' },
+  groupPoll: { operation: 'list' },
+  scheduledTask: { operation: 'list' },
   randomChoice: { items: ['A', 'B'], mode: 'pick', count: 1 }
 })
 
@@ -119,7 +125,7 @@ function byName (name: string) {
 
 test('every production tool has explicit bounded scheduling metadata', () => {
   const definitions = productionDefinitions()
-  assert.equal(definitions.length, 27)
+  assert.equal(definitions.length, 31)
   for (const definition of definitions) {
     assert.ok(['read_only', 'visible_output', 'side_effect'].includes(definition.executionClass))
     assert.equal(typeof definition.retrySafe, 'boolean')

@@ -5,6 +5,10 @@ import { projectYunzaiParticipation } from './participation/YunzaiParticipationA
 import { RunAdmission } from '../agent/run/run-admission.js';
 import { ProactiveCoordination } from './participation/ProactiveCoordination.js';
 import { currentGroupMember } from './CurrentGroupMember.js';
+import { ActivityStore } from './activities/ActivityStore.js';
+import { GroupActivityService } from './activities/GroupActivityService.js';
+import { ActivityWorker } from './activities/ActivityWorker.js';
+import { createActivityDispatch } from './activities/YunzaiActivityDispatch.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { bindYunzaiShutdownSignals, createYunzaiAgentServiceBridge } from './agent-service-bridge.js';
 import { prepareYunzaiMessageEvidence } from './message-input.js';
@@ -530,11 +534,18 @@ export function createProductionYunzaiAgent(options) {
         }))
     });
     const approvalControlPresenter = createApprovalControlPresenter({ outboundFactory });
+    const activityStore = new ActivityStore(options.bridge.redis);
+    const groupActivities = new GroupActivityService(activityStore, () => now().getTime());
+    const activities = new ActivityWorker({ store: activityStore, now: () => now().getTime(),
+        acquire: createActivityDispatch({ botPicker: options.botPicker, outboundFactory, admission,
+            chatPolicy: options.chatPolicy, config: options.bridge.config }),
+        onFailure: () => options.bridge.logger?.warn?.('群定时任务存储暂时不可用。') });
     let approvalOutcomeHandler = async () => {
         throw new Error('approval outcome handler is not initialized');
     };
     const bridge = createYunzaiAgentServiceBridge(Object.freeze({
         ...options.bridge,
+        groupActivities,
         botPicker: options.botPicker,
         presentationRuntime: Object.freeze({
             outboundFactory,
@@ -743,6 +754,7 @@ export function createProductionYunzaiAgent(options) {
         shutdownPromise: null
     };
     const graph = Object.freeze({
+        activities,
         claimScheduledGreeting: async (bot, groupId) => {
             const botId = String(bot.uin ?? bot.self_id ?? '');
             const ticket = proactiveCoordination.begin(botId, String(groupId), 'cron');
@@ -797,6 +809,7 @@ export function createProductionYunzaiAgent(options) {
         shutdown: async (reason = 'process_shutdown') => {
             lifecycle.shutdownPromise ??= (async () => {
                 try {
+                    await activities.close();
                     return await bridge.shutdown(reason);
                 }
                 finally {
@@ -833,6 +846,7 @@ export function initializeProductionYunzaiAgent(options) {
         throw new TypeError('production graph lifecycle is unavailable');
     lifecycle.unbindShutdown = bindYunzaiShutdownSignals(graph);
     productionSingleton = graph;
+    graph.activities.start();
     return graph;
 }
 export function getProductionYunzaiAgent() {

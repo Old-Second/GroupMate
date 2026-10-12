@@ -165,7 +165,7 @@ function listMatches(entries, event) {
     }
     return false;
 }
-function authorized(policy, event) {
+export function chatEntryAuthorized(policy, event) {
     if (!booleanField(event, 'isMaster') && booleanField(event, 'isPrivate') &&
         !policy.enablePrivateChat)
         return false;
@@ -242,7 +242,7 @@ function assertOrdinaryPreparedRequest(value, forcePicture) {
     }
 }
 async function runOrdinaryChat(options, event, policy, prompt, forcePicture) {
-    if (!authorized(policy, event))
+    if (!chatEntryAuthorized(policy, event))
         return;
     let prepared;
     let requestDiagnosticRecorded = false;

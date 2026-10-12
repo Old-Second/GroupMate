@@ -417,7 +417,7 @@ function listMatches (
   return false
 }
 
-function authorized (policy: ChatEntryPolicySnapshot, event: YunzaiMessageEvent): boolean {
+export function chatEntryAuthorized (policy: ChatEntryPolicySnapshot, event: YunzaiMessageEvent): boolean {
   if (!booleanField(event, 'isMaster') && booleanField(event, 'isPrivate') &&
     !policy.enablePrivateChat) return false
   if (listMatches(policy.whitelist, event)) return true
@@ -531,7 +531,7 @@ async function runOrdinaryChat (
   prompt: string,
   forcePicture: boolean
 ): Promise<void> {
-  if (!authorized(policy, event)) return
+  if (!chatEntryAuthorized(policy, event)) return
   let prepared: ValidatedPreparedChatRequest | undefined
   let requestDiagnosticRecorded = false
   let participation: ParticipationRun | null | undefined

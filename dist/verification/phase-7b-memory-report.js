@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
-import { createManagementToolDefinitions, createQueryToolRuntime, createVisibleToolDefinitions } from '../runtime/tools/tool-runtime-factory.js';
+import { createManagementToolDefinitions, createGroupActivityDefinitions, createQueryToolRuntime, createVisibleToolDefinitions } from '../runtime/tools/tool-runtime-factory.js';
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js';
 import { buildGuobaSchemas } from '../runtime/guoba-schema.js';
 import { MEMORY_HOT_CACHE_STATIC_BYTES } from '../agent/memory/redis-memory-hot-cache.js';
@@ -84,8 +84,12 @@ export const PHASE_7B_PRODUCTION_TOOL_FACTORIES = Object.freeze([
     'createKickOutTool',
     'createSetTitleTool',
     'createHandleMessageTool',
+    'createGroupPollTool',
+    'createScheduledTaskTool',
     'createSearchTool',
     'createRandomChoiceTool',
+    'createDateTimeTool',
+    'createUnitConvertTool',
     'createWebsiteTool',
     'createWeatherTool',
     'createGithubTool',
@@ -113,8 +117,12 @@ export const PHASE_7B_PRODUCTION_TOOL_NAMES = Object.freeze([
     'kickOut',
     'setTitle',
     'handleMsg',
+    'groupPoll',
+    'scheduledTask',
     'search',
     'randomChoice',
+    'dateTime',
+    'unitConvert',
     'website',
     'weather',
     'github',
@@ -257,7 +265,7 @@ export function collectPhase7bProductionToolNames() {
         queryGame: unavailable,
         sendGameImage: unavailable
     }).definitions;
-    return Object.freeze([...visible, ...management, ...query].map(definition => definition.name));
+    return Object.freeze([...visible, ...management, ...createGroupActivityDefinitions(), ...query].map(definition => definition.name));
 }
 function validateResourceInput(value) {
     const input = exactRecord(value, 'Phase 7B memory resource samples');

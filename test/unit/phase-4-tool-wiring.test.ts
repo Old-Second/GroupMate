@@ -18,6 +18,8 @@ import {
 import { FakeRedis } from '../helpers/fake-redis.js'
 import { PolicyFetch } from '../../src/runtime/tools/policy-fetch.js'
 import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
+import { ActivityStore } from '../../src/runtime/activities/ActivityStore.js'
+import { GroupActivityService } from '../../src/runtime/activities/GroupActivityService.js'
 
 function createYunzaiToolRuntimeBridge (options: Parameters<typeof createBridge>[0]): YunzaiToolRuntimeBridge {
   const bridge = createBridge(options)
@@ -67,6 +69,30 @@ test('stale cached bot admin is denied by authoritative member role before any m
   assert.equal(muteCalls, 0)
   assert.equal(outcome.result?.status, 'denied')
   assert.equal(cached.get(10000)?.role, 'admin')
+})
+
+test('ordinary group members discover and persist scheduled tasks through the native policy and snapshot boundary', async () => {
+  let raw: string | null = null
+  const store = new ActivityStore({ get: async () => raw, eval: async (_script, { arguments: args }) => {
+    if ((raw ?? '') !== args[0]) return 0
+    raw = args[1]; return 1
+  } })
+  const members = new Map([[7, { user_id: 7, role: 'member' }], [10000, { user_id: 10000, role: 'member' }]])
+  const group = { getMemberMap: async () => members }
+  const event = { isGroup: true, group_id: 9, self_id: 10000, user_id: 7, sender: { user_id: 7, role: 'member' },
+    group, message: [], bot: { pickGroup: () => group } }
+  const bridge = createYunzaiToolRuntimeBridge({ config: config(), redis: new FakeRedis(),
+    groupActivities: new GroupActivityService(store), getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
+  const run = await bridge.prepareAgentRun({ event, prompt: '10秒后提醒我喝水' })
+  assert.ok(run.snapshot.toolNames.includes('groupPoll'))
+  assert.ok(run.snapshot.toolNames.includes('scheduledTask'))
+  const outcome = await executeNativeTool(bridge, run, { runId: 'schedule', callId: 'call-schedule', requestedName: 'scheduledTask',
+    arguments: { operation: 'create', id: '', text: '喝水', at: '', timeZone: 'Asia/Shanghai', delaySeconds: 10, intervalSeconds: 0, occurrences: 1, offset: 0 } })
+  assert.equal(outcome.result?.status, 'success')
+  assert.equal((await store.read()).records[0].content, '喝水')
+  assert.equal((await store.read()).records[0].groupId, '9')
+  const unavailable = createYunzaiToolRuntimeBridge({ config: config(), redis: new FakeRedis(), getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
+  assert.equal((await unavailable.prepareAgentRun({ event, prompt: '提醒我喝水' })).snapshot.toolNames.includes('scheduledTask'), false)
 })
 
 const root = process.cwd()

@@ -273,7 +273,7 @@ test('production initializer owns one complete graph and rejects every reinitial
     code: 'construction_failed'
   })])
   assert.deepEqual(Reflect.ownKeys(graph), [
-    'claimScheduledGreeting', 'inspectStartupInventory', 'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
+    'activities', 'claimScheduledGreeting', 'inspectStartupInventory', 'bridge', 'outboundFactory', 'presenter', 'pendingIndicator',
     'progressPresenter', 'completionCoordinator', 'approvalControlPresenter',
     'buttonPolicy', 'chatController', 'bymController', 'approvalController',
     'diagnosticsController',

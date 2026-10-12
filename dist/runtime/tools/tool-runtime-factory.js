@@ -26,6 +26,9 @@ import { createJinyanTool } from '../../tools/JinyanTool.js';
 import { createKickOutTool } from '../../tools/KickOutTool.js';
 import { createSetTitleTool } from '../../tools/SetTitleTool.js';
 import { createRandomChoiceTool } from '../../tools/RandomChoiceTool.js';
+import { createDateTimeTool } from '../../tools/DateTimeTool.js';
+import { createUnitConvertTool } from '../../tools/UnitConvertTool.js';
+import { createGroupPollTool, createScheduledTaskTool } from '../../tools/GroupActivityTool.js';
 export function createToolRuntimeRegistry(...definitionGroups) {
     const definitions = Object.freeze(definitionGroups.flatMap(group => [...group]));
     return Object.freeze({ definitions, registry: new ToolRegistry(definitions) });
@@ -53,6 +56,9 @@ export function createManagementToolDefinitions(capabilities) {
         createHandleMessageTool(capabilities)
     ]);
 }
+export function createGroupActivityDefinitions(service) {
+    return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service)]);
+}
 export function createQueryToolRuntime(options) {
     const common = { policyFetch: options.policyFetch };
     const search = createSearchTool({
@@ -64,6 +70,8 @@ export function createQueryToolRuntime(options) {
     const definitions = Object.freeze([
         search,
         createRandomChoiceTool(),
+        createDateTimeTool(),
+        createUnitConvertTool(),
         createWebsiteTool(common),
         createWeatherTool({
             ...common, apiKey: options.config.amapKey, apiBaseUrl: options.config.amapApiBaseUrl

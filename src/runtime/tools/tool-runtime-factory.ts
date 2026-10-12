@@ -38,6 +38,10 @@ import { createJinyanTool } from '../../tools/JinyanTool.js'
 import { createKickOutTool } from '../../tools/KickOutTool.js'
 import { createSetTitleTool } from '../../tools/SetTitleTool.js'
 import { createRandomChoiceTool } from '../../tools/RandomChoiceTool.js'
+import { createDateTimeTool } from '../../tools/DateTimeTool.js'
+import { createUnitConvertTool } from '../../tools/UnitConvertTool.js'
+import { createGroupPollTool, createScheduledTaskTool } from '../../tools/GroupActivityTool.js'
+import type { GroupActivityService } from '../activities/GroupActivityService.js'
 import type { QqManagementCapabilities } from '../../tools/management-tool-support.js'
 
 export interface QueryToolRuntimeConfig {
@@ -108,6 +112,10 @@ export function createManagementToolDefinitions (
   ])
 }
 
+export function createGroupActivityDefinitions (service?: GroupActivityService): readonly ToolDefinition[] {
+  return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service)])
+}
+
 export function createQueryToolRuntime (options: QueryToolRuntimeOptions): QueryToolRuntime {
   const common = { policyFetch: options.policyFetch }
   const search = createSearchTool({
@@ -119,6 +127,8 @@ export function createQueryToolRuntime (options: QueryToolRuntimeOptions): Query
   const definitions: readonly ToolDefinition[] = Object.freeze([
     search,
     createRandomChoiceTool(),
+    createDateTimeTool(),
+    createUnitConvertTool(),
     createWebsiteTool(common),
     createWeatherTool({
       ...common, apiKey: options.config.amapKey, apiBaseUrl: options.config.amapApiBaseUrl

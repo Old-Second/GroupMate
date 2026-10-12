@@ -99,6 +99,11 @@ export function intentActionForToolCapability (
   toolName: string,
   input: Readonly<Record<string, unknown>>
 ): IntentAction | null {
+  if (toolName === 'groupPoll') {
+    return ({ create: 'poll_create', vote: 'poll_vote', retract: 'poll_retract', close: 'poll_close', cancel: 'poll_cancel' } as const)[
+      input.operation as 'create' | 'vote' | 'retract' | 'close' | 'cancel'] ?? null
+  }
+  if (toolName === 'scheduledTask') return input.operation === 'create' ? 'schedule_create' : input.operation === 'cancel' ? 'schedule_cancel' : null
   if (toolName === 'sendMessage') return 'send'
   if (toolName === 'jinyan') return input.seconds === 0 ? 'unmute' : 'mute'
   if (toolName === 'kickOut') return 'kick'
@@ -225,6 +230,11 @@ export class ToolPolicyEngine {
     }
 
     const action = intentActionForToolCapability(input.definition.name, input.input)
+    if (input.definition.name === 'groupPoll' || input.definition.name === 'scheduledTask') {
+      if (input.facts.channel.kind !== 'group' || !currentTarget(input.target, input.facts) ||
+        !input.facts.targetExists || input.facts.actorGroupRole === 'none' || input.facts.botGroupRole === 'none') return deny('target_invalid')
+      if (['status', 'list'].includes(String(input.input.operation))) return allowed()
+    }
     if (input.definition.permission === 'current_channel') {
       if (!currentTarget(input.target, input.facts)) return deny('target_invalid')
       if (action === null || !input.intent.actions.includes(action)) return deny('explicit_intent_required')

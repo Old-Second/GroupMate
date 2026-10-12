@@ -98,14 +98,14 @@ function runtime (options: {
   })
 }
 
-test('query and local utility runtime exposes twelve unique canonical definitions', () => {
+test('query and local utility runtime exposes fourteen unique canonical definitions', () => {
   const { policyFetch } = policyFetchFixture(() => response({ data: [] }))
   const created = runtime({ policyFetch })
   assert.deepEqual(created.definitions.map(tool => tool.name), [
-    'search', 'randomChoice', 'website', 'weather', 'github', 'queryUserinfo', 'queryGenshin',
+    'search', 'randomChoice', 'dateTime', 'unitConvert', 'website', 'weather', 'github', 'queryUserinfo', 'queryGenshin',
     'queryStarRail', 'searchImage', 'searchVideo', 'searchMusic', 'imageCaption'
   ])
-  assert.equal(new Set(created.definitions.map(tool => tool.name)).size, 12)
+  assert.equal(new Set(created.definitions.map(tool => tool.name)).size, 14)
   assert.ok(created.registry instanceof ToolRegistry)
   assert.equal(created.definitions.filter(tool => tool.name === 'search').length, 1)
   assert.equal(created.definitions.find(tool => tool.name === 'website')?.network, 'open_http')

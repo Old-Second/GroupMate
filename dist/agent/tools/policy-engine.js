@@ -67,6 +67,11 @@ function explicitTarget(target, facts, intent) {
     return intent.explicitTargetIds.includes(target.groupId);
 }
 export function intentActionForToolCapability(toolName, input) {
+    if (toolName === 'groupPoll') {
+        return { create: 'poll_create', vote: 'poll_vote', retract: 'poll_retract', close: 'poll_close', cancel: 'poll_cancel' }[input.operation] ?? null;
+    }
+    if (toolName === 'scheduledTask')
+        return input.operation === 'create' ? 'schedule_create' : input.operation === 'cancel' ? 'schedule_cancel' : null;
     if (toolName === 'sendMessage')
         return 'send';
     if (toolName === 'jinyan')
@@ -215,6 +220,13 @@ export class ToolPolicyEngine {
             return allowed();
         }
         const action = intentActionForToolCapability(input.definition.name, input.input);
+        if (input.definition.name === 'groupPoll' || input.definition.name === 'scheduledTask') {
+            if (input.facts.channel.kind !== 'group' || !currentTarget(input.target, input.facts) ||
+                !input.facts.targetExists || input.facts.actorGroupRole === 'none' || input.facts.botGroupRole === 'none')
+                return deny('target_invalid');
+            if (['status', 'list'].includes(String(input.input.operation)))
+                return allowed();
+        }
         if (input.definition.permission === 'current_channel') {
             if (!currentTarget(input.target, input.facts))
                 return deny('target_invalid');

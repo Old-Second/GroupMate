@@ -5,7 +5,8 @@ export const CONFIGURABLE_TOOL_NAMES = Object.freeze([
   'search', 'website', 'weather', 'github', 'queryUserinfo', 'queryGenshin', 'queryStarRail',
   'searchImage', 'searchVideo', 'searchMusic', 'imageCaption', 'draw', 'processPicture',
   'sendPicture', 'sendVideo', 'sendAvatar', 'sendMusic', 'sendAudioMessage', 'sendDice',
-  'sendRPS', 'sendMessage', 'editCard', 'jinyan', 'kickOut', 'setTitle', 'handleMsg', 'randomChoice'
+  'sendRPS', 'sendMessage', 'editCard', 'jinyan', 'kickOut', 'setTitle', 'handleMsg', 'randomChoice',
+  'dateTime', 'unitConvert', 'groupPoll', 'scheduledTask'
 ])
 
 export function selectedTtsConfigured (config: Readonly<Record<string, unknown>>): boolean {
@@ -24,6 +25,9 @@ export function toolAvailableInScene (
 ): boolean {
   if (Array.isArray(disabledTools) && disabledTools.includes(definition.name)) return false
   if (definition.effect !== 'side_effect') return true
+  if (definition.name === 'groupPoll' || definition.name === 'scheduledTask') {
+    return facts.channel.kind === 'group' && facts.actorGroupRole !== 'none' && facts.botGroupRole !== 'none'
+  }
   if (definition.permission === 'cross_channel') return true
   if (facts.channel.kind !== 'group' || !['owner', 'admin'].includes(facts.botGroupRole)) return false
   const actorManages = facts.actor.isBotMaster || ['owner', 'admin'].includes(facts.actorGroupRole)

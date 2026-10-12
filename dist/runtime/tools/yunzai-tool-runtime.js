@@ -10,7 +10,7 @@ import { RedisIdempotencyStore } from './redis-idempotency-store.js';
 import { resolveToolRuntimeFacts } from './runtime-facts.js';
 import { resolveCrossChannelAccess } from './cross-channel-policy.js';
 import { selectedTtsConfigured, toolAvailableInScene } from './tool-availability.js';
-import { createManagementToolDefinitions, createQueryToolRuntime, createToolRuntimeRegistry, createVisibleToolDefinitions } from './tool-runtime-factory.js';
+import { createManagementToolDefinitions, createGroupActivityDefinitions, createQueryToolRuntime, createToolRuntimeRegistry, createVisibleToolDefinitions } from './tool-runtime-factory.js';
 import { sessionAddressForTarget } from '../../tools/visible-tool-support.js';
 import { createYunzaiOutboundPortFactory } from '../presentation/yunzai-outbound-port.js';
 import { materializeYunzaiForwardMessage } from '../presentation/yunzai-forward-message.js';
@@ -996,11 +996,13 @@ export function createYunzaiToolRuntimeBridge(options) {
         const visible = createVisibleToolDefinitions(visibleToolServices);
         const captionAvailable = pictureProcessor(policyFetch, configText(options.config, 'extraUrl')) !== undefined;
         const management = createManagementToolDefinitions(managementCapabilities(event));
-        const { definitions, registry } = createToolRuntimeRegistry(query.definitions, visible, management);
+        const { definitions, registry } = createToolRuntimeRegistry(query.definitions, visible, management, createGroupActivityDefinitions(options.groupActivities));
         const enabledTools = definitions
             .filter(definition => {
             if (!toolAvailableInScene(definition, initialFacts, options.config.disabledTools))
                 return false;
+            if (definition.name === 'groupPoll' || definition.name === 'scheduledTask')
+                return options.groupActivities !== undefined;
             if (definition.name === 'draw')
                 return visibleToolServices.drawingAvailable;
             if (definition.name === 'processPicture')
