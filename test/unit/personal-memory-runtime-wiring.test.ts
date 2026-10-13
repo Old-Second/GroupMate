@@ -667,6 +667,50 @@ test('Yunzai directory falls back to an uncached bot lookup when the cache lacks
   assert.equal(snapshot.scene.groupLifecycleId, LIFECYCLE_ID)
 })
 
+test('fresh actor and bot checks share the 600ms participant window without serializing independent RPCs', async () => {
+  let active = 0
+  let maximumActive = 0
+  const calls: string[] = []
+  const snapshot = await createYunzaiSceneParticipantDirectoryV1().resolve({
+    event: { isGroup: true, group_id: GROUP_ID, user_id: CURRENT_USER_ID,
+      sender: { user_id: CURRENT_USER_ID, role: 'owner' },
+      message: [{ type: 'at', data: { qq: '70003' } }],
+      bot: { sendApi: async (name: string, params: Record<string, unknown>) => {
+        assert.equal(name, 'get_group_member_info')
+        assert.equal(params.no_cache, true)
+        assert.equal(String(params.group_id), GROUP_ID)
+        const userId = String(params.user_id)
+        calls.push(userId)
+        maximumActive = Math.max(maximumActive, ++active)
+        try {
+          await new Promise(resolve => setTimeout(resolve, 225))
+          return { user_id: userId, group_id: GROUP_ID, role: 'member', join_time: 123456 }
+        } finally { active-- }
+      } } },
+    accountId: ACCOUNT_ID, observedAt: NOW, freshAuthority: true,
+    messageEvidence: Object.freeze({ ...evidence(), hasReply: false, replyResolved: false,
+      quotedMessageId: null, quotedMessage: undefined })
+  }, AbortSignal.timeout(600))
+  assert.ok(snapshot)
+  assert.deepEqual(calls, [ACCOUNT_ID, CURRENT_USER_ID, '70003'])
+  assert.equal(maximumActive, 2)
+  assert.equal(snapshot.current.identity.groupRole, 'member')
+  assert.deepEqual(snapshot.references.map(ref => ref.participant.identity.userId), ['70003'])
+})
+
+test('parallel fresh checks still reject a missing bot or actor without cached role fallback', async () => {
+  for (const missing of [ACCOUNT_ID, CURRENT_USER_ID]) {
+    const snapshot = await createYunzaiSceneParticipantDirectoryV1().resolve({
+      event: { isGroup: true, group_id: GROUP_ID, user_id: CURRENT_USER_ID,
+        sender: { user_id: CURRENT_USER_ID, role: 'owner' }, message: [],
+        bot: { sendApi: async (_name: string, params: Record<string, unknown>) => String(params.user_id) === missing
+          ? null : { user_id: params.user_id, group_id: GROUP_ID, role: 'member', join_time: 123456 } } },
+      accountId: ACCOUNT_ID, observedAt: NOW, freshAuthority: true, messageEvidence: evidence()
+    }, new AbortController().signal)
+    assert.equal(snapshot, null)
+  }
+})
+
 test('Yunzai directory refreshes at most three referenced group members', async () => {
   const calls: string[] = []
   const directory = createYunzaiSceneParticipantDirectoryV1()

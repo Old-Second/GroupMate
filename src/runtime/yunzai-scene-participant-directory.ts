@@ -315,7 +315,11 @@ YunzaiSceneParticipantDirectoryInputV1
 
       const groupId = qqId(event.group_id)
       if (groupId === null) return null
-      const authoritativeBot = input.freshAuthority ? await currentGroupMember(event.bot, groupId, accountId, signal) : null
+      // These two independent uncached checks share the existing participant deadline.
+      const [authoritativeBot, authoritativeCurrent] = input.freshAuthority === true
+        ? await Promise.all([currentGroupMember(event.bot, groupId, accountId, signal),
+          currentGroupMember(event.bot, groupId, currentUserId, signal)])
+        : [null, null]
       const botMember = input.freshAuthority
         ? authoritativeBot === null ? null : { user_id: authoritativeBot.userId, role: authoritativeBot.role, join_time: authoritativeBot.joinedAt }
         : await refreshBotMember(event, groupId, accountId, signal)
@@ -329,7 +333,7 @@ YunzaiSceneParticipantDirectoryInputV1
         groupName: text(event.group?.name ?? event.group_name)
       })
       const refreshed = input.freshAuthority === true
-        ? await currentGroupMember(event.bot, groupId, currentUserId, signal).then(member => member === null ? null : { user_id: member.userId, role: member.role })
+        ? authoritativeCurrent === null ? null : { user_id: authoritativeCurrent.userId, role: authoritativeCurrent.role }
         : input.refreshCurrentRole === true ? await refreshMember(event, groupId, currentUserId, signal) : null
       if ((input.refreshCurrentRole === true || input.freshAuthority === true) && refreshed === null) return null
       const current = createSceneParticipantV1(Object.freeze({
