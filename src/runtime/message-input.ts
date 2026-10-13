@@ -14,6 +14,8 @@ interface HistoryReaderLike {
 }
 
 interface MessageBotLike {
+  readonly uin?: unknown
+  readonly self_id?: unknown
   getMsg?: (messageId: unknown) => Promise<unknown>
   sendApi?: (
     apiName: string,
@@ -23,6 +25,7 @@ interface MessageBotLike {
 
 export interface MessageEventLike {
   isGroup?: unknown
+  self_id?: unknown
   group_id?: unknown
   user_id?: unknown
   message_id?: unknown
@@ -42,6 +45,7 @@ export interface MessageEventLike {
 
 export interface ModelMessageInput {
   prompt: string
+  mentionedUserIds?: readonly string[]
   imageUrls: string[]
   currentMessageId: string | null
   quotedMessageId: string | null
@@ -62,6 +66,7 @@ export type DeepReadonly<T> =
 export interface PreparedYunzaiMessageEvidenceV1 {
   readonly schemaVersion: 1
   readonly prompt: string
+  readonly mentionedUserIds?: readonly string[]
   readonly imageUrls: readonly string[]
   readonly currentMessageId: string | null
   readonly quotedMessageId: string | null
@@ -80,6 +85,24 @@ interface BuildModelMessageInputOptions {
 
 function isRecord (value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function currentMentionIds (event: MessageEventLike): readonly string[] {
+  const qqId = (value: unknown): string | null => {
+    if (typeof value !== 'string' && (typeof value !== 'number' || !Number.isSafeInteger(value))) return null
+    const id = String(value)
+    return /^[1-9][0-9]{0,19}$/.test(id) ? id : null
+  }
+  const botId = qqId(event.self_id ?? event.bot?.uin ?? event.bot?.self_id)
+  const ids = new Set<string>()
+  for (const segment of Array.isArray(event.message) ? event.message : []) {
+    if (!isRecord(segment) || segment.type !== 'at') continue
+    const data = isRecord(segment.data) ? segment.data : {}
+    const id = qqId(segment.qq ?? data.qq)
+    if (id !== null && id !== botId) ids.add(id)
+    if (ids.size >= 32) break
+  }
+  return [...ids]
 }
 
 function getBoundedScalar (value: unknown): string | undefined {
@@ -370,6 +393,7 @@ export async function buildModelMessageInput ({
   currentPrompt
 }: BuildModelMessageInputOptions): Promise<ModelMessageInput> {
   const current = normalizeMessageContent(event.message, { textOverride: currentPrompt })
+  const mentionedUserIds = currentMentionIds(event)
   const replyResult = await findReplyMessage(event)
   const { hasReply } = replyResult
   const currentMessageId = getBoundedMessageId(event.message_id ?? event.seq) ?? null
@@ -377,6 +401,7 @@ export async function buildModelMessageInput ({
   if (!hasReply) {
     return {
       prompt: currentPrompt,
+      ...(mentionedUserIds.length === 0 ? {} : { mentionedUserIds }),
       imageUrls: current.imageUrls,
       currentMessageId,
       quotedMessageId: null,
@@ -439,6 +464,7 @@ export async function buildModelMessageInput ({
 
   return {
     prompt: `${prefix}\n${JSON.stringify(payload)}`,
+    ...(mentionedUserIds.length === 0 ? {} : { mentionedUserIds }),
     imageUrls: mergeImageUrls(current.imageUrls, quoted.imageUrls),
     currentMessageId,
     quotedMessageId,
@@ -470,6 +496,9 @@ export async function prepareYunzaiMessageEvidence (input: {
   return Object.freeze({
     schemaVersion: 1 as const,
     prompt: messageInput.prompt,
+    ...(messageInput.mentionedUserIds === undefined ? {} : {
+      mentionedUserIds: Object.freeze([...messageInput.mentionedUserIds])
+    }),
     imageUrls: Object.freeze([...messageInput.imageUrls]),
     currentMessageId: messageInput.currentMessageId,
     quotedMessageId: messageInput.quotedMessageId,

@@ -22,7 +22,7 @@ export function createGroupActivityTool (kind: 'reminder' | 'poll', service?: Gr
     name, version: 1, aliases: [],
     description: kind === 'poll'
       ? '当前群投票与匿名汇总。create给出2～10个options、title、multiple；closesAt为具体当地时间，空则90天后截止，timeZone默认用Asia/Shanghai。vote只能代表当前发言者投票，choices为1起编号，可改票；retract撤自己的票。status/list查询；close提前结算，cancel取消，后两者只限发起人/当前管理员。使用真实返回的id，不得猜，不接受其他群/代投票。list每页4项，offset从0开始、按返回nextOffset续页；其他操作offset填0。未用字段填空字符串、空数组、false。到期自动发汇总，无需额外建提醒。'
-      : '当前群持久提醒/倒计时，create/status/list/cancel。text仅正文；notifyTargets指定到期真实艾特：提醒我填["self"]，其他人填当前请求中的QQ号/准确名片/昵称，最多8人；未指定及非create填[]。同名请用户艾特或给QQ号；不猜ID、不艾特机器人/全体。at具体时间与delaySeconds二选一，timeZone为IANA如Asia/Shanghai。一次intervalSeconds=0、occurrences=1；重复间隔至少60秒、最多30次/90天，不支持cron。list每页4项按nextOffset续页；其他offset=0，未用字符串填空。cancel限发起人/管理员，发送中只停后续。重启跳过积压，未知回执不重发。仅当前群文字，不执行命令/额外模型。',
+      : '当前群持久提醒/倒计时，create/status/list/cancel。text仅正文；notifyTargets指定到期真实艾特：提醒我填["self"]，其他人填当前请求中的QQ号/准确名片/昵称，最多8人；本消息直接艾特的对象见mentionedUserIds，仅按当前请求选取，不从历史或引用猜对象。未指定及非create填[]。同名请用户艾特或给QQ号；不猜ID、不艾特机器人/全体。at具体时间与delaySeconds二选一，timeZone为IANA如Asia/Shanghai。一次intervalSeconds=0、occurrences=1；重复间隔至少60秒、最多30次/90天，不支持cron。list每页4项按nextOffset续页；其他offset=0，未用字符串填空。cancel限发起人/管理员，发送中只停后续。重启跳过积压，未知回执不重发。仅当前群文字，不执行命令/额外模型。',
     inputSchema: { type: 'object', properties, required: Object.keys(properties), additionalProperties: false },
     effect: 'side_effect', risk: 'low', readOnly: false, destructive: false, idempotency: 'semantic',
     openWorld: false, timeoutMs: 8000, maxOutputBytes: 32 * 1024, network: 'none', permission: 'current_channel',

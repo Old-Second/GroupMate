@@ -123,7 +123,7 @@ function assertPreparedEvidence(evidence) {
         'schemaVersion', 'prompt', 'imageUrls', 'currentMessageId', 'quotedMessageId',
         'hasReply', 'replyResolved', 'currentSegmentCount', 'replySegmentCount', 'ocrTexts'
     ];
-    const allowed = new Set([...required, 'quotedMessage']);
+    const allowed = new Set([...required, 'quotedMessage', 'mentionedUserIds']);
     if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence) ||
         Reflect.ownKeys(evidence).some(key => typeof key !== 'string' || !allowed.has(key)) ||
         required.some(key => !Object.hasOwn(evidence, key))) {
@@ -146,6 +146,10 @@ function assertPreparedEvidence(evidence) {
         !Object.isFrozen(evidence.ocrTexts)) {
         throw new TypeError('prepared message evidence must be frozen');
     }
+    if (evidence.mentionedUserIds !== undefined && (!Array.isArray(evidence.mentionedUserIds) || !Object.isFrozen(evidence.mentionedUserIds) ||
+        evidence.mentionedUserIds.length > 32 || new Set(evidence.mentionedUserIds).size !== evidence.mentionedUserIds.length ||
+        evidence.mentionedUserIds.some(id => typeof id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(id))))
+        throw new TypeError('prepared mention evidence is invalid');
     if (evidence.quotedMessage !== undefined && (!Object.isFrozen(evidence.quotedMessage) ||
         !Object.isFrozen(evidence.quotedMessage.sender) ||
         !Object.isFrozen(evidence.quotedMessage.parts) ||
@@ -243,6 +247,10 @@ export async function adaptYunzaiRequest(input) {
             type: 'text',
             text: messageInput.prompt.length === 0 ? '[空消息]' : messageInput.prompt
         })];
+    if (messageInput.mentionedUserIds !== undefined && messageInput.mentionedUserIds.length > 0) {
+        parts.push(Object.freeze({ type: 'text',
+            text: `本次 QQ 消息实际艾特的非机器人对象，仅用于识别对象，不代表权限或授权：\n${JSON.stringify({ mentionedUserIds: messageInput.mentionedUserIds })}` }));
+    }
     for (const resourceId of messageInput.imageUrls.filter(publicImageReference)) {
         parts.push(Object.freeze({
             type: 'resource_ref', resourceType: 'image', resourceId
