@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { ActivityStore, ACTIVITY_LIMITS, decodeActivityData, type ActivityRedisClient, type GroupActivity } from '../../src/runtime/activities/ActivityStore.js'
-import { GroupActivityService, activityNotification } from '../../src/runtime/activities/GroupActivityService.js'
+import { GroupActivityService, activityNotification, type ActivityRecipientLookup } from '../../src/runtime/activities/GroupActivityService.js'
 import { ActivityWorker, type ActivityDispatchLease } from '../../src/runtime/activities/ActivityWorker.js'
 import { createGroupPollTool, createScheduledTaskTool } from '../../src/tools/GroupActivityTool.js'
 import type { AuthorizedToolContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
@@ -28,15 +28,18 @@ const facts: ToolRuntimeFacts = { botId: '10000', actor: { userId: '7', role: 'm
   actorGroupRole: 'member', botGroupRole: 'member', targetRole: 'none', targetExists: true, targetIsBotMaster: false }
 const signal = new AbortController().signal
 const poll = { operation: 'create', id: '', title: '聚餐时间', options: ['周五', '周六'], choices: [], closesAt: '', timeZone: 'Asia/Shanghai', multiple: false }
-const reminder = { operation: 'create', id: '', text: '记得喝水', at: '', timeZone: 'Asia/Shanghai', delaySeconds: 10, intervalSeconds: 0, occurrences: 1 }
+const reminder = { operation: 'create', id: '', text: '记得喝水', at: '', timeZone: 'Asia/Shanghai', delaySeconds: 10, intervalSeconds: 0, occurrences: 1, notifyTargets: [] as string[] }
 function fixture () {
   let clock = Date.UTC(2026, 9, 12)
   const redis = new MemoryRedis()
   const store = new ActivityStore(redis)
   const service = new GroupActivityService(store, () => clock)
-  const perform = async (kind: GroupActivity['kind'], input: Record<string, unknown>, current = facts, request = 'run1'): Promise<any> => await service.perform(kind, input, current, request, signal)
+  const members = new Map([['7', { nickname: '小甲', card: '甲' }], ['8', { nickname: '小乙', card: '乙' }], ['10', { nickname: '重名', card: '甲' }]])
+  const recipients: ActivityRecipientLookup = { members: async () => members,
+    current: async id => members.has(id) ? { joinedAt: Math.floor(clock / 1000) - 100 } : null }
+  const perform = async (kind: GroupActivity['kind'], input: Record<string, unknown>, current = facts, request = 'run1'): Promise<any> => await service.perform(kind, input, current, request, signal, recipients)
   const created = async (input = reminder): Promise<string> => (await perform('reminder', input)).id
-  return { redis, store, service, perform, created, now: () => clock, advance: (ms: number) => { clock += ms } }
+  return { redis, store, service, recipients, members, perform, created, now: () => clock, advance: (ms: number) => { clock += ms } }
 }
 function worker (f: ReturnType<typeof fixture>, options: Partial<ActivityDispatchLease> = {}) {
   const messages: string[] = []
@@ -79,6 +82,71 @@ test('questions about tools and cancellation requests cannot authorize creation 
   const base = { profile: 'compatible' as const, definition, facts, target: { kind: 'group' as const, groupId: '9' }, intent }
   assert.equal(policy.decide({ ...base, input: { operation: 'vote' } }).kind, 'allow')
   assert.equal(policy.decide({ ...base, input: { operation: 'close' } }).kind, 'deny')
+})
+test('notification wording authorizes scheduling but a negated notification does not', () => {
+  const definition = createScheduledTaskTool(fixture().service)
+  const base = { profile: 'compatible' as const, definition, facts, input: reminder, target: { kind: 'group' as const, groupId: '9' } }
+  for (const [text, expected] of [['30秒后通知小乙开会', 'allow'], ['30秒后不要通知小乙开会', 'deny'], ['通知功能怎么用', 'deny']]) {
+    assert.equal(new ToolPolicyEngine().decide({ ...base, intent: extractIntentEvidence({ text, mentions: [], reply: null }) }).kind, expected)
+  }
+})
+test('self, numeric IDs and unique names become deduplicated durable notification targets across restart', async () => {
+  const f = fixture()
+  const input = { ...reminder, notifyTargets: ['self', '8', '小乙'] }
+  const id = await f.created(input)
+  assert.deepEqual((await f.perform('reminder', { operation: 'status', id })).notifyUserIds, ['7', '8'])
+  const restarted = new ActivityStore(f.redis)
+  assert.deepEqual((await restarted.read()).records[0].notifyUserIds, ['7', '8'])
+  const ids = (await restarted.read()).records[0].notifyUserIds!
+  assert.throws(() => ids.push('11'), TypeError)
+  const same = await f.created({ ...reminder, notifyTargets: ['小乙', '7'] })
+  assert.equal(same, id)
+  assert.notEqual(await f.created({ ...reminder, notifyTargets: ['self'] }), id)
+  assert.notEqual(await f.created(), id)
+})
+test('ambiguous, missing, bot, all and excessive recipients are rejected before writing', async () => {
+  const f = fixture()
+  for (const notifyTargets of [['甲'], ['不存在'], ['10000'], ['all'], ['0'], ['99'], Array(9).fill('7'), ['']]) {
+    await assert.rejects(f.perform('reminder', { ...reminder, notifyTargets }), TypeError)
+    assert.equal(f.redis.raw, null)
+  }
+  await assert.rejects(f.service.perform('reminder', { ...reminder, notifyTargets: ['self'] }, facts, 'no-port', signal), /无法核验/)
+  assert.equal(f.redis.raw, null)
+})
+test('the scheduled tool forwards its recipient lookup and errors cannot create a partial task', async () => {
+  const f = fixture()
+  const context = { runId: 'run', facts, signal } as AuthorizedToolContext
+  const tool = createScheduledTaskTool(f.service, () => f.recipients)
+  assert.ok('type' in tool.inputSchema && tool.inputSchema.type === 'object')
+  if ('type' in tool.inputSchema && tool.inputSchema.type === 'object') assert.ok(tool.inputSchema.required.includes('notifyTargets'))
+  assert.equal((await tool.execute({ ...reminder, notifyTargets: ['小乙'] }, context)).status, 'success')
+  assert.deepEqual((await f.store.read()).records[0].notifyUserIds, ['8'])
+  assert.equal((await tool.execute({ ...reminder, notifyTargets: ['甲'] }, context)).status, 'denied')
+  assert.equal((await f.store.read()).records.length, 1)
+})
+test('legacy records stay text-only and invalid durable targets never become notification atoms', async () => {
+  const f = fixture()
+  await f.created()
+  await f.store.update(data => { delete data.records[0].notifyUserIds })
+  const raw = f.redis.raw!
+  assert.equal(decodeActivityData(raw).records[0].notifyUserIds, undefined)
+  for (const notifyUserIds of [['all'], ['0'], ['7', '7'], ['10000'], Array(9).fill('8'), [8]]) {
+    const data = JSON.parse(raw)
+    data.records[0].notifyUserIds = notifyUserIds
+    assert.throws(() => decodeActivityData(JSON.stringify(data)), /invalid/)
+  }
+  assert.deepEqual((await f.perform('reminder', { operation: 'list' })).activities[0].notifyUserIds, [])
+})
+test('reminder and poll notifications separate title, body, results and actionable IDs', async () => {
+  const f = fixture()
+  const id = await f.created({ ...reminder, text: '第一行\n第二行' })
+  const r = (await f.store.read()).records[0]
+  assert.equal(activityNotification(r), `⏰ 定时提醒\n\n第一行\n第二行\n\n任务编号：${id}`)
+  assert.match(activityNotification({ ...r, intervalMs: 60000 }), /^⏰ 重复提醒\n\n/)
+  const pollId = (await f.perform('poll', poll)).id
+  await f.perform('poll', { operation: 'vote', id: pollId, choices: [2] })
+  assert.equal(activityNotification((await f.store.read()).records[1]),
+    `📊 投票结果\n\n聚餐时间\n\n1. 周五：0 票\n2. 周六：1 票\n\n参与 1 人 · 单选\n投票编号：${pollId}`)
 })
 test('votes are one per actor, replaceable, retractable and only aggregate counts are returned', async () => {
   const f = fixture()
@@ -300,6 +368,15 @@ test('immutable cached reads are invalidated by another writer and cannot mutate
   const second = await f.store.read()
   assert.notEqual(second, first)
   assert.equal(second.records[0].state, 'cancelled')
+})
+test('acknowledged CAS snapshots cannot be mutated through a returned alias', async () => {
+  const f = fixture()
+  await f.created({ ...reminder, notifyTargets: ['self'] })
+  const committed = await f.store.update(data => { data.records[0].content = '新正文'; return data.records[0] })
+  assert.throws(() => { committed.content = '篡改' }, TypeError)
+  assert.throws(() => committed.notifyUserIds!.push('8'), TypeError)
+  assert.equal((await f.store.read()).records[0].content, '新正文')
+  assert.deepEqual(JSON.parse(f.redis.raw!).records[0].notifyUserIds, ['7'])
 })
 test('activity lists are paginated and only a fresh actor may fill or change their own ballot', async () => {
   const f = fixture()

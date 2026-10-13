@@ -56,8 +56,8 @@ export function createManagementToolDefinitions(capabilities) {
         createHandleMessageTool(capabilities)
     ]);
 }
-export function createGroupActivityDefinitions(service) {
-    return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service)]);
+export function createGroupActivityDefinitions(service, recipientLookup) {
+    return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service, recipientLookup)]);
 }
 export function createQueryToolRuntime(options) {
     const common = { policyFetch: options.policyFetch };

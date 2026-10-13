@@ -1,5 +1,5 @@
 import type { ToolDefinition } from '../../agent/tools/tool-definition.js'
-import type { ToolTarget } from '../../agent/tools/tool-context.js'
+import type { ToolRuntimeFacts, ToolTarget } from '../../agent/tools/tool-context.js'
 import { ToolRegistry } from '../../agent/tools/tool-registry.js'
 import { createGithubTool } from '../../tools/GithubTool.js'
 import { createImageCaptionTool } from '../../tools/ImageCaptionTool.js'
@@ -41,7 +41,7 @@ import { createRandomChoiceTool } from '../../tools/RandomChoiceTool.js'
 import { createDateTimeTool } from '../../tools/DateTimeTool.js'
 import { createUnitConvertTool } from '../../tools/UnitConvertTool.js'
 import { createGroupPollTool, createScheduledTaskTool } from '../../tools/GroupActivityTool.js'
-import type { GroupActivityService } from '../activities/GroupActivityService.js'
+import type { ActivityRecipientLookup, GroupActivityService } from '../activities/GroupActivityService.js'
 import type { QqManagementCapabilities } from '../../tools/management-tool-support.js'
 
 export interface QueryToolRuntimeConfig {
@@ -112,8 +112,9 @@ export function createManagementToolDefinitions (
   ])
 }
 
-export function createGroupActivityDefinitions (service?: GroupActivityService): readonly ToolDefinition[] {
-  return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service)])
+export function createGroupActivityDefinitions (service?: GroupActivityService,
+  recipientLookup?: (facts: ToolRuntimeFacts) => ActivityRecipientLookup): readonly ToolDefinition[] {
+  return Object.freeze([createGroupPollTool(service), createScheduledTaskTool(service, recipientLookup)])
 }
 
 export function createQueryToolRuntime (options: QueryToolRuntimeOptions): QueryToolRuntime {

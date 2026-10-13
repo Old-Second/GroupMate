@@ -1,6 +1,45 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { parseDateTime, validateTimeZone } from '../../tools/local-date-time.js';
 import { ACTIVITY_LIMITS, activeActivity, pruneActivities } from './ActivityStore.js';
+async function notificationRecipients(input, facts, lookup, now, signal) {
+    if (input === undefined)
+        return []; // Legacy callers and records remain text-only.
+    if (!Array.isArray(input) || input.length > ACTIVITY_LIMITS.recipients ||
+        input.some(value => typeof value !== 'string' || value.trim() === '' || value.length > 100))
+        throw new TypeError('通知对象须为最多 8 位当前群成员，不支持全体艾特。');
+    if (input.length === 0)
+        return [];
+    if (lookup === undefined)
+        throw new TypeError('无法核验通知对象，请稍后重试。');
+    let members;
+    const ids = [];
+    for (const raw of input) {
+        const target = raw.trim();
+        let id;
+        if (target === 'self')
+            id = facts.actor.userId;
+        else if (/^[1-9][0-9]{0,19}$/.test(target))
+            id = target;
+        else {
+            if (/^(?:all|全体|全体成员|所有人|everyone)$/i.test(target))
+                throw new TypeError('定时提醒不支持全体艾特。');
+            members ??= await lookup.members(signal);
+            const matches = [...members].filter(([, member]) => member.card === target || member.nickname === target);
+            if (matches.length !== 1)
+                throw new TypeError('通知对象未找到或存在同名成员，请在当前消息中直接艾特对方或提供 QQ 号。');
+            id = matches[0][0];
+        }
+        if (!/^[1-9][0-9]{0,19}$/.test(id) || id === facts.botId)
+            throw new TypeError('通知对象须为当前群成员，不能是机器人自己。');
+        if (ids.includes(id))
+            continue;
+        const member = await lookup.current(id, signal);
+        if (member === null || member.joinedAt === 0 || member.joinedAt * 1000 > now)
+            throw new TypeError('通知对象的当前群成员身份无法核实，请稍后重试。');
+        ids.push(id);
+    }
+    return ids.sort();
+}
 function hash(text) { return createHash('sha256').update(text).digest('hex'); }
 function message(value, max) {
     if (typeof value !== 'string' || value.trim() === '' || value.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value))
@@ -17,12 +56,14 @@ export function activitySummary(r, now) {
     return { id: r.id, kind: r.kind, state: r.state, content: r.content, dueAt: new Date(r.dueAt).toISOString(), timeZone: r.timeZone,
         secondsLeft: activeActivity(r) ? Math.max(0, Math.ceil((r.dueAt - now) / 1000)) : 0,
         remaining: activeActivity(r) ? r.remaining : 0, intervalSeconds: r.intervalMs / 1000,
+        ...(r.kind === 'reminder' ? { notifyUserIds: r.notifyUserIds ?? [] } : {}),
         ...(r.kind === 'poll' ? { multiple: r.multiple, options: r.options.map((text, index) => ({ number: index + 1, text, votes: counts(r)[index] })), voters: Object.keys(r.votes).length } : {}) };
 }
 export function activityNotification(r) {
     if (r.kind === 'reminder')
-        return `提醒 [${r.id}]：${r.content}`;
-    return `投票已截止 [${r.id}]：${r.content}\n${r.options.map((text, index) => `${index + 1}. ${text}：${counts(r)[index]} 票`).join('\n')}\n参与 ${Object.keys(r.votes).length} 人${r.multiple ? '（多选）' : '（单选）'}`;
+        return `⏰ ${r.intervalMs > 0 ? '重复提醒' : '定时提醒'}\n\n${r.content}\n\n任务编号：${r.id}`;
+    const totals = counts(r);
+    return `📊 投票结果\n\n${r.content}\n\n${r.options.map((text, index) => `${index + 1}. ${text}：${totals[index]} 票`).join('\n')}\n\n参与 ${Object.keys(r.votes).length} 人 · ${r.multiple ? '多选' : '单选'}\n投票编号：${r.id}`;
 }
 export class GroupActivityService {
     store;
@@ -31,16 +72,19 @@ export class GroupActivityService {
         this.store = store;
         this.now = now;
     }
-    async perform(kind, input, facts, requestId, signal) {
+    async perform(kind, input, facts, requestId, signal, recipientLookup) {
         if (facts.channel.kind !== 'group' || facts.actorGroupRole === 'none' || facts.botGroupRole === 'none')
             throw new TypeError('仅当前群的现有成员可用。');
         const groupId = facts.channel.groupId;
         const moderator = facts.actor.isBotMaster || ['admin', 'owner'].includes(facts.actorGroupRole);
         const now = this.now();
         const operation = input.operation;
+        const notifyUserIds = kind === 'reminder' && operation === 'create'
+            ? await notificationRecipients(input.notifyTargets, facts, recipientLookup, now, signal) : [];
         const scoped = (r) => r.kind === kind && r.botId === facts.botId && r.groupId === groupId;
         const creationInput = kind === 'reminder'
-            ? [input.text, input.at, input.timeZone, input.delaySeconds, input.intervalSeconds, input.occurrences]
+            ? [input.text, input.at, input.timeZone, input.delaySeconds, input.intervalSeconds, input.occurrences,
+                ...(notifyUserIds.length > 0 ? [notifyUserIds] : [])]
             : [input.title, input.options, input.closesAt, input.timeZone, input.multiple];
         const requestKey = hash(JSON.stringify([facts.botId, groupId, facts.actor.userId, requestId, kind, creationInput]));
         const id = randomBytes(8).toString('hex');
@@ -96,7 +140,8 @@ export class GroupActivityService {
                     throw new TypeError('截止时间须在未来，全部次数须在 90 天以内。');
                 const r = { schemaVersion: 1, id, kind, botId: facts.botId, groupId, ownerId: facts.actor.userId,
                     requestKey, createdAt: now, updatedAt: now, dueAt, state: 'pending', token: '', leaseUntil: 0,
-                    content, timeZone: zone, intervalMs, remaining, options, multiple, votes: {} };
+                    content, timeZone: zone, intervalMs, remaining, options, multiple, votes: {},
+                    ...(kind === 'reminder' ? { notifyUserIds } : {}) };
                 data.records.push(r);
                 return activitySummary(r, now);
             }

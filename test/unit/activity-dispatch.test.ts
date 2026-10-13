@@ -11,12 +11,14 @@ const record: GroupActivity = { schemaVersion: 1, id: 'a'.repeat(16), kind: 'rem
   dueAt: Date.UTC(2026, 9, 12) + 10000, state: 'claimed', token: 'a'.repeat(32), leaseUntil: Date.UTC(2026, 9, 12) + 120000,
   content: '合成提醒', timeZone: 'UTC', intervalMs: 0, remaining: 1, options: [], multiple: false, votes: {} }
 const signal = new AbortController().signal
-function fixture () {
+function fixture (activity: GroupActivity = record) {
   const config: Record<string, unknown> = {}
   let joinedAt = Math.floor(record.createdAt / 1000) - 100
   let missing = false
   let muted = false
   let occupied = false
+  let recipientJoinedAt = joinedAt
+  let recipientMissing = false
   let releases = 0
   const reads: string[] = []
   const deliveries: unknown[] = []
@@ -27,7 +29,9 @@ function fixture () {
     assert.equal(params.no_cache, true)
     assert.equal(String(params.group_id), '9')
     reads.push(String(params.user_id))
-    return missing ? null : { user_id: params.user_id, group_id: 9, role: 'member', join_time: joinedAt }
+    const recipient = String(params.user_id) === '8'
+    return missing || (recipient && recipientMissing) ? null : { user_id: params.user_id, group_id: 9, role: 'member',
+      join_time: recipient ? recipientJoinedAt : joinedAt }
   } } as unknown as YunzaiBotLike
   const policy = { snapshot: async () => ({ whitelist, blacklist }), isMuted: async () => muted } as unknown as ChatEntryPolicyPort
   const acquire = createActivityDispatch({ config, botPicker: { pick: async () => bot }, chatPolicy: policy,
@@ -36,8 +40,9 @@ function fixture () {
       assert.deepEqual(target, { botId: '10000', scope: { kind: 'group', groupId: '9' } })
       return { dispatch: async part => { deliveries.push(part); return { message_id: '123' } }, recall: async () => undefined }
     } }) })
-  return { acquire, config, blacklist, whitelist, reads, deliveries, releases: () => releases,
+  return { acquire: (r = activity, s = signal) => acquire(r, s), config, blacklist, whitelist, reads, deliveries, releases: () => releases,
     setJoined: (value: number) => { joinedAt = value }, setMissing: () => { missing = true },
+    setRecipientJoined: (value: number) => { recipientJoinedAt = value }, setRecipientMissing: () => { recipientMissing = true },
     setMuted: () => { muted = true }, setOccupied: () => { occupied = true } }
 }
 test('scheduled host adapter uses shared admission, uncached actor/bot membership and typed outbound receipts', async () => {
@@ -50,6 +55,36 @@ test('scheduled host adapter uses shared admission, uncached actor/bot membershi
   assert.deepEqual(f.deliveries, [{ media: 'text', atoms: [{ kind: 'text', text: '合成提醒' }] }])
   await lease.release()
   assert.equal(f.releases(), 1)
+})
+test('scheduled notifications deliver genuine typed mentions once after uncached recipient checks', async () => {
+  const f = fixture({ ...record, notifyUserIds: ['7', '8'] })
+  const lease = await f.acquire()
+  assert.ok(lease)
+  assert.equal(await lease.deliver('不应投递', signal), 'failed_definite')
+  assert.equal(await lease.authorize(signal), 'allowed')
+  assert.deepEqual(f.reads, ['7', '10000', '8'])
+  assert.equal(await lease.deliver('⏰ 定时提醒\n\n开会', signal), 'sent')
+  assert.deepEqual(f.deliveries, [{ media: 'text', atoms: [
+    { kind: 'at', target: { userId: '7' } }, { kind: 'text', text: ' ' },
+    { kind: 'at', target: { userId: '8' } }, { kind: 'text', text: '\n' },
+    { kind: 'text', text: '⏰ 定时提醒\n\n开会' }
+  ] }])
+  assert.equal(await lease.deliver('不能重放', signal), 'failed_definite')
+  assert.equal(f.deliveries.length, 1)
+  await lease.release()
+})
+test('recipient lookup failure or rejoining prevents both mention and text dispatch', async () => {
+  const f = fixture({ ...record, notifyUserIds: ['8'] })
+  const lease = await f.acquire()
+  assert.ok(lease)
+  assert.equal(await lease.authorize(signal), 'allowed')
+  f.setRecipientJoined(Math.floor(record.createdAt / 1000) + 1)
+  assert.equal(await lease.authorize(signal), 'revoked')
+  assert.equal(await lease.deliver('开会', signal), 'failed_definite')
+  f.setRecipientMissing()
+  assert.equal(await lease.authorize(signal), 'unavailable')
+  assert.equal(f.deliveries.length, 0)
+  await lease.release()
 })
 test('member departure or lookup outage cannot send; rejoining does not revive an old task', async () => {
   const f = fixture()

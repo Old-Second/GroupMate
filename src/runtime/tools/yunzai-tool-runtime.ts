@@ -1211,7 +1211,12 @@ export function createYunzaiToolRuntimeBridge (
       query.definitions,
       visible,
       management,
-      createGroupActivityDefinitions(options.groupActivities)
+      createGroupActivityDefinitions(options.groupActivities, facts => ({
+        members: async signal => facts.channel.kind === 'group'
+          ? await currentMembers(event, facts.channel.groupId, signal) : new Map(),
+        current: async (userId, signal) => facts.channel.kind === 'group'
+          ? await currentGroupMember(event.bot, facts.channel.groupId, userId, signal) : null
+      }))
     )
     const enabledTools = definitions
       .filter(definition => {

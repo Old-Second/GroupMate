@@ -45,7 +45,7 @@ const actionRules: readonly [IntentAction, RegExp][] = [
   ['poll_retract', /撤票|撤(?:回|销).{0,80}(?:我的票|的票)|取消我的.{0,48}票|退出.{0,12}投票/],
   ['poll_close', /(?:提前结束|提前结算|结束|关闭|结算).{0,24}投票|投票.{0,32}(?:提前结束|提前结算|现在结束|现在结算)/],
   ['poll_cancel', /(?:取消|撤销).{0,24}投票|投票.{0,32}(?:取消|撤销)/],
-  ['schedule_create', /(?:[0-9一二三四五六七八九十两半]+\s*(?:秒|分钟|小时|天)后|今天|明天|每天).{0,32}提醒|(?:创建|设置|新建).{0,8}(?:提醒|倒计时|定时任务)|提醒我|\bremind\s+me\b|\bcreate\s+(?:a\s+)?(?:reminder|schedule)\b/i],
+  ['schedule_create', /(?:[0-9一二三四五六七八九十两半]+\s*(?:秒|分钟|小时|天)后|今天|明天|每天).{0,32}(?:提醒|通知)|(?:创建|设置|新建).{0,8}(?:提醒|倒计时|定时任务)|提醒我|\bremind\s+me\b|\bcreate\s+(?:a\s+)?(?:reminder|schedule)\b/i],
   ['schedule_cancel', /(?:取消|删除|撤销|停止|关闭).{0,24}(?:定时任务|提醒|倒计时)|(?:定时任务|提醒|倒计时).{0,32}(?:取消|删除|撤销|停止|关闭)/],
   ['unmute', /解除.{0,6}禁言|取消.{0,6}禁言|解禁|\bunmute\b/i],
   ['mute', /禁言|闭嘴|\bmute\b|\bban\b/i],
@@ -68,7 +68,7 @@ const actionRules: readonly [IntentAction, RegExp][] = [
 const negatedActionRules: Partial<Readonly<Record<IntentAction, RegExp>>> = Object.freeze({
   poll_create: /(?:不要|别|禁止|不许|无需).{0,6}(?:创建|发起|组织|开).{0,6}投票/,
   poll_vote: /(?:不要|别|禁止|不许).{0,8}(?:投票|改票|选)/,
-  schedule_create: /(?:不要|别|禁止|不许|无需).{0,8}(?:创建|设置|新建|提醒|倒计时)/,
+  schedule_create: /(?:不要|别|禁止|不许|无需).{0,8}(?:创建|设置|新建|提醒|通知|倒计时)/,
   send: /(?:不要|别|禁止|不许|无需).{0,6}(?:发送|转发|发给)|\b(?:do not|don't)\s+(?:send|forward)\b/i,
   mute: /(?:不要|别|禁止|不许).{0,6}(?:禁言|闭嘴)|\b(?:do not|don't)\s+(?:mute|ban)\b/i,
   kick: /(?:不要|别|禁止|不许).{0,6}(?:踢出|踢走|移出群)|\b(?:do not|don't)\s+kick\b/i,

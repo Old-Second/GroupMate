@@ -77,7 +77,10 @@ test('ordinary group members discover and persist scheduled tasks through the na
     if ((raw ?? '') !== args[0]) return 0
     raw = args[1]; return 1
   } })
-  const members = new Map([[7, { user_id: 7, role: 'member' }], [10000, { user_id: 10000, role: 'member' }]])
+  const joined = Math.floor(Date.now() / 1000) - 100
+  const members = new Map([[7, { user_id: 7, role: 'member', join_time: joined }],
+    [8, { user_id: 8, role: 'member', join_time: joined, nickname: '小乙' }],
+    [10000, { user_id: 10000, role: 'member', join_time: joined }]])
   const group = { getMemberMap: async () => members }
   const event = { isGroup: true, group_id: 9, self_id: 10000, user_id: 7, sender: { user_id: 7, role: 'member' },
     group, message: [], bot: { pickGroup: () => group } }
@@ -87,10 +90,11 @@ test('ordinary group members discover and persist scheduled tasks through the na
   assert.ok(run.snapshot.toolNames.includes('groupPoll'))
   assert.ok(run.snapshot.toolNames.includes('scheduledTask'))
   const outcome = await executeNativeTool(bridge, run, { runId: 'schedule', callId: 'call-schedule', requestedName: 'scheduledTask',
-    arguments: { operation: 'create', id: '', text: '喝水', at: '', timeZone: 'Asia/Shanghai', delaySeconds: 10, intervalSeconds: 0, occurrences: 1, offset: 0 } })
+    arguments: { operation: 'create', id: '', text: '喝水', at: '', timeZone: 'Asia/Shanghai', delaySeconds: 10, intervalSeconds: 0, occurrences: 1, offset: 0, notifyTargets: ['self', '小乙'] } })
   assert.equal(outcome.result?.status, 'success')
   assert.equal((await store.read()).records[0].content, '喝水')
   assert.equal((await store.read()).records[0].groupId, '9')
+  assert.deepEqual((await store.read()).records[0].notifyUserIds, ['7', '8'])
   const unavailable = createYunzaiToolRuntimeBridge({ config: config(), redis: new FakeRedis(), getMasterIds: async () => [], getBotId: () => '10000', segment: () => ({}) })
   assert.equal((await unavailable.prepareAgentRun({ event, prompt: '提醒我喝水' })).snapshot.toolNames.includes('scheduledTask'), false)
 })
