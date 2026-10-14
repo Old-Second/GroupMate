@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { AuthorizedToolContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
 import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
+import { parseToolResult } from '../../src/agent/tools/tool-result.js'
 import type { PolicyTransportRequest, PolicyTransportResponse } from '../../src/runtime/tools/policy-fetch.js'
 import { PolicyFetch } from '../../src/runtime/tools/policy-fetch.js'
 import { NetworkPolicy } from '../../src/agent/tools/network-policy.js'
@@ -143,6 +144,65 @@ test('search tool selects one configured backend and never leaks its key', async
   assert.equal(fixture.calls[0].url.href, 'https://api.tavily.com/search')
   assert.equal(fixture.calls[0].headers.authorization, 'Bearer top-secret')
   assert.doesNotMatch(JSON.stringify(result), /top-secret/)
+})
+
+test('search keeps valid Chinese and emoji results within the executor byte limit in one request', async () => {
+  for (const body of [
+    { answer: '摘要😀'.repeat(250), results: Array.from({ length: 8 }, (_, i) => ({
+      title: `来源${i}：${'中文'.repeat(90)}`, url: `https://example.com/${i}`,
+      content: '中文内容😀'.repeat(150)
+    })) },
+    { results: Array.from({ length: 8 }, (_, i) => ({
+      title: `escaped-${i}`, url: `https://example.com/${i}`,
+      content: '"\\\n😀'.repeat(150)
+    })) }
+  ]) {
+    const fixture = policyFetchFixture(() => response(body))
+    const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(t => t.name === 'search')!
+    const result = parseToolResult(await tool.execute({ q: '合成查询', num: 8 }, context), tool.maxOutputBytes)
+    assert.equal(result.status, 'success')
+    if (result.status !== 'success' || result.content[0]?.type !== 'text') assert.fail('expected search text')
+    const output = JSON.parse(result.content[0].text)
+    assert.equal(output.results.length, 8)
+    assert.equal(output.truncated, true)
+    assert.deepEqual(output.results.map((r: { url: string }) => r.url), body.results.map(r => r.url))
+    assert.equal(fixture.calls.length, 1)
+    assert.equal(Buffer.byteLength(JSON.stringify(result)) <= 16 * 1024, true)
+    for (const row of output.results) {
+      assert.equal(row.content.isWellFormed(), true)
+      assert.equal(row.title.isWellFormed(), true)
+    }
+  }
+})
+
+test('search drops lower ranked rows only when complete citation URLs cannot fit', async () => {
+  const rows = Array.from({ length: 8 }, (_, i) => ({
+    title: `来源${i}`, url: `https://example.com/${i}?q=${'a'.repeat(1950)}`, content: '摘要'.repeat(500)
+  }))
+  const fixture = policyFetchFixture(() => response({ results: rows }))
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(t => t.name === 'search')!
+  const result = parseToolResult(await tool.execute({ q: '合成查询', num: 8 }, context), tool.maxOutputBytes)
+  if (result.status !== 'success' || result.content[0]?.type !== 'text') assert.fail('expected search text')
+  const output = JSON.parse(result.content[0].text)
+  assert.equal(output.truncated, true)
+  assert.equal(output.results.length > 0 && output.results.length < 8, true)
+  assert.deepEqual(output.results.map((r: { url: string }) => r.url), rows.slice(0, output.results.length).map(r => r.url))
+  assert.equal(fixture.calls.length, 1)
+})
+
+test('search ignores malformed entries and unusable links without returning their raw payload', async () => {
+  const fixture = policyFetchFixture(() => response({ results: [
+    'private-payload'.repeat(1000), null, ['not-a-row'], { url: 'javascript:alert(1)' },
+    { url: 'https://user:secret@example.com/' }, { url: `https://example.com/${'x'.repeat(2048)}` },
+    { title: 'usable', url: 'https://example.com/intact', content: 'short' }
+  ] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(t => t.name === 'search')!
+  const result = parseToolResult(await tool.execute({ q: '合成查询', num: 8 }, context), tool.maxOutputBytes)
+  if (result.status !== 'success' || result.content[0]?.type !== 'text') assert.fail('expected search text')
+  const output = JSON.parse(result.content[0].text)
+  assert.deepEqual(output.results, [{ title: 'usable', url: 'https://example.com/intact', content: 'short', publishedDate: '' }])
+  assert.doesNotMatch(result.content[0].text, /private-payload|secret|javascript/)
+  assert.equal(fixture.calls.length, 1)
 })
 
 test('missing query configuration returns a typed redacted failure', async () => {

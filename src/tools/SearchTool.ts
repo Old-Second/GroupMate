@@ -2,7 +2,7 @@ import type { ToolDefinition } from '../agent/tools/tool-definition.js'
 import { PolicyFetch } from '../runtime/tools/policy-fetch.js'
 import { readResourceKeys } from '../agent/tools/resource-key.js'
 import {
-  boundedJson, boundedText, clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments,
+  clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments,
   isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult
 } from './query-tool-support.js'
 
@@ -23,8 +23,25 @@ const inputSchema = {
   required: ['q', 'num'], additionalProperties: false
 } as const
 
-function normalizedResults (data: unknown, limit: number): unknown {
-  if (data === null || typeof data !== 'object') return []
+const OUTPUT_LIMIT_BYTES = 16 * 1024
+
+interface SearchResult {
+  readonly title: string
+  readonly url: string
+  readonly content: string
+  readonly publishedDate: string
+}
+
+function clipText (value: unknown, limit: number): string {
+  const text = typeof value === 'string' ? value : ''
+  if (text.length <= limit) return text
+  if (limit === 0) return ''
+  const last = text.charCodeAt(limit - 1)
+  return `${text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit)}…`
+}
+
+function normalizedResults (data: unknown, limit: number): { results: SearchResult[]; truncated: boolean } {
+  if (data === null || typeof data !== 'object') return { results: [], truncated: false }
   const record = data as Record<string, unknown>
   const source = Array.isArray(record.results)
     ? record.results
@@ -34,16 +51,52 @@ function normalizedResults (data: unknown, limit: number): unknown {
           Array.isArray((record.webPages as Record<string, unknown>).value))
         ? (record.webPages as Record<string, unknown>).value as unknown[]
         : []
-  return source.slice(0, limit).map(item => {
-    if (item === null || typeof item !== 'object') return item
+  let truncated = source.length > limit
+  const clip = (value: unknown, size: number): string => {
+    const text = clipText(value, size)
+    if (typeof value === 'string' && text !== value) truncated = true
+    return text
+  }
+  const results = source.slice(0, limit).flatMap(item => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return []
     const value = item as Record<string, unknown>
-    return {
-      title: boundedText(value.title ?? value.name, 200),
-      url: boundedText(value.url, 2_048),
-      content: boundedText(value.content ?? value.snippet ?? value.description, 1_000),
-      publishedDate: boundedText(value.published_date ?? value.datePublished, 100)
-    }
+    // Keep citation URLs intact. A sliced URL is not a usable source.
+    if (typeof value.url !== 'string' || value.url.length > 2048) return []
+    try {
+      const url = new URL(value.url)
+      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return []
+    } catch { return [] }
+    return [{
+      title: clip(value.title ?? value.name, 200),
+      url: value.url,
+      content: clip(value.content ?? value.snippet ?? value.description, 1_000),
+      publishedDate: clip(value.published_date ?? value.datePublished, 100)
+    }]
   })
+  return { results, truncated }
+}
+
+function searchResult (data: unknown, limit: number): ReturnType<typeof textResult> {
+  const record = data !== null && typeof data === 'object' ? data as Record<string, unknown> : {}
+  const normalized = normalizedResults(data, limit)
+  const results = normalized.results
+  const answer = clipText(record.answer, 1000)
+  let snippetLimit = 1000
+  let count = results.length
+  let truncated = normalized.truncated || (typeof record.answer === 'string' && answer !== record.answer)
+  for (;;) {
+    const result = textResult(JSON.stringify({
+      answer: clipText(answer, snippetLimit),
+      results: results.slice(0, count).map(item => ({ ...item, content: clipText(item.content, snippetLimit) })),
+      truncated
+    }))
+    // The executor measures the whole JSON-encoded ToolResult, including the
+    // escaped JSON text. Character counts understate Chinese/emoji output.
+    if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= OUTPUT_LIMIT_BYTES) return result
+    truncated = true
+    if (snippetLimit > 0) snippetLimit = Math.floor(snippetLimit / 2)
+    else count--
+  }
 }
 
 export function createSearchTool (options: SearchToolOptions): ToolDefinition {
@@ -54,9 +107,10 @@ export function createSearchTool (options: SearchToolOptions): ToolDefinition {
   ])
   return readOnlyDefinition({
     name: 'search',
-    description: '搜索互联网公开信息；需要最新资料或不了解问题时使用。',
+    description: '搜索互联网公开信息；需要最新资料或不了解问题时直接使用，无需先问是否联网。num为1～8，通常3～5条即可。结果过长会缩短摘要并保留完整来源链接，truncated表示已压缩；先利用已有结果，不因压缩重复同一搜索。',
     inputSchema,
     network: 'fixed_hosts',
+    maxOutputBytes: OUTPUT_LIMIT_BYTES,
     retrySafe: options.backend !== 'tavily',
     resourceKeys: input => readResourceKeys('search', input),
     execute: async (input, context) => {
@@ -89,11 +143,7 @@ export function createSearchTool (options: SearchToolOptions): ToolDefinition {
       if (isToolResult(response)) return response
       const parsed = parseJsonResponse(response)
       if (isToolResult(parsed)) return parsed
-      const record = parsed !== null && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
-      return textResult(boundedJson({
-        answer: boundedText(record.answer, 1_000),
-        results: normalizedResults(parsed, num)
-      }))
+      return searchResult(parsed, num)
     }
   })
 }
