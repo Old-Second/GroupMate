@@ -94,7 +94,7 @@ export function createSearchImageTool (options: SearchImageToolOptions): ToolDef
   const brave = fixedOriginPolicy('https://api.search.brave.com', ['/res/v1/images/search'])
   const publicSearch = fixedOriginPolicy('https://serp.ikechan8370.com', ['/image/bing'])
   return readOnlyDefinition({
-    name: 'searchImage', description: '搜索公开图片，返回images候选列表及完整url。limit为1～6，未指定张数通常1～2张，不追问数量。用户明确要看图/搜图并发来时，使用候选url继续sendPicture，不再问是否发送；只要链接或不发送时只返回链接。truncated表示说明压缩，已有地址可用，无需重复搜同一关键词。',
+    name: 'searchImage', description: '搜索公开图片，返回images候选列表及完整url。limit为1～6，未指定张数通常1～2张，不追问数量。用户明确要看图/搜新图并发来时，本轮只搜索；成功返回后下一轮才用本次候选url调用sendPicture，不与发送同批，不再问是否发送；只要链接或不发送时只返回链接。truncated表示说明压缩，已有地址可用，无需重复搜同一关键词。',
     inputSchema, network: 'fixed_hosts', maxOutputBytes: OUTPUT_LIMIT_BYTES,
     retrySafe: options.backend !== 'tavily', timeoutMs: 12_000,
     resourceKeys: input => readResourceKeys('searchImage', input),
