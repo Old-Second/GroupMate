@@ -27,7 +27,10 @@ function normalize(data, backend, limit) {
             ? value.properties : {};
         const thumbnail = value.thumbnail !== null && typeof value.thumbnail === 'object'
             ? value.thumbnail : {};
-        const url = httpUrl(value.url ?? value.murl ?? value.image ?? properties.url ?? thumbnail.src);
+        // Brave's top-level url is the source page; properties.url is the image.
+        const url = httpUrl(backend === 'brave'
+            ? properties.url ?? value.image ?? thumbnail.src ?? value.url
+            : value.murl ?? value.image ?? value.url ?? properties.url ?? thumbnail.src);
         if (url === null || seen.has(urlIdentity(url)))
             continue;
         seen.add(urlIdentity(url));
@@ -39,7 +42,7 @@ function normalize(data, backend, limit) {
             title,
             url,
             thumbnail: httpUrl(thumbnail.src ?? value.turl ?? value.thumbnail) ?? url,
-            source: httpUrl(value.purl ?? value.hostPageUrl) ?? '',
+            source: httpUrl(value.purl ?? value.hostPageUrl ?? (backend === 'brave' ? value.url : undefined)) ?? '',
             description
         });
     }

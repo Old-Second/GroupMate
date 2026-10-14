@@ -433,6 +433,23 @@ test('image search uses only the selected fixed backend and returns bounded cand
   if (missingResult.status === 'failed') assert.equal(missingResult.errorCode, 'configuration_missing')
 })
 
+test('Brave image search hands off the original image and keeps its source page separately', async () => {
+  const fixture = policyFetchFixture(() => response({ results: [{
+    url: 'https://page.example/cats', title: '猫咪',
+    properties: { url: 'https://cdn.example/cat.png?signature=original' },
+    thumbnail: { src: 'https://cdn.example/thumbnail.png' }
+  }] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch, imageSearchSource: 'brave', braveSearchApiKey: 'key' })
+    .definitions.find(item => item.name === 'searchImage')!
+  const result = await tool.execute({ q: '猫咪', limit: 1 }, context)
+  assert.equal(result.status, 'success')
+  if (result.status !== 'success' || result.content[0].type !== 'text') throw new Error('expected image candidate')
+  const image = JSON.parse(result.content[0].text).images[0]
+  assert.equal(image.url, 'https://cdn.example/cat.png?signature=original')
+  assert.equal(image.source, 'https://page.example/cats')
+  assert.equal(image.thumbnail, 'https://cdn.example/thumbnail.png')
+})
+
 test('video and music query tools normalize successful fixture responses', async () => {
   const fixture = policyFetchFixture(request => request.url.hostname === 'api.bilibili.com'
     ? response({ code: 0, data: { result: [{ bvid: 'BV1xx411c7mD', title: '<em>title</em>', author: 'up', play: 10, pubdate: 1 }] } })
