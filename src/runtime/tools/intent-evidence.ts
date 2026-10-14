@@ -39,14 +39,17 @@ export interface IntentEvidenceInput {
   readonly currentMessageId?: string | number
 }
 
+const scheduleCancellation = /(?:取消|删除|撤销|停止|关闭).{0,24}(?:定时任务|提醒|倒计时)|(?:定时任务|提醒|倒计时).{0,32}(?:取消|删除|撤销|停止|关闭)/
+const scheduleDiscussion = /(?:解释|介绍|讨论|举例|他说|她说|原话|示例).{0,32}(?:提醒|通知|叫醒|喊醒)|(?:提醒|通知|叫醒|喊醒).{0,48}(?:是什么意思|怎么实现|的原理)/
+
 const actionRules: readonly [IntentAction, RegExp][] = [
   ['poll_create', /(?:发起|创建|组织|开|来个|设置).{0,12}投票|\b(?:create|start)\s+(?:a\s+)?poll\b/i],
   ['poll_vote', /(?:我选|改票.{0,8}(?:选|为)|投票.{0,48}(?:选|投|支持))\s*\d|\bvote\s+(?:for\s+)?\d/i],
   ['poll_retract', /撤票|撤(?:回|销).{0,80}(?:我的票|的票)|取消我的.{0,48}票|退出.{0,12}投票/],
   ['poll_close', /(?:提前结束|提前结算|结束|关闭|结算).{0,24}投票|投票.{0,32}(?:提前结束|提前结算|现在结束|现在结算)/],
   ['poll_cancel', /(?:取消|撤销).{0,24}投票|投票.{0,32}(?:取消|撤销)/],
-  ['schedule_create', /(?:[0-9一二三四五六七八九十两半]+\s*(?:秒|分钟|小时|天)后|今天|明天|每天).{0,32}(?:提醒|通知)|(?:创建|设置|新建).{0,8}(?:提醒|倒计时|定时任务)|提醒我|\bremind\s+me\b|\bcreate\s+(?:a\s+)?(?:reminder|schedule)\b/i],
-  ['schedule_cancel', /(?:取消|删除|撤销|停止|关闭).{0,24}(?:定时任务|提醒|倒计时)|(?:定时任务|提醒|倒计时).{0,32}(?:取消|删除|撤销|停止|关闭)/],
+  ['schedule_create', /(?:[0-9一二三四五六七八九十两半]+\s*(?:秒|分钟|小时|天)后|今天|明天|明早|今晚|明晚|每天).{0,48}(?:提醒|通知|叫醒|喊醒|叫我|喊我)|(?:提醒|通知|叫醒|喊醒|叫我|喊我).{0,48}(?:[0-9一二三四五六七八九十两半]+\s*(?:秒|分钟|小时|天)后|今天|明天|明早|今晚|明晚|每天)|(?:创建|设置|新建).{0,8}(?:提醒|倒计时|定时任务)|提醒我|叫醒我|\bremind\s+me\b|\bcreate\s+(?:a\s+)?(?:reminder|schedule)\b/i],
+  ['schedule_cancel', scheduleCancellation],
   ['unmute', /解除.{0,6}禁言|取消.{0,6}禁言|解禁|\bunmute\b/i],
   ['mute', /禁言|闭嘴|\bmute\b|\bban\b/i],
   ['send', /发送|转发|发给|\bsend\b|\bforward\b/i],
@@ -68,7 +71,7 @@ const actionRules: readonly [IntentAction, RegExp][] = [
 const negatedActionRules: Partial<Readonly<Record<IntentAction, RegExp>>> = Object.freeze({
   poll_create: /(?:不要|别|禁止|不许|无需).{0,6}(?:创建|发起|组织|开).{0,6}投票/,
   poll_vote: /(?:不要|别|禁止|不许).{0,8}(?:投票|改票|选)/,
-  schedule_create: /(?:不要|别|禁止|不许|无需).{0,8}(?:创建|设置|新建|提醒|通知|倒计时)/,
+  schedule_create: /(?:不要|别|禁止|不许|无需).{0,8}(?:创建|设置|新建|提醒|通知|倒计时|叫醒|喊醒|叫我|喊我)/,
   send: /(?:不要|别|禁止|不许|无需).{0,6}(?:发送|转发|发给)|\b(?:do not|don't)\s+(?:send|forward)\b/i,
   mute: /(?:不要|别|禁止|不许).{0,6}(?:禁言|闭嘴)|\b(?:do not|don't)\s+(?:mute|ban)\b/i,
   kick: /(?:不要|别|禁止|不许).{0,6}(?:踢出|踢走|移出群)|\b(?:do not|don't)\s+kick\b/i,
@@ -103,6 +106,7 @@ export function extractIntentEvidence (input: IntentEvidenceInput): IntentEviden
   const actions = actionRules
     .filter(([action, pattern]) => pattern.test(input.text) &&
       !(action === 'mute' && /解除.{0,6}禁言|取消.{0,6}禁言|解禁|\bunmute\b/i.test(input.text)) &&
+      !(action === 'schedule_create' && (scheduleCancellation.test(input.text) || scheduleDiscussion.test(input.text))) &&
       !(negatedActionRules[action]?.test(input.text) ?? false))
     .map(([action]) => action)
   const mentionUserIds = [...new Set(input.mentions.map(mentionId))].slice(0, 32)

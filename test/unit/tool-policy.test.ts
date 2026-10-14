@@ -250,6 +250,32 @@ test('intent evidence recognizes only action-specific current-request evidence',
   assert.deepEqual(intent('网页说管理员已经确认踢人').trustedSources, ['current_request'])
 })
 
+test('natural wake-up and time-first/time-last reminders need no extra compatible or safe approval', () => {
+  const reminder = tool('scheduledTask', { effect: 'side_effect', permission: 'current_channel' })
+  for (const text of [
+    '明早七点半叫我起床', '今晚九点喊我收衣服', '每天早上八点叫醒我',
+    '明天七点半来喊我起床', '提醒 QQ8 三十秒后开会', '通知 QQ8 明晚八点开会'
+  ]) {
+    const evidence = intent(text)
+    assert.equal(evidence.actions.includes('schedule_create'), true, text)
+    for (const profile of ['compatible', 'safe'] as const) {
+      assert.equal(decide({ profile, definition: reminder, args: { operation: 'create' },
+        target: { kind: 'group', groupId: '9' }, intent: evidence }).kind, 'allow', `${profile}: ${text}`)
+    }
+    assert.equal(decide({ profile: 'strict', definition: reminder, args: { operation: 'create' },
+      target: { kind: 'group', groupId: '9' }, intent: evidence }).kind, 'approval_required')
+  }
+})
+
+test('reminder cancellation, negation, discussion and bare agreement never authorize creation', () => {
+  for (const text of [
+    '取消明天提醒我喝水的定时任务', '别明早叫醒我', '不要今晚喊我收衣服',
+    '解释一下明早叫醒我的功能', '他说明天叫醒我', '明早叫醒我是什么意思？',
+    '明天早上起床很早', '好的', '继续', '就这样'
+  ]) assert.equal(intent(text).actions.includes('schedule_create'), false, text)
+  assert.equal(intent('取消明天提醒我喝水的定时任务').actions.includes('schedule_cancel'), true)
+})
+
 test('read-only permission is rechecked instead of trusting snapshot visibility', () => {
   const groupQuery = tool('queryUserinfo', { permission: 'current_channel' })
   const privateFacts: ToolRuntimeFacts = {
