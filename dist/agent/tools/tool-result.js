@@ -151,8 +151,19 @@ export function parseToolResult(value, outputLimitBytes = maxToolOutputBytes) {
     return result;
 }
 export function toolResultForModel(result) {
-    if (result.status !== 'success')
-        return result.userMessage;
+    if (result.status !== 'success') {
+        // Preserve the control facts that distinguish a refusal from a retryable
+        // read failure. Project only the validated contract, never exception data.
+        return JSON.stringify({
+            status: result.status,
+            effect: result.effect,
+            ...(result.status === 'denied'
+                ? { reasonCode: result.reasonCode }
+                : { errorCode: result.errorCode }),
+            userMessage: result.userMessage,
+            retryable: result.retryable
+        });
+    }
     const text = result.content
         .map(item => item.type === 'text'
         ? item.text

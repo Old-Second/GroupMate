@@ -29,7 +29,7 @@ import {
   type ConsumedToolDigestTerminalStatus,
   TOOL_DIGEST_GENERATOR_VERSION
 } from '../../src/agent/context/tool-digest-compactor.js'
-import type { ToolResult } from '../../src/agent/tools/tool-result.js'
+import { toolResultForModel, type ToolResult } from '../../src/agent/tools/tool-result.js'
 import {
   canonicalizeContextJsonValue,
   canonicalJsonStringify
@@ -549,5 +549,48 @@ test('same non-success model body with different ledger status never collides or
     assert.equal(payload.calls[0]?.resultPreview, null)
     assert.equal(payload.calls[0]?.resultPreviewOmitted, true)
     assert.doesNotMatch(artifact.content, /Same safe failure body/)
+  }
+})
+
+test('structured failure feedback and legacy checkpoints bind to the same typed ledger result', () => {
+  for (const terminalStatus of ['denied', 'failed', 'cancelled', 'indeterminate'] as const) {
+    const result = resultFor(terminalStatus, 'Hidden safe failure e\u0301')
+    if (result.status === 'success') throw new Error('expected a failure fixture')
+    const evidence = deepFreeze({
+      schemaVersion: 1 as const,
+      step: 7,
+      calls: [{ callId: 'call-0', terminalStatus, result }]
+    })
+    const legacy = protocolSpan({ result: result.userMessage })
+    const structured = protocolSpan({ result: toolResultForModel(result) })
+    const legacyArtifact = ready(legacy, requestFor(legacy), evidence)
+    const structuredArtifact = ready(structured, requestFor(structured), evidence)
+    assert.notEqual(legacyArtifact.artifactId, structuredArtifact.artifactId)
+    for (const artifact of [legacyArtifact, structuredArtifact]) {
+      const call = (digestPayload(artifact.content) as unknown as {
+        calls: Array<{ terminalStatus: string; resultStatus: string; resultHash: string;
+          resultPreview: null; resultPreviewOmitted: boolean }>
+      }).calls[0]
+      assert.equal(call?.terminalStatus, terminalStatus)
+      assert.equal(call?.resultStatus, result.status)
+      assert.equal(call?.resultPreview, null)
+      assert.equal(call?.resultPreviewOmitted, true)
+      assert.doesNotMatch(artifact.content, /Hidden safe failure/)
+    }
+    const legacyCall = (digestPayload(legacyArtifact.content).calls as Array<{ resultHash: string }>)[0]
+    const structuredCall = (digestPayload(structuredArtifact.content).calls as Array<{ resultHash: string }>)[0]
+    assert.equal(legacyCall?.resultHash, structuredCall?.resultHash)
+
+    const projection = JSON.parse(toolResultForModel(result)) as Record<string, unknown>
+    for (const patch of [
+      { status: 'success' }, { effect: 'committed' }, { retryable: true },
+      { userMessage: 'different failure' }, { unexpected: 'extra field' },
+      result.status === 'denied' ? { reasonCode: 'different_code' } : { errorCode: 'different_code' }
+    ]) {
+      const tampered = protocolSpan({ result: JSON.stringify({ ...projection, ...patch }) })
+      assert.deepEqual(compactConsumedToolSpan(requestFor(tampered), tampered, evidence), {
+        status: 'unavailable', code: 'invalid_compaction_evidence'
+      })
+    }
   }
 })

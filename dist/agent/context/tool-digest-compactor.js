@@ -175,7 +175,7 @@ function parseEvidence(value, span) {
             const message = span.messages[index + 1];
             if (callId !== span.toolProtocol?.callIds[index] || message?.role !== 'tool' ||
                 message.toolCallId !== callId || !resultMatchesTerminalStatus(terminalStatus, result) ||
-                toolResultForModel(result).normalize('NFC') !== message.content) {
+                !modelBodyMatchesResult(result, message.content)) {
                 throw new TypeError('evidence does not match protocol');
             }
             return Object.freeze({ callId, terminalStatus, result });
@@ -187,6 +187,14 @@ function parseEvidence(value, span) {
     catch {
         return null;
     }
+}
+function modelBodyMatchesResult(result, content) {
+    if (toolResultForModel(result).normalize('NFC') === content)
+        return true;
+    // Existing checkpoints contain the former plain failure message. Accept it
+    // only against the strictly validated ledger result; never infer status from
+    // the wire body or accept a partially matching structured projection.
+    return result.status !== 'success' && result.userMessage.normalize('NFC') === content;
 }
 function digestContent(sources, request, span) {
     const protocol = span.toolProtocol;

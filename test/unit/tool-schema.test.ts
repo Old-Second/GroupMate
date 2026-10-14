@@ -254,10 +254,29 @@ test('tool result model feedback is bounded and excludes unsafe error details', 
   const serialized = JSON.stringify(result)
   const feedback = toolResultForModel(result)
 
-  assert.equal(feedback, '工具暂时不可用。')
+  assert.deepEqual(JSON.parse(feedback), result)
+  assert.doesNotMatch(feedback, /cause|stack|rawArguments|responseBody|\?token=|Authorization/i)
   assert.doesNotMatch(serialized, /cause|stack|rawArguments|responseBody|\?token=|Authorization/i)
   assert.throws(() => parseToolResult({
     status: 'success', effect: 'none',
     content: [{ type: 'text', text: 'x'.repeat(65 * 1024) }], retryable: false
   }))
+})
+
+test('model feedback distinguishes denial, non-retryable failure and indeterminate effects without extra fields', () => {
+  const outcomes = [
+    { status: 'denied', effect: 'none', reasonCode: 'explicit_intent_required',
+      userMessage: '需要在当前消息中明确说明操作和目标。', retryable: false },
+    { status: 'failed', effect: 'none', errorCode: 'tool_execution_failed',
+      userMessage: '工具执行失败。', retryable: false },
+    { status: 'indeterminate', effect: 'possible', errorCode: 'tool_outcome_unknown',
+      userMessage: '操作结果暂时无法确认。', retryable: false }
+  ] as const
+  for (const outcome of outcomes) {
+    const valid = parseToolResult(outcome)
+    const feedback = toolResultForModel({ ...valid, rawArguments: 'secret', stack: 'secret' } as unknown as typeof valid)
+    assert.deepEqual(JSON.parse(feedback), outcome)
+    assert.doesNotMatch(feedback, /secret|rawArguments|stack/)
+    assert.equal(Buffer.byteLength(feedback) <= 64 * 1024, true)
+  }
 })
