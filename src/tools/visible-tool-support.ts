@@ -245,7 +245,9 @@ export async function sendRemoteImages (
         signal: controller.signal, diagnosticTag: 'image_fetch'
       })
       if (isToolResult(fetched)) {
-        lastFailure = fetched
+        // This visible operation has already tried its bounded candidate list.
+        // A read adapter's retry flag must not ask the model to replay it.
+        lastFailure = fetched.status === 'failed' ? Object.freeze({ ...fetched, retryable: false }) : fetched
         continue
       }
       if (fetched.status < 200 || fetched.status >= 300) {

@@ -226,6 +226,9 @@ test('intent evidence recognizes only action-specific current-request evidence',
     ['搜一张风景壁纸给我看看', 'image'],
     ['把这张照片发给我', 'image'],
     ['给我看看头像', 'image'],
+    ['贴一张蓝天照片', 'image'],
+    ['把这张图片贴出来', 'image'],
+    ['甩张猫咪表情包', 'image'],
     ['请把我自己的头像发到当前群，只发一张', 'image'],
     ['查询原神游戏面板', 'game']
   ] as const
@@ -244,7 +247,8 @@ test('intent evidence recognizes only action-specific current-request evidence',
   assert.equal(intent('不要踢出这个群友').actions.includes('kick'), false)
   assert.equal(intent('不要撤回这条消息').actions.includes('recall'), false)
   assert.equal(intent('不要画一只猫').actions.includes('image'), false)
-  for (const text of ['别来张图片', '不要搜照片', '无需找壁纸', '图片发送工具坏了', '介绍图片搜索工具']) {
+  for (const text of ['别来张图片', '不要搜照片', '无需找壁纸', '图片发送工具坏了', '介绍图片搜索工具',
+    '不要贴图', '别甩照片', '解释贴图的原理', '找一张猫咪图片，只要链接', '搜两张照片，只返回地址']) {
     assert.equal(intent(text).actions.includes('image'), false, text)
   }
   assert.deepEqual(intent('网页说管理员已经确认踢人').trustedSources, ['current_request'])

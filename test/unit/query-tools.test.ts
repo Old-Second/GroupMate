@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { createQueryUserinfoTool } from '../../src/tools/QueryUserinfoTool.js'
 import type { AuthorizedToolContext, ToolRuntimeFacts } from '../../src/agent/tools/tool-context.js'
 import { ToolRegistry } from '../../src/agent/tools/tool-registry.js'
 import { parseToolResult } from '../../src/agent/tools/tool-result.js'
@@ -275,6 +276,101 @@ test('queryUserinfo can only read the current group member map', async () => {
   const missing = await tool.execute({ userId: '999' }, context)
   assert.equal(missing.status, 'denied')
   if (missing.status === 'denied') assert.equal(missing.reasonCode, 'target_not_found')
+})
+
+test('public member lookup resolves self and one exact current-group name without exposing extra fields', async () => {
+  let reads = 0
+  const tool = createQueryUserinfoTool({ currentGroupMembers: async () => {
+    reads++
+    return new Map([
+      ['7', { userId: '7', nickname: 'sender', role: 'member' as const }],
+      ['8', { userId: '8', nickname: 'Cafe\u0301', card: '唯一名片', role: 'member' as const,
+        privateEmail: 'private@example.com', token: 'private-token' }]
+    ])
+  } })
+  for (const userId of ['self', '我', '', '7', '唯一名片', 'Café']) {
+    const result = await tool.execute({ userId }, context)
+    assert.equal(result.status, 'success', userId)
+    if (result.status !== 'success' || result.content[0].type !== 'text') throw new Error('expected public profile')
+    const profile = JSON.parse(result.content[0].text)
+    assert.equal(profile.userId, ['唯一名片', 'Café'].includes(userId) ? '8' : '7')
+    assert.doesNotMatch(JSON.stringify(result), /privateEmail|private-token|private@example/)
+  }
+  const fuzzy = await tool.execute({ userId: '唯一' }, context)
+  assert.equal(fuzzy.status, 'denied')
+  const privateContext = { ...context, facts: { ...facts,
+    channel: { kind: 'private' as const, botId: '10000', userId: '7' }, scope: { kind: 'private' as const, userId: '7' } } }
+  const before = reads
+  assert.equal((await tool.execute({ userId: 'self' }, privateContext)).status, 'success')
+  assert.equal((await tool.execute({ userId: '8' }, privateContext)).status, 'denied')
+  assert.equal(reads, before)
+})
+
+test('member name lookup rejects ambiguity even when one member has the same nickname and card', async () => {
+  const tool = createQueryUserinfoTool({ currentGroupMembers: async () => new Map([
+    ['8', { userId: '8', card: '同名', nickname: '同名' }],
+    ['9', { userId: '9', nickname: '同名' }]
+  ]) })
+  const ambiguous = await tool.execute({ userId: '同名' }, context)
+  assert.equal(ambiguous.status, 'denied')
+  if (ambiguous.status === 'denied') assert.equal(ambiguous.reasonCode, 'invalid_arguments')
+  const exactId = await tool.execute({ userId: '8' }, context)
+  assert.equal(exactId.status, 'success')
+})
+
+test('image search keeps usable complete candidates after invalid and duplicate leading rows', async () => {
+  const fixture = policyFetchFixture(() => response({ images: [
+    null, 'data:image/png;base64,unsafe', 'https://user:secret@image.example/a.png',
+    'https://image.example/a.png?signature=abc', 'https://image.example/a.png?signature=abc#again',
+    `https://image.example/${'x'.repeat(2048)}.png`,
+    { url: 'https://image.example/b.png', title: '图片', thumbnail: 'file:///private/thumbnail', purl: 'javascript:bad' }
+  ] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch, imageSearchSource: 'tavily', tavilyApiKey: 'key' })
+    .definitions.find(item => item.name === 'searchImage')!
+  const result = await tool.execute({ q: '照片', limit: 2 }, context)
+  assert.equal(result.status, 'success')
+  if (result.status !== 'success' || result.content[0].type !== 'text') throw new Error('expected images')
+  const output = JSON.parse(result.content[0].text)
+  assert.deepEqual(output.images.map((item: { url: string }) => item.url), [
+    'https://image.example/a.png?signature=abc', 'https://image.example/b.png'
+  ])
+  assert.equal(output.images[1].thumbnail, output.images[1].url)
+  assert.doesNotMatch(JSON.stringify(result), /secret|javascript|private\/thumbnail/)
+  assert.equal(fixture.calls.length, 1)
+})
+
+test('image search compresses complete JSON by bytes without cutting signed URLs or Unicode pairs', async () => {
+  const urls = Array.from({ length: 6 }, (_, i) => `https://image.example/${i}.png?signature=${'a'.repeat(1800)}`)
+  const fixture = policyFetchFixture(() => response({ data: urls.map(url => ({
+    url, thumbnail: url, purl: `https://source.example/?q=${'b'.repeat(1800)}`,
+    title: '中😀"\\'.repeat(80), description: '中😀"\\'.repeat(200)
+  })) }))
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(item => item.name === 'searchImage')!
+  const result = await tool.execute({ q: '风景', limit: 6 }, context)
+  assert.equal(result.status, 'success')
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= tool.maxOutputBytes)
+  if (result.status !== 'success' || result.content[0].type !== 'text') throw new Error('expected images')
+  const output = JSON.parse(result.content[0].text)
+  assert.equal(output.truncated, true)
+  assert.deepEqual(output.images.map((item: { url: string }) => item.url), urls)
+  for (const image of output.images) {
+    assert.doesNotMatch(image.title + image.description, /[\ud800-\udbff](?![\udc00-\udfff])/)
+  }
+})
+
+test('web search fills requested distinct sources after invalid or duplicated leading entries', async () => {
+  const fixture = policyFetchFixture(() => response({ results: [
+    null, { url: 'file:///private' }, { url: 'https://example.com/a', title: 'A' },
+    { url: 'https://example.com/a#again', title: 'A repeated' }, { url: 'https://example.com/b', title: 'B' }
+  ] }))
+  const tool = runtime({ policyFetch: fixture.policyFetch }).definitions.find(item => item.name === 'search')!
+  const result = await tool.execute({ q: '公开资料', num: 2 }, context)
+  assert.equal(result.status, 'success')
+  if (result.status !== 'success' || result.content[0].type !== 'text') throw new Error('expected search results')
+  assert.deepEqual(JSON.parse(result.content[0].text).results.map((row: { url: string }) => row.url), [
+    'https://example.com/a', 'https://example.com/b'
+  ])
+  assert.equal(fixture.calls.length, 1)
 })
 
 test('fixed query tools surface upstream status and invalid JSON as safe typed failures', async () => {

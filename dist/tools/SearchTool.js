@@ -1,4 +1,5 @@
 import { readResourceKeys } from '../agent/tools/resource-key.js';
+import { clipText, httpUrl, urlIdentity } from './search-result-support.js';
 import { clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult } from './query-tool-support.js';
 const inputSchema = {
     type: 'object',
@@ -6,15 +7,6 @@ const inputSchema = {
     required: ['q', 'num'], additionalProperties: false
 };
 const OUTPUT_LIMIT_BYTES = 16 * 1024;
-function clipText(value, limit) {
-    const text = typeof value === 'string' ? value : '';
-    if (text.length <= limit)
-        return text;
-    if (limit === 0)
-        return '';
-    const last = text.charCodeAt(limit - 1);
-    return `${text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit)}…`;
-}
 function normalizedResults(data, limit) {
     if (data === null || typeof data !== 'object')
         return { results: [], truncated: false };
@@ -34,28 +26,26 @@ function normalizedResults(data, limit) {
             truncated = true;
         return text;
     };
-    const results = source.slice(0, limit).flatMap(item => {
+    const seen = new Set();
+    const results = [];
+    for (const item of source.slice(0, 64)) {
+        if (results.length >= limit)
+            break;
         if (item === null || typeof item !== 'object' || Array.isArray(item))
-            return [];
+            continue;
         const value = item;
         // Keep citation URLs intact. A sliced URL is not a usable source.
-        if (typeof value.url !== 'string' || value.url.length > 2048)
-            return [];
-        try {
-            const url = new URL(value.url);
-            if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password)
-                return [];
-        }
-        catch {
-            return [];
-        }
-        return [{
-                title: clip(value.title ?? value.name, 200),
-                url: value.url,
-                content: clip(value.content ?? value.snippet ?? value.description, 1_000),
-                publishedDate: clip(value.published_date ?? value.datePublished, 100)
-            }];
-    });
+        const url = httpUrl(value.url);
+        if (url === null || seen.has(urlIdentity(url)))
+            continue;
+        seen.add(urlIdentity(url));
+        results.push({
+            title: clip(value.title ?? value.name, 200),
+            url,
+            content: clip(value.content ?? value.snippet ?? value.description, 1_000),
+            publishedDate: clip(value.published_date ?? value.datePublished, 100)
+        });
+    }
     return { results, truncated };
 }
 function searchResult(data, limit) {

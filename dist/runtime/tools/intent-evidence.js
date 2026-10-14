@@ -1,5 +1,7 @@
 const scheduleCancellation = /(?:取消|删除|撤销|停止|关闭).{0,24}(?:定时任务|提醒|倒计时)|(?:定时任务|提醒|倒计时).{0,32}(?:取消|删除|撤销|停止|关闭)/;
 const scheduleDiscussion = /(?:解释|介绍|讨论|举例|他说|她说|原话|示例).{0,32}(?:提醒|通知|叫醒|喊醒)|(?:提醒|通知|叫醒|喊醒).{0,48}(?:是什么意思|怎么实现|的原理)/;
+const imageDiscussion = /(?:解释|介绍|讨论|举例|他说|她说|原话|示例).{0,32}(?:搜图|找图|发图|贴图|甩图|图片搜索|发送图片)|(?:搜图|找图|发图|贴图|甩图|图片搜索|发送图片).{0,32}(?:是什么意思|怎么实现|的原理)/;
+const imageLinksOnly = /(?:只要|只需|仅需|只返回|只给).{0,12}(?:链接|地址)/;
 const actionRules = [
     ['poll_create', /(?:发起|创建|组织|开|来个|设置).{0,12}投票|\b(?:create|start)\s+(?:a\s+)?poll\b/i],
     ['poll_vote', /(?:我选|改票.{0,8}(?:选|为)|投票.{0,48}(?:选|投|支持))\s*\d|\bvote\s+(?:for\s+)?\d/i],
@@ -17,7 +19,7 @@ const actionRules = [
     ['unset_essence', /取消.{0,4}精华|移除.{0,4}精华/],
     ['set_essence', /设为.{0,4}精华|设置.{0,4}精华|加精/],
     ['recall', /撤回|\brecall\b|delete message/i],
-    ['image', /(?:发|发送|生成|处理|看看|看一下|看下|来|找|搜).{0,12}(?:图|图片|图像|照片|头像|壁纸|表情包)|(?:图|照片|头像|壁纸|表情包).{0,12}(?:发给|发到|发送到|发来|给我看看)|画(?!蛇添足)|绘制/],
+    ['image', /(?:发|发送|贴|甩|生成|处理|看看|看一下|看下|来|找|搜).{0,12}(?:图|图片|图像|照片|头像|壁纸|表情包)|(?:图|照片|头像|壁纸|表情包).{0,12}(?:发给|发到|发送到|发来|发出来|贴出来|给我看看)|画(?!蛇添足)|绘制/],
     ['video', /(?:发|发送|分享|播放|找|搜).{0,12}(?:视频|短片)|(?:视频|短片).{0,20}(?:发给|发到|发送到|发来|分享给|分享到)/],
     ['audio', /语音|朗读|\baudio\b|\bvoice\b/i],
     ['music', /音乐|歌曲|唱一首|播放一首/],
@@ -33,7 +35,7 @@ const negatedActionRules = Object.freeze({
     mute: /(?:不要|别|禁止|不许).{0,6}(?:禁言|闭嘴)|\b(?:do not|don't)\s+(?:mute|ban)\b/i,
     kick: /(?:不要|别|禁止|不许).{0,6}(?:踢出|踢走|移出群)|\b(?:do not|don't)\s+kick\b/i,
     recall: /(?:不要|别|禁止|不许).{0,6}撤回|\b(?:do not|don't)\s+(?:recall|delete)\b/i,
-    image: /(?:不要|别|禁止|不许|无需).{0,6}(?:画|绘制|生成|发送|发|来|找|搜|看).{0,12}(?:图|图片|图像|照片|头像|壁纸|表情包)?/,
+    image: /(?:不要|别|禁止|不许|无需).{0,6}(?:画|绘制|生成|发送|发|贴|甩|来|找|搜|看).{0,12}(?:图|图片|图像|照片|头像|壁纸|表情包)?/,
     video: /(?:不要|别|禁止|不许|无需).{0,6}(?:发|发送|分享|播放|找|搜).{0,12}(?:视频|短片)/,
     audio: /(?:不要|别|禁止|不许|无需).{0,6}(?:发|发送|生成|用|语音|朗读)/,
     music: /(?:不要|别|禁止|不许|无需).{0,6}(?:发|发送|分享|播放|唱).{0,12}(?:音乐|歌曲|一首)/,
@@ -62,6 +64,7 @@ export function extractIntentEvidence(input) {
         .filter(([action, pattern]) => pattern.test(input.text) &&
         !(action === 'mute' && /解除.{0,6}禁言|取消.{0,6}禁言|解禁|\bunmute\b/i.test(input.text)) &&
         !(action === 'schedule_create' && (scheduleCancellation.test(input.text) || scheduleDiscussion.test(input.text))) &&
+        !(action === 'image' && (imageDiscussion.test(input.text) || imageLinksOnly.test(input.text))) &&
         !(negatedActionRules[action]?.test(input.text) ?? false))
         .map(([action]) => action);
     const mentionUserIds = [...new Set(input.mentions.map(mentionId))].slice(0, 32);

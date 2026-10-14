@@ -1,45 +1,78 @@
 import { readResourceKeys } from '../agent/tools/resource-key.js';
-import { boundedJson, boundedText, clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
+import { clipText, httpUrl, urlIdentity } from './search-result-support.js';
+import { clampInteger, configurationFailure, fixedOriginPolicy, invalidArguments, isToolResult, parseJsonResponse, readOnlyDefinition, request, textResult, upstreamFailure } from './query-tool-support.js';
 const inputSchema = {
     type: 'object', properties: { q: { type: 'string' }, limit: { type: 'integer' } },
     required: ['q', 'limit'], additionalProperties: false
 };
+const OUTPUT_LIMIT_BYTES = 16 * 1024;
 function normalize(data, backend, limit) {
     if (data === null || typeof data !== 'object')
-        return [];
+        return { images: [], truncated: false };
     const record = data;
     const candidates = backend === 'tavily'
         ? (Array.isArray(record.images) ? record.images : [])
         : backend === 'brave'
             ? (Array.isArray(record.results) ? record.results : [])
             : (Array.isArray(record.data) ? record.data : Array.isArray(record.results) ? record.results : []);
-    return candidates.slice(0, limit).flatMap(item => {
-        if (typeof item === 'string')
-            return [{ url: item, thumbnail: item, title: '' }];
-        if (item === null || typeof item !== 'object')
-            return [];
-        const value = item;
+    const images = [], seen = new Set();
+    let truncated = false;
+    for (const item of candidates.slice(0, 64)) {
+        if (images.length >= limit)
+            break;
+        if (item === null || typeof item !== 'object' && typeof item !== 'string' || Array.isArray(item))
+            continue;
+        const value = typeof item === 'string' ? { url: item } : item;
         const properties = value.properties !== null && typeof value.properties === 'object'
             ? value.properties : {};
         const thumbnail = value.thumbnail !== null && typeof value.thumbnail === 'object'
             ? value.thumbnail : {};
-        const url = boundedText(value.url ?? value.murl ?? value.image ?? properties.url ?? thumbnail.src, 2_048);
-        return url === '' ? [] : [{
-                title: boundedText(value.title ?? value.desc, 200),
-                url,
-                thumbnail: boundedText(thumbnail.src ?? value.turl ?? value.thumbnail ?? url, 2_048),
-                source: boundedText(value.purl ?? value.hostPageUrl, 2_048),
-                description: boundedText(value.description ?? value.desc, 500)
-            }];
-    });
+        const url = httpUrl(value.url ?? value.murl ?? value.image ?? properties.url ?? thumbnail.src);
+        if (url === null || seen.has(urlIdentity(url)))
+            continue;
+        seen.add(urlIdentity(url));
+        const title = clipText(value.title ?? value.desc, 200);
+        const description = clipText(value.description ?? value.desc, 500);
+        truncated ||= typeof (value.title ?? value.desc) === 'string' && title !== (value.title ?? value.desc);
+        truncated ||= typeof (value.description ?? value.desc) === 'string' && description !== (value.description ?? value.desc);
+        images.push({
+            title,
+            url,
+            thumbnail: httpUrl(thumbnail.src ?? value.turl ?? value.thumbnail) ?? url,
+            source: httpUrl(value.purl ?? value.hostPageUrl) ?? '',
+            description
+        });
+    }
+    return { images, truncated };
+}
+function imageResult(images, truncated) {
+    let textLimit = 500, count = images.length, compactLinks = false;
+    for (;;) {
+        const result = textResult(JSON.stringify({ images: images.slice(0, count).map(image => ({
+                url: image.url,
+                title: clipText(image.title, textLimit),
+                ...(!compactLinks ? { thumbnail: image.thumbnail, source: image.source } : {}),
+                description: clipText(image.description, textLimit)
+            })), truncated }));
+        if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= OUTPUT_LIMIT_BYTES)
+            return result;
+        truncated = true;
+        if (textLimit > 0)
+            textLimit = Math.floor(textLimit / 2);
+        else if (!compactLinks)
+            compactLinks = true;
+        else
+            count--;
+    }
 }
 export function createSearchImageTool(options) {
     const tavily = fixedOriginPolicy('https://api.tavily.com', ['/search']);
     const brave = fixedOriginPolicy('https://api.search.brave.com', ['/res/v1/images/search']);
     const publicSearch = fixedOriginPolicy('https://serp.ikechan8370.com', ['/image/bing']);
     return readOnlyDefinition({
-        name: 'searchImage', description: '搜索公开图片并返回候选图片地址。',
-        inputSchema, network: 'fixed_hosts', retrySafe: options.backend !== 'tavily', timeoutMs: 12_000,
+        name: 'searchImage', description: '搜索公开图片，返回images候选列表及完整url。limit为1～6，未指定张数通常1～2张，不追问数量。用户明确要看图/搜图并发来时，使用候选url继续sendPicture，不再问是否发送；只要链接或不发送时只返回链接。truncated表示说明压缩，已有地址可用，无需重复搜同一关键词。',
+        inputSchema, network: 'fixed_hosts', maxOutputBytes: OUTPUT_LIMIT_BYTES,
+        retrySafe: options.backend !== 'tavily', timeoutMs: 12_000,
         resourceKeys: input => readResourceKeys('searchImage', input),
         execute: async (input, context) => {
             const q = String(input.q ?? '').trim();
@@ -79,10 +112,10 @@ export function createSearchImageTool(options) {
             const parsed = parseJsonResponse(response);
             if (isToolResult(parsed))
                 return parsed;
-            const images = normalize(parsed, options.backend, limit);
+            const { images, truncated } = normalize(parsed, options.backend, limit);
             if (images.length === 0)
                 return upstreamFailure('图片搜索暂时没有结果。', false);
-            return textResult(boundedJson(images));
+            return imageResult(images, truncated);
         }
     });
 }

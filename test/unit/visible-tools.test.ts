@@ -164,6 +164,51 @@ test('visible media tools call the QQ capability and return visible only after s
   }
 })
 
+test('sendPicture skips malformed addresses and duplicate URLs without fetching or dispatching them twice', async () => {
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+  let downloads = 0
+  const services = visibleOptions(calls)
+  const definitions = createVisibleToolDefinitions({ ...services, policyFetch: new PolicyFetch({
+    networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+    transport: { request: async () => { downloads++; return response('image', 'image/png') } }
+  }) })
+  const result = await byName(definitions, 'sendPicture').execute({ urls: [
+    'javascript:bad', 'https://user:secret@image.example/a.png',
+    ' https://image.example/a.png?signature=abc ', 'https://image.example/a.png?signature=abc#again',
+    'https://image.example/b.png'
+  ] }, context)
+  assert.equal(result.status, 'success')
+  assert.equal(downloads, 2)
+  assert.equal(calls.length, 2)
+  assert.match(JSON.stringify(result), /已发送 2 张图片/)
+  assert.doesNotMatch(JSON.stringify(result), /secret/)
+})
+
+test('sendAvatar resolves explicit self aliases and deduplicates the same actual account', async () => {
+  const { definitions, calls } = fixture()
+  const result = await byName(definitions, 'sendAvatar').execute({ userIds: ['self', '7', '我', ' me '] }, context)
+  assert.equal(result.status, 'success')
+  assert.equal(calls.length, 1)
+  assert.match(JSON.stringify(result), /已发送 1 个头像/)
+})
+
+test('exhausted image download candidates do not inherit retryable read failures', async () => {
+  const calls: Array<{ kind: string; target: SessionAddress; value: unknown }> = []
+  let downloads = 0
+  const definitions = createVisibleToolDefinitions({ ...visibleOptions(calls), policyFetch: new PolicyFetch({
+    networkPolicy: new NetworkPolicy({ resolve: async () => [{ address: '93.184.216.34', family: 4 }] }),
+    transport: { request: async () => { downloads++; throw new Error('private upstream detail') } }
+  }) })
+  const result = await byName(definitions, 'sendPicture').execute({ urls: [
+    'https://image.example/a.png', 'https://image.example/b.png'
+  ] }, context)
+  assert.equal(result.status, 'failed')
+  assert.equal(result.retryable, false)
+  assert.equal(downloads, 2)
+  assert.equal(calls.length, 0)
+  assert.doesNotMatch(JSON.stringify(result), /private upstream detail/)
+})
+
 test('processPicture delivers the processed resource without an unusable URL handoff', async () => {
   const { definitions, calls } = fixture()
   const result = await byName(definitions, 'processPicture').execute({
