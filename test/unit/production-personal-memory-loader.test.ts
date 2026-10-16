@@ -14,7 +14,6 @@ const ENABLED_OPTIONS = Object.freeze({
   botInstanceId: 'groupmate-production',
   storageDirectory: '/tmp/groupmate-personal-memory-test',
   deploymentMode: () => 'explicit' as const,
-  groupAllowlist: () => Object.freeze(['10001']),
   recallMaxItems: () => 6,
   recallMaxTokens: () => 1_200,
   recallTimeoutMs: () => 150
@@ -43,7 +42,7 @@ test('real entry and command shell preserve the default-off lazy boundary', asyn
   }))
   assert.equal(handled, true)
   assert.deepEqual(replies, [
-    '个人长期记忆当前未启用。请先由机器人主人在锅巴中开启试点模式。'
+    '个人长期记忆当前未启用，请联系机器人主人检查锅巴中的长期记忆模式。'
   ])
 })
 

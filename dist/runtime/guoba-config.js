@@ -9,7 +9,7 @@ const IDENTIFIER_LIST_FIELDS = new Set([
     'bymDisableGroup'
 ]);
 const GROUP_IDENTIFIER_LIST_FIELDS = new Set([
-    'personalMemoryGroupAllowlist', 'groupCultureGroups', 'semanticSummaryGroups'
+    'semanticSummaryGroups'
 ]);
 const QQ_SCOPE_FIELDS = new Set([
     'whitelist',
@@ -27,7 +27,6 @@ const PERSONAL_MEMORY_MAINTENANCE_ACTIONS = new Set(['none', 'verify', 'rebuild_
 const GUOBA_SECRET_MAXIMUM_UTF8_BYTES = 16 * 1_024;
 export const PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
     personalMemoryMode: 'automatic',
-    personalMemoryGroupAllowlist: Object.freeze([]),
     personalMemoryRecallMaxItems: 6,
     personalMemoryRecallMaxTokens: 1_200,
     personalMemoryRecallTimeoutMs: 150
@@ -55,8 +54,6 @@ export const RESTART_REQUIRED_CONFIG_FIELDS = new Set([
     'chromePath',
     'diskLogEnabled',
     'personalMemoryMode',
-    'personalMemoryGroupAllowlist',
-    'groupCultureGroups',
     'semanticSummaryGroups',
     'personalMemoryRecallMaxItems',
     'personalMemoryRecallMaxTokens',
@@ -144,7 +141,7 @@ export function normalizeGuobaConfigValue(key, value) {
             throw new TypeError('群参与模式配置无效。');
         return value;
     }
-    if (key === 'participationActiveGroups' || key === 'groupCultureGroups' || key === 'semanticSummaryGroups') {
+    if (key === 'participationActiveGroups' || key === 'semanticSummaryGroups') {
         if (!Array.isArray(value) || value.length > 64 || value.some(group => typeof group !== 'string' || !/^[1-9]\d{0,19}$/.test(group)) ||
             new Set(value).size !== value.length)
             throw new TypeError('受控参与群列表配置无效。');

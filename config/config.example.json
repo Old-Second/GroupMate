@@ -115,8 +115,6 @@
   "apiMaxToken": 4096,
   "apiContextWindowTokens": 0,
   "personalMemoryMode": "automatic",
-  "personalMemoryGroupAllowlist": [],
-  "groupCultureGroups": [],
   "semanticSummaryGroups": [],
   "personalMemoryRecallMaxItems": 6,
   "personalMemoryRecallMaxTokens": 1200,

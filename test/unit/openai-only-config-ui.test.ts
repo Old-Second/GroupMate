@@ -146,8 +146,6 @@ const requiredGuobaFields = [
   'hostImageLinkProbeBudgetMs',
   'conversationPreserveTime',
   'personalMemoryMode',
-  'personalMemoryGroupAllowlist',
-  'groupCultureGroups',
   'semanticSummaryGroups',
   'personalMemoryRecallMaxItems',
   'personalMemoryRecallMaxTokens',
@@ -271,7 +269,7 @@ const expectedGuobaGroups = [
   {
     label: '长期记忆',
     fields: [
-      'personalMemoryMode', 'personalMemoryGroupAllowlist', 'groupCultureGroups', 'semanticSummaryGroups',
+      'personalMemoryMode', 'semanticSummaryGroups',
       'personalMemoryRecallMaxItems', 'personalMemoryRecallMaxTokens',
       'personalMemoryRecallTimeoutMs', 'personalMemoryOperationsStatus',
       'personalMemoryMaintenanceAction'
@@ -635,11 +633,11 @@ test('long-term memory defaults to automatic participation with explicit opt-out
   )
   assert.equal(example.personalMemoryMode, 'automatic')
   assert.match(source, /^  personalMemoryMode: 'automatic',/m)
-  assert.deepEqual(example.personalMemoryGroupAllowlist, [])
-  assert.deepEqual(fields.get('personalMemoryGroupAllowlist')?.componentProps, {
-    allowAdd: true,
-    closable: true
-  })
+  for (const removed of ['personalMemoryGroupAllowlist', 'groupCultureGroups']) {
+    assert.equal(Object.hasOwn(example, removed), false)
+    assert.equal(fields.has(removed), false)
+    assert.doesNotMatch(source, new RegExp(`^  ${removed}:`, 'm'))
+  }
   assert.deepEqual(fields.get('personalMemoryRecallMaxItems')?.componentProps, {
     min: 1, max: 12, step: 1
   })
@@ -661,11 +659,11 @@ test('long-term memory defaults to automatic participation with explicit opt-out
   )
 
   for (const field of [
-    'personalMemoryMode', 'personalMemoryGroupAllowlist', 'personalMemoryRecallMaxItems',
+    'personalMemoryMode', 'personalMemoryRecallMaxItems',
     'personalMemoryRecallMaxTokens', 'personalMemoryRecallTimeoutMs'
   ]) assert.match(fields.get(field)?.bottomHelpMessage ?? '', /重启/)
   assert.match(fields.get('personalMemoryMode')?.bottomHelpMessage ?? '', /默认自动.*不需要用户审批.*关闭.*跨重启/)
-  assert.match(fields.get('personalMemoryGroupAllowlist')?.bottomHelpMessage ?? '', /空.*群聊.*不允许/)
+  assert.match(fields.get('personalMemoryMode')?.bottomHelpMessage ?? '', /所有群默认.*#群记忆 关闭/)
   assert.match(fields.get('personalMemoryOperationsStatus')?.bottomHelpMessage ?? '', /不会.*初始化/)
   assert.match(fields.get('personalMemoryMaintenanceAction')?.bottomHelpMessage ?? '', /不会.*删除/)
 

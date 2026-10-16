@@ -8,13 +8,15 @@ import { projectMemoryRetrievalContextV2 } from '../../src/agent/memory/memory-c
 import { projectCultureRecordV1 } from '../../src/agent/contracts/CultureRecord.js'
 import { createProductionPersonalMemoryRuntimeV1 } from '../../src/runtime/production-personal-memory-runtime.js'
 
+function runtimeOptions (directory: string) {
+  return { botInstanceId: 'groupmate-production', storageDirectory: directory,
+    deploymentMode: () => 'automatic' as const, recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150 }
+}
+
 async function fixture (t: { after: (fn: () => unknown) => void }) {
   const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-group-memory-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
-  let cultureGroups = ['40004']
-  const runtime = await createProductionPersonalMemoryRuntimeV1({ botInstanceId: 'groupmate-production',
-    storageDirectory: directory, deploymentMode: () => 'automatic', groupAllowlist: () => ['40004', '50005'],
-    cultureGroups: () => cultureGroups, recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150 })
+  const runtime = await createProductionPersonalMemoryRuntimeV1(runtimeOptions(directory))
   t.after(async () => await runtime.close())
   const db = new DatabaseSync(path.join(directory, 'personal-memory.sqlite'), { readOnly: true })
   t.after(() => db.close())
@@ -50,7 +52,7 @@ async function fixture (t: { after: (fn: () => unknown) => void }) {
       event: e, queryText: '与检索排名无关的边界校验', messageEvidence: { schemaVersion: 1, prompt: '新问题', imageUrls: [],
         currentMessageId: e.message_id, quotedMessageId: null, hasReply: false } }, refs, new AbortController().signal)
   }
-  return { runtime, db, send, recall, authority, setCultureGroups: (groups: string[]) => { cultureGroups = groups }, setRole: (value: string) => { role = value },
+  return { runtime, db, send, recall, authority, setRole: (value: string) => { role = value },
     setJoined: (value: number) => { joined = value }, refreshCount: () => refreshed,
     stopLookup: () => { lookupAvailable = false }, directory }
 }
@@ -219,8 +221,10 @@ test('culture conflict remains pending; explicit correction, renewal, forgetting
 
 test('culture pilot, fresh role, scope, text source and sensitive content gates cannot be bypassed', async t => {
   const f = await fixture(t)
-  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '50005'), /未启用/)
-  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '60006'), /未启用/)
+  assert.match(await f.send('#群文化 关闭', '50005'), /已关闭/)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '50005'), /管理员关闭/)
+  assert.match(await f.send('#群记忆 关闭', '60006'), /已关闭/)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '60006'), /管理员关闭/)
   for (const extras of [{ source: { seq: 1 } }, { message: [{ type: 'reply' }] }, { message: [{ type: 'image' }] }]) {
     assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '40004', '20002', extras), /纯文字/)
   }
@@ -270,15 +274,78 @@ test('culture disabled recall and live dependency authority fail closed while le
   const initial = await f.recall('望远镜')
   const refs = initial.candidates.map((c: any) => ({ namespaceRef: c.namespaceRef, memoryId: c.memoryId,
     revision: c.revision, revisionHash: c.revisionHash }))
-  assert.ok(await f.authority(refs))
-  f.setCultureGroups([])
+  const before = await f.authority(refs)
+  assert.ok(before)
+  assert.match(await f.send('#群文化 关闭'), /群文化已关闭/)
   assert.equal((await f.recall('望远镜')).candidates?.length ?? 0, 0)
   assert.equal(await f.authority(refs), null)
-  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗'), /未启用/)
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗'), /管理员关闭/)
   assert.equal((await f.recall('科幻小说')).candidates?.length, 1)
   assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 2)
-  f.setCultureGroups(['40004'])
-  assert.ok(await f.authority(refs))
+  assert.match(await f.send('#群文化 开启'), /群文化已开启/)
+  const reopened = await f.authority(refs)
+  // Reopening is a new policy generation: a run proven before the close cannot resume.
+  assert.ok(reopened)
+  assert.notEqual(reopened, before)
   f.setJoined(1700000200)
   assert.equal(await f.authority(refs), null)
+})
+
+
+test('group memory and culture default on in every group without any configured group list', async t => {
+  const f = await fixture(t)
+  assert.match(await f.send('#群记忆 状态', '70007'), /群记忆：已开启；群文化：已开启/)
+  assert.match(await f.send('#群记忆 记住 规则 本群禁止刷屏', '70007'), /已保存/)
+  assert.deepEqual((await f.recall('刷屏', '70007')).candidates.map((c: any) => c.text), ['本群禁止刷屏'])
+  f.setRole('member')
+  assert.match(await f.send('#群文化 提议 梗说明 本群使用星球梗', '70007'), /已提交/)
+})
+
+test('only a current group administrator command closes group memory, durably across restart', async t => {
+  const f = await fixture(t)
+  await f.send('#群记忆 记住 规则 本群禁止刷屏')
+  const initial = await f.recall('刷屏')
+  const refs = initial.candidates.map((c: any) => ({ namespaceRef: c.namespaceRef, memoryId: c.memoryId,
+    revision: c.revision, revisionHash: c.revisionHash }))
+  assert.ok(await f.authority(refs))
+  f.setRole('member')
+  assert.match(await f.send('#群记忆 关闭'), /只有当前群管理员/)
+  assert.equal((await f.recall('刷屏')).candidates.length, 1)
+  f.setRole('admin')
+  assert.match(await f.send('#群记忆 关闭'), /群记忆已关闭/)
+  assert.match(await f.send('#群记忆 关闭'), /群记忆已关闭/)
+  assert.match(await f.send('#群记忆 状态'), /群记忆：已关闭/)
+  assert.equal((await f.recall('刷屏')).status, 'unavailable')
+  assert.equal(await f.authority(refs), null)
+  assert.match(await f.send('#群记忆 记住 规则 本群禁止灌水'), /管理员关闭/)
+  // Closing stops injection and new or changed content; existing content remains listable and forgettable.
+  const id = /@[0-9a-f]{8}/u.exec(await f.send('#群记忆 列表'))![0]
+  assert.match(await f.send(`#群记忆 更正 ${id} 本群禁止重复刷屏`), /管理员关闭/)
+  assert.match(await f.send(`#群记忆 续期 ${id} 30`), /管理员关闭/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
+  assert.match(await f.send('#群记忆 状态', '50005'), /群记忆：已开启/)
+  assert.match(await f.send(`#群记忆 遗忘 ${id}`), /已遗忘/)
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
+
+  await f.runtime.close()
+  const restarted = await createProductionPersonalMemoryRuntimeV1(runtimeOptions(f.directory))
+  t.after(async () => await restarted.close())
+  const replies: string[] = []
+  await restarted.commands.handle({ event: { isGroup: true, self_id: '10001', group_id: '40004', user_id: '20002',
+    message_id: 'group-restart-status', sender: { user_id: '20002' }, bot: { sendApi: async () => ({}) } },
+  text: '#群记忆 状态', replyText: async value => { replies.push(value) }, sendPrivateFile: async () => undefined })
+  assert.match(replies.join(''), /群记忆：已关闭/)
+})
+
+test('reopening group memory restores recall only after the administrator command', async t => {
+  const f = await fixture(t)
+  await f.send('#群记忆 记住 规则 本群禁止刷屏')
+  assert.match(await f.send('#群记忆 关闭'), /已关闭/)
+  assert.match(await f.send('#群文化 开启'), /群记忆仍处于关闭状态/)
+  assert.equal((await f.recall('刷屏')).status, 'unavailable')
+  assert.match(await f.send('#群记忆 开启'), /群记忆已开启/)
+  assert.equal((await f.recall('刷屏')).candidates.length, 1)
+  f.stopLookup()
+  assert.match(await f.send('#群记忆 关闭'), /无法核实/)
+  assert.match(await f.send('#群记忆 状态'), /群记忆：已开启/)
 })

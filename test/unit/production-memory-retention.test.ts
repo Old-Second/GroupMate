@@ -11,7 +11,7 @@ test('production retention purges due bodies and retries a failed index rebuild,
   const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-retention-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   const runtime = await createProductionPersonalMemoryRuntimeV1({ botInstanceId: 'groupmate-production',
-    storageDirectory: directory, deploymentMode: () => 'explicit', groupAllowlist: () => [],
+    storageDirectory: directory, deploymentMode: () => 'explicit',
     recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150 })
   let message = 0
   const send = async (text: string, userId: string) => {

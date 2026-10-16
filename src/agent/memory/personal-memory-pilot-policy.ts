@@ -1,5 +1,4 @@
 import {
-  inspectMemoryArray,
   inspectMemoryRecord,
   invalidMemoryValue
 } from './memory-namespace.js'
@@ -28,7 +27,6 @@ export type PersonalMemoryPilotSceneV1 =
 export type PersonalMemoryPilotDisabledReasonV1 =
   | 'deployment_off'
   | 'user_opted_out'
-  | 'group_not_allowed'
 
 export interface PersonalMemoryPilotDecisionV1 {
   readonly status: 'enabled' | 'disabled'
@@ -43,10 +41,7 @@ export interface DecidePersonalMemoryPilotOptionsV1 {
   readonly deploymentMode: PersonalMemoryDeploymentModeV1
   readonly enrollment: PersonalMemoryEnrollmentV1
   readonly scene: PersonalMemoryPilotSceneV1
-  readonly groupAllowlist: readonly string[]
 }
-
-const MAXIMUM_CANARY_GROUPS = 128
 
 function enumValue<T extends string> (value: unknown, values: readonly T[]): T {
   if (typeof value !== 'string' || !values.includes(value as T)) return invalidMemoryValue()
@@ -84,17 +79,6 @@ function parseScene (value: unknown): PersonalMemoryPilotSceneV1 {
   return Object.freeze({ kind: 'group' as const, groupId: qqId(discriminator.groupId) })
 }
 
-function parseGroupAllowlist (value: unknown): ReadonlySet<string> {
-  const input = inspectMemoryArray(value, MAXIMUM_CANARY_GROUPS)
-  const groups = new Set<string>()
-  for (const candidate of input) {
-    const groupId = qqId(candidate)
-    if (groups.has(groupId)) return invalidMemoryValue()
-    groups.add(groupId)
-  }
-  return groups
-}
-
 function disabledDecision (
   reason: PersonalMemoryPilotDisabledReasonV1
 ): PersonalMemoryPilotDecisionV1 {
@@ -112,21 +96,18 @@ export function decidePersonalMemoryPilotV1 (
   optionsValue: DecidePersonalMemoryPilotOptionsV1
 ): PersonalMemoryPilotDecisionV1 {
   const input = inspectMemoryRecord(optionsValue, [
-    'deploymentMode', 'enrollment', 'scene', 'groupAllowlist'
+    'deploymentMode', 'enrollment', 'scene'
   ])
   const deploymentMode = enumValue(
     input.deploymentMode,
     ['off', 'explicit', 'shadow', 'automatic'] as const
   )
   const enrollment = parseEnrollment(input.enrollment)
-  const scene = parseScene(input.scene)
-  const groupAllowlist = parseGroupAllowlist(input.groupAllowlist)
+  // Every private and group scene participates by default; only the subject's durable opt-out narrows it.
+  parseScene(input.scene)
 
   if (deploymentMode === 'off') return disabledDecision('deployment_off')
   if (enrollment.status === 'opted_out') return disabledDecision('user_opted_out')
-  if (scene.kind === 'group' && !groupAllowlist.has(scene.groupId)) {
-    return disabledDecision('group_not_allowed')
-  }
 
   const automaticCandidate = deploymentMode === 'automatic' &&
     enrollment.candidateMode === 'policy_approved'

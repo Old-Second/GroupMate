@@ -75,11 +75,13 @@ import {
 import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js'
 import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js'
 import { createGroupMemoryV1 } from './GroupMemory.js'
+import { openGroupMemoryPolicyStoreV1, type GroupMemoryPolicyStoreV1 } from './GroupMemoryPolicy.js'
 import { parseMemoryRetrievalResultV2, type MemoryRetrievalCandidateV2 } from '../agent/memory/memory-retrieval.js'
 import { createProductionMemoryRetentionV1 } from './ProductionMemoryRetention.js'
 
 const CANONICAL_FILE = 'personal-memory.sqlite'
 const LEXICAL_FILE = 'personal-memory-lexical.sqlite'
+const GROUP_POLICY_FILE = 'group-memory-policy.sqlite'
 const EXPORT_DIRECTORY = 'exports'
 const EXPORT_DELIVERY_DIRECTORY = 'export-delivery'
 const MAX_RECALL_ITEMS = 12
@@ -88,7 +90,6 @@ const MAX_RECALL_TIMEOUT_MS = 500
 const DEFAULT_RECALL_ITEMS = 6
 const DEFAULT_RECALL_TOKENS = 1_200
 const DEFAULT_RECALL_TIMEOUT_MS = 150
-const MAX_GROUP_ALLOWLIST = 256
 
 interface ProjectionCursorV1 {
   readonly namespaceRef: string
@@ -124,27 +125,6 @@ function boundedInteger (
       : fallback
   } catch {
     return fallback
-  }
-}
-
-function configuredGroupAllowlist (source: () => readonly string[]): readonly string[] {
-  try {
-    const value = Reflect.apply(source, undefined, []) as unknown
-    if (!Array.isArray(value)) return Object.freeze([])
-    const result: string[] = []
-    const seen = new Set<string>()
-    for (const item of value) {
-      if (result.length >= MAX_GROUP_ALLOWLIST) break
-      const normalized = typeof item === 'string' || typeof item === 'number'
-        ? String(item).trim()
-        : ''
-      if (!/^[1-9][0-9]{0,31}$/.test(normalized) || seen.has(normalized)) continue
-      seen.add(normalized)
-      result.push(normalized)
-    }
-    return Object.freeze(result)
-  } catch {
-    return Object.freeze([])
   }
 }
 
@@ -575,6 +555,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
   let lexical: SqliteMemoryLexicalDatabaseV1 | null = null
   let shadow: ReturnType<typeof createProductionShadowMemoryV1> | undefined
   let retention: ReturnType<typeof createProductionMemoryRetentionV1> | undefined
+  let groupPolicy: GroupMemoryPolicyStoreV1 | null = null
   try {
     canonical = openSqliteMemoryDatabaseV3({
       location: canonicalLocation,
@@ -585,6 +566,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       location: lexicalLocation,
       now: nowIso
     })
+    groupPolicy = openGroupMemoryPolicyStoreV1(path.join(options.storageDirectory, GROUP_POLICY_FILE))
     const lexicalIndex = createSqliteMemoryLexicalIndexV1({ database: lexical.database })
     const projector = createLexicalProjector({
       canonical: canonical.database,
@@ -649,7 +631,6 @@ export async function createProductionPersonalMemoryRuntimeV1 (
     const boundaryDatabase = canonical.database
     const source = createPersonalMemoryRecallSourceV1({
       deploymentMode: options.deploymentMode,
-      groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
       participants: createYunzaiSceneParticipantDirectoryV1(),
       validateDependencies: async (request, refs, signal) => await validateCanonicalMemoryDependencies(boundaryDatabase, request, refs, signal),
       enrollment,
@@ -688,7 +669,6 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       database: canonical.database,
       queueLocation: path.join(options.storageDirectory, 'personal-memory-extraction.sqlite'),
       botInstanceId: options.botInstanceId, mode: options.deploymentMode,
-      groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
       enrollment, lifecycle, model: options.candidateModel, now: nowIso,
       onApproved: async () => { await projector.rebuild() },
       ...(options.candidateBot === undefined ? {} : { bot: options.candidateBot }),
@@ -707,7 +687,6 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       botInstanceId: options.botInstanceId,
       database: canonical.database,
       mode: options.deploymentMode,
-      groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist),
       now: nowIso,
       facade,
       control,
@@ -720,10 +699,9 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       ...(shadow === undefined ? {} : { clearCandidateJobs: shadow.clearNamespace })
     })
     const groupMemory = createGroupMemoryV1({
-      ...(options.cultureGroups === undefined ? {} : { cultureGroups: options.cultureGroups }),
       botInstanceId: options.botInstanceId, database: canonical.database,
       enabled: () => ['explicit', 'shadow', 'automatic'].includes(options.deploymentMode()),
-      groupAllowlist: () => configuredGroupAllowlist(options.groupAllowlist), now: nowIso,
+      policy: groupPolicy, now: nowIso,
       lifecycle, control, export: exportPort, exportDelivery: exportDeliveryRuntime.delivery,
       retriever: createLexicalMemoryRetrieverV2({ index: lexicalIndex,
         canonical: createSqliteMemoryCanonicalRehydratorV1({ database: canonical.database, now: nowIso }), now: nowIso }),
@@ -767,8 +745,11 @@ export async function createProductionPersonalMemoryRuntimeV1 (
               const result = await groupMemory.recall({ ...fresh, dependencyCheck: groupRefs }, signal)
               if (result.status !== 'completed') return null
             }
+            // Group policy generations make an administrator's close/reopen invalidate prior derivatives.
+            const policy = groupRefs.length === 0 ? null : groupMemory.policy(typed.event)
+            if (groupRefs.length > 0 && policy === null) return null
             return canonicalMemoryAuthorityStamp(boundaryDatabase, refs, {
-              mode: options.deploymentMode(), allowlist: [...configuredGroupAllowlist(options.groupAllowlist)].sort()
+              mode: options.deploymentMode(), groupPolicy: policy
             })
           } catch { return null }
         },
@@ -821,6 +802,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         await shadow?.close()
         await projector.waitForIdle().catch(() => undefined)
         exportDeliveryRuntime.close()
+        groupPolicy?.close()
         lexical?.close()
         canonical?.close()
       }
@@ -828,6 +810,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
   } catch (error) {
     try { await retention?.close() } catch {}
     try { await shadow?.close() } catch {}
+    try { groupPolicy?.close() } catch {}
     try { lexical?.close() } catch {}
     try { canonical?.close() } catch {}
     throw error

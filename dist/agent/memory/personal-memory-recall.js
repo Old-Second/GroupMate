@@ -203,14 +203,6 @@ export function createPersonalMemoryRecallSourceV1(options) {
                         return unavailable('policy_unavailable');
                     }
                     const selected = [];
-                    let canaryDenied = false;
-                    let allowlist;
-                    try {
-                        allowlist = options.groupAllowlist();
-                    }
-                    catch {
-                        return unavailable('policy_unavailable');
-                    }
                     for (const [index, subject] of subjects.entries()) {
                         const namespace = scope.namespaces[index];
                         if (namespace === undefined)
@@ -231,8 +223,7 @@ export function createPersonalMemoryRecallSourceV1(options) {
                                     status: enrollment.policy.state,
                                     candidateMode: enrollment.policy.candidateMode
                                 }),
-                                scene: policyScene(snapshot.scene),
-                                groupAllowlist: allowlist
+                                scene: policyScene(snapshot.scene)
                             }));
                         }
                         catch {
@@ -240,12 +231,9 @@ export function createPersonalMemoryRecallSourceV1(options) {
                         }
                         if (decision.recall)
                             selected.push({ subject, namespace });
-                        else if (decision.reason === 'group_not_allowed')
-                            canaryDenied = true;
                     }
-                    if (selected.length === 0) {
-                        return unavailable(canaryDenied ? 'not_in_canary' : 'not_opted_in');
-                    }
+                    if (selected.length === 0)
+                        return unavailable('not_opted_in');
                     const requestedAt = trustedNow(now);
                     const queryText = boundedQueryText(input.query.text);
                     if (requestedAt === null || queryText === null || requestedAt >= deadline) {

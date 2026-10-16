@@ -33,7 +33,7 @@ export function productionPersonalMemoryCommandGatewayV1 (): PersonalMemoryComma
   return Object.freeze({
     async handle (request: PersonalMemoryCommandRequestV1): Promise<boolean> {
       if (configuredPort !== null) return await configuredPort.handle(request)
-      await request.replyText('个人长期记忆当前未启用。请先由机器人主人在锅巴中开启试点模式。')
+      await request.replyText('个人长期记忆当前未启用，请联系机器人主人检查锅巴中的长期记忆模式。')
       return true
     }
   })

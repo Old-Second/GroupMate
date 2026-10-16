@@ -1407,8 +1407,6 @@ try {
     botInstanceId: 'groupmate-production-v1',
     storageDirectory: resolvePluginPath('data', 'memory'),
     deploymentMode: () => Config.personalMemoryMode,
-    groupAllowlist: () => Config.personalMemoryGroupAllowlist,
-    cultureGroups: () => Config.groupCultureGroups,
     recallMaxItems: () => Config.personalMemoryRecallMaxItems,
     recallMaxTokens: () => Config.personalMemoryRecallMaxTokens,
     recallTimeoutMs: () => Config.personalMemoryRecallTimeoutMs,

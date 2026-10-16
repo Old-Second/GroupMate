@@ -219,7 +219,6 @@ test('deployment off returns before participant, enrollment, retriever and timer
   try {
     const source = createPersonalMemoryRecallSourceV1({
       deploymentMode: () => 'off',
-      groupAllowlist: () => Object.freeze([]),
       participants: Object.freeze({
         resolve: async () => { directoryCalls += 1; return privateSnapshot() }
       }),
@@ -264,7 +263,6 @@ test('private opt-in performs one bounded retrieval and preserves the exact requ
   })
   const source = createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit',
-    groupAllowlist: () => Object.freeze([]),
     participants: directory,
     enrollment: enrollmentPort(() => true),
     retriever,
@@ -275,7 +273,7 @@ test('private opt-in performs one bounded retrieval and preserves the exact requ
   assert.equal(retrievals, 1)
 })
 
-test('group recall filters opt-in per subject and requires the group canary', async () => {
+test('group recall is on in every group and filters only per-subject opt-out', async () => {
   let retrievals = 0
   const directory = Object.freeze({ resolve: async () => groupSnapshot() })
   const retriever: MemoryRetrievalAdapterV2 = Object.freeze({
@@ -297,7 +295,6 @@ test('group recall filters opt-in per subject and requires the group canary', as
   })
   const source = createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit',
-    groupAllowlist: () => Object.freeze([GROUP_ID]),
     participants: directory,
     enrollment: enrollmentPort(userId => userId === '70002'),
     retriever,
@@ -306,18 +303,17 @@ test('group recall filters opt-in per subject and requires the group canary', as
   assert.equal((await source.recall(recallInput('group'))).status, 'completed')
   assert.equal(retrievals, 1)
 
-  const blocked = createPersonalMemoryRecallSourceV1({
+  const optedOut = createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit',
-    groupAllowlist: () => Object.freeze([]),
     participants: directory,
-    enrollment: enrollmentPort(() => true),
+    enrollment: enrollmentPort(() => false),
     retriever,
     now: () => new Date(NOW)
   })
-  assert.deepEqual(await blocked.recall(recallInput('group')), {
+  assert.deepEqual(await optedOut.recall(recallInput('group')), {
     schemaVersion: 2,
     status: 'unavailable',
-    reason: 'not_in_canary'
+    reason: 'not_opted_in'
   })
   assert.equal(retrievals, 1)
 })
@@ -334,7 +330,6 @@ test('internal timeout fails open while caller cancellation propagates', async (
   })
   const createSource = () => createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit' as const,
-    groupAllowlist: () => Object.freeze([]),
     participants: waitingDirectory,
     enrollment: enrollmentPort(() => true),
     retriever: Object.freeze({
@@ -367,7 +362,6 @@ test('host identity resolution owns a budget outside the retrieval deadline', as
   })
   const source = createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit',
-    groupAllowlist: () => Object.freeze([]),
     participants: slowDirectory,
     enrollment: enrollmentPort(() => true),
     retriever: Object.freeze({
@@ -398,7 +392,6 @@ test('host identity resolution exceeding its own budget fails open without retri
   })
   const source = createPersonalMemoryRecallSourceV1({
     deploymentMode: () => 'explicit',
-    groupAllowlist: () => Object.freeze([]),
     participants: stalledDirectory,
     enrollment: enrollmentPort(() => true),
     retriever: Object.freeze({
@@ -423,7 +416,6 @@ test('host identity resolution exceeding its own budget fails open without retri
 test('an invalid host identity budget is rejected when the source is created', () => {
   const options = {
     deploymentMode: () => 'explicit' as const,
-    groupAllowlist: () => Object.freeze([]),
     participants: Object.freeze({ resolve: async () => privateSnapshot() }),
     enrollment: enrollmentPort(() => true),
     retriever: Object.freeze({

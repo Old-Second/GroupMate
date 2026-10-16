@@ -1,6 +1,5 @@
-import { inspectMemoryArray, inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js';
+import { inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js';
 import { MEMORY_RESOURCE_LIMITS } from './memory-resource-limits.js';
-const MAXIMUM_CANARY_GROUPS = 128;
 function enumValue(value, values) {
     if (typeof value !== 'string' || !values.includes(value))
         return invalidMemoryValue();
@@ -33,17 +32,6 @@ function parseScene(value) {
     }
     return Object.freeze({ kind: 'group', groupId: qqId(discriminator.groupId) });
 }
-function parseGroupAllowlist(value) {
-    const input = inspectMemoryArray(value, MAXIMUM_CANARY_GROUPS);
-    const groups = new Set();
-    for (const candidate of input) {
-        const groupId = qqId(candidate);
-        if (groups.has(groupId))
-            return invalidMemoryValue();
-        groups.add(groupId);
-    }
-    return groups;
-}
 function disabledDecision(reason) {
     return Object.freeze({
         status: 'disabled',
@@ -56,19 +44,16 @@ function disabledDecision(reason) {
 }
 export function decidePersonalMemoryPilotV1(optionsValue) {
     const input = inspectMemoryRecord(optionsValue, [
-        'deploymentMode', 'enrollment', 'scene', 'groupAllowlist'
+        'deploymentMode', 'enrollment', 'scene'
     ]);
     const deploymentMode = enumValue(input.deploymentMode, ['off', 'explicit', 'shadow', 'automatic']);
     const enrollment = parseEnrollment(input.enrollment);
-    const scene = parseScene(input.scene);
-    const groupAllowlist = parseGroupAllowlist(input.groupAllowlist);
+    // Every private and group scene participates by default; only the subject's durable opt-out narrows it.
+    parseScene(input.scene);
     if (deploymentMode === 'off')
         return disabledDecision('deployment_off');
     if (enrollment.status === 'opted_out')
         return disabledDecision('user_opted_out');
-    if (scene.kind === 'group' && !groupAllowlist.has(scene.groupId)) {
-        return disabledDecision('group_not_allowed');
-    }
     const automaticCandidate = deploymentMode === 'automatic' &&
         enrollment.candidateMode === 'policy_approved';
     const shadowCandidate = !automaticCandidate &&

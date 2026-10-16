@@ -38,18 +38,16 @@ function decision (
   }>,
   scene: Readonly<{ kind: 'private' } | { kind: 'group'; groupId: string }> = {
     kind: 'private'
-  },
-  groupAllowlist: readonly string[] = []
+  }
 ): PersonalMemoryPilotDecisionV1 {
   return decidePersonalMemoryPilotV1({
     deploymentMode,
     enrollment,
-    scene,
-    groupAllowlist
+    scene
   })
 }
 
-test('personal memory pilot requires deployment mode, opt-in and group canary together', () => {
+test('personal memory defaults on in every group and narrows only by deployment mode or opt-out', () => {
   const optedIn = Object.freeze({
     status: 'opted_in' as const,
     candidateMode: 'policy_approved' as const
@@ -65,13 +63,13 @@ test('personal memory pilot requires deployment mode, opt-in and group canary to
   assert.equal(decision('explicit', {
     status: 'opted_out', candidateMode: 'off'
   }).reason, 'user_opted_out')
-  assert.equal(decision('automatic', optedIn, {
-    kind: 'group', groupId: GROUP_A
-  }, [GROUP_B]).reason, 'group_not_allowed')
+  assert.equal(decision('automatic', {
+    status: 'opted_out', candidateMode: 'off'
+  }, { kind: 'group', groupId: GROUP_B }).reason, 'user_opted_out')
 
   const enabled = decision('automatic', optedIn, {
     kind: 'group', groupId: GROUP_A
-  }, [GROUP_A])
+  })
   assert.deepEqual(enabled, {
     status: 'enabled',
     reason: 'enabled',
@@ -109,25 +107,28 @@ test('personal memory candidate modes only narrow the deployment ceiling', () =>
   )
 })
 
-test('personal memory pilot rejects malformed, duplicate, accessor and proxy policy inputs', () => {
+test('personal memory pilot rejects malformed, removed-field, accessor and proxy policy inputs', () => {
   assert.throws(() => decidePersonalMemoryPilotV1({
     deploymentMode: 'automatic',
     enrollment: { status: 'opted_in', candidateMode: 'policy_approved' },
     scene: { kind: 'group', groupId: GROUP_A },
-    groupAllowlist: [GROUP_A, GROUP_A]
+    groupAllowlist: [GROUP_A]
+  } as never), TypeError)
+  assert.throws(() => decidePersonalMemoryPilotV1({
+    deploymentMode: 'automatic',
+    enrollment: { status: 'opted_in', candidateMode: 'policy_approved' },
+    scene: { kind: 'group', groupId: 'not-a-group' }
   }), TypeError)
   assert.throws(() => decidePersonalMemoryPilotV1(new Proxy({
     deploymentMode: 'off',
     enrollment: { status: 'opted_out', candidateMode: 'off' },
-    scene: { kind: 'private' },
-    groupAllowlist: []
+    scene: { kind: 'private' }
   }, {})), TypeError)
   assert.throws(() => decidePersonalMemoryPilotV1({
     deploymentMode: 'off',
     get enrollment () {
       throw new Error('must not invoke accessors')
     },
-    scene: { kind: 'private' },
-    groupAllowlist: []
+    scene: { kind: 'private' }
   } as never), TypeError)
 })

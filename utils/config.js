@@ -162,8 +162,6 @@ const defaultConfig = {
   // 0 使用模型 Profile/安全默认值，正整数仅对重启后创建的新任务生效。
   apiContextWindowTokens: 0,
   personalMemoryMode: 'automatic',
-  personalMemoryGroupAllowlist: [],
-  groupCultureGroups: [],
   semanticSummaryGroups: [],
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1200,

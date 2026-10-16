@@ -333,7 +333,6 @@ test('Guoba and example config expose the reviewed automatic default with bounde
     'config/config.example.json'
   ), 'utf8')) as Record<string, unknown>
   assert.deepEqual(fields.filter(phase7bMemoryControlFieldIsForbidden).sort(), [
-    'personalMemoryGroupAllowlist',
     'personalMemoryMaintenanceAction',
     'personalMemoryMode',
     'personalMemoryOperationsStatus',

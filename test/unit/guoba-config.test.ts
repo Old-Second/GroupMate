@@ -26,13 +26,6 @@ test('normalizes editable Guoba list fields into unique trimmed values', () => {
     ['123456', '654321']
   )
   assert.deepEqual(
-    normalizeGuobaConfigValue(
-      'personalMemoryGroupAllowlist',
-      ['123456', ' 654321 ', '123456', 'invalid']
-    ),
-    ['123456', '654321']
-  )
-  assert.deepEqual(
     normalizeGuobaConfigValue('blockWords', 'bad phrase, second phrase'),
     ['bad phrase', 'second phrase']
   )
@@ -41,7 +34,6 @@ test('normalizes editable Guoba list fields into unique trimmed values', () => {
 test('normalizes the bounded personal memory pilot configuration fail closed', () => {
   assert.deepEqual(PERSONAL_MEMORY_CONFIG_DEFAULTS, {
     personalMemoryMode: 'automatic',
-    personalMemoryGroupAllowlist: [],
     personalMemoryRecallMaxItems: 6,
     personalMemoryRecallMaxTokens: 1_200,
     personalMemoryRecallTimeoutMs: 150
@@ -251,12 +243,12 @@ test('disk log saves require restart while ordinary live fields keep the normal 
 })
 
 
-test('culture pilots reject malformed, duplicate and oversized lists and require restart', () => {
-  assert.deepEqual(normalizeGuobaConfigValue('groupCultureGroups', ['123456']), ['123456'])
-  for (const value of [null, '123456', [123456], ['invalid'], ['123456', '123456'], Array.from({ length: 65 }, (_, i) => String(i + 1))]) {
-    assert.throws(() => normalizeGuobaConfigValue('groupCultureGroups', value))
+test('removed memory group lists are ordinary unknown values without restart semantics', () => {
+  // Group memory and culture now default on everywhere; obsolete real-config keys stay untouched but unused.
+  for (const key of ['personalMemoryGroupAllowlist', 'groupCultureGroups']) {
+    assert.deepEqual(normalizeGuobaConfigValue(key, ['123456']), ['123456'])
+    assert.doesNotMatch(guobaConfigSaveMessage([key]), /重启/)
   }
-  assert.match(guobaConfigSaveMessage(['groupCultureGroups']), /重启/)
 })
 test('disabled tools only accept distinct canonical names and preserve the caller list', () => {
   const input = ['sendVideo', 'randomChoice']

@@ -45,7 +45,7 @@ async function setup (t: TestContext, mode: 'explicit' | 'shadow' | 'automatic' 
   const admissions: unknown[] = []
   const runtime = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
-    deploymentMode: () => typeof mode === 'function' ? mode() : mode, groupAllowlist: () => ['30003'],
+    deploymentMode: () => typeof mode === 'function' ? mode() : mode,
     recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
     candidateBot: () => bot,
     candidateAdmission: value => admissions.push(value),
@@ -102,7 +102,7 @@ for (const mode of ['shadow', 'automatic'] as const) {
     let restartedRequests = 0
     const restarted = await createProductionPersonalMemoryRuntimeV1({
       botInstanceId: 'groupmate-production', storageDirectory: directory,
-      deploymentMode: () => mode, groupAllowlist: () => ['30003'],
+      deploymentMode: () => mode,
       recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
       candidateModel: { model: () => 'test-model', adapter: { complete: async () => {
         restartedRequests += 1
@@ -230,7 +230,7 @@ test('shutdown cancels a pending provider and leaves a durable job for event-dri
   let calls = 0
   const reopened = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
-    deploymentMode: () => 'shadow', groupAllowlist: () => [],
+    deploymentMode: () => 'shadow',
     recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150,
     candidateModel: { model: () => 'test-model', adapter: { complete: async () => {
       calls += 1
@@ -366,7 +366,7 @@ test('manual opt-out before the first ordinary message persists and defeats auto
   let calls = 0
   const reopened = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
-    deploymentMode: () => 'automatic', groupAllowlist: () => [],
+    deploymentMode: () => 'automatic',
     recallMaxItems: () => 6, recallMaxTokens: () => 1200, recallTimeoutMs: () => 150,
     candidateModel: { model: () => 'test-model', adapter: { complete: async () => {
       calls += 1

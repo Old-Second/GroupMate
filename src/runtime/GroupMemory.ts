@@ -18,13 +18,13 @@ import { parseMemoryRetrievalRequestV2, retrieveMemoryV2, type MemoryRetrievalAd
 import type { PersonalMemoryCommandPortV1, PersonalMemoryCommandRequestV1 } from './personal-memory-command.js'
 import type { PersonalMemoryExportDeliveryV1 } from './yunzai-personal-memory-controller.js'
 import { createYunzaiSceneParticipantDirectoryV1, type YunzaiPersonalMemoryRecallInputV1 } from './yunzai-scene-participant-directory.js'
+import type { GroupMemoryFeatureV1, GroupMemoryPolicyStoreV1, GroupMemoryPolicyV1 } from './GroupMemoryPolicy.js'
 
 interface GroupMemoryOptions {
   readonly botInstanceId: string
   readonly database: DatabaseSync
   readonly enabled: () => boolean
-  readonly groupAllowlist: () => readonly string[]
-  readonly cultureGroups?: () => readonly string[]
+  readonly policy: GroupMemoryPolicyStoreV1
   readonly now: () => string
   readonly lifecycle: MemoryLifecyclePortV1
   readonly control: MemoryControlRepositoryPortV1
@@ -40,7 +40,8 @@ interface GroupMemoryOptions {
 const ADMIN_ACTIONS: readonly MemoryLifecycleActorActionV1[] = [
   'propose_create', 'list_safe', 'inspect_full', 'approve', 'reject', 'correct', 'renew', 'forget'
 ]
-const HELP = ['群记忆命令（仅在当前试点群）：',
+const HELP = ['群记忆命令：',
+  '#群记忆 状态', '#群记忆 开启 / 关闭（群管理员；默认开启）',
   '#群记忆 列表 [页码]', '#群记忆 记住 <规则|共同偏好|文化|群体事实> <以本群或我们群开头的内容>',
   '#群记忆 更正 <@编号> <新内容>', '#群记忆 续期 <@编号> [天数]',
   '#群记忆 遗忘 <@编号>', '#群记忆 导出（群主，私发文件）',
@@ -48,6 +49,9 @@ const HELP = ['群记忆命令（仅在当前试点群）：',
   '群管理员可以保存和修改；普通成员可以查看。第三方个人信息不会写入群记忆。'].join('\n')
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
 class GroupMemoryError extends Error {}
+const FEATURE_LABELS: Readonly<Record<GroupMemoryFeatureV1, string>> = Object.freeze({
+  group_memory: '群记忆', group_culture: '群文化'
+})
 
 function boundedExcerpt (value: string): string {
   let result = ''
@@ -86,10 +90,22 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
   const participants = createYunzaiSceneParticipantDirectoryV1()
   const issuer = createMemoryAccessCapabilityIssuerV1(() => true)
   const root = createMemoryLifecycleAuthorityRootV1(() => true)
+  const policyScope = (event: any) => ({ botInstanceId: options.botInstanceId,
+    accountId: String(event?.self_id ?? event?.bot?.uin ?? ''), groupId: String(event?.group_id ?? '') })
+  // Absent or unreadable policy state never widens access: an unreadable store fails closed.
+  const groupPolicy = (event: any): GroupMemoryPolicyV1 | null => {
+    try { return options.policy.read(policyScope(event)) } catch { return null }
+  }
+  const memoryEnabled = (event: any): boolean => groupPolicy(event)?.group_memory.enabled === true
+  // Recall and dependency checks require the group switch; management commands opt out of that check.
   const authorize = async (event: any, text: string, messageId: string, signal: AbortSignal,
-    refreshCurrentRole = true, freshAuthority = false) => {
-    if (!options.enabled() || event?.isGroup !== true ||
-      !options.groupAllowlist().includes(String(event.group_id))) throw new GroupMemoryError('当前场景未启用群记忆。')
+    refreshCurrentRole = true, freshAuthority = false, requireEnabled = true) => {
+    if (!options.enabled() || event?.isGroup !== true) throw new GroupMemoryError('当前场景未启用群记忆。')
+    const policy = groupPolicy(event)
+    if (policy === null) throw new GroupMemoryError('无法核实当前群记忆开关状态，操作未执行。')
+    if (requireEnabled && !policy.group_memory.enabled) {
+      throw new GroupMemoryError('当前群记忆已由管理员关闭；群管理员可发送“#群记忆 开启”恢复。')
+    }
     const accountId = String(event.self_id ?? event.bot?.uin ?? '')
     const now = options.now()
     const snapshot = await abortable(participants.resolve({ event, accountId, observedAt: now,
@@ -195,12 +211,28 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     if (result.status !== 'found' || result.operation !== 'revision.get') throw new GroupMemoryError('这条群记忆暂时不可修改。')
     return result.value
   }
-  const cultureEnabled = (groupId: string): boolean => {
-    try {
-      const groups = options.cultureGroups?.() ?? []
-      return groups.length <= 64 && groups.every(g => typeof g === 'string' && /^[1-9][0-9]{0,31}$/u.test(g)) &&
-        groups.includes(groupId)
-    } catch { return false }
+  const cultureEnabled = (event: any): boolean => {
+    const policy = groupPolicy(event)
+    return policy?.group_memory.enabled === true && policy.group_culture.enabled
+  }
+  const statusText = (event: any): string => {
+    const policy = groupPolicy(event)
+    if (policy === null) return '当前群记忆状态暂时不可用。'
+    const state = (feature: GroupMemoryFeatureV1) => policy[feature].enabled ? '已开启' : '已关闭'
+    return `当前群记忆：${state('group_memory')}；群文化：${state('group_culture')}。\n` +
+      '默认开启，群管理员可发送“#群记忆 关闭”或“#群文化 关闭”停止注入和新记录，关闭状态跨重启保留。'
+  }
+  const toggle = async (auth: Auth, feature: GroupMemoryFeatureV1, enabled: boolean, event: any): Promise<string> => {
+    requireAdmin(auth)
+    const result = options.policy.decide(policyScope(event), feature, enabled, auth.actorRef, auth.now)
+    if (result.status === 'capacity') throw new GroupMemoryError('群记忆开关容量已满，操作未执行。')
+    const label = FEATURE_LABELS[feature]
+    if (!enabled) {
+      return `当前群的${label}已关闭，不再注入对话或记录新内容；已有内容保留，可用“#${label} 开启”恢复。`
+    }
+    return feature === 'group_culture' && !result.policy.group_memory.enabled
+      ? '当前群的群文化已开启；群记忆仍处于关闭状态，需先发送“#群记忆 开启”才会生效。'
+      : `当前群的${label}已开启。`
   }
   const cultureProposal = async (auth: Auth, selector: string): Promise<MemoryProposalV2> => {
     if (!/^@[0-9a-f]{8}$/u.test(selector)) throw new GroupMemoryError('请使用候选列表里的唯一 @编号。')
@@ -293,16 +325,28 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
         const event = request.event as any
         const messageId = String(event?.message_id ?? '')
         if (!/^[\x21-\x7e]{1,128}$/u.test(messageId)) throw new GroupMemoryError('无法核实当前消息编号。')
-        if (isCulture && !cultureEnabled(String(event?.group_id))) throw new GroupMemoryError('当前群未启用文化提案。')
-        const auth = await authorize(event, request.text, messageId, controller.signal)
         const body = request.text.replace(/^#群(?:记忆|文化)\s*/u, '').trim()
-        if (isCulture && await cultureCommand(auth, body, request.replyText)) return true
-        if (isCulture && !/^(?:列表|更正|续期|遗忘|帮助|状态|$)/u.test(body)) {
-          await request.replyText('群文化命令：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号；列表；更正/续期/遗忘 @编号。仅文字描述，不代表群共识。')
+        if (body === '状态') {
+          if (!options.enabled() || event?.isGroup !== true) throw new GroupMemoryError('当前场景未启用群记忆。')
+          await request.replyText(statusText(event))
           return true
         }
-        if (body === '帮助' || body === '' || body === '状态') {
-          await request.replyText(isCulture ? '群文化：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号。已保存的描述可用列表、更正、续期、遗忘管理；不代表群共识。' : HELP)
+        if (body === '开启' || body === '关闭') {
+          const auth = await authorize(event, request.text, messageId, controller.signal, true, false, false)
+          await request.replyText(await toggle(auth, isCulture ? 'group_culture' : 'group_memory', body === '开启', event))
+          return true
+        }
+        const auth = await authorize(event, request.text, messageId, controller.signal, true, false, false)
+        if (isCulture && !cultureEnabled(event)) {
+          throw new GroupMemoryError('当前群文化或群记忆已由管理员关闭；群管理员可发送“#群文化 开启”或“#群记忆 开启”恢复。')
+        }
+        if (isCulture && await cultureCommand(auth, body, request.replyText)) return true
+        if (isCulture && !/^(?:列表|更正|续期|遗忘|帮助|状态|$)/u.test(body)) {
+          await request.replyText('群文化命令：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号；列表；更正/续期/遗忘 @编号；状态；开启/关闭（群管理员）。仅文字描述，不代表群共识。')
+          return true
+        }
+        if (body === '帮助' || body === '') {
+          await request.replyText(isCulture ? '群文化：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号。已保存的描述可用列表、更正、续期、遗忘管理；群管理员可开启/关闭，默认开启；不代表群共识。' : HELP)
         } else if (/^列表(?:\s+[1-9][0-9]{0,2})?$/u.test(body)) {
           const page = Number(body.split(/\s+/u)[1] ?? 1)
           if (page > MEMORY_RESOURCE_LIMITS.namespaceActiveRecords / 8) throw new GroupMemoryError('群记忆页码超出范围。')
@@ -348,8 +392,15 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           await request.replyText('群主确认删除时请发送“#群记忆 删除全部 确认”。')
         } else {
           requireAdmin(auth)
+          // A closed group keeps list, forget, export and delete-all; it accepts no new or changed content.
+          const requireWritable = (): void => {
+            if (!memoryEnabled(event)) {
+              throw new GroupMemoryError('当前群记忆已由管理员关闭；群管理员可发送“#群记忆 开启”恢复。')
+            }
+          }
           let match = /^记住\s+(规则|共同偏好|文化|群体事实)\s+([\s\S]+)$/u.exec(body)
           if (match !== null) {
+            requireWritable()
             const text = groupMemoryTextV1(match[2]!)
             if (cultureKindV1(text) !== null) throw new GroupMemoryError('分类文化描述请使用群文化提议并由另一位管理员审核。')
             const kind: MemoryKindV1 = match[1] === '规则' ? 'group_rule' :
@@ -368,6 +419,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
             await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal)
             await request.replyText(`已保存当前群记忆：${text}`)
           } else if ((match = /^更正\s+(\S+)\s+([\s\S]+)$/u.exec(body)) !== null) {
+            requireWritable()
             const text = groupMemoryTextV1(match[2]!)
             const before = await revision(auth, match[1]!)
             if (isCulture && before.record.kind !== 'group_culture') throw new GroupMemoryError('群文化命令只能修改文化描述。')
@@ -380,6 +432,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
               reason: '群管理员更正群记忆' }), before)
             await request.replyText('当前群记忆已更正。')
           } else if ((match = /^续期\s+(\S+)(?:\s+([0-9]+))?$/u.exec(body)) !== null) {
+            requireWritable()
             const days = Number(match[2] ?? 30)
             if (!Number.isSafeInteger(days) || days < 1 || days > 1825) throw new GroupMemoryError('续期天数必须为 1 到 1825。')
             const before = await revision(auth, match[1]!)
@@ -407,6 +460,8 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     }
   })
   return Object.freeze({ commands,
+    /** Live policy view for authority stamps; null when the policy store is unreadable. */
+    policy: groupPolicy,
     async recall (input: YunzaiPersonalMemoryRecallInputV1, callerSignal?: AbortSignal): Promise<MemoryRetrievalResultV2> {
       const controller = new AbortController()
       const onAbort = (): void => controller.abort(callerSignal?.reason)
@@ -429,7 +484,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           limits: options.recallLimits(), requestedAt: retrievalAt,
           deadlineAt })
         if (input.dependencyCheck !== undefined) {
-          if (!cultureEnabled(String((input.event as any)?.group_id))) {
+          if (!cultureEnabled(input.event)) {
             for (const dependency of input.dependencyCheck) {
               const row = options.database.prepare(`SELECT revision_wire FROM revision_payloads WHERE namespace_ref = ? AND namespace_generation = ? AND memory_id = ? AND revision = ?`).get(
                 auth.namespaceRef, auth.generation, dependency.memoryId, dependency.revision)
@@ -443,7 +498,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           return { schemaVersion: 2, status: 'completed', mode: 'none', candidates: [], index: { lexical: 'disabled', vector: 'disabled', watermark: null } }
         }
         const result = await retrieveMemoryV2(options.retriever, request, { signal: controller.signal })
-        if (result.status !== 'completed' || cultureEnabled(String((input.event as any)?.group_id))) return result
+        if (result.status !== 'completed' || cultureEnabled(input.event)) return result
         return { ...result, candidates: result.candidates.filter(c => c.kind !== 'group_culture' || cultureKindV1(c.text) === null) }
       } catch {
         return { schemaVersion: 2, status: 'unavailable', reason: 'policy_unavailable' }

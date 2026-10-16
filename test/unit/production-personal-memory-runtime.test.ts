@@ -21,7 +21,6 @@ function options (storageDirectory: string) {
     botInstanceId: 'groupmate-production',
     storageDirectory,
     deploymentMode: () => 'explicit' as const,
-    groupAllowlist: () => Object.freeze([]),
     recallMaxItems: () => 6,
     recallMaxTokens: () => 1_200,
     recallTimeoutMs: () => 150
@@ -437,14 +436,13 @@ test('production personal memory commands complete the private QQ lifecycle and 
   await reopened.close()
 })
 
-test('production personal memory commands fail closed outside the group allowlist and after mode is disabled', async t => {
+test('production personal memory commands work in every group and fail closed after mode is disabled', async t => {
   const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-production-memory-policy-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   let mode: 'off' | 'explicit' = 'explicit'
   const runtime = await createProductionPersonalMemoryRuntimeV1(Object.freeze({
     ...options(directory),
     deploymentMode: () => mode,
-    groupAllowlist: () => Object.freeze(['40004'])
   }))
   t.after(async () => await runtime.close())
 
@@ -460,18 +458,13 @@ test('production personal memory commands fail closed outside the group allowlis
     return replies[0]!
   }
 
-  assert.match(
-    await send(groupEvent('50005', 'group-denied'), '#长期记忆 开启'),
-    /当前群未加入/
-  )
-  assert.match(
-    await send(groupEvent('40004', 'group-allowed'), '#长期记忆 开启'),
-    /已开启/
-  )
+  for (const [groupId, messageId] of [['50005', 'group-any'], ['40004', 'group-other']] as const) {
+    assert.match(await send(groupEvent(groupId, messageId), '#长期记忆 开启'), /已开启/)
+  }
   mode = 'off'
   assert.match(
     await send(groupEvent('40004', 'group-mode-off'), '#长期记忆 记住 不应写入'),
-    /当前未启用/
+    /已由机器人主人.*关闭/
   )
   const status = await runtime.operations.inspect() as Record<string, any>
   assert.equal(status.canonical.activeRecords, 0)

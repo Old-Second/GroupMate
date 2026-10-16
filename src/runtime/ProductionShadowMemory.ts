@@ -36,7 +36,6 @@ interface ShadowOptions {
   readonly queueLocation: string
   readonly botInstanceId: string
   readonly mode: () => ProductionPersonalMemoryModeV1
-  readonly groupAllowlist: () => readonly string[]
   readonly enrollment: PersonalMemoryEnrollmentPortV1
   readonly lifecycle: MemoryLifecyclePortV1
   readonly model: MemoryCandidateModelV1
@@ -142,8 +141,7 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
       deploymentMode: options.mode(),
       enrollment: { status: state.policy.state, candidateMode: state.policy.candidateMode },
       scene: job.source.scene.kind === 'private' ? { kind: 'private' }
-        : { kind: 'group', groupId: job.source.scene.groupId },
-      groupAllowlist: options.groupAllowlist()
+        : { kind: 'group', groupId: job.source.scene.groupId }
     })
     if ((!decision.shadowCandidate && !decision.automaticCandidate) || closed || aborted(signal)) return null
     const actorRef = `actor:${createHash('sha256').update(
@@ -286,8 +284,7 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
           : { kind: 'group', groupId: scene.groupId, groupLifecycleId: scene.groupLifecycleId, groupName: scene.groupName },
         observedAt: instant, normalizedText: prompt, resourceRefs: [] })
       let enrollment = await options.enrollment.read({ schemaVersion: 1, namespace, access }, controller.signal)
-      const eligibleScene = scene.kind === 'private' || options.groupAllowlist().includes(scene.groupId)
-      if (options.mode() === 'automatic' && eligibleScene && (enrollment.status === 'not_enrolled' ||
+      if (options.mode() === 'automatic' && (enrollment.status === 'not_enrolled' ||
         (enrollment.status === 'found' && enrollment.policy.state === 'opted_in' &&
           enrollment.policy.candidateMode !== 'policy_approved' && !isManualMemoryEnrollmentPolicy(enrollment.policy)))) {
         // This is the deployment's default policy, evidenced by the triggering message, not a user approval.

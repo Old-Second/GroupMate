@@ -32,15 +32,6 @@ function currentMode(source) {
         return 'off';
     }
 }
-function groupIsAllowed(source, groupId) {
-    try {
-        const values = Reflect.apply(source, undefined, []);
-        return Array.isArray(values) && values.some(value => qqId(value) === groupId);
-    }
-    catch {
-        return false;
-    }
-}
 function sha256(value) {
     return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -248,7 +239,7 @@ function helpText() {
     return [
         '长期记忆命令：',
         '#长期记忆 状态',
-        '#长期记忆 开启 / 关闭',
+        '#长期记忆 关闭（停止注入和自动记录，默认开启）/ 开启',
         '#长期记忆 开启 仅手动（保留召回，只按明确命令保存）',
         '#长期记忆 记住 <内容>',
         '#长期记忆 列表 [页码]',
@@ -287,10 +278,6 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
         }
         if (snapshot === null) {
             throw new PersonalMemoryCommandError('无法确认当前 QQ 身份或群成员关系，长期记忆操作未执行。');
-        }
-        if (snapshot.scene.kind === 'group' &&
-            !groupIsAllowed(options.groupAllowlist, snapshot.scene.groupId)) {
-            throw new PersonalMemoryCommandError('当前群未加入长期记忆试点，操作未执行。');
         }
         const subjects = selectPersonalMemorySubjectsV1(Object.freeze({
             scene: snapshot.scene,
@@ -761,7 +748,7 @@ export function createYunzaiPersonalMemoryControllerV1(options) {
                 const body = commandBody(request.text);
                 const mode = currentMode(options.mode);
                 if (mode === 'off') {
-                    await request.replyText('个人长期记忆当前未启用。请先由机器人主人在锅巴中开启试点模式并重启。');
+                    await request.replyText('个人长期记忆当前已由机器人主人在锅巴中关闭。');
                     return true;
                 }
                 const auth = await authorize(request);

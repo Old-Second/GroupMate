@@ -189,7 +189,6 @@ export function phase7bMemoryControlFieldIsForbidden(value) {
 }
 const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
     personalMemoryMode: 'automatic',
-    personalMemoryGroupAllowlist: Object.freeze([]),
     personalMemoryRecallMaxItems: 6,
     personalMemoryRecallMaxTokens: 1_200,
     personalMemoryRecallTimeoutMs: 150

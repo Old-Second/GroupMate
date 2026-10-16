@@ -57,7 +57,6 @@ export interface PersonalMemoryRecallSourceV1<TParticipantInput> {
 
 export interface CreatePersonalMemoryRecallSourceOptionsV1<TParticipantInput> {
   readonly deploymentMode: () => PersonalMemoryDeploymentModeV1
-  readonly groupAllowlist: () => readonly string[]
   readonly participants: PersonalMemoryParticipantDirectoryV1<TParticipantInput>
   readonly enrollment: PersonalMemoryEnrollmentPortV1
   readonly validateDependencies?: (request: import('./memory-retrieval.js').MemoryRetrievalRequestV2, refs: readonly MemoryDependency[], signal: AbortSignal) => Promise<boolean>
@@ -302,13 +301,6 @@ export function createPersonalMemoryRecallSourceV1<TParticipantInput> (
             subject: PersonalMemorySubjectV1
             namespace: typeof scope.namespaces[number]
           }> = []
-          let canaryDenied = false
-          let allowlist: readonly string[]
-          try {
-            allowlist = options.groupAllowlist()
-          } catch {
-            return unavailable('policy_unavailable')
-          }
           for (const [index, subject] of subjects.entries()) {
             const namespace = scope.namespaces[index]
             if (namespace === undefined) return unavailable('policy_unavailable')
@@ -327,18 +319,14 @@ export function createPersonalMemoryRecallSourceV1<TParticipantInput> (
                   status: enrollment.policy.state,
                   candidateMode: enrollment.policy.candidateMode
                 }),
-                scene: policyScene(snapshot.scene),
-                groupAllowlist: allowlist
+                scene: policyScene(snapshot.scene)
               }))
             } catch {
               return unavailable('policy_unavailable')
             }
             if (decision.recall) selected.push({ subject, namespace })
-            else if (decision.reason === 'group_not_allowed') canaryDenied = true
           }
-          if (selected.length === 0) {
-            return unavailable(canaryDenied ? 'not_in_canary' : 'not_opted_in')
-          }
+          if (selected.length === 0) return unavailable('not_opted_in')
 
           const requestedAt = trustedNow(now)
           const queryText = boundedQueryText(input.query.text)

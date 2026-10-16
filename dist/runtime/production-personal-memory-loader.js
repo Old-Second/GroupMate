@@ -34,8 +34,6 @@ export async function initializeProductionPersonalMemoryRuntimeV1(options) {
         botInstanceId: options.botInstanceId,
         storageDirectory: options.storageDirectory,
         deploymentMode: options.deploymentMode,
-        groupAllowlist: options.groupAllowlist,
-        ...(options.cultureGroups === undefined ? {} : { cultureGroups: options.cultureGroups }),
         recallMaxItems: options.recallMaxItems,
         recallMaxTokens: options.recallMaxTokens,
         recallTimeoutMs: options.recallTimeoutMs,
