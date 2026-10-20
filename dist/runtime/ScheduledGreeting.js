@@ -29,7 +29,7 @@ export async function runScheduledGreetings(ports) {
                 lease = await ports.claim?.(bot, groupId);
                 if (ports.claim !== undefined && lease === null)
                     continue;
-                const message = await ports.generate();
+                const message = await ports.generate(bot, groupId);
                 const rendered = await ports.render(message);
                 if (rendered === null)
                     return false;

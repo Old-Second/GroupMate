@@ -13,7 +13,7 @@ interface GreetingPorts {
   readonly probability: number
   readonly bots: readonly Record<string, any>[]
   readonly random?: () => number
-  readonly generate: () => Promise<string>
+  readonly generate: (bot: Record<string, any>, groupId: number) => Promise<string>
   readonly render: (text: string) => Promise<unknown>
   readonly send: (bot: Record<string, any>, groupId: number, message: unknown, current?: () => boolean) => Promise<unknown>
 }
@@ -38,7 +38,7 @@ export async function runScheduledGreetings (ports: GreetingPorts): Promise<bool
       try {
         lease = await ports.claim?.(bot, groupId)
         if (ports.claim !== undefined && lease === null) continue
-        const message = await ports.generate()
+        const message = await ports.generate(bot, groupId)
         const rendered = await ports.render(message)
         if (rendered === null) return false
         if (lease !== undefined && !lease!.current()) continue

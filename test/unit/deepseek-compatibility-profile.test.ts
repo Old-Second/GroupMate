@@ -71,6 +71,15 @@ test('DeepSeek profile owns thinking tool protocol without changing standard', a
     thinking: { type: 'enabled' },
     reasoning_effort: 'max'
   })
+  assert.deepEqual(standardOpenAIProfile.encodeRequestExtensions({
+    enabled: true,
+    effort: 'xhigh'
+  }), { reasoning_effort: 'xhigh' })
+  assert.deepEqual(standardOpenAIProfile.encodeRequestExtensions({
+    enabled: false,
+    effort: 'xhigh'
+  }), {})
+  assert.deepEqual(standardOpenAIProfile.encodeRequestExtensions({ enabled: true }), {})
 })
 
 test('documented thinking sampling, effort mapping and forced-tool limits are enforced', () => {
@@ -80,6 +89,17 @@ test('documented thinking sampling, effort mapping and forced-tool limits are en
   assert.equal(thinking.temperature, undefined)
   assert.equal(thinking.top_p, 0.95)
   assert.equal(thinking.reasoning_effort, 'high')
+  for (const [effort, expected] of [
+    ['low', 'low'], ['medium', 'high'], ['high', 'high'],
+    ['xhigh', 'max'], ['max', 'max'], ['ultra', 'max']
+  ] as const) {
+    assert.equal(
+      buildImmutableChatRequest({ ...request, reasoning: { enabled: true, effort } },
+        deepSeekCompatibilityProfile).reasoning_effort,
+      expected,
+      `DeepSeek must normalize ${effort} to a supported effort`
+    )
+  }
   const nonThinking = buildImmutableChatRequest({ ...request, reasoning: { enabled: false } }, deepSeekCompatibilityProfile)
   assert.equal(nonThinking.temperature, 0.5)
   assert.equal(nonThinking.top_p, undefined)

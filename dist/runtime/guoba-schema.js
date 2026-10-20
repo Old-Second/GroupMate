@@ -18,9 +18,14 @@ const thinkingModeOptions = [
 ];
 const reasoningEffortOptions = [
     { label: '默认', value: 'default' },
+    { label: 'low', value: 'low' },
+    { label: 'medium', value: 'medium' },
     { label: 'high', value: 'high' },
-    { label: 'max', value: 'max' }
+    { label: 'xhigh', value: 'xhigh' },
+    { label: 'max', value: 'max' },
+    { label: 'ultra', value: 'ultra' }
 ];
+const reasoningEffortHelp = '标准 OpenAI-compatible 支持 low / medium / high / xhigh / max / ultra，DeepSeek 兼容仅支持 low / high / max（medium 按 high，xhigh 和 ultra 按 max 传递）；默认表示由服务端决定。';
 const crossChannelPolicyOptions = [
     { label: '完全不允许', value: 'disabled' },
     { label: '仅机器人主人允许', value: 'master' },
@@ -66,7 +71,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('apiMaxToken', '最大输出 Token', '单次模型回复允许使用的最大输出 Token 数。', 'InputNumber', { min: 1 }),
         field('apiContextWindowTokens', '模型上下文窗口 Token', '0 表示使用模型 Profile；未知模型使用 32,768 Token 安全默认值。正整数只会缩小已知 Profile 能力，或为未知标准 OpenAI-compatible 模型显式声明窗口，并在新任务创建时冻结；暂停任务恢复时不会重读。大窗口仍受 512 KiB 请求、256 KiB checkpoint、Redis 与内存硬上限约束。修改后必须重启。', 'InputNumber', { min: 0, max: 1_048_576, step: 1 }),
         field('apiThinkingMode', '思考模式', '向支持该扩展的 OpenAI-compatible 服务传递 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
-        field('apiReasoningEffort', '思考强度', '向支持该扩展的模型传递 reasoning_effort；默认表示由服务端决定。', 'Select', { options: reasoningEffortOptions }),
+        field('apiReasoningEffort', '思考强度', `向支持该扩展的模型传递 reasoning_effort；${reasoningEffortHelp}`, 'Select', { options: reasoningEffortOptions }),
         field('forwardReasoning', '转发思考过程', '将兼容服务返回的 reasoning_content 以转发消息展示；可能增加消息数量并暴露模型推理文本。', 'Switch'),
         field('forwardToolDetails', '转发工具执行详情', '以转发消息展示脱敏后的工具名、参数和结果摘要；仍可能暴露用户输入、任务目标和执行结果，群聊中请按需开启。', 'Switch'),
         field('openAiForceUseReverse', '强制保留自定义 API 地址', '开启后即使设置了代理或环境可直连，也始终使用上方自定义 API Base URL。', 'Switch'),
@@ -82,6 +87,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('helloProbability', '主动聊天触发概率', '每次定时任务实际发送主动消息的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
         field('helloInterval', '主动聊天间隔小时', '定时任务在 7:00 到 23:00 之间使用的小时步长；修改后需重启以重建任务。', 'InputNumber', { min: 1, max: 24 }),
         field('helloPrompt', '主动打招呼提示词', '定时主动聊天时用于生成短消息的提示词。', 'InputTextArea'),
+        field('helloUseGroupContext', '主动聊天结合群聊', '开启后主动聊天会读取最近群聊记录来承接当前话题；条数取“群聊上下文条数”且最多 20 条，该值为 0 时不读取。读取失败或关闭时退回普通开场。记录只作为不可信聊天数据使用，仍会增加 Token 消耗。', 'Switch'),
         field('enableBYM', '开启随机参与群聊', '按概率观察普通群消息并自然参与，固定使用当前 OpenAI-compatible API。', 'Switch'),
         field('bymRecognizeLeadingAlias', '识别句首称呼', '开启后，消息以 Yunzai 机器人别名或助手称呼开头时视为明确点名并触发回复；关闭后句中、句尾称呼仍会触发。', 'Switch'),
         field('participationMode', '群参与策略', '默认保持现有策略；影子模式只记录比对；受控参与仅对下方指定群生效，支持点名和同人续问，未启用冷启动随机插话。', 'Select', { options: [{ label: '现有策略', value: 'legacy' }, { label: '影子比对', value: 'shadow' }, { label: '受控参与', value: 'active' }] }),
@@ -89,7 +95,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('bymRate', '随机参与触发概率', '每条符合条件的群消息触发随机参与的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
         field('bymDisableGroup', '随机参与禁用群', '这些群不会触发随机参与；输入群号标签。', 'GTags', { allowAdd: true, closable: true }),
         field('bymThinkingMode', '随机参与思考模式', '随机参与请求单独使用的 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
-        field('bymReasoningEffort', '随机参与思考强度', '随机参与请求单独使用的 reasoning_effort；默认表示由服务端决定。', 'Select', { options: reasoningEffortOptions }),
+        field('bymReasoningEffort', '随机参与思考强度', `随机参与请求单独使用的 reasoning_effort；${reasoningEffortHelp}`, 'Select', { options: reasoningEffortOptions }),
         field('bymPreset', '随机参与额外设定', '附加到随机参与系统提示后的角色或群聊风格设定。', 'InputTextArea'),
         field('bymFuckList', '反击触发词', '命中任一词时启用反击设定；使用标签或分隔符输入。', 'GTags', { allowAdd: true, closable: true }),
         field('bymFuckBlacklist', '反击豁免 QQ', '这些 QQ 号不会触发反击，但仍可触发普通随机参与。', 'GTags', { allowAdd: true, closable: true }),

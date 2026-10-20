@@ -152,7 +152,7 @@ function configuredThinkingMode (value) {
 
 function configuredReasoningEffort (value) {
   return value === 'low' || value === 'medium' || value === 'high' ||
-    value === 'max' ? value : 'default'
+    value === 'xhigh' || value === 'max' || value === 'ultra' ? value : 'default'
 }
 
 function ttsMode () {

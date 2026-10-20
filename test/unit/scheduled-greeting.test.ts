@@ -8,14 +8,18 @@ test('overlapping cron callbacks generate and send one greeting per bot/group wh
   const pending = new Promise<void>(resolve => { release = resolve })
   let calls = 0
   const sent: unknown[] = []
-  const ports = { groups: ['9', '9'], probability: 25, bots: [{ uin: '1', gl: new Map([[9, {}]]) }],
-    random: () => 0.24, generate: async () => { calls++; await pending; return 'hello' },
+  const generated: unknown[][] = []
+  const bot = { uin: '1', gl: new Map([[9, {}]]) }
+  const ports = { groups: ['9', '9'], probability: 25, bots: [bot],
+    random: () => 0.24,
+    generate: async (...args: unknown[]) => { calls++; generated.push(args); await pending; return 'hello' },
     render: async (text: string) => text, send: async (...args: unknown[]) => { sent.push(args) } }
   const first = runScheduledGreetings(ports)
   await runScheduledGreetings(ports)
   release()
   await first
   assert.equal(calls, 1)
+  assert.deepEqual(generated, [[bot, 9]])
   assert.equal(sent.length, 1)
   await runScheduledGreetings({ ...ports, random: () => 0.25 })
   assert.equal(sent.length, 1)

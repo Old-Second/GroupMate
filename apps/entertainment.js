@@ -374,7 +374,11 @@ ${translateLangLabels}
       await this.reply('机器人不在这个群里！')
       return
     }
-    let message = await generateHello()
+    let message = await generateHello({
+      bot: e.bot,
+      // A bare command replies in the current chat; use that group's context.
+      groupId: groupId || e.group_id
+    })
     let sendable = message
     logger.info(`打招呼给群聊${groupId}：` + message)
     if (Config.defaultUseTTS) {
@@ -396,7 +400,7 @@ ${translateLangLabels}
       groups: Config.initiativeChatGroups || [],
       probability: Config.helloProbability,
       bots: this.e ? [this.e.bot] : listYunzaiBots(),
-      generate: generateHello,
+      generate: (bot, groupId) => generateHello({ bot, groupId }),
       render: async message => {
         if (Config.defaultUseTTS) {
           let audio

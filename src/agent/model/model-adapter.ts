@@ -10,9 +10,11 @@ import type { ProviderRequestWireIdentityV1 } from '../run/provider-generation.j
 
 export type ModelToolMode = 'auto' | 'required' | 'disabled'
 
+export type ModelReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
+
 export interface ModelReasoningOptions {
   readonly enabled: boolean
-  readonly effort?: 'low' | 'medium' | 'high' | 'max'
+  readonly effort?: ModelReasoningEffort
 }
 
 export interface ModelToolDefinition {

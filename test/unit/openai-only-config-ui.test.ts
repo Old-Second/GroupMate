@@ -216,6 +216,7 @@ const requiredGuobaFields = [
   'lengthScale',
   'initiativeChatGroups',
   'helloPrompt',
+  'helloUseGroupContext',
   'helloInterval',
   'helloProbability',
   'emojiBaseURL',
@@ -260,7 +261,7 @@ const expectedGuobaGroups = [
   {
     label: '群聊参与',
     fields: [
-      'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt',
+      'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt', 'helloUseGroupContext',
       'enableBYM', 'bymRecognizeLeadingAlias', 'participationMode', 'participationActiveGroups', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
       'bymReasoningEffort', 'bymPreset', 'bymFuckList', 'bymFuckBlacklist',
       'bymFuckPrompt', 'bymFuckRecall', 'bymFuckRecallTime'
@@ -454,6 +455,20 @@ test('Guoba exposes only explicit standard and DeepSeek compatibility profiles',
   )
   assert.match(field?.bottomHelpMessage ?? '', /不会.*自动猜测/)
   assert.match(field?.bottomHelpMessage ?? '', /重启/)
+})
+
+test('Guoba exposes every reasoning effort the runtime accepts', () => {
+  const fields = new Map(buildGuobaSchemas({
+    vitsRoleOptions: [], voicevoxRoleOptions: [], azureRoleOptions: []
+  }).flatMap(schema => schema.field ? [[schema.field, schema] as const] : []))
+
+  for (const field of ['apiReasoningEffort', 'bymReasoningEffort']) {
+    assert.deepEqual(
+      (fields.get(field)?.componentProps?.options as Array<{ value: string }>).map(option => option.value),
+      ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      `${field} must offer every effort value the runtime normalizes`
+    )
+  }
 })
 
 test('Guoba exposes one bounded restart-only context window override', async () => {

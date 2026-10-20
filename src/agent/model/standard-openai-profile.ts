@@ -1,4 +1,5 @@
 import type { JsonObject } from './json-value.js'
+import type { ModelReasoningOptions } from './model-adapter.js'
 import {
   expiredImageInputRecoveryHint,
   type OpenAICompatibleProfile,
@@ -26,7 +27,10 @@ export const standardOpenAIProfile: OpenAICompatibleProfile = Object.freeze({
         tool_choice: input.mode === 'required' ? 'required' : 'auto'
       })
     : Object.freeze({ tool_choice: 'none' }),
-  encodeRequestExtensions: () => EMPTY_OBJECT,
+  encodeRequestExtensions: (input: ModelReasoningOptions) =>
+    !input.enabled || input.effort === undefined
+      ? EMPTY_OBJECT
+      : Object.freeze({ reasoning_effort: input.effort }),
   encodeRequestMetadata: () => EMPTY_OBJECT,
   decodeUsageExtensions: () => EMPTY_OBJECT,
   extractAssistantReasoning: () => undefined,

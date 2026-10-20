@@ -11,6 +11,7 @@ import type {
   ProviderRequestMetadata,
   ModelReasoningTrace,
   ModelRequest,
+  ModelReasoningEffort,
   ModelReasoningOptions
 } from './model-adapter.js'
 import { modelRequestError, normalizeModelReasoningTrace } from './model-adapter.js'
@@ -131,13 +132,20 @@ function restoreDeepSeekAssistantState (state: ProviderTurnState): Readonly<Json
   })
 }
 
+const DEEPSEEK_REASONING_EFFORTS = new Set(['low', 'high', 'max'])
+
+function deepSeekReasoningEffort (effort: ModelReasoningEffort): 'low' | 'high' | 'max' {
+  if (DEEPSEEK_REASONING_EFFORTS.has(effort)) return effort as 'low' | 'high' | 'max'
+  return effort === 'medium' ? 'high' : 'max'
+}
+
 function encodeDeepSeekReasoningOptions (
   input: ModelReasoningOptions
 ): Readonly<JsonObject> {
   return Object.freeze({
     thinking: Object.freeze({ type: input.enabled ? 'enabled' : 'disabled' }),
     ...(!input.enabled || input.effort === undefined ? {} : {
-      reasoning_effort: input.effort === 'medium' ? 'high' : input.effort
+      reasoning_effort: deepSeekReasoningEffort(input.effort)
     })
   })
 }

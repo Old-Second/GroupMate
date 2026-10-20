@@ -44,7 +44,7 @@ const defaultConfig = {
   chatExampleBot2: '',
   chatExampleBot3: '',
   enableSuggestedResponses: false,
-  promptPrefixOverride: 'Your answer shouldn\'t be too verbose. Prefer to answer in Chinese.',
+  promptPrefixOverride: '你是这个QQ群里的普通群友，不是客服或助手。用自然、口语化的中文和大家聊天，像真人一样接话，不要刻意讨好或过度热情。',
   assistantLabel: 'ChatGPT',
   headless: false,
   chromePath: '',
@@ -63,6 +63,8 @@ const defaultConfig = {
   lengthScale: 1.2,
   initiativeChatGroups: [],
   helloPrompt: '写一段话让大家来找我聊天。类似于“有人找我聊天吗？"这种风格，轻松随意一点控制在20个字以内',
+  // 主动打招呼时读取群聊记录，让开场话能接上当前话题；读取失败时退回普通开场。
+  helloUseGroupContext: true,
   helloInterval: 3,
   helloProbability: 50,
   emojiBaseURL: 'https://www.gstatic.com/android/keyboard/emojikitchen',
@@ -148,7 +150,7 @@ const defaultConfig = {
   // 伪人额外设定
   bymPreset: '',
   bymThinkingMode: 'default',
-  // 伪人模式OpenAI兼容API思考强度：default/high/max
+  // 伪人模式OpenAI兼容API思考强度：default/low/medium/high/xhigh/max/ultra（DeepSeek兼容仅 low/high/max）
   bymReasoningEffort: 'default',
   // 思考过程转发
   forwardReasoning: true,
@@ -156,7 +158,7 @@ const defaultConfig = {
   forwardToolDetails: true,
   // OpenAI兼容API思考模式开关：default/enabled/disabled
   apiThinkingMode: 'default',
-  // OpenAI兼容API思考强度：default/high/max
+  // OpenAI兼容API思考强度：default/low/medium/high/xhigh/max/ultra（DeepSeek兼容仅 low/high/max）
   apiReasoningEffort: 'default',
   apiMaxToken: 4096,
   // 0 使用模型 Profile/安全默认值，正整数仅对重启后创建的新任务生效。

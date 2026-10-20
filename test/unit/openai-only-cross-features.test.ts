@@ -11,8 +11,9 @@ async function readSource (file: string): Promise<string> {
 
 test('BYM and auxiliary callers use only the configured OpenAI-compatible API', async () => {
   const bym = await readSource('apps/bym.js')
-  const [randomMessage, legacyChat, translation, auxiliaryCompletion, index] = await Promise.all([
+  const [randomMessage, greetingContext, legacyChat, translation, auxiliaryCompletion, index] = await Promise.all([
     readSource('utils/randomMessage.js'),
+    readSource('src/runtime/GreetingContext.ts'),
     readSource('utils/chat.js'),
     readSource('src/runtime/translation-service.ts'),
     readSource('src/runtime/auxiliary-completion-service.ts'),
@@ -24,8 +25,12 @@ test('BYM and auxiliary callers use only the configured OpenAI-compatible API', 
   assert.doesNotMatch(bym, /model\/core\.js|core\.sendMessage/)
   assert.doesNotMatch(bym, /bymMode|\b(?:bing|claude2?|gemini|qwen|chatglm4?|xh):\s*system/)
 
-  for (const source of [randomMessage, legacyChat]) {
-    assert.match(source, /dist\/runtime\/auxiliary-completion-service\.js/)
+  // The legacy greeting module is now a thin config projection; the bounded
+  // prompt builder in GreetingContext owns the auxiliary call.
+  assert.match(randomMessage, /dist\/runtime\/GreetingContext\.js/)
+  assert.match(greetingContext, /auxiliary-completion-service\.js/)
+  assert.match(legacyChat, /dist\/runtime\/auxiliary-completion-service\.js/)
+  for (const source of [randomMessage, greetingContext, legacyChat]) {
     assert.doesNotMatch(source, /completion-facade|ChatGPTAPI|chat\/completions/)
   }
   assert.doesNotMatch(

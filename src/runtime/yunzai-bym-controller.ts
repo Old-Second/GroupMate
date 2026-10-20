@@ -21,7 +21,7 @@ import {
 } from './safe-chat-logging.js'
 
 export type ConfiguredThinkingMode = 'default' | 'enabled' | 'disabled'
-export type ConfiguredReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'max'
+export type ConfiguredReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 
 export interface BymPolicySnapshot {
   readonly enabled: boolean

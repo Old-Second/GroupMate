@@ -103,12 +103,28 @@
             "value": "default"
           },
           {
+            "label": "low",
+            "value": "low"
+          },
+          {
+            "label": "medium",
+            "value": "medium"
+          },
+          {
             "label": "high",
             "value": "high"
           },
           {
+            "label": "xhigh",
+            "value": "xhigh"
+          },
+          {
             "label": "max",
             "value": "max"
+          },
+          {
+            "label": "ultra",
+            "value": "ultra"
           }
         ]
       },

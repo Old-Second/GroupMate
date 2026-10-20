@@ -97,11 +97,17 @@ function restoreDeepSeekAssistantState(state) {
         reasoning_content: payload.reasoningContent
     });
 }
+const DEEPSEEK_REASONING_EFFORTS = new Set(['low', 'high', 'max']);
+function deepSeekReasoningEffort(effort) {
+    if (DEEPSEEK_REASONING_EFFORTS.has(effort))
+        return effort;
+    return effort === 'medium' ? 'high' : 'max';
+}
 function encodeDeepSeekReasoningOptions(input) {
     return Object.freeze({
         thinking: Object.freeze({ type: input.enabled ? 'enabled' : 'disabled' }),
         ...(!input.enabled || input.effort === undefined ? {} : {
-            reasoning_effort: input.effort === 'medium' ? 'high' : input.effort
+            reasoning_effort: deepSeekReasoningEffort(input.effort)
         })
     });
 }
