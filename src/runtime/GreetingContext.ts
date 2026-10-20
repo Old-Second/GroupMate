@@ -253,8 +253,11 @@ function withTimeout<Value> (
       clearTimeout(timer)
       resolve(value)
     }
+    // Keep the timer referenced: when the host read never settles, this timer
+    // is the only thing that can resolve the greeting. An unref'd timer lets
+    // the event loop drain first, so the fallback never arrives (Node 22's
+    // test runner reports that as a cancelled test).
     const timer = setTimeout(() => finish(fallback), timeoutMs)
-    timer.unref?.()
     operation.then(finish, () => finish(fallback))
   })
 }
