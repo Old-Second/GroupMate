@@ -81,14 +81,30 @@ function parseContextBudget(value) {
     safeInteger(input.maxItems, 'context budget maxItems', 1);
     safeInteger(input.maxBytes, 'context budget maxBytes', 1);
 }
+function parseHistoryCompaction(value) {
+    const input = jsonObject(value, 'history compaction');
+    const keys = [
+        'enabled', 'triggerPercent', 'keepPercent', 'cacheIdleExpiryMs',
+        'minReclaimTokens', 'summaryMaxChars'
+    ];
+    exactKeys(input, keys, keys, 'history compaction');
+    if (typeof input.enabled !== 'boolean') {
+        throw new TypeError('history compaction enabled is invalid');
+    }
+    safeInteger(input.triggerPercent, 'history compaction triggerPercent', 1);
+    safeInteger(input.keepPercent, 'history compaction keepPercent', 1);
+    safeInteger(input.cacheIdleExpiryMs, 'history compaction cacheIdleExpiryMs', 1);
+    safeInteger(input.minReclaimTokens, 'history compaction minReclaimTokens');
+    safeInteger(input.summaryMaxChars, 'history compaction summaryMaxChars', 1);
+}
 function projectRequest(value) {
     const input = boundedRecord(value, RUN_RESOURCE_LIMITS.requestBytes, 'request');
     const allowed = [
         'requestId', 'requestRef', 'requestKind', 'presentationRoute', 'createdAt',
         'deadlineAt', 'sessionAddress', 'actor', 'channel', 'message', 'references',
-        'systemInstructions', 'model', 'contextBudget', 'sessionTtlSeconds'
+        'systemInstructions', 'model', 'contextBudget', 'historyCompaction', 'sessionTtlSeconds'
     ];
-    exactKeys(input, allowed, allowed.slice(0, -1), 'request');
+    exactKeys(input, allowed, allowed.filter(key => key !== 'historyCompaction' && key !== 'sessionTtlSeconds'), 'request');
     text(input.requestId, 'request ID');
     if (typeof input.requestRef !== 'string' || !RUN_REF_PATTERN.test(input.requestRef)) {
         throw new TypeError('request reference is invalid');
@@ -117,6 +133,8 @@ function projectRequest(value) {
         text(instruction, 'system instruction');
     parseRunModelConfig(input.model);
     parseContextBudget(input.contextBudget);
+    if (input.historyCompaction !== undefined)
+        parseHistoryCompaction(input.historyCompaction);
     if (input.sessionTtlSeconds !== undefined) {
         safeInteger(input.sessionTtlSeconds, 'session TTL', 1);
     }
@@ -168,7 +186,9 @@ function parseModelRequest(value) {
         'reasoning', 'temperature', 'topP'
     ], ['model', 'messages', 'tools', 'toolMode', 'streaming', 'maxOutputTokens', 'reasoning'], 'model request');
     text(input.model, 'model request name');
-    for (const message of jsonArray(input.messages, 512, 'model messages')) {
+    // Long-context sessions can replay thousands of messages; the byte bound
+    // above stays the effective limit.
+    for (const message of jsonArray(input.messages, 32_768, 'model messages')) {
         parseModelMessage(message);
     }
     for (const definition of jsonArray(input.tools, 256, 'model tools')) {

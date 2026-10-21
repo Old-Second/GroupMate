@@ -15,6 +15,7 @@ import {
   type TrustedRequestKind
 } from '../agent/contracts/interaction.js'
 import type { ContextBudget } from '../agent/context/context-budget.js'
+import type { SessionHistoryCompactionPolicy } from '../agent/session/session-history-compaction.js'
 import type { RunModelConfig } from '../agent/run/run-checkpoint.js'
 import { RUN_REF_PATTERN } from '../agent/run/run-reference.js'
 import {
@@ -49,6 +50,7 @@ export interface AdaptYunzaiRequestInput {
   readonly systemInstructions: readonly string[]
   readonly model: RunModelConfig
   readonly contextBudget: ContextBudget
+  readonly historyCompaction?: SessionHistoryCompactionPolicy
   readonly sessionTtlSeconds?: number
 }
 
@@ -75,6 +77,7 @@ export interface YunzaiAgentRequestDraft {
   readonly systemInstructions: readonly string[]
   readonly model: RunModelConfig
   readonly contextBudget: ContextBudget
+  readonly historyCompaction?: SessionHistoryCompactionPolicy
   readonly sessionTtlSeconds?: number
 }
 
@@ -147,6 +150,39 @@ function frozenBudget (input: ContextBudget): ContextBudget {
     safetyMarginTokens: input.safetyMarginTokens,
     maxItems: input.maxItems,
     maxBytes: input.maxBytes
+  })
+}
+
+function integerInRange (value: unknown, minimum: number, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+    value < minimum || value > maximum) {
+    throw new TypeError('session history compaction policy is invalid')
+  }
+  return value
+}
+
+/**
+ * The compaction policy is frozen into the request so a mid-run configuration
+ * change cannot rewrite the history structure between two turns of one task.
+ */
+function frozenHistoryCompaction (
+  input: SessionHistoryCompactionPolicy
+): SessionHistoryCompactionPolicy {
+  if (typeof input !== 'object' || input === null || typeof input.enabled !== 'boolean') {
+    throw new TypeError('session history compaction policy is invalid')
+  }
+  const triggerPercent = integerInRange(input.triggerPercent, 1, 99)
+  const keepPercent = integerInRange(input.keepPercent, 1, 98)
+  if (keepPercent >= triggerPercent) {
+    throw new TypeError('session history compaction policy is invalid')
+  }
+  return Object.freeze({
+    enabled: input.enabled,
+    triggerPercent,
+    keepPercent,
+    cacheIdleExpiryMs: integerInRange(input.cacheIdleExpiryMs, 60_000, 30 * 24 * 60 * 60 * 1_000),
+    minReclaimTokens: integerInRange(input.minReclaimTokens, 0, 1_000_000),
+    summaryMaxChars: integerInRange(input.summaryMaxChars, 200, 20_000)
   })
 }
 
@@ -431,6 +467,9 @@ export async function adaptYunzaiRequest (
     systemInstructions: Object.freeze([...input.systemInstructions]),
     model: frozenModel(input.model),
     contextBudget: frozenBudget(input.contextBudget),
+    ...(input.historyCompaction === undefined
+      ? {}
+      : { historyCompaction: frozenHistoryCompaction(input.historyCompaction) }),
     ...(input.sessionTtlSeconds === undefined
       ? {}
       : { sessionTtlSeconds: input.sessionTtlSeconds })

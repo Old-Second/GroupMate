@@ -384,7 +384,7 @@ test('model context override is parsed once with zero preserving the selected pr
   const override = resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: 1_048_576 })
   assert.deepEqual(override, { contextWindowTokens: 1_048_576 })
   assert.equal(Object.isFrozen(override), true)
-  for (const value of [-1, 1.5, '65536', 1_048_577]) {
+  for (const value of [-1, 1.5, '65536', 16_777_217]) {
     assert.throws(
       () => resolveConfiguredModelCapabilityOverride({ apiContextWindowTokens: value }),
       /context window configuration is invalid/

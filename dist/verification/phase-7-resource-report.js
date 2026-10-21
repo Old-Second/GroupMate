@@ -18,18 +18,18 @@ export const PHASE_7_RESOURCE_THRESHOLDS = Object.freeze({
     catastrophicMaximumMultiplier: 2
 });
 export const PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS = Object.freeze({
-    requestBytes: 512 * 1_024,
+    requestBytes: 16 * 1_024 * 1_024,
     sseLineBytes: 64 * 1_024,
-    providerResponseBytes: 1_024 * 1_024,
+    providerResponseBytes: 4 * 1_024 * 1_024,
     toolArgumentsBytes: 32 * 1_024,
     toolResultBytes: 64 * 1_024,
     providerStateBytes: 128 * 1_024,
     sanitizedErrorBodyBytes: 16 * 1_024,
-    providerProtocolChainBytes: 192 * 1_024,
-    checkpointBytes: 256 * 1_024,
+    providerProtocolChainBytes: 8 * 1_024 * 1_024,
+    checkpointBytes: 12 * 1_024 * 1_024,
     eventCount: 96,
     eventBytes: 128 * 1_024,
-    namespaceBytes: 8 * 1_024 * 1_024,
+    namespaceBytes: 32 * 1_024 * 1_024,
     tombstoneBytes: 4 * 1_024,
     checkpointKeys: 16,
     eventKeys: 16,
@@ -181,8 +181,8 @@ export function buildPhase7ResourceReport(value) {
         contextArtifactLimits: sameRecord(CONTEXT_ARTIFACT_RESOURCE_LIMITS, PHASE_7_EXPECTED_CONTEXT_ARTIFACT_RESOURCE_LIMITS) && MAX_CONTEXT_ARTIFACT_BYTES === 16 * 1_024 &&
             MAX_CONTEXT_ARTIFACT_CONTENT_BYTES === 8 * 1_024 && MAX_CONTEXT_ARTIFACT_REFS === 32,
         plannerInputLimit: MAX_CONTEXT_PLANNER_INPUT_BYTES === RUN_RESOURCE_LIMITS.requestBytes &&
-            RUN_RESOURCE_LIMITS.requestBytes === 512 * 1_024 &&
-            RUN_RESOURCE_LIMITS.checkpointBytes === 256 * 1_024,
+            RUN_RESOURCE_LIMITS.requestBytes === 16 * 1_024 * 1_024 &&
+            RUN_RESOURCE_LIMITS.checkpointBytes === 12 * 1_024 * 1_024,
         artifactNamespaceUsage: scenarios.artifactRedis.artifactStore.records.maximum > 0 &&
             scenarios.artifactRedis.artifactStore.records.maximum <=
                 CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceKeys &&

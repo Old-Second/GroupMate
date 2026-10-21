@@ -875,7 +875,7 @@ function parseLoadedRunCheckpoint (value: unknown): LoadedRunCheckpoint {
   const parsedJson = parseJsonValue(value, {
     maxBytes: RUN_RESOURCE_LIMITS.checkpointBytes + RUN_RESOURCE_LIMITS.eventBytes,
     maxDepth: 32,
-    maxNodes: 32_768
+    maxNodes: 1_048_576
   })
   const unparsed = record(parsedJson, 'run checkpoint')
   const checkpointKeys = unparsed.schemaVersion === 1

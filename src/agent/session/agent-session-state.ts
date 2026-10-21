@@ -10,6 +10,7 @@ import {
 import { parseProviderTurnState, type ProviderTurnState } from '../run/provider-state.js'
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js'
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js'
+import { parseSessionHistorySummary } from './session-history-summary.js'
 
 export interface SemanticConversationMessage {
   readonly kind: 'message'
@@ -28,10 +29,49 @@ export interface ProviderProtocolSpan {
 
 export type CanonicalConversationItem = SemanticConversationMessage | ProviderProtocolSpan
 
+export interface SessionHistorySummaryLine {
+  readonly role: AgentMessage['role']
+  readonly at: string
+  readonly text: string
+  readonly omittedCharacters?: number
+}
+
+/**
+ * The persisted compression of turns that no longer fit the verbatim replay
+ * window. It is replayed as one user turn and its acknowledgement ahead of the
+ * retained messages.
+ */
+export interface SessionHistorySummary {
+  readonly schemaVersion: 1
+  readonly generator: Readonly<{ kind: 'deterministic'; version: 'session-extractive-v1' }>
+  readonly updatedAt: string
+  readonly coveredThrough: string
+  readonly coveredItems: number
+  readonly omittedLines: number
+  readonly lines: readonly SessionHistorySummaryLine[]
+}
+
+/**
+ * Structural ceiling for the verbatim history. It matches the context item
+ * budget, so a conversation that reaches it is compressed rather than allowed
+ * to outgrow what one request can replay. A 1M-token window with short group
+ * messages can hold tens of thousands of turns, so this only stops runaway
+ * allocation; the byte ceiling below and the token budget do the real work.
+ */
+export const MAX_AGENT_SESSION_MESSAGES = 16_384
+
+/**
+ * Persisted session byte ceiling. The token budget keeps the replay window
+ * smaller in practice; this bound must still accept a full long-context
+ * history so a large configured window can be saved at all.
+ */
+export const MAX_AGENT_SESSION_BYTES = 16 * 1_024 * 1_024
+
 export interface AgentSessionState {
-  readonly schemaVersion: 1 | 2
+  readonly schemaVersion: 1 | 2 | 3
   readonly contextDependencies?: ContextDependencyProof
   readonly messages: readonly CanonicalConversationItem[]
+  readonly historySummary?: SessionHistorySummary
   readonly migratedFrom?: Readonly<{
     readonly kind: 'legacy'
     readonly sourceVersion: 1
@@ -39,7 +79,7 @@ export interface AgentSessionState {
   }>
 }
 
-const SESSION_STATE_BYTES = 512 * 1_024
+const SESSION_STATE_BYTES = MAX_AGENT_SESSION_BYTES
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const PROFILE = /^[a-z][a-z0-9_.-]{0,63}$/
 
@@ -186,11 +226,19 @@ export function parseAgentSessionState (value: unknown): AgentSessionState {
   const cloned = parseJsonValue(value, {
     maxBytes: SESSION_STATE_BYTES,
     maxDepth: 32,
-    maxNodes: 32_768
+    // A token-budgeted session may hold thousands of messages; the byte bound
+    // above is what keeps the persisted state small, not the node count.
+    maxNodes: 1_048_576
   })
   const state = record(cloned, 'agent session state')
-  exact(state, state.schemaVersion === 2 ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies'] : ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state')
-  if ((state.schemaVersion !== 1 && state.schemaVersion !== 2) || !Array.isArray(state.messages) || state.messages.length > 128) {
+  const allowedKeys = state.schemaVersion === 3
+    ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies', 'historySummary']
+    : state.schemaVersion === 2
+      ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies']
+      : ['schemaVersion', 'messages', 'migratedFrom']
+  exact(state, allowedKeys, 'agent session state')
+  if ((state.schemaVersion !== 1 && state.schemaVersion !== 2 && state.schemaVersion !== 3) ||
+    !Array.isArray(state.messages) || state.messages.length > MAX_AGENT_SESSION_MESSAGES) {
     throw new TypeError('agent session state is invalid')
   }
   const ids = new Set<string>()
@@ -218,8 +266,16 @@ export function parseAgentSessionState (value: unknown): AgentSessionState {
     : parseMigratedFrom(state.migratedFrom)
   return Object.freeze({
     schemaVersion: state.schemaVersion,
-    ...(state.schemaVersion === 2 ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) } : {}),
+    ...(state.schemaVersion === 2
+      ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) }
+      : {}),
+    ...(state.schemaVersion === 3 && state.contextDependencies !== undefined
+      ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) }
+      : {}),
     messages: Object.freeze(messages),
+    ...(state.schemaVersion === 3 && state.historySummary !== undefined
+      ? { historySummary: parseSessionHistorySummary(state.historySummary) }
+      : {}),
     ...(migratedFrom === undefined ? {} : { migratedFrom })
   })
 }

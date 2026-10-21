@@ -25,7 +25,7 @@ const reasoningEffortOptions = [
     { label: 'max', value: 'max' },
     { label: 'ultra', value: 'ultra' }
 ];
-const reasoningEffortHelp = '标准 OpenAI-compatible 支持 low / medium / high / xhigh / max / ultra，DeepSeek 兼容仅支持 low / high / max（medium 按 high，xhigh 和 ultra 按 max 传递）；默认表示由服务端决定。';
+const reasoningEffortHelp = '标准 OpenAI-compatible 支持 low / medium / high / xhigh / max / ultra，DeepSeek 兼容仅支持 low / high / max（medium、xhigh 按 high，ultra 按 max 传递）；默认表示由服务端决定。';
 const crossChannelPolicyOptions = [
     { label: '完全不允许', value: 'disabled' },
     { label: '仅机器人主人允许', value: 'master' },
@@ -68,9 +68,9 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('promptPrefixOverride', '系统设定', '普通对话使用的系统设定，用于定义身份、语气和回答边界。', 'InputTextArea'),
         field('temperature', '生成温度', '控制普通回复的随机性；服务端不支持时可能忽略该参数。', 'InputNumber', { min: 0, max: 2, step: 0.1 }),
         field('apiStream', '流式响应', '开启 Chat Completions 流式传输；最终 QQ 回复仍由统一展示层发送。', 'Switch'),
-        field('apiMaxToken', '最大输出 Token', '单次模型回复允许使用的最大输出 Token 数。', 'InputNumber', { min: 1 }),
-        field('apiContextWindowTokens', '模型上下文窗口 Token', '0 表示使用模型 Profile；未知模型使用 32,768 Token 安全默认值。正整数只会缩小已知 Profile 能力，或为未知标准 OpenAI-compatible 模型显式声明窗口，并在新任务创建时冻结；暂停任务恢复时不会重读。大窗口仍受 512 KiB 请求、256 KiB checkpoint、Redis 与内存硬上限约束。修改后必须重启。', 'InputNumber', { min: 0, max: 1_048_576, step: 1 }),
-        field('apiThinkingMode', '思考模式', '向支持该扩展的 OpenAI-compatible 服务传递 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
+        field('apiMaxToken', '最大输出 Token', '单次模型回复允许使用的最大输出 Token 数，范围 1-393216（DeepSeek 文档上限 384K）；群聊回复通常 4096 已足够。输出预留会从上下文预算中扣除。', 'InputNumber', { min: 1, max: 393_216, step: 1 }),
+        field('apiContextWindowTokens', '模型上下文窗口 Token', '0 表示使用模型 Profile；未知模型使用 32,768 Token 安全默认值。正整数可缩小或显式放大已知 Profile 的窗口，并为未知标准 OpenAI-compatible 模型声明窗口，在新任务创建时冻结。实际请求预算还会与请求体字节上限取小；1M 需要约 4 MiB 请求体。修改后必须重启。', 'InputNumber', { min: 0, max: 16_777_216, step: 1 }),
+        field('apiThinkingMode', '思考模式', '向支持该扩展的 OpenAI-compatible 服务传递 thinking.type。默认不主动开启思考：DeepSeek 兼容会显式传 disabled（官方默认是开启且 effort=high，会显著增加费用与延迟），标准 OpenAI-compatible 不传该参数、由服务端决定。', 'Select', { options: thinkingModeOptions }),
         field('apiReasoningEffort', '思考强度', `向支持该扩展的模型传递 reasoning_effort；${reasoningEffortHelp}`, 'Select', { options: reasoningEffortOptions }),
         field('forwardReasoning', '转发思考过程', '将兼容服务返回的 reasoning_content 以转发消息展示；可能增加消息数量并暴露模型推理文本。', 'Switch'),
         field('forwardToolDetails', '转发工具执行详情', '以转发消息展示脱敏后的工具名、参数和结果摘要；仍可能暴露用户输入、任务目标和执行结果，群聊中请按需开启。', 'Switch'),
@@ -82,6 +82,13 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('hostImageLinkRefresh', '历史图片链接续签', '重放会话历史里的图片时，用宿主当前的签名参数换掉捕获时那一份。QQ 图片链接的签名约 57 分钟轮换一次，不续签会让整条请求被模型服务判为格式错误。关闭后历史图片按捕获时的链接原样重放，超过 10 分钟的会只保留文字。修改后需重启。', 'Switch'),
         field('hostImageLinkProbeBudgetMs', '历史图片存活探测预算', '续签后仍可能遇到宿主已经删除的图片文件，这类链接会一直让请求失败。这里是每次请求用于确认历史图片是否还在的总时间预算，范围 0 到 3000 毫秒；默认 500，0 表示不探测。超出预算就按可用处理，不影响回复。修改后需重启。', 'InputNumber', { min: 0, max: 3_000, step: 50 }),
         field('conversationPreserveTime', '会话保留秒数', 'Redis 会话过期时间；大于 0 时按秒过期，0 表示不设置自动过期。', 'InputNumber', { min: 0 }),
+        divider('上下文压缩'),
+        field('contextCompactionEnabled', '启用会话压缩', '开启后会话历史超过触发比例时折叠为摘要；关闭后按原始消息保留，直到字节或条目硬上限。关闭会显著增加每轮请求体积与费用。', 'Switch'),
+        field('contextCompactionTriggerPercent', '压缩触发比例（%）', '会话历史占可用输入预算的比例达到该值时触发压缩，范围 1-99，默认 65。可用输入预算 = 模型窗口 - 输出预留 - 工具预留 - 安全余量。比例越高，压缩越少、缓存更稳定，但每次请求更大。', 'InputNumber', { min: 1, max: 99, step: 1 }),
+        field('contextCompactionKeepPercent', '压缩后保留比例（%）', '压缩后保留最近原文占可用输入预算的比例，范围 1-98，默认 35；必须小于触发比例。比例越高保留原文越多，但压缩后更早再次触发。', 'InputNumber', { min: 1, max: 98, step: 1 }),
+        field('contextCompactionSummaryMaxChars', '历史摘要字符上限', '滚动摘要在上下文中保留的最大字符数，范围 200-20000，默认 2400。摘要按每条消息的首尾节选生成，不会发起额外的模型请求。', 'InputNumber', { min: 200, max: 20_000, step: 100 }),
+        field('contextPrefixCacheIdleMinutes', '前缀缓存空闲分钟', '会话空闲超过该时长后，视为供应商前缀缓存已失效，并借机提前压缩；范围 0-43200，0 表示使用默认 360 分钟。缓存已冷时重写前缀不额外损失命中率。', 'InputNumber', { min: 0, max: 43_200, step: 30 }),
+        field('contextCompactionMinReclaimTokens', '提前压缩最小回收 Token', '缓存空闲提前压缩时，至少能回收多少 Token 才值得重写前缀；范围 0-1000000，默认 1024。设置过小会产生收益甚微的压缩。', 'InputNumber', { min: 0, max: 1_000_000, step: 256 }),
         divider('群聊参与'),
         field('initiativeChatGroups', '定时主动聊天群', '定时发送主动话题的群号列表，使用逗号、分号、竖线或空格分隔。'),
         field('helloProbability', '主动聊天触发概率', '每次定时任务实际发送主动消息的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
@@ -94,7 +101,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         field('participationActiveGroups', '受控参与试点群', '仅这些群使用受控参与；空列表不启用任何新群。仍服从随机参与开关、禁用群和现有权限。', 'GTags', { allowAdd: true, closable: true }),
         field('bymRate', '随机参与触发概率', '每条符合条件的群消息触发随机参与的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
         field('bymDisableGroup', '随机参与禁用群', '这些群不会触发随机参与；输入群号标签。', 'GTags', { allowAdd: true, closable: true }),
-        field('bymThinkingMode', '随机参与思考模式', '随机参与请求单独使用的 thinking.type；默认表示不显式传参。', 'Select', { options: thinkingModeOptions }),
+        field('bymThinkingMode', '随机参与思考模式', '随机参与请求单独使用的 thinking.type。默认不主动开启思考：DeepSeek 兼容会显式传 disabled（官方默认是开启且 effort=high），标准 OpenAI-compatible 不传该参数。', 'Select', { options: thinkingModeOptions }),
         field('bymReasoningEffort', '随机参与思考强度', `随机参与请求单独使用的 reasoning_effort；${reasoningEffortHelp}`, 'Select', { options: reasoningEffortOptions }),
         field('bymPreset', '随机参与额外设定', '附加到随机参与系统提示后的角色或群聊风格设定。', 'InputTextArea'),
         field('bymFuckList', '反击触发词', '命中任一词时启用反击设定；使用标签或分隔符输入。', 'GTags', { allowAdd: true, closable: true }),

@@ -13,7 +13,19 @@ import type {
 } from '../agent/contracts/interaction.js'
 import type { SessionAddress } from '../agent/contracts/identity.js'
 import { ContextEngine } from '../agent/context/context-engine.js'
+import { deriveContextBudget } from './context-budget-policy.js'
+import {
+  SESSION_HISTORY_EARLY_RECLAIM_TOKENS,
+  SESSION_HISTORY_HIGH_WATER_PERCENT,
+  SESSION_HISTORY_KEEP_RECENT_PERCENT,
+  type SessionHistoryCompactionPolicy
+} from '../agent/session/session-history-compaction.js'
+import {
+  HISTORY_SUMMARY_HARD_MAX_CHARS,
+  HISTORY_SUMMARY_MAX_CHARS
+} from '../agent/session/session-history-summary.js'
 import type { ContextArtifactStore } from '../agent/context/context-artifact-store.js'
+import type { ContextBudget } from '../agent/context/context-budget.js'
 import type { ContextItem } from '../agent/context/context-item.js'
 import { projectMemoryRetrievalContextOutcomeV2 } from '../agent/memory/memory-context-projection.js'
 import {
@@ -25,6 +37,10 @@ import type {
   ProviderRequestMetadata
 } from '../agent/model/model-adapter.js'
 import type { ModelCapabilityOverride } from '../agent/model/model-capability.js'
+import {
+  MAX_CAPABILITY_TOKENS,
+  resolveModelCapabilitySnapshot
+} from '../agent/model/model-capability.js'
 import {
   ModelProviderError,
   parseProviderRequestMetadata
@@ -815,10 +831,47 @@ export function resolveConfiguredModelCapabilityOverride (
   const value = config.apiContextWindowTokens
   if (value === undefined || value === 0) return undefined
   if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
-    value < 1 || value > 1_048_576) {
+    value < 1 || value > MAX_CAPABILITY_TOKENS) {
     throw new TypeError('model context window configuration is invalid')
   }
   return Object.freeze({ contextWindowTokens: value })
+}
+
+/**
+ * The window the run planner freezes must be the same one the context engine
+ * budgets against. The declared window can exceed what one request body may
+ * carry, so the effective override is clamped to the derived request budget;
+ * otherwise the planner would reserve room for history that the request body
+ * ceiling then rejects.
+ */
+function effectiveModelCapabilityOverride (
+  config: RuntimeConfig
+): ModelCapabilityOverride | undefined {
+  const configured = resolveConfiguredModelCapabilityOverride(config)
+  const model = configText(config, 'model')
+  if (model === '') return configured
+  const profile = compatibilityConfig(config).profile
+  const capability = resolveModelCapabilitySnapshot({
+    profile,
+    model,
+    ...(configured === undefined ? {} : { override: configured })
+  })
+  const budget = deriveContextBudget({
+    contextWindowTokens: capability.contextWindowTokens,
+    maxOutputTokens: Math.min(
+      configInteger(config, 'apiMaxToken', 4_096, 1, MAX_CONFIGURED_OUTPUT_TOKENS),
+      capability.maxOutputTokens
+    )
+  })
+  // Keep the profile/safe-default snapshot when nothing needed clamping, so
+  // its provenance and hash stay stable for the common case.
+  if (configured === undefined && budget.modelContextTokens === capability.contextWindowTokens) {
+    return undefined
+  }
+  return Object.freeze({
+    ...(configured ?? {}),
+    contextWindowTokens: budget.modelContextTokens
+  })
 }
 
 function providerConfigurationError (reason: string): ModelProviderError {
@@ -1158,10 +1211,70 @@ function approvalText (interruption: ApprovalInterruption, ttlSeconds: number): 
   ].join('\n')
 }
 
+/**
+ * Compaction policy from configuration.
+ *
+ * Values are clamped instead of rejected so a hand-edited config file can
+ * never stop ordinary replies; the management UI validates before saving.
+ * `keepPercent` is forced below `triggerPercent`, otherwise a fold would
+ * immediately cross its own high-water mark again on the next turn.
+ */
+function historyCompactionPolicy (config: RuntimeConfig): SessionHistoryCompactionPolicy {
+  const triggerPercent = configInteger(
+    config,
+    'contextCompactionTriggerPercent',
+    SESSION_HISTORY_HIGH_WATER_PERCENT,
+    1,
+    99
+  )
+  const configuredKeep = configInteger(
+    config,
+    'contextCompactionKeepPercent',
+    SESSION_HISTORY_KEEP_RECENT_PERCENT,
+    1,
+    98
+  )
+  const idleMinutes = configInteger(config, 'contextPrefixCacheIdleMinutes', 360, 0, 43_200)
+  return Object.freeze({
+    enabled: configBoolean(config, 'contextCompactionEnabled', true),
+    triggerPercent,
+    keepPercent: Math.min(configuredKeep, triggerPercent - 1),
+    cacheIdleExpiryMs: (idleMinutes > 0 ? idleMinutes : 360) * 60 * 1_000,
+    minReclaimTokens: configInteger(
+      config,
+      'contextCompactionMinReclaimTokens',
+      SESSION_HISTORY_EARLY_RECLAIM_TOKENS,
+      0,
+      1_000_000
+    ),
+    summaryMaxChars: configInteger(
+      config,
+      'contextCompactionSummaryMaxChars',
+      HISTORY_SUMMARY_MAX_CHARS,
+      200,
+      HISTORY_SUMMARY_HARD_MAX_CHARS
+    )
+  })
+}
+
+/**
+ * Upper bound for one configured reply. Long-context models can emit much more
+ * than a chat reply needs; this still prevents a typo from reserving the whole
+ * window as output. 384K is the documented DeepSeek maximum; the DeepSeek
+ * profile rejects anything larger, so the two ceilings must agree.
+ */
+const MAX_CONFIGURED_OUTPUT_TOKENS = 393_216
+
 function modelConfig (config: RuntimeConfig, options: YunzaiAgentHandleOptions) {
   const model = configText(config, 'model')
   if (model === '') throw providerConfigurationError('model_missing')
-  const maxOutputTokens = configInteger(config, 'apiMaxToken', 4_096, 1, 8_192)
+  const maxOutputTokens = configInteger(
+    config,
+    'apiMaxToken',
+    4_096,
+    1,
+    MAX_CONFIGURED_OUTPUT_TOKENS
+  )
   const temperature = configNumber(config, 'temperature', 0, 2)
   return Object.freeze({
     model,
@@ -1172,14 +1285,26 @@ function modelConfig (config: RuntimeConfig, options: YunzaiAgentHandleOptions) 
   })
 }
 
-function contextBudget (maxOutputTokens: number) {
-  return Object.freeze({
-    modelContextTokens: 32_768,
-    reservedOutputTokens: maxOutputTokens,
-    reservedToolTokens: 4_096,
-    safetyMarginTokens: 1_024,
-    maxItems: 128,
-    maxBytes: 512 * 1_024
+/**
+ * The budget for one request, derived from the model's declared window rather
+ * than a fixed 32k. `apiContextWindowTokens` and the provider profile both feed
+ * the same capability snapshot the run planner freezes, so the two no longer
+ * disagree about how much history fits.
+ */
+function contextBudget (
+  config: RuntimeConfig,
+  model: string,
+  configuredOutputTokens: number
+): ContextBudget {
+  const override = resolveConfiguredModelCapabilityOverride(config)
+  const capability = resolveModelCapabilitySnapshot({
+    profile: compatibilityConfig(config).profile,
+    model,
+    ...(override === undefined ? {} : { override })
+  })
+  return deriveContextBudget({
+    contextWindowTokens: capability.contextWindowTokens,
+    maxOutputTokens: Math.min(configuredOutputTokens, capability.maxOutputTokens)
   })
 }
 
@@ -1362,7 +1487,12 @@ export class YunzaiAgentServiceBridge {
           toolRun
         ),
         model: requestModel,
-        contextBudget: contextBudget(requestModel.maxOutputTokens),
+        contextBudget: contextBudget(
+          this.#options.config,
+          requestModel.model,
+          requestModel.maxOutputTokens
+        ),
+        historyCompaction: historyCompactionPolicy(this.#options.config),
         ...(options.sessionTtlSeconds === undefined
           ? {}
           : { sessionTtlSeconds: options.sessionTtlSeconds })
@@ -1660,7 +1790,7 @@ export function createYunzaiAgentServiceBridge (
   dependencies: YunzaiAgentServiceBridgeDependencies
 ): YunzaiAgentServiceBridge {
   const selected = compatibilityConfig(options.config)
-  const modelCapabilityOverride = resolveConfiguredModelCapabilityOverride(options.config)
+  const modelCapabilityOverride = effectiveModelCapabilityOverride(options.config)
   let providerIsolationIdSource: ProviderIsolationIdSource | null = null
   if (selected.profile.cacheIsolation === 'conversation_required') {
     try {
@@ -1805,7 +1935,13 @@ export function createYunzaiAgentServiceBridge (
           1,
           120_000
         ),
-        outputTokens: configInteger(options.config, 'apiMaxToken', 4_096, 1, 8_192)
+        outputTokens: configInteger(
+          options.config,
+          'apiMaxToken',
+          4_096,
+          1,
+          MAX_CONFIGURED_OUTPUT_TOKENS
+        )
       }),
       now,
       generateId,

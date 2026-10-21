@@ -3,7 +3,7 @@ import { agentMessageText } from '../contracts/content-projection.js';
 import { publicModelImageUrl } from '../model/model-adapter.js';
 import { createContextSpanV1, domainSeparatedContextHash, MAX_CONTEXT_SPANS } from './context-span.js';
 import { MAX_CONTEXT_PLANNER_INPUT_BYTES, planModelTurn } from './context-planner.js';
-import { asciiContextCompare, canonicalizeModelMessages, CONTEXT_TOKEN_ESTIMATOR_VERSION } from './context-token-estimator.js';
+import { asciiContextCompare, canonicalizeModelMessages, CONTEXT_TOKEN_ESTIMATOR_VERSION, MAX_CONTEXT_MESSAGES } from './context-token-estimator.js';
 const optionalPriority = {
     system_instruction: 0,
     runtime_fact: 5,
@@ -535,7 +535,7 @@ function strictPlannerGate(items, currentRequestId, maxMessages) {
                 // Task 10 switches the production seam to the fixed Planner estimator and exact budget.
                 maxInputTokens: Number.MAX_SAFE_INTEGER,
                 maxSerializedMessageBytes: 512 * 1_024,
-                maxMessages: Math.min(maxMessages, 128),
+                maxMessages: Math.min(maxMessages, MAX_CONTEXT_MESSAGES),
                 estimatedToolTokens: 0,
                 reservedOutputTokens: 0
             }),

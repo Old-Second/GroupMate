@@ -23,7 +23,10 @@ import {
   parseContextSpanV1,
   type ContextSpanV1
 } from '../agent/context/context-span.js'
-import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../agent/context/context-token-estimator.js'
+import {
+  CONTEXT_TOKEN_ESTIMATOR_VERSION,
+  MAX_CONTEXT_MESSAGES
+} from '../agent/context/context-token-estimator.js'
 import type { ModelMessage } from '../agent/model/model-adapter.js'
 import { modelCapabilityStableHash } from '../agent/model/model-capability.js'
 import type { RunCheckpoint } from '../agent/run/run-checkpoint.js'
@@ -324,7 +327,7 @@ function plannerBudget (
       MAX_CONTEXT_PLANNER_INPUT_BYTES,
       RUN_RESOURCE_LIMITS.providerProtocolChainBytes
     ) - (correction ? 0 : CORRECTION_RESERVE_BYTES),
-    maxMessages: correction ? 128 : 127,
+    maxMessages: correction ? MAX_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES - 1,
     estimatedToolTokens,
     reservedOutputTokens,
     // Count only images actually selected, so optional history can be trimmed.

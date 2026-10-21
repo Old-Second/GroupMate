@@ -4,7 +4,22 @@ import { jsonByteLength, parseJsonValue } from '../model/json-value.js';
 import { parseProviderTurnState } from '../run/provider-state.js';
 import { RUN_RESOURCE_LIMITS } from '../run/run-limits.js';
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js';
-const SESSION_STATE_BYTES = 512 * 1_024;
+import { parseSessionHistorySummary } from './session-history-summary.js';
+/**
+ * Structural ceiling for the verbatim history. It matches the context item
+ * budget, so a conversation that reaches it is compressed rather than allowed
+ * to outgrow what one request can replay. A 1M-token window with short group
+ * messages can hold tens of thousands of turns, so this only stops runaway
+ * allocation; the byte ceiling below and the token budget do the real work.
+ */
+export const MAX_AGENT_SESSION_MESSAGES = 16_384;
+/**
+ * Persisted session byte ceiling. The token budget keeps the replay window
+ * smaller in practice; this bound must still accept a full long-context
+ * history so a large configured window can be saved at all.
+ */
+export const MAX_AGENT_SESSION_BYTES = 16 * 1_024 * 1_024;
+const SESSION_STATE_BYTES = MAX_AGENT_SESSION_BYTES;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROFILE = /^[a-z][a-z0-9_.-]{0,63}$/;
 function record(value, label) {
@@ -139,11 +154,19 @@ export function parseAgentSessionState(value) {
     const cloned = parseJsonValue(value, {
         maxBytes: SESSION_STATE_BYTES,
         maxDepth: 32,
-        maxNodes: 32_768
+        // A token-budgeted session may hold thousands of messages; the byte bound
+        // above is what keeps the persisted state small, not the node count.
+        maxNodes: 1_048_576
     });
     const state = record(cloned, 'agent session state');
-    exact(state, state.schemaVersion === 2 ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies'] : ['schemaVersion', 'messages', 'migratedFrom'], 'agent session state');
-    if ((state.schemaVersion !== 1 && state.schemaVersion !== 2) || !Array.isArray(state.messages) || state.messages.length > 128) {
+    const allowedKeys = state.schemaVersion === 3
+        ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies', 'historySummary']
+        : state.schemaVersion === 2
+            ? ['schemaVersion', 'messages', 'migratedFrom', 'contextDependencies']
+            : ['schemaVersion', 'messages', 'migratedFrom'];
+    exact(state, allowedKeys, 'agent session state');
+    if ((state.schemaVersion !== 1 && state.schemaVersion !== 2 && state.schemaVersion !== 3) ||
+        !Array.isArray(state.messages) || state.messages.length > MAX_AGENT_SESSION_MESSAGES) {
         throw new TypeError('agent session state is invalid');
     }
     const ids = new Set();
@@ -173,8 +196,16 @@ export function parseAgentSessionState(value) {
         : parseMigratedFrom(state.migratedFrom);
     return Object.freeze({
         schemaVersion: state.schemaVersion,
-        ...(state.schemaVersion === 2 ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) } : {}),
+        ...(state.schemaVersion === 2
+            ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) }
+            : {}),
+        ...(state.schemaVersion === 3 && state.contextDependencies !== undefined
+            ? { contextDependencies: parseContextDependencyProof(state.contextDependencies) }
+            : {}),
         messages: Object.freeze(messages),
+        ...(state.schemaVersion === 3 && state.historySummary !== undefined
+            ? { historySummary: parseSessionHistorySummary(state.historySummary) }
+            : {}),
         ...(migratedFrom === undefined ? {} : { migratedFrom })
     });
 }

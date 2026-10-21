@@ -126,6 +126,18 @@ export function buildGuobaConfigPatch(value, options) {
         }
         patch[key] = normalizeGuobaConfigValue(key, raw);
     }
+    // The two percentages only make sense together: a keep value at or above the
+    // trigger would re-cross the high-water mark on the very next turn.
+    const mergedTrigger = Object.hasOwn(patch, 'contextCompactionTriggerPercent')
+        ? patch.contextCompactionTriggerPercent
+        : options.current.contextCompactionTriggerPercent;
+    const mergedKeep = Object.hasOwn(patch, 'contextCompactionKeepPercent')
+        ? patch.contextCompactionKeepPercent
+        : options.current.contextCompactionKeepPercent;
+    if (typeof mergedTrigger === 'number' && typeof mergedKeep === 'number' &&
+        mergedKeep >= mergedTrigger) {
+        throw new TypeError('压缩后保留比例必须小于压缩触发比例。');
+    }
     return Object.freeze(patch);
 }
 export function normalizeGuobaConfigValue(key, value) {
@@ -183,8 +195,49 @@ export function normalizeGuobaConfigValue(key, value) {
     }
     if (key === 'apiContextWindowTokens') {
         if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
-            value < 0 || value > 1_048_576) {
+            value < 0 || value > 16_777_216) {
             throw new TypeError('模型上下文窗口配置无效。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionEnabled') {
+        if (typeof value !== 'boolean') {
+            throw new TypeError('会话压缩开关配置无效。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionTriggerPercent') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 1 || value > 99) {
+            throw new TypeError('会话压缩触发比例配置无效，应为 1-99。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionKeepPercent') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 1 || value > 98) {
+            throw new TypeError('会话压缩保留比例配置无效，应为 1-98。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionSummaryMaxChars') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 200 || value > 20_000) {
+            throw new TypeError('历史摘要字符上限配置无效，应为 200-20000。');
+        }
+        return value;
+    }
+    if (key === 'contextPrefixCacheIdleMinutes') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 0 || value > 43_200) {
+            throw new TypeError('前缀缓存空闲时间配置无效，应为 0-43200 分钟。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionMinReclaimTokens') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 0 || value > 1_000_000) {
+            throw new TypeError('提前压缩最小回收 Token 配置无效。');
         }
         return value;
     }

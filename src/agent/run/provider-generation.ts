@@ -130,7 +130,7 @@ export function providerRequestWireIdentity (
     const body = parseJsonValue(value, {
       maxBytes: RUN_RESOURCE_LIMITS.requestBytes,
       maxDepth: 32,
-      maxNodes: 32_768
+      maxNodes: 1_048_576
     })
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new TypeError()
     encoded = JSON.stringify(body)

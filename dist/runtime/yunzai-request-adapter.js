@@ -65,6 +65,35 @@ function frozenBudget(input) {
         maxBytes: input.maxBytes
     });
 }
+function integerInRange(value, minimum, maximum) {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+        value < minimum || value > maximum) {
+        throw new TypeError('session history compaction policy is invalid');
+    }
+    return value;
+}
+/**
+ * The compaction policy is frozen into the request so a mid-run configuration
+ * change cannot rewrite the history structure between two turns of one task.
+ */
+function frozenHistoryCompaction(input) {
+    if (typeof input !== 'object' || input === null || typeof input.enabled !== 'boolean') {
+        throw new TypeError('session history compaction policy is invalid');
+    }
+    const triggerPercent = integerInRange(input.triggerPercent, 1, 99);
+    const keepPercent = integerInRange(input.keepPercent, 1, 98);
+    if (keepPercent >= triggerPercent) {
+        throw new TypeError('session history compaction policy is invalid');
+    }
+    return Object.freeze({
+        enabled: input.enabled,
+        triggerPercent,
+        keepPercent,
+        cacheIdleExpiryMs: integerInRange(input.cacheIdleExpiryMs, 60_000, 30 * 24 * 60 * 60 * 1_000),
+        minReclaimTokens: integerInRange(input.minReclaimTokens, 0, 1_000_000),
+        summaryMaxChars: integerInRange(input.summaryMaxChars, 200, 20_000)
+    });
+}
 function frozenPresentationRoute(input) {
     const { requestKind, intent, sessionAddress, actorId, requestMessageId } = input;
     const profile = requestKind === 'ordinary_chat' ? 'ordinary' : 'proactive';
@@ -298,6 +327,9 @@ export async function adaptYunzaiRequest(input) {
         systemInstructions: Object.freeze([...input.systemInstructions]),
         model: frozenModel(input.model),
         contextBudget: frozenBudget(input.contextBudget),
+        ...(input.historyCompaction === undefined
+            ? {}
+            : { historyCompaction: frozenHistoryCompaction(input.historyCompaction) }),
         ...(input.sessionTtlSeconds === undefined
             ? {}
             : { sessionTtlSeconds: input.sessionTtlSeconds })

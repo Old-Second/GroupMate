@@ -1,7 +1,7 @@
 import { parseJsonValue } from '../model/json-value.js';
 import { canonicalSessionKey } from './conversation-scope.js';
-import { parseAgentSessionState } from './agent-session-state.js';
-const SESSION_BYTES = 512 * 1_024;
+import { MAX_AGENT_SESSION_BYTES, parseAgentSessionState } from './agent-session-state.js';
+const SESSION_BYTES = MAX_AGENT_SESSION_BYTES;
 function record(value, label) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError(`${label} must be an object`);
@@ -36,7 +36,8 @@ function parseCanonicalRecord(value, address) {
     const cloned = parseJsonValue(value, {
         maxBytes: SESSION_BYTES,
         maxDepth: 36,
-        maxNodes: 40_000
+        // See `parseAgentSessionState`: a long conversation is bounded by bytes.
+        maxNodes: 1_048_576
     });
     const session = record(cloned, 'agent session');
     exact(session, [

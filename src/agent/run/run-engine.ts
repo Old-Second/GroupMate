@@ -2222,7 +2222,7 @@ export class RunEngine {
       const value = parseJsonValue(request as unknown as JsonValue, {
         maxBytes: RUN_RESOURCE_LIMITS.requestBytes,
         maxDepth: 32,
-        maxNodes: 32_768
+        maxNodes: 1_048_576
       })
       if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError('model request identity is invalid')

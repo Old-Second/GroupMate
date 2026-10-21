@@ -41,6 +41,7 @@ import {
 } from '../../src/agent/run/run-observation.js'
 import { ToolScheduler } from '../../src/agent/run/tool-scheduler.js'
 import type { AgentSessionState } from '../../src/agent/session/agent-session-state.js'
+import { createSessionHistorySummary } from '../../src/agent/session/session-history-summary.js'
 import { RedisAgentSessionStore } from '../../src/agent/session/redis-agent-session-store.js'
 import type { SessionStore } from '../../src/agent/session/session-store.js'
 import type { ToolCall } from '../../src/agent/tools/tool-call.js'
@@ -231,7 +232,7 @@ test('ordinary direct replies share active qualification while persisted session
   assert.equal(result.kind, 'completed')
   if (result.kind !== 'completed') assert.fail('ordinary run failed')
   assert.equal(result.sessionPersistence, 'saved')
-  assert(saved && saved.schemaVersion === 2)
+  assert(saved && saved.schemaVersion === 3)
   assert(saved.contextDependencies)
   assert.equal(Object.hasOwn(saved.contextDependencies, 'requiresLiveParticipation'), false)
   notifyRunFinalDelivery(result, true)
@@ -241,6 +242,135 @@ test('ordinary direct replies share active qualification while persisted session
 })
 
 const createdAt = '2026-07-14T01:00:00.000Z'
+
+function seededSession (
+  messageCount: number,
+  updatedAt: string = createdAt,
+  text: (index: number) => string = index => `seed ${index}`
+): SessionRecord<AgentSessionState> {
+  const messages = Array.from({ length: messageCount }, (_, index) => Object.freeze({
+    kind: 'message' as const,
+    message: Object.freeze({
+      id: `seed-${index}`,
+      role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+      parts: Object.freeze([{ type: 'text' as const, text: text(index) }]),
+      createdAt,
+      provenance: Object.freeze({
+        source: 'qq_message', trust: 'untrusted', sensitivity: 'group',
+        sourceId: `seed-${index}`, createdAt
+      })
+    })
+  }))
+  return Object.freeze({
+    schemaVersion: 1,
+    sessionId: 'seeded-session',
+    botId: 'bot-1',
+    scope: Object.freeze({ kind: 'group_user' as const, groupId: 'group-1', userId: 'actor-1' }),
+    startedBy: Object.freeze({ userId: 'actor-1' }),
+    createdAt,
+    updatedAt,
+    turnCount: messageCount,
+    state: parseAgentSessionState({ schemaVersion: 1, messages })
+  })
+}
+
+async function savedSessionAfterTurn (
+  seeded: SessionRecord<AgentSessionState>,
+  now: string
+): Promise<AgentSessionState> {
+  let saved: AgentSessionState | undefined
+  const service = new AgentService({
+    sessions: Object.freeze({
+      ...contractSessions(async record => { saved = record.state }),
+      get: async () => seeded
+    }),
+    runStore: new InMemoryRunStore(),
+    admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ start: async input => completedResult(
+      input.runId, input.runRef, { kind: 'reply_text', text: '本轮答复' }) }),
+    createRuntime: async () => contractRuntime(),
+    now: () => new Date(now)
+  })
+  const result = await service.handle(request('session-retention', '继续聊'))
+  assert.equal(result.kind, 'completed')
+  assert(saved, 'expected the completed turn to persist its session')
+  return saved
+}
+
+test('a completed turn compresses an oversized session instead of dropping turns at a count limit', async () => {
+  // request() budgets 8192 tokens: fold above 65% and keep the recent 35% verbatim.
+  const long = (index: number) => `第 ${index} 轮：${'历史内容。'.repeat(120)}`
+  const state = await savedSessionAfterTurn(seededSession(40, createdAt, long), createdAt)
+  assert.ok(state.historySummary, 'expected the oldest turns to be summarized')
+  assert.ok((state.historySummary?.coveredItems ?? 0) >= 25)
+  assert.ok(state.messages.length >= 4 && state.messages.length <= 12)
+  const head = state.messages[0]
+  assert(head && head.kind === 'message')
+  assert.equal(head.kind === 'message' ? head.message.role : '', 'user')
+  const tail = state.messages.at(-1)
+  assert(tail && tail.kind === 'message')
+  assert.equal(tail.kind === 'message' ? tail.message.role : '', 'assistant')
+  // The compressed state must survive the real persistence codec unchanged.
+  assert.deepEqual(parseAgentSessionState(JSON.parse(JSON.stringify(state))), state)
+})
+
+test('a short conversation keeps every turn verbatim and creates no summary', async () => {
+  const state = await savedSessionAfterTurn(seededSession(20), createdAt)
+  assert.equal(state.historySummary, undefined)
+  assert.equal(state.messages.length, 22)
+})
+
+test('an idle conversation folds early because its prefix cache is cold', async () => {
+  const coldNow = new Date(Date.parse(createdAt) + 7 * 60 * 60 * 1_000).toISOString()
+  const warm = await savedSessionAfterTurn(seededSession(20, createdAt, () => 'x'.repeat(500)), createdAt)
+  assert.equal(warm.historySummary, undefined)
+  const cold = await savedSessionAfterTurn(seededSession(20, createdAt, () => 'x'.repeat(500)), coldNow)
+  assert.ok(cold.historySummary)
+  assert.ok(cold.messages.length < 22)
+})
+
+test('a compressed session replays system, the summary pair, then the recent turns', async () => {
+  const past = seededSession(6).state.messages
+  const summary = createSessionHistorySummary(undefined, past.slice(0, 4), createdAt)
+  const seeded = Object.freeze({
+    ...seededSession(0),
+    state: parseAgentSessionState({
+      schemaVersion: 3,
+      messages: [...past.slice(4)],
+      historySummary: summary
+    })
+  })
+  let prepared: readonly { role: string; content: string | null }[] | undefined
+  const service = new AgentService({
+    sessions: Object.freeze({ ...contractSessions(), get: async () => seeded }),
+    runStore: new InMemoryRunStore(),
+    admission: { acquire: async () => noOpLease(), recover: async () => noOpLease() },
+    contextEngine: contractContextEngine(), progressPresenter: new RunProgressPresenter(),
+    createEngine: () => contractEngine({ start: async input => {
+      prepared = (await input.runtime.prepareContext(new AbortController().signal)).messages
+      return completedResult(input.runId, input.runRef, { kind: 'reply_text', text: '本轮答复' })
+    } }),
+    createRuntime: async () => contractRuntime(),
+    now: () => new Date(createdAt)
+  })
+  const result = await service.handle(request('session-summary-replay', '继续聊'))
+  assert.equal(result.kind, 'completed')
+  assert.ok(prepared)
+  const roles = prepared!.map(message => message.role)
+  const summaryUser = prepared!.findIndex(message => (
+    message.role === 'user' && message.content?.startsWith('历史摘要（此前 4 条消息') === true
+  ))
+  const summaryAssistant = prepared!.findIndex(message => (
+    message.role === 'assistant' && message.content === '已确认摘要。'
+  ))
+  assert.ok(summaryUser > 0, JSON.stringify(roles))
+  assert.equal(summaryAssistant, summaryUser + 1)
+  assert.equal(roles[0], 'system')
+  const recent = prepared!.slice(summaryAssistant + 1)
+  assert.ok(recent.some(message => message.content?.startsWith('seed ')))
+})
+
 const facts: ToolRuntimeFacts = Object.freeze({
   botId: 'bot-1',
   actor: Object.freeze({ userId: 'actor-1', role: 'owner', isBotMaster: true }),

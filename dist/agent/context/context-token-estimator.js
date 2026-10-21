@@ -2,12 +2,25 @@ import { types as utilTypes } from 'node:util';
 import { MAX_MODEL_IMAGE_URLS, publicModelImageUrl } from '../model/model-adapter.js';
 import { parseExactToolArgumentsText } from '../model/tool-arguments-text.js';
 export const CONTEXT_TOKEN_ESTIMATOR_VERSION = 'context-byte-quarter-v1';
-export const MAX_CONTEXT_CANONICAL_MESSAGE_BYTES = 512 * 1_024;
+/**
+ * Byte ceiling for one canonical message list. It covers the whole wire the
+ * planner may commit, so it follows the long-context request ceiling rather
+ * than the 512 KiB a 32k window needed; the derived token budget is what keeps
+ * ordinary requests small.
+ */
+export const MAX_CONTEXT_CANONICAL_MESSAGE_BYTES = 16 * 1_024 * 1_024;
 const SAFE_ASCII = /^[\x21-\x7e]{1,128}$/;
 const PROFILE_ID = /^[a-z][a-z0-9_.-]{0,63}$/;
 const MAX_JSON_DEPTH = 32;
-const MAX_JSON_NODES = 8_192;
-export const MAX_CONTEXT_MESSAGES = 128;
+/**
+ * Preflight node budget for one canonical value. A token-budgeted session may
+ * replay thousands of messages, so the walk must accept the whole planning
+ * input without becoming an implicit message-count limit. The byte bounds
+ * remain authoritative.
+ */
+const MAX_JSON_NODES = 1_048_576;
+/** Structural message bound; the serialized byte bound below stays authoritative. */
+export const MAX_CONTEXT_MESSAGES = 32_768;
 const MAX_CONTEXT_TOOL_CALLS = 128;
 const MAX_CONTEXT_STRING_CODE_UNITS = 512 * 1_024;
 export function invalidContextValue() {

@@ -1,10 +1,15 @@
 import { contextArtifactToSpan, MAX_CONTEXT_ARTIFACT_REFS, parseContextArtifactV1 } from './context-artifact.js';
 import { createContextPlanV1, contextWireHash, parseContextPlanV1 } from './context-plan.js';
 import { contextSpanHash, contextWireProtocolIsValid, MAX_CONTEXT_SPANS, parseContextSourceRefs, parseContextSpanV1 } from './context-span.js';
-import { asciiContextCompare, canonicalizeContextJsonValue, canonicalJsonStringify, CONTEXT_TOKEN_ESTIMATOR_VERSION, estimateModelMessagesTokens, inspectContextArray, inspectContextRecord, invalidContextValue, requireContextAscii, requireContextHash, requireSafeInteger, serializeModelMessages, serializedModelMessagesBytes } from './context-token-estimator.js';
+import { asciiContextCompare, canonicalizeContextJsonValue, canonicalJsonStringify, CONTEXT_TOKEN_ESTIMATOR_VERSION, estimateModelMessagesTokens, inspectContextArray, inspectContextRecord, invalidContextValue, MAX_CONTEXT_MESSAGES, requireContextAscii, requireContextHash, requireSafeInteger, serializeModelMessages, serializedModelMessagesBytes } from './context-token-estimator.js';
 import { domainSeparatedContextHash } from './context-span.js';
 export const CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN = 'groupmate.context.compaction-request.v1';
-export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 512 * 1_024;
+/**
+ * Byte ceiling for one planning input. It matches the run request ceiling so a
+ * long-context prompt is not truncated by the planner before the provider even
+ * sees it; the derived context budget keeps ordinary requests far below it.
+ */
+export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 16 * 1_024 * 1_024;
 export const MAX_CONTEXT_COMPACTION_TOOL_CALLS = 8;
 const BLOCKED_BUDGET = Object.freeze({
     status: 'blocked',
@@ -54,7 +59,8 @@ function parseBudget(value) {
             imageTokensPerImage: requireSafeInteger(input.imageTokensPerImage)
         })
     });
-    if (budget.maxSerializedMessageBytes > 512 * 1_024 || budget.maxMessages > 128) {
+    if (budget.maxSerializedMessageBytes > MAX_CONTEXT_PLANNER_INPUT_BYTES ||
+        budget.maxMessages > MAX_CONTEXT_MESSAGES) {
         return invalidContextValue();
     }
     return budget;

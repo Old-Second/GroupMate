@@ -6,7 +6,7 @@ export function detachedRunContentSnapshot(value, maxBytes) {
     return parseJsonValue(value, {
         maxBytes,
         maxDepth: 32,
-        maxNodes: 8_192
+        maxNodes: 1_048_576
     });
 }
 export function snapshotModelRequestForJournal(request) {

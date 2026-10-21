@@ -1,5 +1,6 @@
 import {
   domainSeparatedContextHash,
+  MAX_CONTEXT_SPANS,
   type ContextSpanV1
 } from './context-span.js'
 import type { ModelMessage } from '../model/model-adapter.js'
@@ -17,8 +18,14 @@ import {
 
 export const CONTEXT_PLAN_HASH_DOMAIN = 'groupmate.context.plan.v1'
 export const CONTEXT_WIRE_HASH_DOMAIN = 'groupmate.context.wire.v1'
-export const MAX_CONTEXT_PLAN_BYTES = 32 * 1_024
-export const MAX_CONTEXT_PLAN_REFS = 128
+/**
+ * Plan and byte bounds follow the structural span bound: a token-budgeted
+ * conversation may replay thousands of short turns, and the plan must be able
+ * to describe every one of them while staying inside the run checkpoint byte
+ * limit (12 MiB).
+ */
+export const MAX_CONTEXT_PLAN_BYTES = 8 * 1_024 * 1_024
+export const MAX_CONTEXT_PLAN_REFS = MAX_CONTEXT_SPANS
 
 export interface ContextPlanIncludedV1 {
   readonly spanId: string

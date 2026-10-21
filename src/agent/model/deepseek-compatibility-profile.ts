@@ -132,11 +132,22 @@ function restoreDeepSeekAssistantState (state: ProviderTurnState): Readonly<Json
   })
 }
 
-const DEEPSEEK_REASONING_EFFORTS = new Set(['low', 'high', 'max'])
-
+/**
+ * The provider accepts only low/high/max. The documented mapping is
+ * `minimal→low`, `low→low`, `medium→high`, `high→high`, `xhigh→high`,
+ * `max→max`, `ultra→max`; the plugin has no `minimal`, so the remaining
+ * non-provider names collapse onto the nearest supported effort instead of
+ * silently escalating to the most expensive one.
+ */
 function deepSeekReasoningEffort (effort: ModelReasoningEffort): 'low' | 'high' | 'max' {
-  if (DEEPSEEK_REASONING_EFFORTS.has(effort)) return effort as 'low' | 'high' | 'max'
-  return effort === 'medium' ? 'high' : 'max'
+  switch (effort) {
+    case 'low': return 'low'
+    case 'medium': return 'high'
+    case 'high': return 'high'
+    case 'xhigh': return 'high'
+    case 'max': return 'max'
+    case 'ultra': return 'max'
+  }
 }
 
 function encodeDeepSeekReasoningOptions (

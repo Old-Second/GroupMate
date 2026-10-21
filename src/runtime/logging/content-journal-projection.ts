@@ -38,7 +38,7 @@ export interface ProjectedJournalEvent {
 }
 
 export const CONTENT_JOURNAL_JSON_DEPTH_LIMIT = 32
-export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 8_192
+export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 1_048_576
 
 export interface ProjectionBudget {
   reserveArray(length: number, label: string): void

@@ -91,7 +91,7 @@ test('documented thinking sampling, effort mapping and forced-tool limits are en
   assert.equal(thinking.reasoning_effort, 'high')
   for (const [effort, expected] of [
     ['low', 'low'], ['medium', 'high'], ['high', 'high'],
-    ['xhigh', 'max'], ['max', 'max'], ['ultra', 'max']
+    ['xhigh', 'high'], ['max', 'max'], ['ultra', 'max']
   ] as const) {
     assert.equal(
       buildImmutableChatRequest({ ...request, reasoning: { enabled: true, effort } },

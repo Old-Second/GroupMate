@@ -1,9 +1,15 @@
-import { domainSeparatedContextHash } from './context-span.js';
+import { domainSeparatedContextHash, MAX_CONTEXT_SPANS } from './context-span.js';
 import { inspectContextArray, inspectContextRecord, invalidContextValue, MAX_CONTEXT_CANONICAL_MESSAGE_BYTES, MAX_CONTEXT_MESSAGES, requireContextAscii, requireContextHash, requireSafeInteger, serializeModelMessages } from './context-token-estimator.js';
 export const CONTEXT_PLAN_HASH_DOMAIN = 'groupmate.context.plan.v1';
 export const CONTEXT_WIRE_HASH_DOMAIN = 'groupmate.context.wire.v1';
-export const MAX_CONTEXT_PLAN_BYTES = 32 * 1_024;
-export const MAX_CONTEXT_PLAN_REFS = 128;
+/**
+ * Plan and byte bounds follow the structural span bound: a token-budgeted
+ * conversation may replay thousands of short turns, and the plan must be able
+ * to describe every one of them while staying inside the run checkpoint byte
+ * limit (12 MiB).
+ */
+export const MAX_CONTEXT_PLAN_BYTES = 8 * 1_024 * 1_024;
+export const MAX_CONTEXT_PLAN_REFS = MAX_CONTEXT_SPANS;
 function includedJson(values) {
     return `[${values.map(value => {
         return `{"spanId":${JSON.stringify(value.spanId)},"representation":${JSON.stringify(value.representation)},"wireStart":${value.wireStart},"wireCount":${value.wireCount},"wireHash":${JSON.stringify(value.wireHash)},"contentHash":${JSON.stringify(value.contentHash)}}`;

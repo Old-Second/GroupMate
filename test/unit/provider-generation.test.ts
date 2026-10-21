@@ -6,6 +6,7 @@ import {
   providerRequestScopeFingerprint,
   parseFrozenProviderGenerationV1
 } from '../../src/agent/run/provider-generation.js'
+import { RUN_RESOURCE_LIMITS } from '../../src/agent/run/run-limits.js'
 
 const HASH = 'a'.repeat(64)
 
@@ -83,7 +84,7 @@ test('provider generation codec rejects unknown keys, invalid hashes and unbound
   })), TypeError)
   assert.throws(() => createFrozenProviderGenerationV1(Object.freeze({
     ...valid,
-    requestBytes: 512 * 1_024 + 1
+    requestBytes: RUN_RESOURCE_LIMITS.requestBytes + 1
   })), TypeError)
   assert.throws(() => parseFrozenProviderGenerationV1(Object.freeze({
     schemaVersion: 1,

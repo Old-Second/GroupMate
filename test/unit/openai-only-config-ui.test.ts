@@ -92,6 +92,12 @@ const preservedFields = [
   'model',
   'apiStream',
   'apiContextWindowTokens',
+  'contextCompactionEnabled',
+  'contextCompactionTriggerPercent',
+  'contextCompactionKeepPercent',
+  'contextCompactionSummaryMaxChars',
+  'contextPrefixCacheIdleMinutes',
+  'contextCompactionMinReclaimTokens',
   'apiThinkingMode',
   'apiReasoningEffort',
   'azureTTSKey',
@@ -128,6 +134,12 @@ const requiredGuobaFields = [
   'apiStream',
   'apiMaxToken',
   'apiContextWindowTokens',
+  'contextCompactionEnabled',
+  'contextCompactionTriggerPercent',
+  'contextCompactionKeepPercent',
+  'contextCompactionSummaryMaxChars',
+  'contextPrefixCacheIdleMinutes',
+  'contextCompactionMinReclaimTokens',
   'apiThinkingMode',
   'apiReasoningEffort',
   'promptPrefixOverride',
@@ -256,6 +268,17 @@ const expectedGuobaGroups = [
       'groupContextLength', 'groupContextTip', 'groupMerge',
       'hostImageLinkRefresh', 'hostImageLinkProbeBudgetMs',
       'conversationPreserveTime'
+    ]
+  },
+  {
+    label: '上下文压缩',
+    fields: [
+      'contextCompactionEnabled',
+      'contextCompactionTriggerPercent',
+      'contextCompactionKeepPercent',
+      'contextCompactionSummaryMaxChars',
+      'contextPrefixCacheIdleMinutes',
+      'contextCompactionMinReclaimTokens'
     ]
   },
   {
@@ -481,10 +504,10 @@ test('Guoba exposes one bounded restart-only context window override', async () 
   ) as Record<string, unknown>
 
   assert.equal(field?.component, 'InputNumber')
-  assert.deepEqual(field?.componentProps, { min: 0, max: 1_048_576, step: 1 })
+  assert.deepEqual(field?.componentProps, { min: 0, max: 16_777_216, step: 1 })
   assert.match(field?.bottomHelpMessage ?? '', /0.*Profile|Profile.*0/)
-  assert.match(field?.bottomHelpMessage ?? '', /512 KiB/)
-  assert.match(field?.bottomHelpMessage ?? '', /256 KiB/)
+  assert.match(field?.bottomHelpMessage ?? '', /4 MiB/)
+  assert.match(field?.bottomHelpMessage ?? '', /放大/)
   assert.match(field?.bottomHelpMessage ?? '', /重启/)
   assert.match(source, /^  apiContextWindowTokens: 0,/m)
   assert.equal(example.apiContextWindowTokens, 0)
@@ -601,7 +624,7 @@ test('Guoba external service fields provide actionable setup references', () => 
   assert.match(serpOptions.find(option => option.value === 'azure')?.label ?? '', /退役/)
 })
 
-test('Guoba groups supported settings into ten functional sections', () => {
+test('Guoba groups supported settings into eleven functional sections', () => {
   const schemas = buildGuobaSchemas({
     vitsRoleOptions: [],
     voicevoxRoleOptions: [],

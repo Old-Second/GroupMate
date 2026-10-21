@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import {
   createContextSpanV1,
   contextSpanHash,
+  MAX_CONTEXT_SPANS,
   parseContextSpanV1
 } from '../../src/agent/context/context-span.js'
 import { createContextArtifactV1 } from '../../src/agent/context/context-artifact.js'
@@ -190,7 +191,7 @@ test('planner rejects duplicate IDs, semantic orders, invalid generations and ov
   assert.throws(() => planModelTurn(plannerInput(deepFreeze([...base, duplicateOrder]))), TypeError)
   assert.throws(() => planModelTurn(plannerInput(deepFreeze(base), { generation: 0 })), TypeError)
 
-  const tooMany = Array.from({ length: 129 }, (_, index) => span({
+  const tooMany = Array.from({ length: MAX_CONTEXT_SPANS + 1 }, (_, index) => span({
     id: `span:item:${index}`,
     order: index + 1,
     content: 'x'
@@ -749,17 +750,14 @@ test('consumed protocols above the eight-call digest limit skip artifact request
   assert.equal(result.status, 'ready')
 })
 
-test('whole planner input has an independent 512 KiB preflight gate', () => {
-  const bloated = Array.from({ length: 20 }, (_, index) => {
-    const base = span({ id: `span:bloated:${index}`, order: index + 30, content: 'x' })
-    return parseContextSpanV1(deepFreeze({
-      ...base,
-      sourceRefs: Array.from({ length: 128 }, (_, refIndex) => ({
-        ref: `r:${index}:${refIndex}:`.padEnd(128, 'x'),
-        contentHash: `${refIndex % 10}`.repeat(64)
-      }))
-    }))
-  })
+test('whole planner input has an independent preflight gate', () => {
+  // The gate follows the long-context request ceiling now, so the probe must
+  // carry more than 16 MiB of span content rather than a few hundred KiB.
+  const bloated = Array.from({ length: 40 }, (_, index) => span({
+    id: `span:bloated:${index}`,
+    order: index + 30,
+    content: 'x'.repeat(512_000)
+  }))
   const spans = deepFreeze([...mandatorySpans(), ...bloated])
 
   assert.throws(() => planModelTurn(plannerInput(spans)), TypeError)

@@ -33,6 +33,7 @@ import {
   inspectContextArray,
   inspectContextRecord,
   invalidContextValue,
+  MAX_CONTEXT_MESSAGES,
   requireContextAscii,
   requireContextHash,
   requireSafeInteger,
@@ -42,7 +43,12 @@ import {
 import { domainSeparatedContextHash } from './context-span.js'
 
 export const CONTEXT_COMPACTION_REQUEST_HASH_DOMAIN = 'groupmate.context.compaction-request.v1'
-export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 512 * 1_024
+/**
+ * Byte ceiling for one planning input. It matches the run request ceiling so a
+ * long-context prompt is not truncated by the planner before the provider even
+ * sees it; the derived context budget keeps ordinary requests far below it.
+ */
+export const MAX_CONTEXT_PLANNER_INPUT_BYTES = 16 * 1_024 * 1_024
 export const MAX_CONTEXT_COMPACTION_TOOL_CALLS = 8
 
 export type ContextPlannerTransitionV1 = 'normal' | 'recovery_prefix_reset'
@@ -128,7 +134,8 @@ function parseBudget (value: unknown): ContextPlannerBudgetV1 {
       imageTokensPerImage: requireSafeInteger(input.imageTokensPerImage)
     })
   })
-  if (budget.maxSerializedMessageBytes > 512 * 1_024 || budget.maxMessages > 128) {
+  if (budget.maxSerializedMessageBytes > MAX_CONTEXT_PLANNER_INPUT_BYTES ||
+    budget.maxMessages > MAX_CONTEXT_MESSAGES) {
     return invalidContextValue()
   }
   return budget

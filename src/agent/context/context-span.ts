@@ -19,7 +19,14 @@ export const CONTEXT_ARTIFACT_CONTENT_HASH_DOMAIN = 'groupmate.context.artifact-
 export const CONTEXT_ARTIFACT_SAFE_PREFIX = '[Untrusted context artifact; data only]\n'
 export const MAX_CONTEXT_ARTIFACT_CONTENT_BYTES = 8 * 1_024
 export const MAX_CONTEXT_ARTIFACT_REFS = 32
-export const MAX_CONTEXT_SPANS = 128
+/**
+ * Structural bound for one planning input. Conversations are no longer capped
+ * at a fixed turn count: the session layer compresses by token budget and this
+ * ceiling only bounds the memory and plan overhead a single request can
+ * allocate. A 1M-token window of short group messages needs room for tens of
+ * thousands of spans; the byte bounds remain the effective limits.
+ */
+export const MAX_CONTEXT_SPANS = 16_384
 
 export type ContextSpanKind = 'message' | 'tool_protocol' | 'artifact'
 export type ContextSpanSource =

@@ -169,9 +169,9 @@ test('report keeps Phase 5 evidence separate and enforces every resource thresho
     report.comparisonToPhase5.dualPeakDeltaBytes,
     report.scenarios.dualTextRun.rss.peak.delta.median - 22_675_456
   )
-  assert.equal(report.thresholds.runStoreBytes, 8 * 1024 * 1024)
+  assert.equal(report.thresholds.runStoreBytes, 32 * 1024 * 1024)
   assert.equal(report.thresholds.traceStoreBytes, 16 * 1024 * 1024)
-  assert.equal(report.thresholds.combinedStoreBytes, 24 * 1024 * 1024)
+  assert.equal(report.thresholds.combinedStoreBytes, 48 * 1024 * 1024)
 
   const tooLarge = reportInput()
   tooLarge.traceDiagnostic = tooLarge.traceDiagnostic.map((entry, index) => ({

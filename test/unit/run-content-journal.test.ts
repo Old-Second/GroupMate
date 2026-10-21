@@ -588,7 +588,7 @@ test('Yunzai bridge journals the exact normalized request once before run claim 
   assert.deepEqual(Reflect.ownKeys(journalRequests[0] ?? {}), [
     'requestId', 'requestRef', 'requestKind', 'presentationRoute', 'createdAt',
     'deadlineAt', 'sessionAddress', 'actor', 'channel', 'message', 'references',
-    'systemInstructions', 'model', 'contextBudget'
+    'systemInstructions', 'model', 'contextBudget', 'historyCompaction'
   ])
   assert.equal(journalRequests[0]?.message.parts[0]?.type, 'text')
   assert.equal(

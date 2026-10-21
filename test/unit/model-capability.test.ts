@@ -78,7 +78,7 @@ test('uses the safe default when no profile capability or override exists', () =
   })
 })
 
-test('known capability overrides may only narrow provider-declared features', () => {
+test('known capability overrides may widen the window but only narrow provider features', () => {
   assert.deepEqual(resolveModelCapabilitySnapshot({
     profile: deepSeekCompatibilityProfile,
     model: 'deepseek-v4-flash',
@@ -98,10 +98,28 @@ test('known capability overrides may only narrow provider-declared features', ()
     priceCatalogVersion: 'deepseek-cny-2026-07-19'
   })
 
+  // A provider can raise a model's window without a plugin release, so an
+  // explicit override is allowed to widen it while the output ceiling stays
+  // at the profile value.
+  assert.deepEqual(resolveModelCapabilitySnapshot({
+    profile: deepSeekCompatibilityProfile,
+    model: 'deepseek-v4-flash',
+    override: { contextWindowTokens: 2_000_000 },
+    now: BEFORE_ALIAS_EXPIRY
+  }), {
+    schemaVersion: 1,
+    source: 'user_override',
+    contextWindowTokens: 2_000_000,
+    maxOutputTokens: 384_000,
+    promptCaching: 'deepseek_disk',
+    usageExtensions: ['prompt_cache_hit_tokens', 'prompt_cache_miss_tokens'],
+    priceCatalogVersion: 'deepseek-cny-2026-07-19'
+  })
+
   assert.throws(() => resolveModelCapabilitySnapshot({
     profile: deepSeekCompatibilityProfile,
     model: 'deepseek-v4-flash',
-    override: { contextWindowTokens: 1_000_001 },
+    override: { contextWindowTokens: 16_777_217 },
     now: BEFORE_ALIAS_EXPIRY
   }), /override/i)
   assert.throws(() => resolveModelCapabilitySnapshot({

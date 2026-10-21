@@ -161,8 +161,16 @@ const defaultConfig = {
   // OpenAI兼容API思考强度：default/low/medium/high/xhigh/max/ultra（DeepSeek兼容仅 low/high/max）
   apiReasoningEffort: 'default',
   apiMaxToken: 4096,
-  // 0 使用模型 Profile/安全默认值，正整数仅对重启后创建的新任务生效。
+  // 0 使用模型 Profile/安全默认值，正整数可缩小或显式放大窗口，对重启后创建的新任务生效。
   apiContextWindowTokens: 0,
+  // 会话压缩：达到可用输入预算的触发比例时折叠为摘要，并保留最近原文的比例。
+  contextCompactionEnabled: true,
+  contextCompactionTriggerPercent: 65,
+  contextCompactionKeepPercent: 35,
+  contextCompactionSummaryMaxChars: 2400,
+  // 前缀缓存空闲分钟；超过后视为缓存已冷并提前压缩。0 使用默认 360。
+  contextPrefixCacheIdleMinutes: 360,
+  contextCompactionMinReclaimTokens: 1024,
   personalMemoryMode: 'automatic',
   semanticSummaryGroups: [],
   personalMemoryRecallMaxItems: 6,

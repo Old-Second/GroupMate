@@ -5,7 +5,7 @@ import { contextArtifactRefsRetainedOrCleared } from '../agent/context/context-a
 import { contextWireHash } from '../agent/context/context-plan.js';
 import { MAX_CONTEXT_PLANNER_INPUT_BYTES, planModelTurn as planContextModelTurn } from '../agent/context/context-planner.js';
 import { createContextSpanV1, domainSeparatedContextHash, MAX_CONTEXT_SPANS, parseContextSpanV1 } from '../agent/context/context-span.js';
-import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../agent/context/context-token-estimator.js';
+import { CONTEXT_TOKEN_ESTIMATOR_VERSION, MAX_CONTEXT_MESSAGES } from '../agent/context/context-token-estimator.js';
 import { modelCapabilityStableHash } from '../agent/model/model-capability.js';
 import { MODEL_TURN_CAPACITY_LIMITS } from '../agent/run/model-turn-capacity.js';
 import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js';
@@ -218,7 +218,7 @@ function plannerBudget(checkpoint, request) {
         schemaVersion: 1,
         maxInputTokens,
         maxSerializedMessageBytes: Math.min(MAX_CONTEXT_PLANNER_INPUT_BYTES, RUN_RESOURCE_LIMITS.providerProtocolChainBytes) - (correction ? 0 : CORRECTION_RESERVE_BYTES),
-        maxMessages: correction ? 128 : 127,
+        maxMessages: correction ? MAX_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES - 1,
         estimatedToolTokens,
         reservedOutputTokens,
         // Count only images actually selected, so optional history can be trimmed.

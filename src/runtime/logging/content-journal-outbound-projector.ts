@@ -1,6 +1,5 @@
 import { types as utilTypes } from 'node:util'
 import type { SessionAddress } from '../../agent/contracts/identity.js'
-import { RUN_RESOURCE_LIMITS } from '../../agent/run/run-limits.js'
 import type {
   DeliveryResult,
   OutboundMedia,
@@ -26,6 +25,14 @@ import {
   type ProjectedJournalEvent,
   type UnknownRecord
 } from './content-journal-projection.js'
+
+/**
+ * Outbound QQ messages are far smaller than a model response, so their journal
+ * budget stays at 1 MiB even though the provider response ceiling grew for
+ * long-context output. Keeping it independent also keeps the journal from
+ * writing megabytes for a single delivery.
+ */
+const CONTENT_JOURNAL_OUTBOUND_MAX_BYTES = 1 * 1_024 * 1_024
 
 export type GroupMateOutboundJournalEvent =
   | {
@@ -321,7 +328,7 @@ function projectRecallResult (value: unknown): Readonly<Record<string, unknown>>
 function boundedOutboundPayload (
   value: Readonly<Record<string, unknown>>
 ): Readonly<Record<string, unknown>> {
-  return boundedRecord(value, RUN_RESOURCE_LIMITS.providerResponseBytes, 'outbound payload')
+  return boundedRecord(value, CONTENT_JOURNAL_OUTBOUND_MAX_BYTES, 'outbound payload')
 }
 
 export function projectOutboundJournalEvent (
@@ -330,7 +337,7 @@ export function projectOutboundJournalEvent (
   const input = ownDataRecord(value, 'outbound journal event')
   const budget = createProjectionBudget({
     maxNodes: CONTENT_JOURNAL_JSON_NODE_LIMIT,
-    maxTextBytes: RUN_RESOURCE_LIMITS.providerResponseBytes
+    maxTextBytes: CONTENT_JOURNAL_OUTBOUND_MAX_BYTES
   })
   if (input.type === 'qq.outbound.deliver') {
     const keys = [

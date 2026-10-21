@@ -2,12 +2,13 @@ import type { SessionAddress } from '../contracts/identity.js'
 import { parseJsonValue, type JsonValue } from '../model/json-value.js'
 import { canonicalSessionKey } from './conversation-scope.js'
 import {
+  MAX_AGENT_SESSION_BYTES,
   parseAgentSessionState,
   type AgentSessionState
 } from './agent-session-state.js'
 import type { SessionCodec, SessionRecord } from './session-record.js'
 
-const SESSION_BYTES = 512 * 1_024
+const SESSION_BYTES = MAX_AGENT_SESSION_BYTES
 
 function record (value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -48,7 +49,8 @@ function parseCanonicalRecord (
   const cloned = parseJsonValue(value, {
     maxBytes: SESSION_BYTES,
     maxDepth: 36,
-    maxNodes: 40_000
+    // See `parseAgentSessionState`: a long conversation is bounded by bytes.
+    maxNodes: 1_048_576
   })
   const session = record(cloned, 'agent session')
   exact(session, [

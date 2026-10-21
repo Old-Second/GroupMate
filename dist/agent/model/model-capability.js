@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
-const MAX_CAPABILITY_TOKENS = 1_048_576;
+/**
+ * Structural ceiling for a declared model window. Long-context providers now
+ * ship 1M-token and larger windows, so the override parser must accept them;
+ * the runtime still bounds what one request may carry through the context
+ * budget and the request byte ceiling.
+ */
+export const MAX_CAPABILITY_TOKENS = 16_777_216;
 const CAPABILITY_KEYS = Object.freeze([
     'schemaVersion',
     'source',
@@ -132,13 +138,16 @@ export function resolveModelCapabilitySnapshot(input) {
         return base;
     const known = profileSnapshot !== undefined;
     if (known) {
-        if ((override.contextWindowTokens ?? base.contextWindowTokens) > base.contextWindowTokens ||
-            (override.maxOutputTokens ?? 0) > base.maxOutputTokens ||
+        // The user may declare a larger window than the profile shipped with: a
+        // provider can raise a model's window without a plugin update, and the
+        // override is the explicit escape hatch. Provider features and the output
+        // ceiling still may not be widened beyond what the profile knows.
+        if ((override.maxOutputTokens ?? 0) > base.maxOutputTokens ||
             (override.promptCaching !== undefined && override.promptCaching !== 'unknown' &&
                 override.promptCaching !== base.promptCaching) ||
             (override.usageExtensions !== undefined && override.usageExtensions
                 .some(extension => !base.usageExtensions.includes(extension)))) {
-            throw new TypeError('model capability override may only narrow a known profile');
+            throw new TypeError('model capability override may only widen the context window');
         }
     }
     else if ((override.promptCaching !== undefined && override.promptCaching !== 'unknown') ||

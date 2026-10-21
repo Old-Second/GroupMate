@@ -81,18 +81,15 @@ test('canonical model messages reject non-public or invalid image URLs', () => {
   }
 })
 
-test('canonical message bytes accept exactly 512 KiB and reject one byte more', () => {
-  const empty = deepFreeze([{ role: 'user' as const, content: '' }])
-  const overhead = serializedModelMessagesBytes(empty)
-  const exact = deepFreeze([{
-    role: 'user' as const,
-    content: 'x'.repeat(MAX_CONTEXT_CANONICAL_MESSAGE_BYTES - overhead)
-  }])
-  assert.equal(serializedModelMessagesBytes(exact), MAX_CONTEXT_CANONICAL_MESSAGE_BYTES)
-  assert.throws(() => serializedModelMessagesBytes(deepFreeze([{
-    role: 'user' as const,
-    content: `${exact[0].content}x`
-  }])), TypeError)
+test('canonical message bytes accept the long-context ceiling and reject more', () => {
+  // No single message may exceed the 512K-code-unit string bound, so the
+  // whole-list ceiling is probed with several large messages.
+  const largeMessage = () => deepFreeze({ role: 'user' as const, content: 'x'.repeat(500_000) })
+  const accepted = deepFreeze(Array.from({ length: 33 }, largeMessage))
+  assert.ok(serializedModelMessagesBytes(accepted) <= MAX_CONTEXT_CANONICAL_MESSAGE_BYTES)
+  assert.throws(() => serializedModelMessagesBytes(
+    deepFreeze(Array.from({ length: 34 }, largeMessage))
+  ), TypeError)
 })
 
 test('canonical message JSON recursively sorts arbitrary tool and provider-state keys', () => {

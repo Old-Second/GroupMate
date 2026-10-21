@@ -75,6 +75,36 @@
         "data": "apiContextWindowTokens"
       },
       {
+        "type": "check",
+        "label": "启用会话压缩",
+        "data": "contextCompactionEnabled"
+      },
+      {
+        "type": "number",
+        "label": "压缩触发比例（%）",
+        "data": "contextCompactionTriggerPercent"
+      },
+      {
+        "type": "number",
+        "label": "压缩后保留比例（%）",
+        "data": "contextCompactionKeepPercent"
+      },
+      {
+        "type": "number",
+        "label": "历史摘要字符上限",
+        "data": "contextCompactionSummaryMaxChars"
+      },
+      {
+        "type": "number",
+        "label": "前缀缓存空闲分钟",
+        "data": "contextPrefixCacheIdleMinutes"
+      },
+      {
+        "type": "number",
+        "label": "提前压缩最小回收 Token",
+        "data": "contextCompactionMinReclaimTokens"
+      },
+      {
         "type": "select",
         "label": "思考模式",
         "data": "apiThinkingMode",

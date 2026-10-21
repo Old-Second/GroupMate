@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import type { AgentContentPart, AgentMessage } from '../../src/agent/contracts/content.js'
 import { AgentError, serializeAgentError } from '../../src/agent/contracts/error.js'
 import { ContextEngine } from '../../src/agent/context/context-engine.js'
+import { MAX_CONTEXT_SPANS } from '../../src/agent/context/context-span.js'
 import { planModelTurn } from '../../src/agent/context/context-planner.js'
 import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../../src/agent/context/context-token-estimator.js'
 import { resourceReferenceLabel } from '../../src/agent/contracts/content-projection.js'
@@ -780,7 +781,7 @@ test('maxItems and maxBytes reject input before token estimation', async () => {
     maxBytes: 1
   }), (error: unknown) => error instanceof AgentError && error.code === 'context_budget_exceeded')
   await assert.rejects(engine.prepare(input({
-    runtimeFacts: Array.from({ length: 127 }, (_, index) => item(
+    runtimeFacts: Array.from({ length: MAX_CONTEXT_SPANS }, (_, index) => item(
       `hard-item-${index}`, 'runtime_fact', `${index}`
     ))
   }), {
@@ -788,10 +789,10 @@ test('maxItems and maxBytes reject input before token estimation', async () => {
     maxItems: 1_000
   }), (error: unknown) => error instanceof AgentError && error.code === 'context_budget_exceeded')
   await assert.rejects(engine.prepare(input({
-    currentRequest: item('current', 'current_request', 'x'.repeat(512 * 1_024))
+    currentRequest: item('current', 'current_request', 'x'.repeat(2_000))
   }), {
     ...budget(1_000),
-    maxBytes: 1_000_000
+    maxBytes: 1_000
   }), (error: unknown) => error instanceof AgentError && error.code === 'context_budget_exceeded')
   assert.equal(estimates, 0)
 })

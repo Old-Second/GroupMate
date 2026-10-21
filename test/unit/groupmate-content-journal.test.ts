@@ -1045,14 +1045,14 @@ test('rejects unbounded hostile and binary generic content with fixed failure ev
     ...modelRequestFixture(),
     tools: [{
       ...modelRequestFixture().tools[0],
-      parameters: { nodes: Array.from({ length: 8_200 }, (_, index) => index) }
+      parameters: { nodes: Array.from({ length: 1_100_000 }, (_, index) => index) }
     }]
   })
   invalidRequests.push({
     ...modelRequestFixture(),
     tools: [{
       ...modelRequestFixture().tools[0],
-      parameters: { body: 'x'.repeat(600 * 1_024) }
+      parameters: { body: 'x'.repeat(17 * 1_024 * 1_024) }
     }]
   })
 

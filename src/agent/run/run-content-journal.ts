@@ -87,7 +87,7 @@ export function detachedRunContentSnapshot<T> (
   return parseJsonValue(value, {
     maxBytes,
     maxDepth: 32,
-    maxNodes: 8_192
+    maxNodes: 1_048_576
   }) as unknown as T
 }
 

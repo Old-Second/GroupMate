@@ -129,9 +129,9 @@ test('Phase 7 report locks memory stops and every RunStore and artifact hard lim
     crashRecoveryPeakDeltaBytes: 45 * MIB,
     catastrophicMaximumMultiplier: 2
   })
-  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.requestBytes, 512 * 1_024)
-  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.checkpointBytes, 256 * 1_024)
-  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.namespaceBytes, 8 * MIB)
+  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.requestBytes, 16 * 1_024 * 1_024)
+  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.checkpointBytes, 12 * 1_024 * 1_024)
+  assert.equal(PHASE_7_EXPECTED_RUN_RESOURCE_LIMITS.namespaceBytes, 32 * MIB)
   assert.deepEqual(PHASE_7_EXPECTED_RUN_ADMISSION_LIMITS, {
     activeRuns: 2,
     queuedRuns: 3
@@ -141,7 +141,7 @@ test('Phase 7 report locks memory stops and every RunStore and artifact hard lim
   assert.equal(PHASE_7_EXPECTED_CONTEXT_ARTIFACT_RESOURCE_LIMITS.sourceRefs, 32)
   assert.equal(PHASE_7_EXPECTED_CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceKeys, 128)
   assert.equal(PHASE_7_EXPECTED_CONTEXT_ARTIFACT_RESOURCE_LIMITS.namespaceBytes, 2 * MIB)
-  assert.equal(report.limitContracts.plannerInputBytes, 512 * 1_024)
+  assert.equal(report.limitContracts.plannerInputBytes, 16 * 1_024 * 1_024)
   assert.equal(report.gates.admissionLimits, true)
   assert.equal(report.gates.runStoreLimits, true)
   assert.equal(report.gates.contextArtifactLimits, true)

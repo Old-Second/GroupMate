@@ -15,11 +15,15 @@ import {
   createContextSpanV1,
   parseContextSpanV1
 } from '../../src/agent/context/context-span.js'
-import { CONTEXT_TOKEN_ESTIMATOR_VERSION } from '../../src/agent/context/context-token-estimator.js'
+import {
+  CONTEXT_TOKEN_ESTIMATOR_VERSION,
+  MAX_CONTEXT_CANONICAL_MESSAGE_BYTES
+} from '../../src/agent/context/context-token-estimator.js'
 import {
   CONTEXT_WIRE_HASH_DOMAIN,
   CONTEXT_PLAN_HASH_DOMAIN,
   MAX_CONTEXT_PLAN_BYTES,
+  MAX_CONTEXT_PLAN_REFS,
   contextWireHash,
   contextPlanHash,
   createContextPlanV1,
@@ -521,67 +525,73 @@ test('plan structural ranges, ref counts and message hard limits are exact', () 
     artifactRefs: [artifactB, artifactA]
   })), TypeError)
 
-  const omitted128 = Array.from({ length: 128 }, (_, index) => ({
+  const omittedAll = Array.from({ length: MAX_CONTEXT_PLAN_REFS }, (_, index) => ({
     spanId: `span:omitted:${index}`,
     reason: 'budget' as const
   }))
   const emptyDraft = {
     ...draft,
     included: [],
-    omitted: omitted128,
+    omitted: omittedAll,
     estimatedInputTokens: 0,
     serializedMessageBytes: 2,
     messageCount: 0
   }
-  assert.equal(createContextPlanV1(deepFreeze(emptyDraft)).omitted.length, 128)
+  assert.equal(createContextPlanV1(deepFreeze(emptyDraft)).omitted.length, MAX_CONTEXT_PLAN_REFS)
   assert.throws(() => createContextPlanV1(deepFreeze({
     ...emptyDraft,
-    omitted: [...omitted128, { spanId: 'span:omitted:128', reason: 'budget' as const }]
+    omitted: [...omittedAll, { spanId: 'span:omitted:overflow', reason: 'budget' as const }]
   })), TypeError)
   assert.equal(createContextPlanV1(deepFreeze({
     ...draft,
     included: [included[0]],
     messageCount: 1,
-    serializedMessageBytes: 512 * 1_024
-  })).serializedMessageBytes, 512 * 1_024)
+    serializedMessageBytes: MAX_CONTEXT_CANONICAL_MESSAGE_BYTES
+  })).serializedMessageBytes, MAX_CONTEXT_CANONICAL_MESSAGE_BYTES)
   assert.throws(() => createContextPlanV1(deepFreeze({
     ...draft,
     included: [included[0]],
     messageCount: 1,
-    serializedMessageBytes: 512 * 1_024 + 1
+    serializedMessageBytes: MAX_CONTEXT_CANONICAL_MESSAGE_BYTES + 1
   })), TypeError)
 
-  let lastAccepted = 0
-  let firstRejected = 0
-  for (let idLength = 16; idLength <= 128; idLength += 1) {
-    const entries = Array.from({ length: 128 }, (_, index) => {
-      const prefix = `span:${index}:`
-      return {
-        spanId: `${prefix}${'x'.repeat(idLength - prefix.length)}`,
-        representation: 'raw' as const,
-        wireStart: index,
-        wireCount: 1,
-        wireHash: '6'.repeat(64),
-        contentHash: '5'.repeat(64)
-      }
-    })
-    try {
-      const plan = createContextPlanV1(deepFreeze({
-        ...draft,
-        included: entries,
-        estimatedInputTokens: 128,
-        serializedMessageBytes: 128,
-        messageCount: 128
-      }))
-      assert.ok(Buffer.byteLength(JSON.stringify(plan), 'utf8') <= MAX_CONTEXT_PLAN_BYTES)
-      lastAccepted = idLength
-    } catch {
-      firstRejected = idLength
-      break
+  // Probe the exact ref ceiling instead of every intermediate size: the plan
+  // now accepts thousands of entries, so a one-by-one sweep would build
+  // millions of objects.
+  const entriesAtLimit = Array.from({ length: MAX_CONTEXT_PLAN_REFS }, (_, index) => {
+    const prefix = `span:${index}:`
+    return {
+      spanId: `${prefix}${'x'.repeat(128 - prefix.length)}`,
+      representation: 'raw' as const,
+      wireStart: index,
+      wireCount: 1,
+      wireHash: '6'.repeat(64),
+      contentHash: '5'.repeat(64)
     }
-  }
-  assert.ok(lastAccepted >= 16)
-  assert.equal(firstRejected, lastAccepted + 1)
+  })
+  const planAtLimit = createContextPlanV1(deepFreeze({
+    ...draft,
+    included: entriesAtLimit,
+    estimatedInputTokens: MAX_CONTEXT_PLAN_REFS,
+    serializedMessageBytes: MAX_CONTEXT_PLAN_REFS,
+    messageCount: MAX_CONTEXT_PLAN_REFS
+  }))
+  assert.equal(planAtLimit.included.length, MAX_CONTEXT_PLAN_REFS)
+  assert.ok(Buffer.byteLength(JSON.stringify(planAtLimit), 'utf8') <= MAX_CONTEXT_PLAN_BYTES)
+  assert.throws(() => createContextPlanV1(deepFreeze({
+    ...draft,
+    included: [...entriesAtLimit, {
+      spanId: 'span:overflow',
+      representation: 'raw' as const,
+      wireStart: MAX_CONTEXT_PLAN_REFS,
+      wireCount: 1,
+      wireHash: '6'.repeat(64),
+      contentHash: '5'.repeat(64)
+    }],
+    estimatedInputTokens: MAX_CONTEXT_PLAN_REFS + 1,
+    serializedMessageBytes: MAX_CONTEXT_PLAN_REFS + 1,
+    messageCount: MAX_CONTEXT_PLAN_REFS + 1
+  })), TypeError)
 })
 
 test('artifact codec binds stable origin generation, source refs, size and hashes', () => {

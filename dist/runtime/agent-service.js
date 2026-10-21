@@ -14,6 +14,8 @@ import { createFrozenObservationPolicy } from '../agent/run/run-observation.js';
 import { createRunRef } from '../agent/run/run-reference.js';
 import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
+import { compactSessionHistory, prefixCacheLikelyCold } from '../agent/session/session-history-compaction.js';
+import { historySummaryMessages } from '../agent/session/session-history-summary.js';
 import { progressResumeStateFromEvents } from './run-progress-presenter.js';
 import { activateRequestObservation, beginRequestObservation, createRequestObservationDraft } from './request-observation.js';
 import { createRunContextPlanner } from './run-context-planner.js';
@@ -99,6 +101,8 @@ function isApprovalRecoveryDeferred(value) {
 }
 const EMPTY_ITEMS = Object.freeze([]);
 const EMPTY_HOST_IMAGE_LINKS = Object.freeze(new Map());
+/** Share of a context source discarded per trim, so cuts amortize over turns. */
+const CONTEXT_TRIM_BATCH_PERCENT = 20;
 function imageResourceParts(message) {
     return message.parts.filter((part) => (part.type === 'resource_ref' && part.resourceType === 'image'));
 }
@@ -436,18 +440,48 @@ function protocolMessageItem(span, modelMessage, index) {
         })
     });
 }
-function sessionItems(items) {
-    return Object.freeze(items.flatMap(item => {
-        if (item.kind === 'message') {
-            return [Object.freeze({
-                    id: `session:${item.message.id}`,
-                    source: 'session_history',
-                    message: item.message,
-                    ...(item.providerState === undefined ? {} : { assistantState: item.providerState })
-                })];
-        }
-        return item.messages.map((message, index) => protocolMessageItem(item, message, index));
+function historySummaryItems(state) {
+    const summary = state.historySummary;
+    if (summary === undefined)
+        return EMPTY_ITEMS;
+    const sourceId = `history-summary:${summary.coveredThrough}`;
+    return Object.freeze(historySummaryMessages(summary).map(entry => {
+        const id = `history-summary:${entry.role}`;
+        return Object.freeze({
+            id: `session:${id}`,
+            source: 'session_history',
+            message: Object.freeze({
+                id,
+                role: entry.role,
+                parts: Object.freeze([Object.freeze({ type: 'text', text: entry.text })]),
+                createdAt: summary.updatedAt,
+                provenance: Object.freeze({
+                    source: 'session_summary',
+                    trust: 'untrusted',
+                    sensitivity: 'sensitive',
+                    sourceId,
+                    createdAt: summary.updatedAt
+                })
+            })
+        });
     }));
+}
+function sessionItems(state) {
+    const items = state.messages;
+    return Object.freeze([
+        ...historySummaryItems(state),
+        ...items.flatMap(item => {
+            if (item.kind === 'message') {
+                return [Object.freeze({
+                        id: `session:${item.message.id}`,
+                        source: 'session_history',
+                        message: item.message,
+                        ...(item.providerState === undefined ? {} : { assistantState: item.providerState })
+                    })];
+            }
+            return item.messages.map((message, index) => protocolMessageItem(item, message, index));
+        })
+    ]);
 }
 function atomicGroups(items) {
     const groups = [];
@@ -491,12 +525,16 @@ function boundedOptionalContext(mandatory, runtimeFacts, history, groupContext, 
         (memoryGroups.length > 0 || groupGroups.length > 0 || historyGroups.length > 0)) {
         // Apply the same retention order before projection as the Context Planner:
         // ambient group/history must not erase relevance-filtered memory first.
-        if (groupGroups.length > 0)
-            groupGroups.shift();
-        else if (historyGroups.length > 0)
-            historyGroups.shift();
-        else
-            memoryGroups.shift();
+        // Drop a batch rather than the single oldest group: the group window is
+        // re-read in full every turn, so dropping one entry per turn rewrites the
+        // prompt at that position on every turn, while a larger cut keeps the
+        // surviving window byte-identical across the turns until the next cut.
+        const source = groupGroups.length > 0
+            ? groupGroups
+            : historyGroups.length > 0
+                ? historyGroups
+                : memoryGroups;
+        source.splice(0, Math.max(1, Math.ceil(source.length * CONTEXT_TRIM_BATCH_PERCENT / 100)));
     }
     return Object.freeze({
         runtimeFacts: Object.freeze([...runtimeFacts]),
@@ -569,7 +607,7 @@ function activeFinalEnvelope(result, context, sessionPersistence, sessionSaveDur
         });
     return finalEnvelope(result, requestObservationDraft, sessionPersistence);
 }
-function appendTerminalTurn(record, request, result, updatedAt, dependencies) {
+function appendTerminalTurn(record, request, result, updatedAt, dependencies, cacheCold = false) {
     const existing = [...record.state.messages];
     const appended = [];
     const ids = new Set(existing.map(item => (item.kind === 'message' ? item.message.id : item.id)));
@@ -581,20 +619,39 @@ function appendTerminalTurn(record, request, result, updatedAt, dependencies) {
         appended.push(Object.freeze({ kind: 'message', message: result.output,
             ...(result.assistantState === undefined ? {} : { providerState: result.assistantState }) }));
     }
-    const messages = [...existing, ...appended].slice(-128);
+    // Fold older turns into the persistent summary in one batch instead of
+    // trimming to a fixed message count, so the session block that leads every
+    // prompt stays byte-identical between folds. An already-cold provider prefix
+    // makes the fold free, so it runs early after a long idle gap.
+    const compacted = compactSessionHistory([...existing, ...appended], {
+        budget: request.contextBudget,
+        updatedAt,
+        cacheCold,
+        ...(request.historyCompaction === undefined
+            ? {}
+            : { policy: request.historyCompaction }),
+        ...(record.state.historySummary === undefined
+            ? {}
+            : { summary: record.state.historySummary })
+    });
+    const messages = [...compacted.items];
     let state;
     while (state === undefined) {
         try {
             state = parseAgentSessionState({
-                schemaVersion: dependencies === undefined ? 1 : 2,
+                schemaVersion: 3,
                 ...(dependencies === undefined ? {} : { contextDependencies: dependencies }),
                 messages,
+                ...(compacted.summary === undefined ? {} : { historySummary: compacted.summary }),
                 ...(record.state.migratedFrom === undefined
                     ? {}
                     : { migratedFrom: record.state.migratedFrom })
             });
         }
         catch (error) {
+            // Structural safety net only. The parser bounds are larger than the
+            // compaction target, so this path is not expected to run; when it does,
+            // dropping the oldest item keeps the turn rather than losing the save.
             if (messages.length <= appended.length)
                 throw error;
             messages.shift();
@@ -1110,7 +1167,7 @@ export class AgentService {
         if (port === undefined)
             return EMPTY_HOST_IMAGE_LINKS;
         const replayed = Object.freeze([
-            ...(session === null ? EMPTY_ITEMS : sessionItems(session.state.messages)),
+            ...(session === null ? EMPTY_ITEMS : sessionItems(session.state)),
             ...(runtime.groupContext ?? EMPTY_ITEMS),
             ...(runtime.memoryContext ?? EMPTY_ITEMS)
         ]);
@@ -1143,7 +1200,7 @@ export class AgentService {
             const runtimeFacts = Object.freeze([...(runtime.runtimeFacts ?? EMPTY_ITEMS)]);
             const history = dropOptional || session === null
                 ? EMPTY_ITEMS
-                : withHostImageLinks(sessionItems(session.state.messages), hostImageLinks);
+                : withHostImageLinks(sessionItems(session.state), hostImageLinks);
             const groupContext = dropOptional
                 ? EMPTY_ITEMS
                 : withHostImageLinks(Object.freeze([...(runtime.groupContext ?? EMPTY_ITEMS)]), hostImageLinks);
@@ -1355,11 +1412,15 @@ export class AgentService {
                 result.kind === 'completed' && contextCurrent) {
                 const sessionSaveStarted = readMonotonic(this.#monotonicNow);
                 try {
-                    const next = appendTerminalTurn(pending.session, pending.request, result, this.#now().toISOString(), pending.participation === undefined || pending.binding.contextDependencies === undefined
+                    const savedAt = this.#now().toISOString();
+                    // A prefix the provider has already evicted can be rewritten for
+                    // free, so the batch trim runs early after a long idle gap.
+                    const cacheCold = prefixCacheLikelyCold(pending.session.updatedAt, savedAt, pending.request.historyCompaction?.cacheIdleExpiryMs);
+                    const next = appendTerminalTurn(pending.session, pending.request, result, savedAt, pending.participation === undefined || pending.binding.contextDependencies === undefined
                         ? pending.binding.contextDependencies
                         : Object.freeze({ schemaVersion: 1, memories: pending.binding.contextDependencies.memories,
                             authorityStamp: pending.binding.contextDependencies.authorityStamp,
-                            ...(pending.binding.contextDependencies.scene === undefined ? {} : { scene: pending.binding.contextDependencies.scene }) }));
+                            ...(pending.binding.contextDependencies.scene === undefined ? {} : { scene: pending.binding.contextDependencies.scene }) }), cacheCold);
                     const saveOptions = {
                         signal: undefined,
                         ...(pending.request.sessionTtlSeconds === undefined

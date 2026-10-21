@@ -11,8 +11,10 @@ import type { ContextArtifactV1 } from '../../src/agent/context/context-artifact
 import {
   createContextSpanV1,
   domainSeparatedContextHash,
+  MAX_CONTEXT_SPANS,
   type ContextSpanV1
 } from '../../src/agent/context/context-span.js'
+import { MAX_CONTEXT_MESSAGES } from '../../src/agent/context/context-token-estimator.js'
 import type { RunCheckpoint } from '../../src/agent/run/run-checkpoint.js'
 import type { ToolExecutionLedger } from '../../src/agent/run/tool-ledger.js'
 import { toolResultForModel } from '../../src/agent/tools/tool-result.js'
@@ -404,28 +406,38 @@ test('correction planning appends one mandatory tool-disabled instruction', asyn
   assert.match(corrected.messages.at(-1)?.content ?? '', /不要调用工具/)
 })
 
-test('128 initial spans leave space for tool generations and an append-only correction', async () => {
+test('a near-capacity initial span set leaves space for tool generations and an append-only correction', async () => {
+  // Leave the 16-slot generation reserve plus the tool turn itself unused, so
+  // the first plan can still absorb a ready tool protocol span. The item
+  // ceiling and the token budget are independent now, so a span set this large
+  // only fits a long-context window; the point here is the structural reserve.
   const spans = Object.freeze([
-    ...Array.from({ length: 126 }, (_, index) => {
+    ...Array.from({ length: MAX_CONTEXT_SPANS - 20 }, (_, index) => {
       const original = ordinarySpan(`many-${index}`, 'runtime_fact', 'user', '历史')
       const { schemaVersion, serializedBytes, estimatedTokens, ...draft } = original
       return createContextSpanV1(Object.freeze({ ...draft, semanticOrder: index + 4 }))
     }), ...baseSpans.filter(span => span.requirement === 'mandatory')
   ])
-  assert.equal(spans.length, 128)
+  assert.equal(spans.length, MAX_CONTEXT_SPANS - 18)
+  const capability = Object.freeze({
+    ...plannerCheckpoint().modelCapability,
+    contextWindowTokens: 1_048_576
+  })
   const planner = createRunContextPlanner({ namespaceRef: runRef, initialSpans: spans })
-  const first = await planner.planModelTurn(plannerCheckpoint(),
+  const first = await planner.planModelTurn(plannerCheckpoint({ modelCapability: capability }),
     Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal)
   const pending = protocol(1, 'capacity-tool')
   const second = await planner.planModelTurn(plannerCheckpoint({
+    modelCapability: capability,
     contextPlan: first.plan, messages: first.messages, pendingContextMessages: Object.freeze([pending.assistant, pending.tool]),
     toolLedgers: Object.freeze([pending.ledger]), step: 1
   }), Object.freeze({ kind: 'normal', transition: 'normal' }), new AbortController().signal)
   const corrected = await planner.planModelTurn(plannerCheckpoint({
+    modelCapability: capability,
     contextPlan: second.plan, messages: second.messages, toolLedgers: Object.freeze([pending.ledger]), step: 1
   }), Object.freeze({ kind: 'correction', transition: 'normal' }), new AbortController().signal)
   assert.deepEqual(corrected.messages.slice(0, -1), second.messages)
-  assert.ok(corrected.messages.length <= 128)
+  assert.ok(corrected.messages.length <= MAX_CONTEXT_MESSAGES)
 })
 
 test('ordinary history compacts into provenance-linked untrusted excerpts with bounded storage', async () => {
@@ -464,7 +476,10 @@ test('a read tool can follow a compacted normal history plan without changing it
       priority: 'normal', semanticOrder: index + 4,
       provenance: Object.freeze({ ...draft.provenance, kind: 'group_snapshot' }) }))
   })
-  const capability = Object.freeze({ ...plannerCheckpoint().modelCapability, contextWindowTokens: 1_048_576 })
+  // A 32k window forces the optional history over its token budget, which is
+  // what produces the compacted plan this test follows. The request byte
+  // ceiling is far larger now, so only the token budget can trigger it.
+  const capability = Object.freeze({ ...plannerCheckpoint().modelCapability, contextWindowTokens: 32_768 })
   const planner = createRunContextPlanner({ namespaceRef: runRef,
     initialSpans: Object.freeze([...baseSpans, ...history]), artifactStore: store })
   const first = await planner.planModelTurn(plannerCheckpoint({ modelCapability: capability }),

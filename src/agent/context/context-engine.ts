@@ -23,7 +23,8 @@ import { MAX_CONTEXT_PLANNER_INPUT_BYTES, planModelTurn } from './context-planne
 import {
   asciiContextCompare,
   canonicalizeModelMessages,
-  CONTEXT_TOKEN_ESTIMATOR_VERSION
+  CONTEXT_TOKEN_ESTIMATOR_VERSION,
+  MAX_CONTEXT_MESSAGES
 } from './context-token-estimator.js'
 
 export interface ContextEngineOptions {
@@ -633,7 +634,7 @@ function strictPlannerGate (
         // Task 10 switches the production seam to the fixed Planner estimator and exact budget.
         maxInputTokens: Number.MAX_SAFE_INTEGER,
         maxSerializedMessageBytes: 512 * 1_024,
-        maxMessages: Math.min(maxMessages, 128),
+        maxMessages: Math.min(maxMessages, MAX_CONTEXT_MESSAGES),
         estimatedToolTokens: 0,
         reservedOutputTokens: 0
       }),

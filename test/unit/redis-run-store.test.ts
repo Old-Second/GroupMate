@@ -1199,10 +1199,15 @@ test('RunCheckpointCodec rejects non-JSON, unknown fields and every checkpoint/e
     ...source,
     messages: Object.freeze([{ role: 'user', content: 'ok', runtime: () => undefined }])
   } as unknown as RunCheckpoint), /unsupported value|unknown model message key/)
+  // A single message is capped at 256 KiB, so the checkpoint byte limit is
+  // crossed with many large messages rather than one oversized string.
   assert.throws(() => codec.encode({
     ...source,
-    messages: Object.freeze([{ role: 'user', content: 'x'.repeat(257 * 1_024) }])
-  } as unknown as RunCheckpoint), /checkpoint byte limit/)
+    messages: Object.freeze(Array.from({ length: 64 }, () => ({
+      role: 'user' as const,
+      content: 'x'.repeat(256 * 1_024)
+    })))
+  } as unknown as RunCheckpoint), /byte limit/)
 
   const tooManyEvents = Array.from({ length: 97 }, (_, index) => event(source.runId, index))
   assert.throws(() => codec.encode({
@@ -1246,7 +1251,7 @@ test('RedisRunStore enforces checkpoint key and namespace byte budgets before wr
   const largeRedis = new FakeRedis(() => Date.parse(timestamp))
   await largeRedis.set(
     'GROUPMATE:RUN:v1:approval-index:bounded-fixture',
-    'x'.repeat(8 * 1_024 * 1_024)
+    'x'.repeat(33 * 1_024 * 1_024)
   )
   const largeStore = new RedisRunStore({ client: largeRedis })
   await assert.rejects(largeStore.create(checkpoint('run-byte-limit')), error => (

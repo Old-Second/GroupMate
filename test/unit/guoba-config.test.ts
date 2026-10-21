@@ -165,15 +165,46 @@ test('leaves scalar Guoba values unchanged', () => {
 })
 
 test('normalizes the explicit context window override with zero as profile default', () => {
-  for (const value of [0, 1, 65_536, 1_000_000, 1_048_576]) {
+  for (const value of [0, 1, 65_536, 1_000_000, 1_048_576, 16_777_216]) {
     assert.equal(normalizeGuobaConfigValue('apiContextWindowTokens', value), value)
   }
-  for (const value of [-1, 1.5, '65536', 1_048_577, Number.NaN]) {
+  for (const value of [-1, 1.5, '65536', 16_777_217, Number.NaN]) {
     assert.throws(
       () => normalizeGuobaConfigValue('apiContextWindowTokens', value),
       /模型上下文窗口配置无效/
     )
   }
+})
+
+test('validates the compaction percentages as a pair', () => {
+  assert.equal(normalizeGuobaConfigValue('contextCompactionTriggerPercent', 65), 65)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionKeepPercent', 35), 35)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionEnabled', false), false)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionSummaryMaxChars', 20_000), 20_000)
+  assert.equal(normalizeGuobaConfigValue('contextPrefixCacheIdleMinutes', 0), 0)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionMinReclaimTokens', 0), 0)
+  for (const value of [0, 100, 1.5, '65']) {
+    assert.throws(
+      () => normalizeGuobaConfigValue('contextCompactionTriggerPercent', value),
+      /压缩触发比例/
+    )
+  }
+  for (const value of [0, 99, 1.5]) {
+    assert.throws(
+      () => normalizeGuobaConfigValue('contextCompactionKeepPercent', value),
+      /保留比例/
+    )
+  }
+  assert.throws(
+    () => buildGuobaConfigPatch({
+      contextCompactionTriggerPercent: 40,
+      contextCompactionKeepPercent: 50
+    }, {
+      current: { contextCompactionTriggerPercent: 65, contextCompactionKeepPercent: 35 },
+      supportedKeys: ['contextCompactionTriggerPercent', 'contextCompactionKeepPercent']
+    }),
+    /保留比例必须小于压缩触发比例/
+  )
 })
 
 test('normalizes the OpenAI compatibility profile explicitly and fail closed', () => {

@@ -18,7 +18,7 @@ export function projectParticipationObservation(value) {
     return Object.freeze({ type: 'participation.shadow', payload: Object.freeze(data) });
 }
 export const CONTENT_JOURNAL_JSON_DEPTH_LIMIT = 32;
-export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 8_192;
+export const CONTENT_JOURNAL_JSON_NODE_LIMIT = 1_048_576;
 export function createProjectionBudget(options) {
     if (!Number.isSafeInteger(options.maxNodes) || options.maxNodes <= 0 ||
         !Number.isSafeInteger(options.maxTextBytes) || options.maxTextBytes <= 0) {
