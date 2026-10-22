@@ -789,17 +789,21 @@ function approvalText(interruption, ttlSeconds) {
  *
  * Values are clamped instead of rejected so a hand-edited config file can
  * never stop ordinary replies; the management UI validates before saving.
- * `keepPercent` is forced below `triggerPercent`, otherwise a fold would
- * immediately cross its own high-water mark again on the next turn.
+ * `contextCompactionTriggerTokens` is an absolute history mark, so a deployment
+ * can declare a 1M window and still fold at 256k tokens. When it is 0 the
+ * trigger is the configured share of the available input budget. The keep share
+ * is relative to the history present at the fold, so it may legitimately exceed
+ * the trigger share; it is only bounded below 100% so every fold reclaims
+ * something.
  */
 function historyCompactionPolicy(config) {
     const triggerPercent = configInteger(config, 'contextCompactionTriggerPercent', SESSION_HISTORY_HIGH_WATER_PERCENT, 1, 99);
-    const configuredKeep = configInteger(config, 'contextCompactionKeepPercent', SESSION_HISTORY_KEEP_RECENT_PERCENT, 1, 98);
     const idleMinutes = configInteger(config, 'contextPrefixCacheIdleMinutes', 360, 0, 43_200);
     return Object.freeze({
         enabled: configBoolean(config, 'contextCompactionEnabled', true),
         triggerPercent,
-        keepPercent: Math.min(configuredKeep, triggerPercent - 1),
+        triggerTokens: configInteger(config, 'contextCompactionTriggerTokens', 0, 0, MAX_CAPABILITY_TOKENS),
+        keepPercent: configInteger(config, 'contextCompactionKeepPercent', SESSION_HISTORY_KEEP_RECENT_PERCENT, 1, 98),
         cacheIdleExpiryMs: (idleMinutes > 0 ? idleMinutes : 360) * 60 * 1_000,
         minReclaimTokens: configInteger(config, 'contextCompactionMinReclaimTokens', SESSION_HISTORY_EARLY_RECLAIM_TOKENS, 0, 1_000_000),
         summaryMaxChars: configInteger(config, 'contextCompactionSummaryMaxChars', HISTORY_SUMMARY_MAX_CHARS, 200, HISTORY_SUMMARY_HARD_MAX_CHARS)

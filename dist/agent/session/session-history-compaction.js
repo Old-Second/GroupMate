@@ -10,8 +10,11 @@
  *
  * The conversation is therefore never trimmed to a fixed message count. Recent
  * turns stay verbatim up to a token target derived from the request budget;
- * once the history crosses a higher token mark, everything older than the
- * target is folded into one persisted excerpt summary. The next prompts replay
+ * once the history crosses a higher token mark — a share of the budget or an
+ * absolute token count — everything older than the target is folded into one
+ * persisted excerpt summary. The target is a share of the history actually
+ * present when the fold happens, so "keep the last 35%" means the same thing
+ * at a 32k window and at a 1M one. The next prompts replay
  * `system` + `[user: 历史摘要]` + `[assistant: 已确认摘要]` + the recent
  * verbatim turns, so the prefix stays byte-identical between compressions and
  * only the turn that crosses the mark pays for the rewrite.
@@ -36,6 +39,7 @@ export const SESSION_HISTORY_ITEM_RETAINED_PERCENT = 60;
 export const DEFAULT_SESSION_HISTORY_COMPACTION_POLICY = Object.freeze({
     enabled: true,
     triggerPercent: SESSION_HISTORY_HIGH_WATER_PERCENT,
+    triggerTokens: 0,
     keepPercent: SESSION_HISTORY_KEEP_RECENT_PERCENT,
     cacheIdleExpiryMs: PREFIX_CACHE_IDLE_EXPIRY_MS,
     minReclaimTokens: SESSION_HISTORY_EARLY_RECLAIM_TOKENS,
@@ -62,9 +66,10 @@ function validPolicy(policy) {
     return typeof policy.enabled === 'boolean' &&
         Number.isSafeInteger(policy.triggerPercent) &&
         policy.triggerPercent >= 1 && policy.triggerPercent <= 99 &&
+        Number.isSafeInteger(policy.triggerTokens) &&
+        policy.triggerTokens >= 0 &&
         Number.isSafeInteger(policy.keepPercent) &&
         policy.keepPercent >= 1 && policy.keepPercent <= 98 &&
-        policy.keepPercent < policy.triggerPercent &&
         Number.isSafeInteger(policy.cacheIdleExpiryMs) && policy.cacheIdleExpiryMs > 0 &&
         Number.isSafeInteger(policy.minReclaimTokens) && policy.minReclaimTokens >= 0 &&
         Number.isSafeInteger(policy.summaryMaxChars) && policy.summaryMaxChars >= 200 &&
@@ -97,8 +102,18 @@ export function compactSessionHistory(items, options) {
     const summaryTokens = options.summary === undefined
         ? 0
         : estimateTokens(historySummaryMessages(options.summary));
-    const highWaterTokens = Math.floor(availableTokens * policy.triggerPercent / 100);
-    const keepRecentTokens = Math.floor(availableTokens * policy.keepPercent / 100);
+    // An absolute mark lets a deployment fold at 256k tokens regardless of how
+    // large a window it declares; it can never exceed what one request may carry.
+    const highWaterTokens = policy.triggerTokens > 0
+        ? Math.min(policy.triggerTokens, availableTokens)
+        : Math.floor(availableTokens * policy.triggerPercent / 100);
+    // The keep share is relative to the history actually being folded, so
+    // "keep 35%" retains 35% of the turns that existed at the moment of the fold
+    // instead of a window-dependent share that can exceed the trigger itself.
+    // It is capped by the same share of the available input budget so a history
+    // far above the high-water mark cannot fold down to something that crosses
+    // the mark again on the very next turn.
+    const keepRecentTokens = Math.max(1, Math.min(Math.floor(itemTotal * policy.keepPercent / 100), Math.floor(availableTokens * policy.keepPercent / 100)));
     // The context item budget covers the whole prompt, so the conversation may
     // only claim the part the system, group and memory blocks do not need.
     const itemReserve = Math.min(SESSION_HISTORY_ITEM_RESERVE, Math.floor(options.budget.maxItems / 4));
@@ -106,13 +121,17 @@ export function compactSessionHistory(items, options) {
     const itemRetained = Math.max(1, Math.floor(itemHighWater * SESSION_HISTORY_ITEM_RETAINED_PERCENT / 100));
     const overTokens = itemTotal + summaryTokens > highWaterTokens;
     const overItems = items.length > itemHighWater;
+    // Rewriting the prefix is only free once the provider cache is gone, and it
+    // is only worth doing while the history is close enough to the fold point
+    // that reclaiming the tail actually buys turns before the next fold.
     const coldCacheReclaim = options.cacheCold === true &&
-        itemTotal > keepRecentTokens + policy.minReclaimTokens;
+        itemTotal > keepRecentTokens + policy.minReclaimTokens &&
+        itemTotal >= Math.floor(highWaterTokens / 2);
     if (!overTokens && !overItems && !coldCacheReclaim)
         return unchanged(items, options.summary);
     // Walk backwards until the verbatim tail reaches its token target. The tail
-    // was chosen to be about a third of the budget, so a fold roughly halves the
-    // replayed history and the next few turns stay cache-warm.
+    // is a fixed share of the folded history, so a fold cuts the replayed history
+    // by that share and the next few turns stay cache-warm.
     let cut = items.length;
     let retainedTokens = 0;
     for (let index = items.length - 1; index >= 0; index -= 1) {

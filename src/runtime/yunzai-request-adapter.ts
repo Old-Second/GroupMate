@@ -172,13 +172,12 @@ function frozenHistoryCompaction (
     throw new TypeError('session history compaction policy is invalid')
   }
   const triggerPercent = integerInRange(input.triggerPercent, 1, 99)
+  const triggerTokens = integerInRange(input.triggerTokens, 0, 16_777_216)
   const keepPercent = integerInRange(input.keepPercent, 1, 98)
-  if (keepPercent >= triggerPercent) {
-    throw new TypeError('session history compaction policy is invalid')
-  }
   return Object.freeze({
     enabled: input.enabled,
     triggerPercent,
+    triggerTokens,
     keepPercent,
     cacheIdleExpiryMs: integerInRange(input.cacheIdleExpiryMs, 60_000, 30 * 24 * 60 * 60 * 1_000),
     minReclaimTokens: integerInRange(input.minReclaimTokens, 0, 1_000_000),

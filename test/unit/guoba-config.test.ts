@@ -176,8 +176,10 @@ test('normalizes the explicit context window override with zero as profile defau
   }
 })
 
-test('validates the compaction percentages as a pair', () => {
+test('validates the compaction trigger and keep settings independently', () => {
   assert.equal(normalizeGuobaConfigValue('contextCompactionTriggerPercent', 65), 65)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionTriggerTokens', 0), 0)
+  assert.equal(normalizeGuobaConfigValue('contextCompactionTriggerTokens', 262_144), 262_144)
   assert.equal(normalizeGuobaConfigValue('contextCompactionKeepPercent', 35), 35)
   assert.equal(normalizeGuobaConfigValue('contextCompactionEnabled', false), false)
   assert.equal(normalizeGuobaConfigValue('contextCompactionSummaryMaxChars', 20_000), 20_000)
@@ -189,21 +191,29 @@ test('validates the compaction percentages as a pair', () => {
       /压缩触发比例/
     )
   }
+  for (const value of [-1, 1.5, '262144', 16_777_217]) {
+    assert.throws(
+      () => normalizeGuobaConfigValue('contextCompactionTriggerTokens', value),
+      /压缩触发 Token/
+    )
+  }
   for (const value of [0, 99, 1.5]) {
     assert.throws(
       () => normalizeGuobaConfigValue('contextCompactionKeepPercent', value),
       /保留比例/
     )
   }
-  assert.throws(
-    () => buildGuobaConfigPatch({
-      contextCompactionTriggerPercent: 40,
-      contextCompactionKeepPercent: 50
+  // The keep share is relative to the history at the fold, so it is allowed to
+  // exceed the trigger share — the two values use different bases.
+  assert.deepEqual(
+    buildGuobaConfigPatch({
+      contextCompactionTriggerPercent: 25,
+      contextCompactionKeepPercent: 35
     }, {
       current: { contextCompactionTriggerPercent: 65, contextCompactionKeepPercent: 35 },
       supportedKeys: ['contextCompactionTriggerPercent', 'contextCompactionKeepPercent']
     }),
-    /保留比例必须小于压缩触发比例/
+    { contextCompactionTriggerPercent: 25, contextCompactionKeepPercent: 35 }
   )
 })
 

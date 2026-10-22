@@ -119,7 +119,7 @@ function parseContextBudget (value: unknown): void {
 function parseHistoryCompaction (value: unknown): void {
   const input = jsonObject(value, 'history compaction') as UnknownRecord
   const keys = [
-    'enabled', 'triggerPercent', 'keepPercent', 'cacheIdleExpiryMs',
+    'enabled', 'triggerPercent', 'triggerTokens', 'keepPercent', 'cacheIdleExpiryMs',
     'minReclaimTokens', 'summaryMaxChars'
   ]
   exactKeys(input, keys, keys, 'history compaction')
@@ -127,6 +127,7 @@ function parseHistoryCompaction (value: unknown): void {
     throw new TypeError('history compaction enabled is invalid')
   }
   safeInteger(input.triggerPercent, 'history compaction triggerPercent', 1)
+  safeInteger(input.triggerTokens, 'history compaction triggerTokens')
   safeInteger(input.keepPercent, 'history compaction keepPercent', 1)
   safeInteger(input.cacheIdleExpiryMs, 'history compaction cacheIdleExpiryMs', 1)
   safeInteger(input.minReclaimTokens, 'history compaction minReclaimTokens')

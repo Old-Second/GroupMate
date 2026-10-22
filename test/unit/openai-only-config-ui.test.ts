@@ -94,6 +94,7 @@ const preservedFields = [
   'apiContextWindowTokens',
   'contextCompactionEnabled',
   'contextCompactionTriggerPercent',
+  'contextCompactionTriggerTokens',
   'contextCompactionKeepPercent',
   'contextCompactionSummaryMaxChars',
   'contextPrefixCacheIdleMinutes',
@@ -136,6 +137,7 @@ const requiredGuobaFields = [
   'apiContextWindowTokens',
   'contextCompactionEnabled',
   'contextCompactionTriggerPercent',
+  'contextCompactionTriggerTokens',
   'contextCompactionKeepPercent',
   'contextCompactionSummaryMaxChars',
   'contextPrefixCacheIdleMinutes',
@@ -275,6 +277,7 @@ const expectedGuobaGroups = [
     fields: [
       'contextCompactionEnabled',
       'contextCompactionTriggerPercent',
+      'contextCompactionTriggerTokens',
       'contextCompactionKeepPercent',
       'contextCompactionSummaryMaxChars',
       'contextPrefixCacheIdleMinutes',

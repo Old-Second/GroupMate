@@ -163,9 +163,11 @@ const defaultConfig = {
   apiMaxToken: 4096,
   // 0 使用模型 Profile/安全默认值，正整数可缩小或显式放大窗口，对重启后创建的新任务生效。
   apiContextWindowTokens: 0,
-  // 会话压缩：达到可用输入预算的触发比例时折叠为摘要，并保留最近原文的比例。
+  // 会话压缩：达到触发点时折叠为摘要，并保留压缩前原文的比例。
   contextCompactionEnabled: true,
   contextCompactionTriggerPercent: 65,
+  // 绝对触发 Token 数；0 使用上面的可用输入预算比例。
+  contextCompactionTriggerTokens: 0,
   contextCompactionKeepPercent: 35,
   contextCompactionSummaryMaxChars: 2400,
   // 前缀缓存空闲分钟；超过后视为缓存已冷并提前压缩。0 使用默认 360。

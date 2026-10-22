@@ -86,6 +86,11 @@
       },
       {
         "type": "number",
+        "label": "压缩触发 Token 上限（0 为按比例）",
+        "data": "contextCompactionTriggerTokens"
+      },
+      {
+        "type": "number",
         "label": "压缩后保留比例（%）",
         "data": "contextCompactionKeepPercent"
       },

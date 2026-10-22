@@ -117,6 +117,7 @@
   "apiContextWindowTokens": 0,
   "contextCompactionEnabled": true,
   "contextCompactionTriggerPercent": 65,
+  "contextCompactionTriggerTokens": 0,
   "contextCompactionKeepPercent": 35,
   "contextCompactionSummaryMaxChars": 2400,
   "contextPrefixCacheIdleMinutes": 360,

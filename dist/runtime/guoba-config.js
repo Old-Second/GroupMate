@@ -126,18 +126,11 @@ export function buildGuobaConfigPatch(value, options) {
         }
         patch[key] = normalizeGuobaConfigValue(key, raw);
     }
-    // The two percentages only make sense together: a keep value at or above the
-    // trigger would re-cross the high-water mark on the very next turn.
-    const mergedTrigger = Object.hasOwn(patch, 'contextCompactionTriggerPercent')
-        ? patch.contextCompactionTriggerPercent
-        : options.current.contextCompactionTriggerPercent;
-    const mergedKeep = Object.hasOwn(patch, 'contextCompactionKeepPercent')
-        ? patch.contextCompactionKeepPercent
-        : options.current.contextCompactionKeepPercent;
-    if (typeof mergedTrigger === 'number' && typeof mergedKeep === 'number' &&
-        mergedKeep >= mergedTrigger) {
-        throw new TypeError('压缩后保留比例必须小于压缩触发比例。');
-    }
+    // The trigger and keep shares use different bases: the trigger is a share of
+    // the available input budget (or an absolute token mark when configured), the
+    // keep share is a share of the history present at the fold. A keep value at or
+    // above the trigger is therefore a valid, deliberate choice and only the
+    // per-field ranges are enforced here.
     return Object.freeze(patch);
 }
 export function normalizeGuobaConfigValue(key, value) {
@@ -210,6 +203,13 @@ export function normalizeGuobaConfigValue(key, value) {
         if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
             value < 1 || value > 99) {
             throw new TypeError('会话压缩触发比例配置无效，应为 1-99。');
+        }
+        return value;
+    }
+    if (key === 'contextCompactionTriggerTokens') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 0 || value > 16_777_216) {
+            throw new TypeError('会话压缩触发 Token 配置无效，应为 0-16777216。');
         }
         return value;
     }

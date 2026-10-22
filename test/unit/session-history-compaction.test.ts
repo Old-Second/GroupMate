@@ -201,19 +201,46 @@ test('configured trigger and keep shares replace the defaults', () => {
   })
   assert.equal(relaxed.compacted, false)
   assert.equal(relaxed.items.length, input.length)
+})
 
-  // A keep share at or above the trigger is impossible to configure through
-  // the UI, but the kernel still refuses to fold in that combination.
-  const impossible = compactSessionHistory(input, {
-    budget: budget(),
+test('an absolute trigger mark folds at the configured token count', () => {
+  const input = items(400)
+  const itemTokens = input.reduce((sum, item) =>
+    sum + Math.ceil(Buffer.byteLength(JSON.stringify(item), 'utf8') / 4), 0)
+
+  // 99% of a 100k budget is above this history, so only the absolute mark can
+  // decide whether it folds.
+  const percentOnly = compactSessionHistory(input, {
+    budget: budget(100_000),
     updatedAt: UPDATED_AT,
     policy: {
       ...DEFAULT_SESSION_HISTORY_COMPACTION_POLICY,
-      triggerPercent: 10,
-      keepPercent: 50
+      triggerPercent: 99,
+      triggerTokens: 0,
+      keepPercent: 35
     }
   })
-  assert.equal(impossible.compacted, false)
+  assert.equal(percentOnly.compacted, false)
+
+  const absolute = compactSessionHistory(input, {
+    budget: budget(100_000),
+    updatedAt: UPDATED_AT,
+    policy: {
+      ...DEFAULT_SESSION_HISTORY_COMPACTION_POLICY,
+      triggerPercent: 99,
+      triggerTokens: 50_000,
+      keepPercent: 35
+    }
+  })
+  assert.equal(absolute.compacted, true)
+  assert.ok(itemTokens > 50_000)
+
+  // The keep share is relative to the history present at the fold, not to the
+  // model window: 35% of what was there stays verbatim.
+  const retainedTokens = absolute.items.reduce((sum, item) =>
+    sum + Math.ceil(Buffer.byteLength(JSON.stringify(item), 'utf8') / 4), 0)
+  const share = retainedTokens / itemTokens
+  assert.ok(share >= 0.30 && share <= 0.40, `retained share was ${share}`)
 })
 
 test('disabling compaction keeps every turn verbatim', () => {
