@@ -915,6 +915,44 @@ test('uses the canonical Yunzai reply reference and resolver when available', as
   )
 })
 
+test('a quoted NapCat forward reaches the model as readable nodes', async () => {
+  const result = await prepareYunzaiMessageEvidence({
+    currentPrompt: '评价一下',
+    ocrTexts: [],
+    event: {
+      isGroup: true,
+      group_id: 'group-1',
+      reply_id: 'quoted-forward',
+      getReply: async () => ({
+        message_id: 'quoted-forward',
+        group_id: 'group-1',
+        sender: { user_id: 'actor-2', card: 'forwarder' },
+        raw_message: '[CQ:forward,id=res,content=&#91;object Object&#93;]',
+        message: [{
+          type: 'forward',
+          id: 'res',
+          content: [{
+            sender: { user_id: 30001, nickname: 'n1', card: '甲' },
+            message: [{ type: 'text', data: { text: '原话一' } },
+              { type: 'image', data: { url: 'https://fixture.invalid/inside.png' } }]
+          }, {
+            sender: { user_id: 30002, nickname: '乙', card: '' },
+            message: [{ type: 'text', data: { text: '原话二' } }]
+          }]
+        }]
+      }),
+      message: [{ type: 'reply', id: 'quoted-forward' }, { type: 'text', text: '评价一下' }]
+    }
+  })
+
+  assert.equal(result.replyResolved, true)
+  assert.equal(parseInputPayload(result.prompt).quotedMessage.content,
+    '[合并转发 共2条]\n【甲】：原话一[图片]\n【乙】：原话二')
+  assert.deepEqual(result.imageUrls, [])
+  assert.equal(result.prompt.includes('object Object'), false)
+  assert.equal(result.quotedMessage?.parts[0]?.type, 'text')
+})
+
 test('uses a reply message id for direct lookup without confusing it with history sequence', async () => {
   const projectedMessageCalls: unknown[] = []
   let historyCalls = 0

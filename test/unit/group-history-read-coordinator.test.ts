@@ -301,6 +301,63 @@ test('snapshot keeps legacy history rows that have no message identifier', async
   assert.equal(rows[0]?.raw_message, '没有消息标识的旧适配器历史')
 })
 
+test('snapshot expands a delivered forward instead of its opaque CQ raw text', async () => {
+  const coordinator = new GroupHistoryReadCoordinator({ timeoutMs: 5 })
+
+  const rows = await coordinator.read({
+    key: 'bot\0group',
+    limit: 50,
+    load: async () => [{
+      message_id: 'm-forward',
+      raw_message: '[CQ:forward,id=x,content=&#91;object Object&#93;&#44;&#91;object Object&#93;]',
+      message: [{
+        type: 'forward',
+        id: 'x',
+        content: [
+          { sender: { card: '甲' }, message: [{ type: 'text', data: { text: '转发里的第一句' } }] },
+          { sender: { nickname: '乙' }, message: [{ type: 'text', data: { text: '第二句' } }] }
+        ]
+      }],
+      sender: { user_id: 'member-1', card: '群友', nickname: '群友' }
+    }, {
+      message_id: 'm-plain',
+      raw_message: '普通消息[CQ:face,id=1]',
+      message: [{ type: 'text', text: '普通消息' }],
+      sender: { user_id: 'member-1', card: '群友', nickname: '群友' }
+    }]
+  })
+
+  assert.equal(rows[0]?.raw_message,
+    '[合并转发 共2条]\n【甲】：转发里的第一句\n【乙】：第二句')
+  assert.equal(rows[1]?.raw_message, '普通消息[CQ:face,id=1]')
+  assert.equal(JSON.stringify(rows).includes('object Object'), false)
+})
+
+test('snapshot keeps one forwarded log to its own excerpt budget', async () => {
+  const coordinator = new GroupHistoryReadCoordinator({ timeoutMs: 5 })
+
+  const rows = await coordinator.read({
+    key: 'bot\0group',
+    limit: 50,
+    load: async () => [{
+      message_id: 'm-forward',
+      raw_message: '[CQ:forward,id=x]',
+      message: [{ type: 'text', text: '看看这个' }, {
+        type: 'forward',
+        content: Array.from({ length: 40 }, () => ({
+          sender: { card: '群友' }, message: [{ type: 'text', data: { text: '长'.repeat(500) } }]
+        }))
+      }],
+      sender: { user_id: 'member-1', card: '群友', nickname: '群友' }
+    }]
+  })
+
+  const text = rows[0]?.raw_message ?? ''
+  assert.match(text, /^看看这个\n\[合并转发 共40条\]/)
+  assert.match(text, /其余转发内容未展示/)
+  assert.ok([...text].length <= '看看这个\n'.length + 2_000)
+})
+
 test('diagnostics use fixed cache-aware codes and isolate callback failures', async () => {
   const codes: GroupHistoryDiagnosticCode[] = []
   const withoutCache = new GroupHistoryReadCoordinator({

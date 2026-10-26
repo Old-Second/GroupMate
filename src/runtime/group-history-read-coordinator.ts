@@ -1,3 +1,5 @@
+import { forwardSegmentText } from './message-content.js'
+
 const DEFAULT_TIMEOUT_MS = 3_000
 const DEFAULT_MAX_IN_FLIGHT = 2
 const MAX_WAITERS_PER_OPERATION = 2
@@ -8,6 +10,9 @@ const DEFAULT_MAX_CACHE_BYTES = 1024 * 1024
 const GROUP_HISTORY_TIMEOUT = Symbol('group_history_timeout')
 const MAX_HISTORY_ITEMS = 64
 const MAX_HISTORY_TEXT = 4_096
+// A forwarded log stays in the group window for many later turns, so history
+// keeps a shorter excerpt than a directly quoted forward.
+const MAX_HISTORY_FORWARD_TEXT = 2_000
 const MAX_IDENTIFIER = 128
 const MAX_DISPLAY_NAME = 256
 
@@ -110,17 +115,43 @@ function messageText (value: unknown): string {
       if (typeof target === 'string' || typeof target === 'number') fragments.push(`@${target}`)
     } else if (type === 'image') {
       fragments.push('[图片]')
+    } else if (type === 'forward' || type === 'node') {
+      fragments.push(`\n${forwardSegmentText(segment, MAX_HISTORY_FORWARD_TEXT)}\n`)
     }
   }
-  return fragments.join('')
+  return fragments.join('').trim()
+}
+
+function hasForwardSegment (value: unknown): boolean {
+  try {
+    if (!Array.isArray(value)) return false
+  } catch {
+    return false
+  }
+  const rawLength = ownData(value, 'length')
+  const length = typeof rawLength === 'number' && Number.isSafeInteger(rawLength)
+    ? Math.min(Math.max(rawLength, 0), 256)
+    : 0
+  for (let index = 0; index < length; index += 1) {
+    const segment = ownData(value, String(index))
+    if (segment === null || typeof segment !== 'object' || Array.isArray(segment)) continue
+    const type = ownData(segment, 'type')
+    if (type === 'forward' || type === 'node') return true
+  }
+  return false
 }
 
 function snapshotRow (raw: unknown): GroupHistorySnapshotRow | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
   const messageId = identifierText(ownData(raw, 'message_id') ?? ownData(raw, 'seq'))
   const rawMessage = ownData(raw, 'raw_message')
+  const structured = ownData(raw, 'message')
+  // raw_message renders a forward as an opaque CQ code (NapCat even inlines
+  // "[object Object]"), so readable nodes win over the raw string.
   const text = boundedCharacters(
-    typeof rawMessage === 'string' ? rawMessage : messageText(ownData(raw, 'message')),
+    typeof rawMessage === 'string' && !hasForwardSegment(structured)
+      ? rawMessage
+      : messageText(structured),
     MAX_HISTORY_TEXT
   ).trim()
   if (text === '') return null
