@@ -185,8 +185,20 @@ function isForwardType (segment: UnknownRecord): boolean {
   return type === 'forward' || type === 'node'
 }
 
+// napcat-adapter retypes a whole forward as `node`; its content then lists the
+// forwarded messages (or node segments) instead of one node's own segments.
+function isNodeList (value: unknown): boolean {
+  const { items } = boundedItems(value, MAX_FORWARD_NODE_SEGMENTS)
+  return items.length > 0 && items.every(item => {
+    if (!isRecord(item)) return false
+    const type = ownValue(item, 'type')
+    return type === undefined || getSafeType(type) === 'node'
+  })
+}
+
 function forwardItems (segment: UnknownRecord): unknown {
-  if (getSafeType(ownValue(segment, 'type')) !== 'node') return segmentField(segment, 'content')
+  const content = segmentField(segment, 'content')
+  if (getSafeType(ownValue(segment, 'type')) !== 'node' || isNodeList(content)) return content
   return forwardNodeMessage(segment) === undefined ? undefined : [segment]
 }
 

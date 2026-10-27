@@ -158,6 +158,26 @@ test('reads raw OneBot forward data and multi-line node text', () => {
   assert.equal(rendered, '[合并转发 共1条]\n【Dave】：line one\n  line two')
 })
 
+test('expands napcat-adapter forwards that arrive retyped as a node container', () => {
+  // napcat-adapter maps a forward segment to `{ type: 'node', ...data }`, so the
+  // forwarded log is a `node` whose content holds whole OneBot messages.
+  const rendered = forwardSegmentText({
+    type: 'node',
+    id: 'adapter-id',
+    content: [
+      napcatNode('Alice', [text('第一句')]),
+      napcatNode('Bob', [text('第二句')])
+    ]
+  })
+
+  assert.equal(rendered, '[合并转发 共2条]\n【Alice】：第一句\n【Bob】：第二句')
+  assert.equal(rendered.includes('消息段:unknown'), false)
+  assert.equal(
+    forwardSegmentText({ type: 'node', nickname: 'Eve', content: [text('单个节点')] }),
+    '[合并转发 共1条]\n【Eve】：单个节点'
+  )
+})
+
 test('keeps the summary label when the host did not deliver forward nodes', () => {
   assert.equal(forwardSegmentText({ type: 'forward', id: 'only-id' }), '[合并转发]')
   assert.equal(forwardSegmentText({ type: 'forward', id: 'x', content: [] }), '[合并转发]')

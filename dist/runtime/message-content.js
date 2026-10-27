@@ -150,9 +150,21 @@ function isForwardType(segment) {
     const type = getSafeType(ownValue(segment, 'type'));
     return type === 'forward' || type === 'node';
 }
+// napcat-adapter retypes a whole forward as `node`; its content then lists the
+// forwarded messages (or node segments) instead of one node's own segments.
+function isNodeList(value) {
+    const { items } = boundedItems(value, MAX_FORWARD_NODE_SEGMENTS);
+    return items.length > 0 && items.every(item => {
+        if (!isRecord(item))
+            return false;
+        const type = ownValue(item, 'type');
+        return type === undefined || getSafeType(type) === 'node';
+    });
+}
 function forwardItems(segment) {
-    if (getSafeType(ownValue(segment, 'type')) !== 'node')
-        return segmentField(segment, 'content');
+    const content = segmentField(segment, 'content');
+    if (getSafeType(ownValue(segment, 'type')) !== 'node' || isNodeList(content))
+        return content;
     return forwardNodeMessage(segment) === undefined ? undefined : [segment];
 }
 function appendForwardNode(value, depth, context) {

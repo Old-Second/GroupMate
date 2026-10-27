@@ -333,6 +333,31 @@ test('snapshot expands a delivered forward instead of its opaque CQ raw text', a
   assert.equal(JSON.stringify(rows).includes('object Object'), false)
 })
 
+test('snapshot expands a napcat-adapter forward retyped as node', async () => {
+  const coordinator = new GroupHistoryReadCoordinator({ timeoutMs: 5 })
+
+  const rows = await coordinator.read({
+    key: 'bot\0group',
+    limit: 50,
+    load: async () => [{
+      message_id: 'm-adapter-forward',
+      raw_message: '[转发消息]',
+      message: [{
+        type: 'node',
+        id: 'x',
+        content: [
+          { sender: { card: '甲' }, message: [{ type: 'text', data: { text: '转发里的第一句' } }] },
+          { sender: { nickname: '乙' }, message: [{ type: 'text', data: { text: '第二句' } }] }
+        ]
+      }],
+      sender: { user_id: 'member-1', card: '群友', nickname: '群友' }
+    }]
+  })
+
+  assert.equal(rows[0]?.raw_message,
+    '[合并转发 共2条]\n【甲】：转发里的第一句\n【乙】：第二句')
+})
+
 test('snapshot keeps one forwarded log to its own excerpt budget', async () => {
   const coordinator = new GroupHistoryReadCoordinator({ timeoutMs: 5 })
 
