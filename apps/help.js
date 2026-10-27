@@ -56,6 +56,11 @@ const helpData = [
         icon: 'game',
         title: '#chatgpt设置语音角色',
         desc: '设置当前语音角色'
+      },
+      {
+        icon: 'smiley-wink',
+        title: '#对话偏好 称呼/语气/详略',
+        desc: '设置回复本人时的称呼、语气和详略'
       }
     ]
   },

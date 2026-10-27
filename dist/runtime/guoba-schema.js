@@ -131,6 +131,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
                 { label: '重建词法索引', value: 'rebuild_lexical' }
             ]
         }),
+        field('conversationPreferencesEnabled', '个人对话偏好', '默认开启：用户可用“#对话偏好”设置机器人回复本人时的称呼、语气（活泼、温柔、正式、冷静）和详略（简短、详细）。偏好只在本人的普通对话中作为不可信资料注入当前请求附近，不进入系统设定，也不影响随机参与、他人对话、人设、群规则和工具权限；称呼经长度、换行、指令式写法和输入/输出屏蔽词检查。关闭后立即停止注入和新设置，已存偏好保留，用户仍可查看和清除。', 'Switch'),
         divider('工具与搜索'),
         field('smartMode', '开启工具调用', '允许模型使用搜索、图片、语音和授权群管理工具，会增加请求次数；权限仍由运行时校验。', 'Switch'),
         field('disabledTools', '隐藏指定工具', '填入工具名，例如 searchVideo；下一次请求生效。用于停用故障服务或不需要的能力，移除后恢复发现。', 'Select', {

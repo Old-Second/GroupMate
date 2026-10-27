@@ -178,6 +178,8 @@ const defaultConfig = {
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1200,
   personalMemoryRecallTimeoutMs: 150,
+  // 个人对话偏好（称呼/语气/详略）：只对本人普通对话生效；关闭后停止注入，已存偏好保留。
+  conversationPreferencesEnabled: true,
   toolPrivateSendPolicy: 'master', // 工具发起私聊：disabled/master/everyone。
   toolCrossGroupSendPolicy: 'disabled', // 工具跨群发送：disabled/master/everyone。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。

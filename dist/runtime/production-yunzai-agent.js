@@ -40,6 +40,8 @@ import { SafeObservationFailureLogLimiter, createPresentationObservationLog, cre
 import { TraceRecorder } from './observability/trace-recorder.js';
 import { OwnerDiagnostics } from './observability/owner-diagnostics.js';
 import { YunzaiDiagnosticsController } from './yunzai-diagnostics-controller.js';
+import { createConversationPreferenceController } from './yunzai-conversation-preference-controller.js';
+import { conversationPreferencesEnabled, createRedisConversationPreferenceStore } from './conversation-preferences.js';
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API']);
 const RECOVERED_LEGACY_SETTINGS = Object.freeze({
     schemaVersion: 1,
@@ -749,6 +751,17 @@ export function createProductionYunzaiAgent(options) {
         currentLevel: () => observability.currentLevel(),
         logger: options.bridge.logger
     }));
+    const conversationPreferenceController = createConversationPreferenceController({
+        store: createRedisConversationPreferenceStore(options.bridge.redis),
+        enabled: () => conversationPreferencesEnabled(options.bridge.config),
+        blockWords: async (actorId) => {
+            const settings = await options.presentationSettings.load(actorId);
+            return Object.freeze([...settings.promptBlockWords, ...settings.blockWords]);
+        },
+        reply: async (event, message) => {
+            await controls.presentCommand({ event, message, quote: true });
+        }
+    });
     const lifecycle = {
         unbindShutdown: null,
         shutdownPromise: null
@@ -799,6 +812,7 @@ export function createProductionYunzaiAgent(options) {
         bymController,
         approvalController,
         diagnosticsController,
+        conversationPreferenceController,
         observability: Object.freeze({
             hub: observability.hub,
             gate: observability.gate,

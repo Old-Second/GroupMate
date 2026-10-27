@@ -140,6 +140,14 @@ import { TraceRecorder } from './observability/trace-recorder.js'
 import type { ObservabilityLevel } from './observability/trace-policy.js'
 import { OwnerDiagnostics } from './observability/owner-diagnostics.js'
 import { YunzaiDiagnosticsController } from './yunzai-diagnostics-controller.js'
+import {
+  createConversationPreferenceController,
+  type ConversationPreferenceController
+} from './yunzai-conversation-preference-controller.js'
+import {
+  conversationPreferencesEnabled,
+  createRedisConversationPreferenceStore
+} from './conversation-preferences.js'
 
 const CONVERSATION_MODE_PREFIXES = Object.freeze(['api', 'API'])
 
@@ -191,6 +199,7 @@ export interface ProductionYunzaiAgent {
   readonly bymController: YunzaiBymController
   readonly approvalController: YunzaiApprovalController
   readonly diagnosticsController: YunzaiDiagnosticsController
+  readonly conversationPreferenceController: ConversationPreferenceController<YunzaiMessageEvent>
   readonly observability: Readonly<{
     hub: ObservationHub
     gate: RunObservationPolicyGate
@@ -1037,6 +1046,17 @@ export function createProductionYunzaiAgent (
     currentLevel: () => observability.currentLevel(),
     logger: options.bridge.logger
   }))
+  const conversationPreferenceController = createConversationPreferenceController<YunzaiMessageEvent>({
+    store: createRedisConversationPreferenceStore(options.bridge.redis),
+    enabled: () => conversationPreferencesEnabled(options.bridge.config),
+    blockWords: async actorId => {
+      const settings = await options.presentationSettings.load(actorId)
+      return Object.freeze([...settings.promptBlockWords, ...settings.blockWords])
+    },
+    reply: async (event, message) => {
+      await controls.presentCommand({ event, message, quote: true })
+    }
+  })
 
   const lifecycle: GraphLifecycle = {
     unbindShutdown: null,
@@ -1074,6 +1094,7 @@ export function createProductionYunzaiAgent (
     bymController,
     approvalController,
     diagnosticsController,
+    conversationPreferenceController,
     observability: Object.freeze({
       hub: observability.hub,
       gate: observability.gate,

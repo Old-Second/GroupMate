@@ -91,6 +91,12 @@ import { createAgentRunLog } from './safe-chat-logging.js'
 import { resolveForwardToolDetailsSetting } from './config-persistence.js'
 import type { GroupMateContentJournal } from './logging/groupmate-content-journal.js'
 import { TerminalFactCollector } from './terminal-fact-collector.js'
+import {
+  conversationPreferenceContextItem,
+  conversationPreferencesEnabled,
+  createRedisConversationPreferenceStore,
+  type ConversationPreferenceStore
+} from './conversation-preferences.js'
 import { resolveOpenAICompatibleModelRuntimeConfig } from './model-runtime-config.js'
 import {
   RedisApprovalReferenceIndex,
@@ -1334,6 +1340,7 @@ export class YunzaiAgentServiceBridge {
   readonly #monotonicNow: () => number | 'unavailable'
   readonly #requestJournal?: Pick<GroupMateContentJournal, 'recordRequest'>
   readonly #groupHistory: GroupHistoryReadCoordinator
+  readonly #preferences: ConversationPreferenceStore
   #approvalDisplays = 0
   #approvalDisplaysIdle: Promise<void> | undefined
   #resolveApprovalDisplaysIdle: (() => void) | undefined
@@ -1368,6 +1375,7 @@ export class YunzaiAgentServiceBridge {
       timeoutMs: input.options.groupHistoryTimeoutMs,
       onDiagnostic: code => { reportGroupHistoryDiagnostic(input.options, code) }
     })
+    this.#preferences = createRedisConversationPreferenceStore(input.options.redis)
   }
 
   get conversations (): ConversationSessionPort {
@@ -1515,9 +1523,13 @@ export class YunzaiAgentServiceBridge {
       } catch {
         // Request journaling must not alter adaptation or run admission.
       }
+      const preferenceFacts = requestKind === 'ordinary_chat'
+        ? await this.#preferenceFacts(request)
+        : Object.freeze([])
       this.#prepared.set(requestId, Object.freeze({
         run: toolRun,
         runtimeFacts: Object.freeze([
+          ...preferenceFacts,
           runtimeIdentityItem(request, event, messageEvidence)
         ]),
         groupContext,
@@ -1553,6 +1565,31 @@ export class YunzaiAgentServiceBridge {
       return result
     } finally {
       this.#prepared.delete(requestId)
+    }
+  }
+
+  /**
+   * The requester's own conversation preferences, as an untrusted runtime item
+   * placed with the per-turn metadata. Only the person asking is looked up, so
+   * in a shared group session one member's preferences never reach another's
+   * turn. A read failure answers without preferences.
+   */
+  async #preferenceFacts (request: YunzaiAgentRequestDraft): Promise<readonly ContextItem[]> {
+    if (!conversationPreferencesEnabled(this.#options.config)) return Object.freeze([])
+    try {
+      const item = conversationPreferenceContextItem({
+        requestId: request.requestId,
+        createdAt: request.createdAt,
+        sensitivity: request.channel.kind === 'group' ? 'group' : 'private',
+        preferences: await this.#preferences.load(request.actor.userId),
+        blockWords: Object.freeze([
+          ...configStringList(this.#options.config, 'promptBlockWords'),
+          ...configStringList(this.#options.config, 'blockWords')
+        ])
+      })
+      return Object.freeze(item === null ? [] : [item])
+    } catch {
+      return Object.freeze([])
     }
   }
 

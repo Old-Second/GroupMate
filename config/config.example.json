@@ -127,6 +127,7 @@
   "personalMemoryRecallMaxItems": 6,
   "personalMemoryRecallMaxTokens": 1200,
   "personalMemoryRecallTimeoutMs": 150,
+  "conversationPreferencesEnabled": true,
   "enableBYM": false,
   "bymRecognizeLeadingAlias": true,
   "participationMode": "legacy",

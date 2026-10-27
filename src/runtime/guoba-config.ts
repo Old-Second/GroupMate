@@ -200,6 +200,13 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
     return boundedPersonalMemoryInteger(value, 500)
   }
 
+  if (key === 'conversationPreferencesEnabled') {
+    if (typeof value !== 'boolean') {
+      throw new TypeError('对话偏好开关配置无效。')
+    }
+    return value
+  }
+
   if (key === 'hostImageLinkRefresh') {
     if (typeof value !== 'boolean') {
       throw new TypeError('历史图片链接续签配置无效。')

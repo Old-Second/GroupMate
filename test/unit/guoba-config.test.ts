@@ -252,6 +252,16 @@ test('normalizes pending indicator compatibility as a boolean-only field', () =>
   )
 })
 
+test('normalizes the conversation preference owner switch as a live boolean', () => {
+  assert.equal(normalizeGuobaConfigValue('conversationPreferencesEnabled', true), true)
+  assert.equal(normalizeGuobaConfigValue('conversationPreferencesEnabled', false), false)
+  assert.throws(
+    () => normalizeGuobaConfigValue('conversationPreferencesEnabled', 'off'),
+    /对话偏好开关配置无效/
+  )
+  assert.equal(guobaConfigSaveMessage(['conversationPreferencesEnabled']), '保存成功~')
+})
+
 test('normalizes the three observability levels fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'off'), 'off')
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'basic'), 'basic')
