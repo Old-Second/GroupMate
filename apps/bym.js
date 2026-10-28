@@ -10,7 +10,7 @@ export class bym extends plugin {
       priority: 5000,
       rule: [
         {
-          reg: '^[^#][sS]*',
+          reg: '^[^#][\\s\\S]*',
           fnc: 'bym',
           priority: '-1000000',
           log: false

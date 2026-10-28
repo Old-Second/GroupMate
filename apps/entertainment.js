@@ -46,19 +46,20 @@ export class Entertainment extends plugin {
           fnc: 'combineEmoj'
         },
         {
-          reg: '^#?(今日词云|群友在聊什么)$',
-          fnc: 'wordcloud'
+          // 先匹配带范围和对象的形式，再回落到最近 N 小时，否则 #词云 永远被下一条吃掉
+          reg: '^#(我的)?(本月|本周|今日)?词云\\s*$',
+          fnc: 'wordcloud_new'
         },
         {
           reg: '^#(|最新)词云(\\d{1,2}h{0,1}|)$',
           fnc: 'wordcloud_latest'
         },
         {
-          reg: '^#(我的)?(本月|本周|今日)?词云$',
+          reg: '^#?(今日词云|群友在聊什么)$',
           fnc: 'wordcloud_new'
         },
         {
-          reg: '^#((寄批踢|gpt|GPT)?翻[sS]*|chatgpt翻译帮助)',
+          reg: '^#((寄批踢|gpt|GPT)?翻[\\s\\S]*|chatgpt翻译帮助)',
           fnc: 'translate'
         },
         {
@@ -206,29 +207,6 @@ ${translateLangLabels}
     return true
   }
 
-  async wordcloud (e) {
-    if (e.isGroup) {
-      let groupId = e.group_id
-      let lock = await redis.get(`CHATGPT:WORDCLOUD:${groupId}`)
-      if (lock) {
-        await this.reply('别着急，上次统计还没完呢')
-        return true
-      }
-      await this.reply('在统计啦，请稍等...')
-      await redis.set(`CHATGPT:WORDCLOUD:${groupId}`, '1', { EX: 600 })
-      try {
-        let img = await makeWordcloud(e, e.group_id)
-        this.reply(img, true)
-      } catch (err) {
-        logger.error(err)
-        await this.reply(err)
-      }
-      await redis.del(`CHATGPT:WORDCLOUD:${groupId}`)
-    } else {
-      await this.reply('请在群里发送此命令')
-    }
-  }
-
   async wordcloud_latest (e) {
     if (e.isGroup) {
       let groupId = e.group_id
@@ -250,7 +228,9 @@ ${translateLangLabels}
 
       await redis.set(`CHATGPT:WORDCLOUD:${groupId}`, '1', { EX: 600 })
       try {
-        await makeWordcloud(e, e.group_id, duration)
+        // makeWordcloud 只返回图片，必须在这里投递，否则命令没有任何结果
+        let img = await makeWordcloud(e, e.group_id, duration)
+        await this.reply(img, true)
       } catch (err) {
         logger.error(err)
         await this.reply(err)
@@ -272,7 +252,7 @@ ${translateLangLabels}
       if (at) {
         userId = at.qq
       }
-      let lock = await redis.get(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId}`)
+      let lock = await redis.get(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId || 'all'}`)
       if (lock) {
         await this.reply('别着急，上次统计还没完呢')
         return true
@@ -298,14 +278,16 @@ ${translateLangLabels}
         startOfToday.setHours(0, 0, 0, 0) // Set the time to midnight (start of the day)
         duration = (now - startOfToday) / 1000 / 60 / 60
       }
-      await redis.set(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId}`, '1', { EX: 600 })
+      await redis.set(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId || 'all'}`, '1', { EX: 600 })
       try {
-        await makeWordcloud(e, e.group_id, duration, userId)
+        // makeWordcloud 只返回图片，必须在这里投递，否则命令没有任何结果
+        let img = await makeWordcloud(e, e.group_id, duration, userId)
+        await this.reply(img, true)
       } catch (err) {
         logger.error(err)
         await this.reply(err)
       }
-      await redis.del(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId}`)
+      await redis.del(`CHATGPT:WORDCLOUD_NEW:${groupId}_${userId || 'all'}`)
     } else {
       await this.reply('请在群里发送此命令')
     }

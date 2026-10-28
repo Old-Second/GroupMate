@@ -11,10 +11,9 @@ async function readSource (file: string): Promise<string> {
 
 test('BYM and auxiliary callers use only the configured OpenAI-compatible API', async () => {
   const bym = await readSource('apps/bym.js')
-  const [randomMessage, greetingContext, legacyChat, translation, auxiliaryCompletion, index] = await Promise.all([
+  const [randomMessage, greetingContext, translation, auxiliaryCompletion, index] = await Promise.all([
     readSource('utils/randomMessage.js'),
     readSource('src/runtime/GreetingContext.ts'),
-    readSource('utils/chat.js'),
     readSource('src/runtime/translation-service.ts'),
     readSource('src/runtime/auxiliary-completion-service.ts'),
     readSource('index.js')
@@ -29,8 +28,7 @@ test('BYM and auxiliary callers use only the configured OpenAI-compatible API', 
   // prompt builder in GreetingContext owns the auxiliary call.
   assert.match(randomMessage, /dist\/runtime\/GreetingContext\.js/)
   assert.match(greetingContext, /auxiliary-completion-service\.js/)
-  assert.match(legacyChat, /dist\/runtime\/auxiliary-completion-service\.js/)
-  for (const source of [randomMessage, greetingContext, legacyChat]) {
+  for (const source of [randomMessage, greetingContext]) {
     assert.doesNotMatch(source, /completion-facade|ChatGPTAPI|chat\/completions/)
   }
   assert.doesNotMatch(
@@ -41,7 +39,7 @@ test('BYM and auxiliary callers use only the configured OpenAI-compatible API', 
   assert.match(index, /configureAuxiliaryCompletionService\([\s\S]*?adapter:\s*modelPort/)
   assert.match(index, /configureTranslationService\([\s\S]*?adapter:\s*modelPort/)
   assert.doesNotMatch(
-    [randomMessage, legacyChat, translation, auxiliaryCompletion].join('\n'),
+    [randomMessage, translation, auxiliaryCompletion].join('\n'),
     /translateSource|CustomGoogleGeminiClient|XinghuoClient|QwenApi|gpt-3\.5-turbo/
   )
 })
@@ -62,7 +60,7 @@ test('prompt, history, buttons and entertainment expose no removed provider path
   )
 
   const entertainment = sources[3]
-  for (const marker of ["fnc: 'translate'", "fnc: 'ocr'", "fnc: 'screenshotUrl'", "fnc: 'wordcloud'"]) {
+  for (const marker of ["fnc: 'translate'", "fnc: 'ocr'", "fnc: 'screenshotUrl'", "fnc: 'wordcloud_new'"]) {
     assert.equal(entertainment.includes(marker), true, `${marker} must remain`)
   }
   assert.doesNotMatch(entertainment, /translateSource|\bVQA\b|图片识别|识图/i)

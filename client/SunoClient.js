@@ -128,6 +128,7 @@ export class SunoClient {
     }
   }
 
+  // 保留的客户端能力：apps/vocal.js 已不再挂心跳定时任务，诊断行为由单元测试固定。
   async heartbeat () {
     let lastToken = this.sessToken
     let payload = decrypt(lastToken)

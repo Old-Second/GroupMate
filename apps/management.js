@@ -52,12 +52,7 @@ export class ChatgptManagement extends plugin {
           permission: 'master'
         },
         {
-          reg: '^#chatgpt切换API$',
-          fnc: 'useOpenAIAPIBasedSolution',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt模式(帮助)?$',
+          reg: '^#chatgpt(模式(帮助)?|切换API)$',
           fnc: 'modeHelp'
         },
         {
@@ -159,11 +154,6 @@ export class ChatgptManagement extends plugin {
         {
           reg: '^#chatgpt导入配置',
           fnc: 'importConfig',
-          permission: 'master'
-        },
-        {
-          reg: '^#chatgpt(开启|关闭)智能模式$',
-          fnc: 'switchSmartMode',
           permission: 'master'
         },
         {
@@ -358,8 +348,10 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
         let searchResults = []
         commandSet.forEach(plugin => {
           plugin.rule.forEach(item => {
-            if (item.reg.toLowerCase().includes(cmd.toLowerCase())) {
-              searchResults.push(item.reg)
+            // Rules of other plugins may carry a RegExp or no reg at all.
+            const reg = item.reg === undefined || item.reg === null ? '' : String(item.reg)
+            if (reg.toLowerCase().includes(cmd.toLowerCase())) {
+              searchResults.push(reg)
             }
           })
         })
@@ -385,7 +377,10 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
 
     const prompts = []
     for (const plugin of commandSet) {
-      const commands = plugin.rule.map(v => v.reg.includes('[#*0-9]') ? '表情合成功能只需要发送两个emoji表情即可' : v.reg)
+      const commands = plugin.rule.map(v => {
+        const reg = v.reg === undefined || v.reg === null ? '' : String(v.reg)
+        return reg.includes('[#*0-9]') ? '表情合成功能只需要发送两个emoji表情即可' : reg
+      })
       const category = getCategory(e, plugin)
       if (category || (!e.msg.includes('对话') && !e.msg.includes('管理') && !e.msg.includes('娱乐') && !e.msg.includes('人物设定') && !e.msg.includes('聊天记录'))) {
         prompts.push(generatePrompt(plugin, commands))
@@ -563,26 +558,11 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     return false
   }
 
-  async useOpenAIAPIBasedSolution (e) {
-    let use = resolveProviderModeForRuntime(await redis.get('CHATGPT:USE'), logger)
-    if (use !== 'api') {
-      await redis.set('CHATGPT:USE', 'api')
-      await this.reply('已切换到基于OpenAI API的解决方案，如果已经对话过建议执行`#结束对话`避免引起404错误')
-    } else {
-      await this.reply('当前已经是API模式了')
-    }
-  }
-
-  async checkAuth (e) {
-    if (!e.isMaster) {
-      this.reply(`只有主人才能命令ChatGPT哦~
-    (*/ω＼*)`)
-      return false
-    }
-    return true
-  }
-
   async versionChatGPTPlugin (e) {
+    if (!Config.enableToolbox) {
+      await this.reply('版本信息页由可选的后台服务提供，当前未开启。请先发送 #chatgpt开启工具箱，或在锅巴中打开“开启旧管理面板”。')
+      return
+    }
     let img = await renderUrl(e, `http://127.0.0.1:${Config.serverPort || 3321}/version`, { Viewport: { width: 800, height: 600 }, retType: 'base64' })
     this.reply(img)
   }
@@ -593,7 +573,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
   }
 
   async shutUp (e) {
-    let duration = e.msg.replace(/^#chatgpt(本群)?(群\d+)?(关闭|闭嘴|关机|休眠|下班)/, '')
+    let duration = e.msg.replace(/^#chatgpt(本群)?(群\d+)?(闭嘴|关机|休眠|下班)/, '')
     let scope
     let time = 3600000
     if (duration === '永久') {
@@ -601,7 +581,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     } else if (duration) {
       time = parseDuration(duration)
     }
-    const match = e.msg.match(/#chatgpt群(\d+)?(关闭|闭嘴|关机|休眠|下班)(.*)/)
+    const match = e.msg.match(/^#chatgpt群(\d+)?(闭嘴|关机|休眠|下班)(.*)/)
     if (e.msg.indexOf('本群') > -1) {
       if (e.isGroup) {
         scope = e.group.group_id
@@ -945,43 +925,13 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     this.finish('doImportConfig')
   }
 
-  async switchSmartMode (e) {
-    if (e.msg.includes('开启')) {
-      if (Config.smartMode) {
-        await this.reply('已经开启了')
-        return
-      }
-      Config.smartMode = true
-      await this.reply('好的，已经打开智能模式，注意API额度哦。配合开启读取群聊上下文效果更佳！')
-    } else {
-      if (!Config.smartMode) {
-        await this.reply('已经是关闭得了')
-        return
-      }
-      Config.smartMode = false
-      await this.reply('好的，已经关闭智能模式')
-    }
-  }
-
   async viewAPIModel (e) {
     const contents = [
-      '仅列出部分模型以供参考',
-      'gpt-3.5-turbo',
-      'gpt-3.5-turbo-0301',
-      'gpt-3.5-turbo-0613',
-      'gpt-3.5-turbo-1106',
-      'gpt-3.5-turbo-16k',
-      'gpt-3.5-turbo-16k-0613',
-      'gpt-4',
-      'gpt-4-32k',
-      'gpt-4-1106-preview'
+      '当前模型：' + (Config.model || '未设置'),
+      '可用模型由所配置的 OpenAI-compatible 服务决定，本插件不维护模型清单。',
+      '请查阅服务方文档后用 #chatgpt设置API模型 设置。'
     ]
-    let modelList = []
-    contents.forEach(value => {
-      // console.log(value)
-      modelList.push(value)
-    })
-    await this.reply(makeForwardMsg(e, modelList, '模型列表'))
+    await this.reply(makeForwardMsg(e, contents, '模型列表'))
   }
 
   async setAPIModel (e) {
@@ -1025,7 +975,7 @@ azure语音：Azure 语音是微软 Azure 平台提供的一项语音服务，�
     config.push(`\n当前模型：${Config.model}`)
     config.push(`\n当前开启流式输出：${Config.apiStream}`)
     config.push(`\n当前开启主动群聊：${Config.enableBYM}`)
-    config.push(`\n当前工具调用：${Config.smartMode}`)
+    config.push(`\n当前隐藏工具：${Config.disabledTools?.length ? Config.disabledTools.join('、') : '无'}`)
     if (e.isPrivate) {
       config.push(`\n当前APIKey：${Config.apiKey}`)
       config.push(`\n当前API地址：${Config.openAiBaseUrl}`)

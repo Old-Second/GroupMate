@@ -1,5 +1,5 @@
 export const unsupportedProviderMessage = '该模型模式已不再支持，GroupMate 当前仅支持 OpenAI-compatible API';
-const directProviderCommand = String.raw `#(?:图片)?(?:chat3|api3|chatglm|glm4|bing|claude(?:2|3|\.ai)?|xh|qwen|gemini)[sS]*(?![a-z0-9])`;
+const directProviderCommand = String.raw `#(?:图片)?(?:chat3|api3|chatglm|glm4|bing|claude(?:2|3|\.ai)?|xh|qwen|gemini)[\s\S]*(?![a-z0-9])`;
 const xinghuoCommand = String.raw `#星火(?:(?:搜索|查找)?助手)`;
 const providerSwitchCommand = String.raw `#chatgpt切换(?:api3|browser|浏览器|必应|bing|copilot|claude(?:2|\.ai)?|gemini|星火|azure|通义千问|qwen|千问|智谱(?:清言)?|chatglm4?)`;
 const providerTokenCommand = String.raw `#chatgpt(?:(?:设置|绑定|删除|解绑)(?:token)|(?:设置|绑定)(?:poe)(?:token)|(?:设置|绑定|添加|删除|移除|查看|浏览|迁移|恢复)(?:必应|bing)\s*(?:token))`;

@@ -22,28 +22,6 @@ export class Vocal extends plugin {
         }
       ]
     })
-    // this.task = [
-    //   {
-    //     // 设置十分钟左右的浮动
-    //     cron: '0/1 * * * ?',
-    //     // cron: '*/2 * * * *',
-    //     name: '保持suno心跳',
-    //     fnc: this.heartbeat.bind(this)
-    //   }
-    // ]
-  }
-
-  async heartbeat (e) {
-    let sessTokens = Config.sunoSessToken.split(',')
-    let clientTokens = Config.sunoClientToken.split(',')
-    for (let i = 0; i < sessTokens.length; i++) {
-      let sessToken = sessTokens[i]
-      let clientToken = clientTokens[i]
-      if (sessToken && clientToken) {
-        let client = new SunoClient({ sessToken, clientToken })
-        await client.heartbeat()
-      }
-    }
   }
 
   async createSong (e) {

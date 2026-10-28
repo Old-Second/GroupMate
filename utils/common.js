@@ -1,4 +1,3 @@
-import { exec } from 'child_process'
 import lodash from 'lodash'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,7 +11,6 @@ import VoiceVoxTTS, { supportConfigurations as voxRoleList } from './tts/voicevo
 import AzureTTS, { supportConfigurations as azureRoleList } from './tts/microsoft-azure.js'
 import { translate } from '../dist/runtime/translation-service.js'
 import uploadRecord from './uploadRecord.js'
-import Version from './version.js'
 import {
   createBrowserReleaseLog,
   releaseBrowserAfterRender
@@ -20,26 +18,6 @@ import {
 import { createChatErrorLog } from '../dist/runtime/safe-chat-logging.js'
 import fetch, { FormData, fileFromSync } from 'node-fetch'
 import https from 'https'
-let pdfjsLib
-try {
-  pdfjsLib = (await import('pdfjs-dist')).default
-} catch (err) {}
-
-let mammoth
-try {
-  mammoth = (await import('mammoth')).default
-} catch (err) {}
-
-let XLSX
-try {
-  XLSX = (await import('xlsx')).default
-} catch (err) {}
-
-let PPTX
-try {
-  PPTX = (await import('nodejs-pptx')).default
-} catch (err) {}
-
 let _puppeteer
 try {
   const Puppeteer = (await import('../../../renderers/puppeteer/lib/puppeteer.js')).default
@@ -95,123 +73,6 @@ export async function makeForwardMsg (e, msg = [], dec = '') {
   return common.makeForwardMsg(e, msg, dec)
 }
 
-// @see https://github.com/sindresorhus/p-timeout
-export async function pTimeout (
-  promise,
-  options
-) {
-  const {
-    milliseconds,
-    fallback,
-    message,
-    customTimers = { setTimeout, clearTimeout }
-  } = options
-
-  let timer
-
-  const cancelablePromise = new Promise((resolve, reject) => {
-    if (typeof milliseconds !== 'number' || Math.sign(milliseconds) !== 1) {
-      throw new TypeError(
-          `Expected \`milliseconds\` to be a positive number, got \`${milliseconds}\``
-      )
-    }
-
-    if (milliseconds === Number.POSITIVE_INFINITY) {
-      resolve(promise)
-      return
-    }
-
-    if (options.signal) {
-      const { signal } = options
-      if (signal.aborted) {
-        reject(getAbortedReason(signal))
-      }
-
-      signal.addEventListener('abort', () => {
-        reject(getAbortedReason(signal))
-      })
-    }
-
-    timer = customTimers.setTimeout.call(
-      undefined,
-      () => {
-        if (fallback) {
-          try {
-            resolve(fallback())
-          } catch (error) {
-            reject(error)
-          }
-
-          return
-        }
-
-        const errorMessage =
-              typeof message === 'string'
-                ? message
-                : `Promise timed out after ${milliseconds} milliseconds`
-        const timeoutError =
-              message instanceof Error ? message : new Error(errorMessage)
-
-        if (typeof promise.cancel === 'function') {
-          promise.cancel()
-        }
-
-        reject(timeoutError)
-      },
-      milliseconds
-    )
-    ;(async () => {
-      try {
-        resolve(await promise)
-      } catch (error) {
-        reject(error)
-      } finally {
-        customTimers.clearTimeout.call(undefined, timer)
-      }
-    })()
-  })
-
-  cancelablePromise.clear = () => {
-    customTimers.clearTimeout.call(undefined, timer)
-    timer = undefined
-  }
-
-  return cancelablePromise
-}
-/**
- TODO: Remove below function and just 'reject(signal.reason)' when targeting Node 18.
- */
-function getAbortedReason (signal) {
-  const reason =
-      signal.reason === undefined
-        ? getDOMException('This operation was aborted.')
-        : signal.reason
-
-  return reason instanceof Error ? reason : getDOMException(reason)
-}
-/**
- TODO: Remove AbortError and just throw DOMException when targeting Node 18.
- */
-function getDOMException (errorMessage) {
-  return globalThis.DOMException === undefined
-    ? new Error(errorMessage)
-    : new DOMException(errorMessage)
-}
-
-export async function checkPnpm () {
-  let npm = 'npm'
-  let ret = await execSync('pnpm -v')
-  if (ret.stdout) npm = 'pnpm'
-  return npm
-}
-
-async function execSync (cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { windowsHide: true }, (error, stdout, stderr) => {
-      resolve({ error, stdout, stderr })
-    })
-  })
-}
 
 export function mkdirs (dirname) {
   if (fs.existsSync(dirname)) {
@@ -235,13 +96,6 @@ export function formatDate (date) {
   return formattedDate
 }
 
-export function formatDate2 (date) {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-
-  return `${year}-${month}-${day}`
-}
 export async function getMasterQQ () {
   return (await import('../../../lib/config/config.js')).default.masterQQ
 }
@@ -458,27 +312,6 @@ export function formatDuration (duration) {
   return result || '0秒钟'
 }
 
-/**
- * 判断服务器所在地是否为中国
- * @returns {Promise<boolean>}
- */
-export async function isCN () {
-  if (await redis.get('CHATGPT:COUNTRY_CODE')) {
-    return await redis.get('CHATGPT:COUNTRY_CODE') === 'CN'
-  } else {
-    try {
-      let response = await fetch('https://ipinfo.io/country')
-      let countryCode = (await response.text()).trim()
-      await redis.set('CHATGPT:COUNTRY_CODE', countryCode, { EX: 3600 })
-      return countryCode === 'CN'
-    } catch (err) {
-      console.warn(err)
-      // 没拿到归属地默认CN
-      return true
-    }
-  }
-}
-
 export function limitString (str, maxLength, addDots = true) {
   if (str.length <= maxLength) {
     return str
@@ -581,66 +414,6 @@ export function maskQQ (qq) {
   let len = qq.length // QQ号长度
   let newqq = qq.slice(0, 3) + '*'.repeat(len - 7) + qq.slice(len - 3) // 替换中间3位为*
   return newqq
-}
-
-export function completeJSON (input) {
-  let result = {}
-
-  let inJson = false
-  let inQuote = false
-  let onStructure = false
-  let isKey = true
-  let tempKey = ''
-  let tempValue = ''
-  for (let i = 0; i < input.length; i++) {
-    // 获取当前字符
-    let char = input[i]
-    // 获取到json头
-    if (!inJson && char === '{') {
-      inJson = true
-      continue
-    }
-    // 如果不再json中，忽略当前字符
-    if (!inJson) continue
-
-    // 获取结构引号
-    if (char === '"' && input[i - 1] != '\\') {
-      inQuote = !inQuote
-      // 如果是开始数据，则确保当前结构开放
-      if (inQuote) onStructure = true
-      continue
-    }
-    // 获取:切换kv
-    if (!inQuote && onStructure && char === ':') {
-      isKey = !isKey
-      continue
-    }
-    // 将字符写入缓存
-    if (inQuote && onStructure) {
-      // 根据当前类型写入对应缓存
-      if (isKey) {
-        tempKey += char
-      } else {
-        tempValue += char
-      }
-    }
-    // 结束结构追加数据
-    if (!inQuote && onStructure && char === ',') {
-      // 追加结构
-      result[tempKey] = tempValue.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
-      // 结束结构清除数据
-      onStructure = false
-      inQuote = false
-      isKey = true
-      tempKey = ''
-      tempValue = ''
-    }
-  }
-  // 处理截断的json数据
-  if (onStructure && tempKey != '') {
-    result[tempKey] = tempValue.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
-  }
-  return result
 }
 
 export async function isImage (link) {
@@ -806,24 +579,6 @@ export async function getImageOcrText (e) {
   }
 }
 
-export function getMaxModelTokens (model = 'gpt-3.5-turbo') {
-  if (model.startsWith('gpt-3.5-turbo')) {
-    if (model.includes('16k')) {
-      return 16000
-    } else if (model.includes('0613') || model.includes('0314')) {
-      return 4000
-    } else {
-      return 16000
-    }
-  } else {
-    if (model.includes('32k')) {
-      return 32000
-    } else {
-      return 16000
-    }
-  }
-}
-
 export function getUin (e) {
   if (e?.self_id) return e.self_id
   if (e?.bot?.uin) return e.bot.uin
@@ -976,25 +731,6 @@ export function getUserSpeaker (userSetting) {
 }
 
 /**
- * 获取或者下载文件，如果文件存在则直接返回不会重新下载
- * @param destPath 相对路径，如received/abc.pdf
- * @param url
- * @param ignoreCertificateError 忽略证书错误
- * @return {Promise<string>} 最终下载文件的存储位置
- */
-export async function getOrDownloadFile (destPath, url, ignoreCertificateError = true) {
-  const _path = process.cwd()
-  let dest = path.join(_path, 'data', 'chatgpt', destPath)
-  const p = path.dirname(dest)
-  mkdirs(p)
-  if (fs.existsSync(dest)) {
-    return dest
-  } else {
-    return await downloadFile(url, destPath, false, ignoreCertificateError)
-  }
-}
-
-/**
  *
  * @param url 要下载的文件链接
  * @param destPath 目标路径，如received/abc.pdf. 目前如果文件名重复会覆盖。
@@ -1036,179 +772,6 @@ export async function downloadFile (url, destPath, absolute = false, ignoreCerti
   })
   logger.info(`File downloaded successfully! URL: ${url}, Destination: ${dest}`)
   return dest
-}
-
-export function isPureText (filename) {
-  const ext = path.extname(filename).toLowerCase()
-
-  // List of file extensions that can be treated as pure text
-  const textFileExtensions = ['.txt', '.log', '.md', '.csv', '.html', '.css', '.js', '.json', '.xml', '.py', '.java', '.cpp', '.c', '.rb', '.php', '.sql', '.sh', '.pl', '.r', '.swift', '.go', '.ts', '.htm', '.yaml', '.yml', '.ini', '.properties', '.tsv']
-
-  // File types that require additional processing
-  const processingExtensions = ['.docx', '.pptx', '.xlsx', '.pdf', '.epub']
-
-  if (textFileExtensions.includes(ext)) {
-    return 'text'
-  } else if (processingExtensions.includes(ext)) {
-    // Return the file extension if additional processing is needed
-    return ext.replace('.', '')
-  } else {
-    return false
-  }
-}
-
-/**
- * 从文件中提取文本内容
- * @param fileMsgElem MessageElem
- * @param e
- * @returns {Promise<{}>} 提取的文本内容和文件名
- */
-export async function extractContentFromFile (fileMsgElem, e) {
-  logger.info('filename: ' + fileMsgElem.name)
-  let fileType = isPureText(fileMsgElem.name)
-  if (fileType) {
-    // 可读的文件类型
-    let fileUrl = fileMsgElem.url || (e.isGroup ? await e.group.getFileUrl(fileMsgElem.fid) : await e.friend.getFileUrl(fileMsgElem.fid))
-    let filePath = await downloadFile(fileUrl, path.join('received', fileMsgElem.name))
-    switch (fileType) {
-      case 'pdf': {
-        if (!pdfjsLib) {
-          return {}
-        }
-        const data = new Uint8Array(fs.readFileSync(filePath))
-        let loadingTask = pdfjsLib.getDocument(data)
-        try {
-          const pdfDocument = await loadingTask.promise
-          const numPages = pdfDocument.numPages
-          let pdfText = ''
-
-          // limit pages to prevent OOM or LLM down
-          let maxPage = 100
-          // Iterate through each page and extract text
-          for (let pageNum = 1; pageNum <= Math.min(numPages, maxPage); ++pageNum) {
-            const page = await pdfDocument.getPage(pageNum)
-            const textContent = await page.getTextContent()
-            const pageText = textContent.items.map(item => item.str).join(' ')
-            pdfText += pageText
-          }
-
-          return {
-            content: pdfText,
-            name: fileMsgElem.name
-          }
-        } catch (error) {
-          console.error('Error reading PDF file:', error)
-          return {}
-        }
-      }
-      case 'doc': {
-        logger.error('not supported file type now')
-        return ''
-      }
-      case 'docx': {
-        if (!mammoth) {
-          return {}
-        }
-        try {
-          const { value } = await mammoth.extractRawText({ path: filePath })
-          return {
-            content: value,
-            name: fileMsgElem.name
-          }
-        } catch (error) {
-          logger.error('Error reading .docx file:', error)
-          return {}
-        }
-      }
-      case 'xls': {
-        logger.error('not supported file type now')
-        return {}
-      }
-      case 'xlsx': {
-        if (!XLSX) {
-          return {}
-        }
-        try {
-          const workbook = XLSX.readFile(filePath)
-          const sheetName = workbook.SheetNames[0] // Assuming the first sheet is the one you want to read
-          const sheet = workbook.Sheets[sheetName]
-          const data = XLSX.utils.sheet_to_json(sheet, { header: 1 })
-
-          // Convert the 2D array to plain text
-          return {
-            content: data.map(row => row.join('\t')).join('\n'),
-            name: fileMsgElem.name
-          }
-        } catch (error) {
-          console.error('Error reading .xlsx file:', error)
-          return {}
-        }
-      }
-      case 'ppt': {
-        logger.error('not supported file type now')
-        return {}
-      }
-      case 'pptx': {
-        if (!PPTX) {
-          return {}
-        }
-        try {
-          let pptx = new PPTX.Composer()
-          await pptx.load(filePath)
-          let presentationContent = []
-          let slideNumber = 1
-          let maxSlideNumber = 60
-          while (slideNumber <= maxSlideNumber) {
-            let slide
-            try {
-              slide = pptx.getSlide(slideNumber)
-            } catch (error) {
-              // Slide number out of range, break the loop
-              break
-            }
-
-            let slideContent = []
-
-            // Iterate through slide elements and extract text content
-            slide.elements.forEach(element => {
-              if (element.text) {
-                slideContent.push(element.text)
-              }
-            })
-
-            // Add slide content to the presentation content array
-            presentationContent.push(slideContent.join('\n'))
-
-            // Move to the next slide
-            slideNumber++
-          }
-          return {
-            content: presentationContent.join('\n'),
-            name: fileMsgElem.name
-          }
-        } catch (error) {
-          console.error('Error reading .pptx file:', error)
-          return {}
-        }
-      }
-      case 'epub': {
-        logger.error('not supported file type now')
-        return {}
-      }
-      default: {
-        // text type
-        const data = fs.readFileSync(filePath)
-        let text = String(data)
-        if (text) {
-          return {
-            content: text,
-            name: fileMsgElem.name
-          }
-        }
-      }
-    }
-    return {}
-  }
 }
 
 /**
@@ -1258,118 +821,4 @@ function maskString (str) {
   const maskedChars = '*'.repeat(str.length - 6)
 
   return firstThreeChars + maskedChars + lastThreeChars
-}
-
-/**
- * generated by ai
- * @param rawJsonString
- * @returns {string}
- */
-function fixNewlinesInJsonString(rawJsonString) {
-  // 标记是否在字符串内
-  let inString = false
-  // 结果字符串
-  let result = ''
-  for (let i = 0; i < rawJsonString.length; i++) {
-    const currentChar = rawJsonString[i]
-    const nextChar = i + 1 < rawJsonString.length ? rawJsonString[i + 1] : ''
-    // 检查当前字符是否为双引号，且不是转义的双引号
-    if (currentChar === '"' && (i === 0 || rawJsonString[i - 1] !== '\\')) {
-      inString = !inString // 切换在字符串内的标记
-    }
-    // 如果在字符串内且遇到换行符，则替换为\\n
-    if (inString && (currentChar === '\n' || (currentChar === '\r' && nextChar === '\n'))) {
-      result += '\\n'
-      if (currentChar === '\r') i++ // 跳过\n
-    } else {
-      result += currentChar
-    }
-  }
-  return result
-}
-
-/**
- * generated by ai
- * @param text
- * @returns {array}
- */
-export function extractMarkdownJson(text) {
-  const lines = text.split('\n')
-  const mdJsonPairs = []
-  let currentJson = ''
-  let currentMd = ''
-  let originalMd = ''
-  let jsonStarted = false
-  let isJsonBlock = false
-
-  lines.forEach(line => {
-    if (line.startsWith('```json')) {
-      jsonStarted = true
-      isJsonBlock = true
-      currentJson = ''
-      currentMd = line + '\n'
-      originalMd = line + '\n'
-    } else if (line.startsWith('```') && !isJsonBlock) {
-      // 处理没有json标签的代码块
-      if (currentMd) {
-        mdJsonPairs.push({
-          markdown: currentMd + line,
-          origin: originalMd + currentMd + line
-        })
-      }
-      currentMd = line + '\n'
-      originalMd = line + '\n'
-    } else if (line.startsWith('```') && currentJson) {
-      jsonStarted = false
-      isJsonBlock = false
-      try {
-        const parsedJson = JSON.parse(fixNewlinesInJsonString(currentJson))
-        mdJsonPairs.push({
-          json: parsedJson,
-          markdown: currentMd + line,
-          origin: originalMd + currentJson + '\n' + line
-        })
-      } catch (e) {
-        console.error('JSON解析错误:', e)
-        // 尝试修复并关闭JSON和Markdown
-        const fixedJson = fixNewlinesInJsonString(currentJson + '"}')
-        try {
-          const parsedJson = JSON.parse(fixedJson)
-          mdJsonPairs.push({
-            json: parsedJson,
-            markdown: currentMd + fixedJson + '\n```',
-            origin: originalMd + currentJson + '\n```'
-          })
-        } catch (e) {
-          console.error('修复后的JSON解析错误:', e)
-        }
-      }
-      currentJson = ''
-      currentMd = ''
-      originalMd = ''
-    } else {
-      if (jsonStarted) {
-        currentJson += line + (line ? '\n' : '')
-      }
-      currentMd += line + '\n'
-      originalMd += line + (line ? '\n' : '')
-    }
-  });
-
-  // 检查是否有未结束的JSON
-  if (jsonStarted) {
-    const fixedJson = fixNewlinesInJsonString(currentJson + '"}')
-    try {
-      const parsedJson = JSON.parse(fixedJson)
-      mdJsonPairs.push({
-        json: parsedJson,
-        markdown: currentMd + fixedJson + '\n```',
-        origin: originalMd + currentJson + '\n```'
-      });
-    } catch (e) {
-      console.error('未结束的JSON解析错误:', e)
-    }
-  }
-
-  return mdJsonPairs
 }

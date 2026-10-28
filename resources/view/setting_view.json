@@ -170,11 +170,6 @@
       },
       {
         "type": "check",
-        "label": "工具调用",
-        "data": "smartMode"
-      },
-      {
-        "type": "check",
         "label": "读取群聊上下文",
         "data": "enableGroupContext"
       },

@@ -1,5 +1,6 @@
 import { AbstractPostProcessor } from './BasicProcessor.js'
 
+// 刻意保留：本文件没有静态引用，由 BasicProcessor 的 collectProcessors 目录扫描动态加载。
 export class ReasonerProcessor extends AbstractPostProcessor {
   constructor () {
     super()

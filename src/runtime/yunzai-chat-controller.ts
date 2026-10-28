@@ -251,9 +251,9 @@ export function buildYunzaiChatRules (
 ): readonly YunzaiPluginRule[] {
   const modes = [...conversationModePrefixes].join('|')
   return Object.freeze([
-    freezeRule({ reg: '^#(图片)?chat1[sS]*', fnc: 'chatgpt1' }),
+    freezeRule({ reg: '^#(图片)?chat1[\\s\\S]*', fnc: 'chatgpt1' }),
     freezeRule({
-      reg: entryMode === 'at' ? '^[^#][sS]*' : '^#(图片)?chat[^gpt][sS]*',
+      reg: entryMode === 'at' ? '^[^#][\\s\\S]*' : '^#(图片)?chat[^gpt][\\s\\S]*',
       fnc: 'chatgpt',
       log: false
     }),
@@ -261,7 +261,7 @@ export function buildYunzaiChatRules (
       reg: '^#(chatgpt)?对话列表$', fnc: 'getAllConversations', permission: 'master'
     }),
     freezeRule({
-      reg: `^#?(${modes})?(结束|新开|摧毁|毁灭|完结)对话([sS]*)$`,
+      reg: `^#?(${modes})?(结束|新开|摧毁|毁灭|完结)对话([\\s\\S]*)$`,
       fnc: 'destroyConversations'
     }),
     freezeRule({

@@ -7,8 +7,6 @@ import {
 import { migrateLegacyCrossChannelPolicies } from '../dist/runtime/tools/cross-channel-policy.js'
 // Reverse proxy of https://api.openai.com
 export const defaultOpenAIReverseProxy = 'https://mondstadt.d201.eu.org/v1'
-// blocked in China Mainland
-export const defaultOpenAIAPI = 'https://api.openai.com/v1'
 const defaultConfig = {
   blockWords: ['屏蔽词1', '屏蔽词b'],
   promptBlockWords: ['屏蔽词1', '屏蔽词b'],
@@ -114,7 +112,6 @@ const defaultConfig = {
   imageSearchSource: 'auto',
   extraUrl: '',
   disabledTools: [],
-  smartMode: false,
   toolPolicyProfile: 'compatible',
   toolApprovalTtlSeconds: 120,
   trssBotUin: '',

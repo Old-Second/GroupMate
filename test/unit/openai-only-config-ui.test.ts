@@ -107,7 +107,6 @@ const preservedFields = [
   'defaultTTSRole',
   'voicevoxSpace',
   'voicevoxTTSSpeaker',
-  'smartMode',
   'toolPrivateSendPolicy',
   'toolCrossGroupSendPolicy',
   'enableToolVideoDownload',
@@ -148,7 +147,6 @@ const requiredGuobaFields = [
   'temperature',
   'forwardReasoning',
   'forwardToolDetails',
-  'smartMode',
   'toolPolicyProfile',
   'disabledTools',
   'toolApprovalTtlSeconds',
@@ -306,7 +304,7 @@ const expectedGuobaGroups = [
   {
     label: '工具与搜索',
     fields: [
-      'smartMode', 'disabledTools', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
+      'disabledTools', 'toolPolicyProfile', 'toolApprovalTtlSeconds',
       'toolPrivateSendPolicy', 'toolCrossGroupSendPolicy',
       'enableToolVideoDownload', 'toolVideoMaxMB', 'serpSource', 'tavilyApiKey',
       'azSerpKey', 'imageSearchSource', 'braveSearchApiKey', 'amapKey',

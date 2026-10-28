@@ -26,11 +26,6 @@ const helpData = [
         icon: 'destroy',
         title: '#(结束|新开|摧毁|毁灭|完结)对话',
         desc: '结束当前会话'
-      },
-      {
-        icon: 'destroy-other',
-        title: '#(结束|新开|摧毁|毁灭|完结)对话 @某人',
-        desc: '结束指定群友的当前会话'
       }
     ]
   },
@@ -91,6 +86,11 @@ const helpData = [
         icon: 'switch',
         title: '#chatgpt(允许|禁止|打开|关闭|同意)私聊',
         desc: '设置私聊通道'
+      },
+      {
+        icon: 'confirm',
+        title: '确认 / 拒绝',
+        desc: '批准或拒绝机器人请求的一次性工具操作'
       }
     ]
   },
@@ -114,8 +114,8 @@ const helpData = [
       },
       {
         icon: 'token',
-        title: '#chatgpt(开启|关闭)智能模式',
-        desc: '开关工具调用'
+        title: '#chatgpt查看当前配置',
+        desc: '查看当前模型、流式输出和隐藏工具'
       },
       {
         icon: 'eat',

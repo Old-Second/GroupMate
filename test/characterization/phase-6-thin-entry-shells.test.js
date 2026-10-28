@@ -94,7 +94,7 @@ test('chat BYM and approval shells preserve metadata rules and delegate one-for-
   assert.match(bym.source, /event:\s*'message'/)
   assert.match(bym.source, /priority:\s*5000/)
   assert.match(bym.source, /priority:\s*'-1000000'/)
-  assert.match(bym.source, /reg:\s*'\^\[\^#\]\[sS\]\*'/)
+  assert.match(bym.source, /reg:\s*'\^\[\^#\]\[\\\\s\\\\S\]\*'/)
   assertSingleDelegate(bym.source, 'bym', 'bym', 'bymController')
 
   const approvalClass = exportedClass(approval.file)

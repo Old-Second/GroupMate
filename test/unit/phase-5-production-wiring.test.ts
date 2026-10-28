@@ -59,7 +59,6 @@ test('Phase 5 production entries reach one run engine and one OpenAI-compatible 
   assert.equal(files.includes('model/core.js'), false)
   assert.equal(files.includes('utils/openai/chatgpt-api.js'), false)
   assert.equal(files.includes('dist/runtime/completion-facade.js'), false)
-  assert.equal(files.includes('utils/chat.js'), false)
   const combined = [...graph.values()].join('\n')
   assert.doesNotMatch(
     combined,

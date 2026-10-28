@@ -28,6 +28,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 /**
  * collect
+ *
+ * 目录自动加载：本目录下除本文件以外的每个 `.js` 都会被动态 import，凡直接继承
+ * AbstractPostProcessor 的导出类都会被实例化。这些文件没有任何静态引用，静态分析
+ * 会把它们误判为死代码，清理前务必确认不在这条路径上。
+ *
  * @param {'pre' | 'post' | undefined} type
  * @return {Promise<AbstractPostProcessor[]>}
  */
@@ -63,7 +68,7 @@ export async function collectProcessors (type) {
           }
         }
       } catch (err) {
-        // console.error(`Error processing file ${file}:`, err)
+        logger?.debug?.(`后处理器加载失败：${file}`, err)
       }
     }
   }

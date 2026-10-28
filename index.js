@@ -1521,7 +1521,7 @@ if (Config.enableToolbox) {
 runtimeLogger.info(`${pluginDisplayName}加载成功`)
 runtimeLogger.info(`当前版本${Config.version}`)
 runtimeLogger.info(`仓库地址 ${repositoryUrl}`)
-runtimeLogger.info('文档地址 https://www.yunzai.chat')
+runtimeLogger.info('命令清单 docs/commands.md；发送 #chatgpt帮助 查看常用命令')
 runtimeLogger.info('**************************************')
 
 export { apps }

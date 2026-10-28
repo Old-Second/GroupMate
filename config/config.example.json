@@ -101,7 +101,6 @@
   "extraUrl": "",
   "disabledTools": [],
   "githubAPIKey": "",
-  "smartMode": false,
   "toolPolicyProfile": "compatible",
   "toolApprovalTtlSeconds": 120,
   "toolPrivateSendPolicy": "master",
