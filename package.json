@@ -15,6 +15,8 @@
   "packageManager": "pnpm@10.32.1",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "lint:prune": "eslint . --prune-suppressions",
     "test": "pnpm run build && node --test --test-concurrency=1 test/unit/*.test.js test/characterization/*.test.js && pnpm run test:ts",
     "test:unit": "pnpm run build && node --test --test-concurrency=1 test/unit/*.test.js && pnpm run test:ts",
     "test:ts": "tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/unit/*.test.js",
@@ -60,8 +62,10 @@
   },
   "devDependencies": {
     "@types/node": "22.14.0",
+    "eslint": "^10.13.0",
     "ts-node": "^10.9.1",
     "ts-node-register": "^1.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.1"
   }
 }

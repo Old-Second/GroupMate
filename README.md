@@ -48,13 +48,15 @@ pnpm install --frozen-lockfile
 ## 本地验证
 
 ```bash
+pnpm run lint
 pnpm test
 pnpm test:unit
 pnpm test:characterization
+node scripts/check-dist-drift.mjs
 git diff --check
 ```
 
-默认测试完全离线并以单并发执行。`pnpm test:online:openai` 仅用于明确配置并主动启用后的 OpenAI-compatible 连通性检查，不属于默认测试。
+默认测试完全离线并以单并发执行。`pnpm test:online:openai` 仅用于明确配置并主动启用后的 OpenAI-compatible 连通性检查，不属于默认测试。闸门覆盖范围、lint 规则与 baseline、以及只能手动触发的验证入口见 `docs/quality-gates.md`。
 
 ## 主要目录
 

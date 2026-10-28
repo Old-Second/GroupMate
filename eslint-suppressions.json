@@ -1,0 +1,297 @@
+{
+  "index.js": {
+    "no-empty": {
+      "count": 4
+    }
+  },
+  "server/index.js": {
+    "no-useless-escape": {
+      "count": 3
+    }
+  },
+  "src/agent/memory/OpenAiMemoryCandidateExtractor.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/agent/memory/memory-canonical-wire.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "src/agent/memory/memory-export-port.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/agent/memory/sqlite-memory-export.ts": {
+    "no-empty": {
+      "count": 9
+    }
+  },
+  "src/agent/memory/sqlite-memory-extraction-queue.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/agent/memory/sqlite-memory-lexical-index.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "src/agent/memory/sqlite-memory-lifecycle-mutation.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/agent/memory/sqlite-memory-maintenance.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/GreetingContext.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/GroupMemory.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/GroupMemoryPolicy.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/ProductionShadowMemory.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/SunoDiagnostics.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/activities/ActivityWorker.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/agent-service-bridge.ts": {
+    "no-empty": {
+      "count": 6
+    }
+  },
+  "src/runtime/agent-service.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/logging/content-journal-projection.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/logging/groupmate-content-journal.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/logging/groupmate-disk-log.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/logging/journaled-yunzai-outbound.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/observability/owner-diagnostics.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/participation/ParticipationShadow.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/presentation/groupmate-picture-renderer.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/presentation/pending-indicator-presenter.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/presentation/presentation-settings.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/presentation/remote-picture-renderer.ts": {
+    "no-empty": {
+      "count": 9
+    }
+  },
+  "src/runtime/presentation/reply-presenter.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/presentation/tts-reply-presentation.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/production-personal-memory-runtime.ts": {
+    "no-empty": {
+      "count": 9
+    }
+  },
+  "src/runtime/production-yunzai-agent.ts": {
+    "no-empty": {
+      "count": 11
+    }
+  },
+  "src/runtime/provider-isolation-id.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/run-approval-router.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/run-presentation-lifecycle.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "src/runtime/tools/policy-fetch.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/tools/yunzai-tool-runtime.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "src/runtime/translation-service.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "src/runtime/yunzai-approval-controller.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/runtime/yunzai-bym-controller.ts": {
+    "no-empty": {
+      "count": 4
+    }
+  },
+  "src/runtime/yunzai-chat-controller.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/yunzai-personal-memory-controller.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/runtime/yunzai-update-controller.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/tools/GithubTool.ts": {
+    "no-useless-escape": {
+      "count": 3
+    }
+  },
+  "src/verification/phase-7b-memory-scenario.ts": {
+    "no-empty": {
+      "count": 6
+    }
+  },
+  "src/verification/phase-7c-memory-scenario.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "src/verification/phase-7d-memory-report.ts": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "src/verification/phase-7d-memory-scenario.ts": {
+    "no-empty": {
+      "count": 3
+    }
+  },
+  "test/characterization/pending-indicator-config.test.js": {
+    "no-useless-escape": {
+      "count": 1
+    }
+  },
+  "test/unit/node-runtime-baseline.test.ts": {
+    "no-regex-spaces": {
+      "count": 1
+    }
+  },
+  "test/unit/openai-only-config-ui.test.ts": {
+    "no-regex-spaces": {
+      "count": 6
+    }
+  },
+  "test/unit/reply-presenter.test.ts": {
+    "no-constant-condition": {
+      "count": 1
+    }
+  },
+  "test/unit/sqlite-memory-lifecycle-mutation.test.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "test/unit/sqlite-memory-maintenance.test.ts": {
+    "no-empty": {
+      "count": 2
+    }
+  },
+  "test/unit/sqlite-memory-migrations-v2.test.ts": {
+    "no-useless-escape": {
+      "count": 1
+    }
+  },
+  "utils/browser.js": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "utils/common.js": {
+    "no-empty": {
+      "count": 4
+    }
+  },
+  "utils/prompts.js": {
+    "no-empty": {
+      "count": 1
+    }
+  },
+  "utils/tts/microsoft-azure.js": {
+    "no-empty": {
+      "count": 2
+    }
+  }
+}

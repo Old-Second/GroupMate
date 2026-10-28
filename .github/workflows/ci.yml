@@ -23,9 +23,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts --no-optional
+      - run: pnpm run lint
       - run: pnpm test
-      - run: node --check apps/chat.js
-      - run: node --check scripts/memory-scenario.mjs
-      - run: node --check scripts/measure-memory.mjs
-      - run: node --check scripts/smoke-openai-compatible.mjs
+      - run: node scripts/check-dist-drift.mjs
+      - name: syntax check entry points
+        run: |
+          for file in index.js guoba.support.js apps/*.js scripts/*.mjs; do
+            node --check "$file"
+          done
       - run: git diff --check "$(git rev-list --max-parents=0 HEAD)"..HEAD

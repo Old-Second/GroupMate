@@ -256,7 +256,7 @@ test('each authorized management capability calls one narrow host method', async
  * facts for the target `{ kind: 'none' }`, so `targetRole` is still unknown when
  * the hierarchy gate runs. The gate refuses rather than defers, which is why a
  * kick never reaches execution even for an authorized actor. The direction is
- * fail-closed - no side effect leaks - but `docs/tools.md:16` promises the
+ * fail-closed - no side effect leaks - but `docs/tools.md:13` promises the
  * capability to an authority holder, so the refusal is a gap, not the contract.
  */
 test('a kick is refused while the target role is unknown and admitted once it is resolved', async () => {
