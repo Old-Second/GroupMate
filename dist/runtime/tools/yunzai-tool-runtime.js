@@ -834,6 +834,14 @@ function safeAudit(logger) {
         }
     };
 }
+/** Keeps a lost idempotency write visible in the journal; behavior is unchanged. */
+function safeControlFailures(logger) {
+    return {
+        emit(event) {
+            logger?.info?.(Object.freeze({ event: 'groupmate.tool.control_failure', ...event }));
+        }
+    };
+}
 function sameJson(left, right) {
     try {
         return JSON.stringify(left) === JSON.stringify(right);
@@ -949,6 +957,7 @@ export function createYunzaiToolRuntimeBridge(options) {
             policy: new ToolPolicyEngine(),
             idempotencyStore: new RedisIdempotencyStore({ client: options.redis, botIdHash }),
             audit: safeAudit(options.logger),
+            controlFailures: safeControlFailures(options.logger),
             generateId: runtimeId,
             hash: sha256Value,
             now: () => new Date()

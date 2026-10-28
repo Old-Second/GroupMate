@@ -2,7 +2,12 @@ import { currentGroupMember } from '../CurrentGroupMember.js'
 import { AgentError } from '../../agent/contracts/error.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import type { ToolAuditEvent, ToolAuditSink } from '../../agent/tools/audit.js'
+import type {
+  ToolAuditEvent,
+  ToolAuditSink,
+  ToolControlFailureEvent,
+  ToolControlFailureSink
+} from '../../agent/tools/audit.js'
 import type { SessionAddress } from '../../agent/contracts/identity.js'
 import type {
   ToolExecutionContext,
@@ -996,6 +1001,17 @@ function safeAudit (logger: YunzaiToolRuntimeBridgeOptions['logger']): ToolAudit
   }
 }
 
+/** Keeps a lost idempotency write visible in the journal; behavior is unchanged. */
+function safeControlFailures (
+  logger: YunzaiToolRuntimeBridgeOptions['logger']
+): ToolControlFailureSink {
+  return {
+    emit (event: ToolControlFailureEvent): void {
+      logger?.info?.(Object.freeze({ event: 'groupmate.tool.control_failure', ...event }))
+    }
+  }
+}
+
 function sameJson (left: unknown, right: unknown): boolean {
   try {
     return JSON.stringify(left) === JSON.stringify(right)
@@ -1139,6 +1155,7 @@ export function createYunzaiToolRuntimeBridge (
       policy: new ToolPolicyEngine(),
       idempotencyStore: new RedisIdempotencyStore({ client: options.redis, botIdHash }),
       audit: safeAudit(options.logger),
+      controlFailures: safeControlFailures(options.logger),
       generateId: runtimeId,
       hash: sha256Value,
       now: () => new Date()

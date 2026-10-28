@@ -4,6 +4,10 @@ import { ToolInputError, validateToolInputRecord } from './schema-validator.js';
 import { completedPreparedCall, parseSerializablePreparedCapability } from './prepared-capability.js';
 import { parseToolResult } from './tool-result.js';
 const idempotencyTtlSeconds = 300;
+function errorName(error) {
+    const name = error instanceof Error ? error.name : typeof error;
+    return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : 'unavailable';
+}
 function failedResult(errorCode) {
     const messages = {
         configuration_missing: '工具配置不完整。',
@@ -108,6 +112,37 @@ export class ToolExecutor {
         }
         catch {
             return false;
+        }
+    }
+    /**
+     * Records a lost control-plane write without changing the tool outcome.
+     *
+     * The sink is observability only: a failing sink must never turn a dispatched
+     * side effect into a different result, so its own failure stays swallowed.
+     */
+    #noteControlFailure(operation, unpersistedState, definition, request, error) {
+        try {
+            this.#options.controlFailures?.emit(Object.freeze({
+                eventType: 'control_failure',
+                operation,
+                unpersistedState,
+                runRef: typeof request.call.runRef === 'string' &&
+                    RUN_REF_PATTERN.test(request.call.runRef)
+                    ? request.call.runRef
+                    : 'unavailable',
+                runIdHash: this.#options.hash(request.call.runId),
+                callIdHash: this.#options.hash(request.call.callId),
+                toolName: definition.name,
+                toolVersion: 1,
+                profile: request.profile,
+                effect: definition.effect,
+                risk: definition.risk,
+                errorName: errorName(error),
+                occurredAt: this.#options.now().toISOString()
+            }));
+        }
+        catch {
+            // Observability failures must not change Agent or QQ behavior.
         }
     }
     #duplicateResult(reservation) {
@@ -362,7 +397,9 @@ export class ToolExecutor {
                         completedAt: this.#options.now().toISOString()
                     }, idempotencyTtlSeconds);
                 }
-                catch { }
+                catch (error) {
+                    this.#noteControlFailure('idempotency_complete', 'failed', definition, auditRequest, error);
+                }
             }
             return failedResult('tool_control_unavailable');
         }
@@ -425,7 +462,9 @@ export class ToolExecutor {
                     try {
                         await this.#options.idempotencyStore.markIndeterminate(key, idempotencyTtlSeconds);
                     }
-                    catch { }
+                    catch (error) {
+                        this.#noteControlFailure('idempotency_mark_indeterminate', 'unknown', definition, auditRequest, error);
+                    }
                 }
                 await this.#tryAudit('indeterminate', definition, auditRequest, {
                     errorCode: 'tool_outcome_unknown', startedAt

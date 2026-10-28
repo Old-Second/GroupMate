@@ -1,4 +1,10 @@
-import type { ToolAuditEvent, ToolAuditEventType, ToolAuditSink } from './audit.js'
+import type {
+  ToolAuditEvent,
+  ToolAuditEventType,
+  ToolAuditSink,
+  ToolControlFailureSink,
+  ToolControlOperation
+} from './audit.js'
 import { RUN_REF_PATTERN } from '../run/run-reference.js'
 import type { ToolCall } from './tool-call.js'
 import type {
@@ -57,9 +63,15 @@ export interface ToolExecutorOptions {
   readonly policy: ToolPolicyEngine
   readonly idempotencyStore: IdempotencyStore
   readonly audit: ToolAuditSink
+  readonly controlFailures?: ToolControlFailureSink
   readonly generateId: () => string
   readonly hash: (value: string) => string
   readonly now: () => Date
+}
+
+function errorName (error: unknown): string {
+  const name = error instanceof Error ? error.name : typeof error
+  return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : 'unavailable'
 }
 
 function failedResult (errorCode: ToolErrorCode): ToolResult {
@@ -186,6 +198,43 @@ export class ToolExecutor implements ToolRuntime {
       return true
     } catch {
       return false
+    }
+  }
+
+  /**
+   * Records a lost control-plane write without changing the tool outcome.
+   *
+   * The sink is observability only: a failing sink must never turn a dispatched
+   * side effect into a different result, so its own failure stays swallowed.
+   */
+  #noteControlFailure (
+    operation: ToolControlOperation,
+    unpersistedState: 'failed' | 'unknown',
+    definition: ToolDefinition,
+    request: ToolAuditRequest,
+    error: unknown
+  ): void {
+    try {
+      this.#options.controlFailures?.emit(Object.freeze({
+        eventType: 'control_failure',
+        operation,
+        unpersistedState,
+        runRef: typeof request.call.runRef === 'string' &&
+          RUN_REF_PATTERN.test(request.call.runRef)
+          ? request.call.runRef
+          : 'unavailable',
+        runIdHash: this.#options.hash(request.call.runId),
+        callIdHash: this.#options.hash(request.call.callId),
+        toolName: definition.name,
+        toolVersion: 1,
+        profile: request.profile,
+        effect: definition.effect,
+        risk: definition.risk,
+        errorName: errorName(error),
+        occurredAt: this.#options.now().toISOString()
+      }))
+    } catch {
+      // Observability failures must not change Agent or QQ behavior.
     }
   }
 
@@ -476,7 +525,11 @@ export class ToolExecutor implements ToolRuntime {
             status: 'failed', effect: 'none', errorCode: 'tool_control_unavailable',
             completedAt: this.#options.now().toISOString()
           }, idempotencyTtlSeconds)
-        } catch {}
+        } catch (error) {
+          this.#noteControlFailure(
+            'idempotency_complete', 'failed', definition, auditRequest, error
+          )
+        }
       }
       return failedResult('tool_control_unavailable')
     }
@@ -551,7 +604,11 @@ export class ToolExecutor implements ToolRuntime {
             await this.#options.idempotencyStore.markIndeterminate(
               key, idempotencyTtlSeconds
             )
-          } catch {}
+          } catch (error) {
+            this.#noteControlFailure(
+              'idempotency_mark_indeterminate', 'unknown', definition, auditRequest, error
+            )
+          }
         }
         await this.#tryAudit('indeterminate', definition, auditRequest, {
           errorCode: 'tool_outcome_unknown', startedAt
