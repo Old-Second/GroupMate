@@ -458,7 +458,7 @@ export async function createServer () {
       if (clients) {
         for (const index in clients) {
           const user = GetUser(index)
-          if (user.autho == 'admin' || user.user == e.user_id) {
+          if (user?.autho == 'admin' || user?.user == e.user_id) {
             clients[index].send(JSON.stringify(messageData))
           }
         }
@@ -575,7 +575,7 @@ export async function createServer () {
       if (clients) {
         for (const index in clients) {
           const user = GetUser(index)
-          if (user.autho == 'admin') {
+          if (user?.autho == 'admin') {
             clients[index].send(JSON.stringify({
               notice: 'updateConfig'
             }))

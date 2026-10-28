@@ -22,7 +22,7 @@ export function UserInfo(token) {
 }
 // 获取用户数据
 export function GetUser(user) {
-    return users.user.find(user => user === user)
+    return users.user.find(item => String(item.user) === String(user))
 }
 // 添加用户token
 export async function AddUser(data) {
