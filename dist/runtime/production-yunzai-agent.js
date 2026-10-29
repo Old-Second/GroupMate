@@ -785,13 +785,12 @@ export function createProductionYunzaiAgent(options) {
         outcomeHandler: approvalOutcomeHandler
     });
     const approvalController = createYunzaiApprovalController(approvalOptions);
+    const usageWindow = observability.usage;
     const diagnosticsController = new YunzaiDiagnosticsController(new OwnerDiagnostics({
         metrics: observability.metrics,
         traceStore: observability.traceStore,
         currentLevel: () => observability.currentLevel(),
-        ...(observability.usage === undefined
-            ? {}
-            : { usage: () => observability.usage.snapshot() }),
+        ...(usageWindow === undefined ? {} : { usage: () => usageWindow.snapshot() }),
         pipeline: () => observability.pipelineSnapshot(),
         logger: options.bridge.logger
     }));

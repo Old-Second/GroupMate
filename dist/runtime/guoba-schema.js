@@ -44,7 +44,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
             ]
         }),
         field('observationSuccessSampleRate', '成功轨迹采样率', '成功运行保留脱敏轨迹的百分比，范围 0-100，默认 5。失败与取消的运行始终保留，诊断级别保留全部，所以本项只影响成功样本。采样率在运行开始时冻结进该运行的策略，修改后只影响新运行，已有运行的校验不受影响。', 'InputNumber', { min: 0, max: 100 }),
-        field('usageAggregationEnabled', '按群与按人用量聚合', '默认开启：在内存窗口里按计费日（北京时间）、按群、按人汇总 Token 与参考费用，供“#GroupMate用量”查看。最多保留 7 天，每天最多 32 个群与 64 个人，超出部分只计溢出次数。身份不写入指标标签、不落盘、不进 Redis 轨迹，展示时只给掩码尾号；关闭或把可观测性切到完全关闭都会立即清空该窗口。', 'Switch'),
+        field('usageAggregationEnabled', '按群与按人用量聚合', '默认开启：在内存窗口里按计费日（北京时间）、按群、按人汇总 Token 与参考费用，供“#GroupMate用量”查看。最多保留 7 天，每天最多 32 个群与 64 个人，超出部分只计溢出次数；查看时按群与按人各最多展开 16 行，其余只报条数。身份不写入指标标签、不落盘、不进 Redis 轨迹，展示时只给掩码尾号；关闭或把可观测性切到完全关闭都会立即清空该窗口。', 'Switch'),
         field('diskLogEnabled', '完整内容落盘日志', '开启后将完整业务内容写入独立落盘日志；最长保留 30 天，单文件 32 MiB 轮转，目录总量硬上限 512 MiB。该日志与 Redis 脱敏可观测轨迹彼此独立，修改后需重启。', 'Switch'),
         field('debug', '调试日志', '独立控制旧业务调试日志，不会改变脱敏观测级别、轨迹采样或清理屏障。', 'Switch'),
         divider('模型与会话'),

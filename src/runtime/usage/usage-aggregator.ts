@@ -86,6 +86,9 @@ export interface UsageAggregateSnapshotV1 {
   readonly days: readonly UsageDayRowV1[]
   readonly groups: readonly UsageScopeRowV1[]
   readonly actors: readonly UsageScopeRowV1[]
+  /** Rows the row cap left out of `groups` and `actors`, so truncation is visible. */
+  readonly omittedGroupRows: number
+  readonly omittedActorRows: number
 }
 
 /**
@@ -250,7 +253,7 @@ class BoundedKeySet {
     if (this.#values.has(value)) return false
     this.#values.add(value)
     if (this.#values.size > this.#capacity) {
-      const oldest = this.#values.values().next().value as string | undefined
+      const oldest = this.#values.values().next().value
       if (oldest !== undefined) this.#values.delete(oldest)
     }
     return true
@@ -355,6 +358,8 @@ export class UsageAggregator {
   }
 
   snapshot (): UsageAggregateSnapshotV1 {
+    const groups = scopeRows(this.#groups)
+    const actors = scopeRows(this.#actors)
     return Object.freeze({
       schemaVersion: 1,
       windowStartedAt: this.#windowStartedAt,
@@ -367,8 +372,10 @@ export class UsageAggregator {
       days: Object.freeze([...this.#days.entries()]
         .sort((left, right) => right[0].localeCompare(left[0]))
         .map(([day, totals]) => Object.freeze({ day, totals: freezeTotals(totals) }))),
-      groups: scopeRows(this.#groups),
-      actors: scopeRows(this.#actors)
+      groups: groups.rows,
+      actors: actors.rows,
+      omittedGroupRows: groups.omitted,
+      omittedActorRows: actors.omitted
     })
   }
 
@@ -436,8 +443,11 @@ export class UsageAggregator {
   }
 }
 
-function scopeRows (entries: ReadonlyMap<string, ScopeEntry>): readonly UsageScopeRowV1[] {
-  return Object.freeze([...entries.values()]
+function scopeRows (entries: ReadonlyMap<string, ScopeEntry>): Readonly<{
+  rows: readonly UsageScopeRowV1[]
+  omitted: number
+}> {
+  const sorted = [...entries.values()]
     .map(entry => Object.freeze({
       day: entry.day,
       maskedId: maskUsageIdentifier(entry.id),
@@ -448,5 +458,8 @@ function scopeRows (entries: ReadonlyMap<string, ScopeEntry>): readonly UsageSco
       right.day.localeCompare(left.day) ||
       left.maskedId.localeCompare(right.maskedId)
     ))
-    .slice(0, USAGE_AGGREGATE_LIMITS.maxRows))
+  return Object.freeze({
+    rows: Object.freeze(sorted.slice(0, USAGE_AGGREGATE_LIMITS.maxRows)),
+    omitted: Math.max(0, sorted.length - USAGE_AGGREGATE_LIMITS.maxRows)
+  })
 }

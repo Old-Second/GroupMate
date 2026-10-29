@@ -276,10 +276,12 @@ export class OwnerDiagnostics {
             ...(usage.groups.length === 0
                 ? ['无']
                 : usage.groups.map(row => `${row.maskedId} ${row.day} ${totalsText(row.totals)}`)),
+            ...(usage.omittedGroupRows > 0 ? [`其余 ${usage.omittedGroupRows} 行未展开`] : []),
             '按人（掩码尾号）：',
             ...(usage.actors.length === 0
                 ? ['无']
                 : usage.actors.map(row => `${row.maskedId} ${row.day} ${totalsText(row.totals)}`)),
+            ...(usage.omittedActorRows > 0 ? [`其余 ${usage.omittedActorRows} 行未展开`] : []),
             `维度溢出：群 ${usage.droppedGroupRuns} / 人 ${usage.droppedActorRuns}`
         ].join('\n'), REPORT_MAXIMUM_CODE_POINTS));
     }

@@ -130,7 +130,9 @@ const usageSnapshot: UsageAggregateSnapshotV1 = Object.freeze({
   ]),
   actors: Object.freeze([
     Object.freeze({ day: '2026-10-29', maskedId: ACTOR_MASK, totals: usageTotals })
-  ])
+  ]),
+  omittedGroupRows: 3,
+  omittedActorRows: 0
 })
 
 const pipeline: ObservationPipelineSnapshotV1 = Object.freeze({
@@ -173,6 +175,7 @@ function harness (input: {
   const reads = { metrics: 0, load: 0, recent: 0, usage: 0 }
   const logs: Readonly<Record<string, unknown>>[] = []
   const usageSource = input.usage === 'absent' ? undefined : input.usage ?? usageSnapshot
+  const pipelineSource = input.pipeline
   return {
     reads,
     logs,
@@ -200,7 +203,7 @@ function harness (input: {
           return usageSource
         }
       }),
-      ...(input.pipeline === undefined ? {} : { pipeline: () => input.pipeline! }),
+      ...(pipelineSource === undefined ? {} : { pipeline: () => pipelineSource }),
       logger: Object.freeze({
         info: (entry: Readonly<Record<string, unknown>>) => { logs.push(entry) }
       })
@@ -310,6 +313,7 @@ test('a usage report carries masked identifiers overflow counts and the window',
   assert.match(response.text, /已统计运行：3（拒绝 1）/)
   assert.match(response.text, new RegExp(`${GROUP_MASK.replace(/\*/g, '\\*')} 2026-10-29`))
   assert.match(response.text, new RegExp(`${ACTOR_MASK.replace(/\*/g, '\\*')} 2026-10-29`))
+  assert.match(response.text, /其余 3 行未展开/)
   assert.match(response.text, /维度溢出：群 2 \/ 人 0/)
   assert.ok([...response.text].length <= 4_000)
 })

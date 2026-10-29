@@ -243,6 +243,8 @@ export class UsageAggregator {
         this.#currentLevel = level;
     }
     snapshot() {
+        const groups = scopeRows(this.#groups);
+        const actors = scopeRows(this.#actors);
         return Object.freeze({
             schemaVersion: 1,
             windowStartedAt: this.#windowStartedAt,
@@ -255,8 +257,10 @@ export class UsageAggregator {
             days: Object.freeze([...this.#days.entries()]
                 .sort((left, right) => right[0].localeCompare(left[0]))
                 .map(([day, totals]) => Object.freeze({ day, totals: freezeTotals(totals) }))),
-            groups: scopeRows(this.#groups),
-            actors: scopeRows(this.#actors)
+            groups: groups.rows,
+            actors: actors.rows,
+            omittedGroupRows: groups.omitted,
+            omittedActorRows: actors.omitted
         });
     }
     #acceptDay(day) {
@@ -322,7 +326,7 @@ export class UsageAggregator {
     }
 }
 function scopeRows(entries) {
-    return Object.freeze([...entries.values()]
+    const sorted = [...entries.values()]
         .map(entry => Object.freeze({
         day: entry.day,
         maskedId: maskUsageIdentifier(entry.id),
@@ -330,6 +334,9 @@ function scopeRows(entries) {
     }))
         .sort((left, right) => (right.totals.totalTokens - left.totals.totalTokens ||
         right.day.localeCompare(left.day) ||
-        left.maskedId.localeCompare(right.maskedId)))
-        .slice(0, USAGE_AGGREGATE_LIMITS.maxRows));
+        left.maskedId.localeCompare(right.maskedId)));
+    return Object.freeze({
+        rows: Object.freeze(sorted.slice(0, USAGE_AGGREGATE_LIMITS.maxRows)),
+        omitted: Math.max(0, sorted.length - USAGE_AGGREGATE_LIMITS.maxRows)
+    });
 }

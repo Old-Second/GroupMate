@@ -251,6 +251,11 @@ test('a per-day scope overflow is counted rather than silently merged', () => {
   assert.equal(snapshot.droppedGroupRuns, 2)
   assert.equal(snapshot.days[0]?.totals.runs, total)
   assert.equal(snapshot.groups.length, USAGE_AGGREGATE_LIMITS.maxRows)
+  assert.equal(
+    snapshot.omittedGroupRows,
+    USAGE_AGGREGATE_LIMITS.maxGroupsPerDay - USAGE_AGGREGATE_LIMITS.maxRows
+  )
+  assert.equal(snapshot.omittedActorRows, 0)
 })
 
 test('switching observability off clears the window and stops collecting', () => {

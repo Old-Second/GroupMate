@@ -16,7 +16,7 @@ export class diagnostics extends plugin {
   constructor () {
     super({
       name: 'GroupMate 主人诊断',
-      dsc: '查看 GroupMate 状态和脱敏运行轨迹',
+      dsc: '查看 GroupMate 状态、指标、用量和脱敏运行轨迹',
       event: 'message',
       priority: 1142,
       rule: [
