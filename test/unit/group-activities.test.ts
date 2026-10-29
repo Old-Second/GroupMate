@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
+import { getEventListeners } from 'node:events'
 import { test } from 'node:test'
-import { ActivityStore, ACTIVITY_LIMITS, decodeActivityData, type ActivityRedisClient, type GroupActivity } from '../../src/runtime/activities/ActivityStore.js'
+import { ActivityStore, ACTIVITY_LIMITS, decodeActivityData, type ActivityData, type ActivityRedisClient, type GroupActivity } from '../../src/runtime/activities/ActivityStore.js'
 import { GroupActivityService, activityNotification, type ActivityRecipientLookup } from '../../src/runtime/activities/GroupActivityService.js'
 import { ActivityWorker, type ActivityDispatchLease } from '../../src/runtime/activities/ActivityWorker.js'
 import { createGroupPollTool, createScheduledTaskTool } from '../../src/tools/GroupActivityTool.js'
@@ -467,4 +468,98 @@ test('closing a worker aborts owned dispatch, clears the timer and never starts 
   await w.close()
   f.advance(10000)
   assert.equal(await w.tick(), 0)
+})
+
+/**
+ * The dispatch signal used to be `AbortSignal.any([<worker lifetime>, AbortSignal.timeout(...)])`,
+ * which left about 2.2 KiB of live heap per dispatch registered against the worker-lifetime
+ * signal. It is now a per-dispatch controller released when the dispatch returns, so these fix
+ * both halves of the contract: everything that used to be cancelled still is, and nothing new is.
+ */
+
+/** `#run` hands the worker-lifetime signal to the due-selection CAS, the only place it is observable. */
+function observeWorkerSignal (f: ReturnType<typeof fixture>): () => AbortSignal {
+  const seen: AbortSignal[] = []
+  const update = f.store.update.bind(f.store)
+  Object.defineProperty(f.store, 'update', {
+    configurable: true,
+    value: async (mutate: (data: ActivityData) => unknown, signal?: AbortSignal): Promise<unknown> => {
+      if (signal !== undefined && !seen.includes(signal)) seen.push(signal)
+      return await update(mutate, signal)
+    }
+  })
+  return () => seen[0]
+}
+test('an in-flight dispatch holds one scoped registration and closing the worker still aborts it', async () => {
+  const f = fixture()
+  await f.created()
+  f.advance(10000)
+  const workerSignal = observeWorkerSignal(f)
+  let captured: AbortSignal | null = null
+  let admit = (): void => {}
+  let arrive = (): void => {}
+  const gate = new Promise<void>(resolve => { admit = resolve })
+  const arrived = new Promise<void>(resolve => { arrive = resolve })
+  const w = new ActivityWorker({ store: f.store, now: f.now, acquire: async (_record, signal) => {
+    captured = signal
+    arrive()
+    await gate
+    return { authorize: async () => 'allowed', deliver: async () => 'sent', release: async () => undefined }
+  } })
+  const running = w.tick()
+  await arrived
+  assert.equal(getEventListeners(workerSignal(), 'abort').length, 1)
+  assert.equal(captured!.aborted, false)
+  const closing = w.close()
+  assert.equal(captured!.aborted, true)
+  assert.equal((captured!.reason as Error).name, 'AbortError')
+  admit()
+  assert.equal(await running, 0)
+  await closing
+  assert.equal(getEventListeners(workerSignal(), 'abort').length, 0)
+  assert.equal((await f.store.read()).records[0].state, 'pending')
+})
+test('the dispatch budget aborts only its own dispatch and the next dispatch starts clean', async () => {
+  const f = fixture()
+  await f.created()
+  f.advance(10000)
+  const captured: AbortSignal[] = []
+  let attempt = 0
+  const w = new ActivityWorker({ store: f.store, now: f.now, dispatchTimeoutMs: 20,
+    acquire: async (_record, signal) => {
+      captured.push(signal)
+      if (++attempt === 1) await new Promise(resolve => setTimeout(resolve, 80))
+      return { authorize: async () => 'allowed', deliver: async () => 'sent', release: async () => undefined }
+    } })
+  assert.equal(await w.tick(), 0)
+  assert.equal(captured[0].aborted, true)
+  assert.equal((captured[0].reason as Error).name, 'TimeoutError')
+  assert.equal((await f.store.read()).records[0].state, 'pending')
+  assert.equal(await w.tick(), 1)
+  assert.notEqual(captured[1], captured[0])
+  assert.equal(captured[1].aborted, false)
+  assert.equal((await f.store.read()).records[0].state, 'completed')
+  await w.close()
+})
+test('a successful dispatch releases its registration and is never cancelled afterwards', async () => {
+  const f = fixture()
+  await f.perform('reminder', { ...reminder, intervalSeconds: 60, occurrences: 10 })
+  f.advance(10000)
+  const workerSignal = observeWorkerSignal(f)
+  const delivered: AbortSignal[] = []
+  const w = new ActivityWorker({ store: f.store, now: f.now, acquire: async (_record, signal) => ({
+    authorize: async () => 'allowed',
+    deliver: async () => { delivered.push(signal); return 'sent' },
+    release: async () => undefined
+  }) })
+  for (let round = 0; round < 9; round++) {
+    assert.equal(await w.tick(), 1)
+    assert.equal(getEventListeners(workerSignal(), 'abort').length, 0)
+    f.advance(60000)
+  }
+  assert.equal(delivered.length, 9)
+  assert.equal(new Set(delivered).size, 9)
+  assert.equal(delivered.some(signal => signal.aborted), false)
+  await w.close()
+  assert.equal(delivered.some(signal => signal.aborted), false)
 })

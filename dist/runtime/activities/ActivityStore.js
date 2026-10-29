@@ -1,6 +1,8 @@
 export const ACTIVITY_KEY = 'GROUPMATE:ACTIVITIES:v1';
 export const ACTIVITY_LIMITS = Object.freeze({ records: 128, bytes: 64 * 1024, perGroup: 24, perActor: 8,
-    pollsPerGroup: 8, voters: 100, recipients: 8, retentionMs: 7 * 86400000, horizonMs: 90 * 86400000, leaseMs: 120000 });
+    pollsPerGroup: 8, voters: 100, recipients: 8, retentionMs: 7 * 86400000, horizonMs: 90 * 86400000, leaseMs: 120000,
+    /** Wall-clock budget for one dispatch, well inside `leaseMs` so a timed-out dispatch still finalizes under its own lease. */
+    dispatchMs: 45000 });
 const casScript = `-- GROUPMATE_ACTIVITY_CAS_V1
 local current = redis.call('GET', KEYS[1]) or ''
 if current ~= ARGV[1] then return 0 end
