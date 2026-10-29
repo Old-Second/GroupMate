@@ -1,7 +1,7 @@
 {
   "index.js": {
     "no-empty": {
-      "count": 4
+      "count": 3
     }
   },
   "server/index.js": {

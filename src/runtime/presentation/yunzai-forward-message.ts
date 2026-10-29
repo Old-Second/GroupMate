@@ -2,7 +2,7 @@ import type { OutboundPart } from './yunzai-outbound-port.js'
 
 type ForwardPart = Extract<OutboundPart, { media: 'forward' }>
 
-interface YunzaiForwardTarget {
+export interface YunzaiForwardTarget {
   readonly makeForwardMsg?: (nodes: readonly Readonly<{ message: string }>[]) => unknown
 }
 

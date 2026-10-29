@@ -1,10 +1,8 @@
 import fs from 'node:fs'
-import path from 'node:path'
 import { Config } from './utils/config.js'
 import { newFetch } from './utils/proxy.js'
 import { collectProcessors } from './utils/postprocessors/BasicProcessor.js'
 import { convertFaces } from './utils/face.js'
-import { materializeYunzaiMusicSegment } from './dist/runtime/presentation/yunzai-music-segment.js'
 import { resolveToolVoice } from './dist/runtime/tools/tool-voice-selection.js'
 import { ttsTargetEncoding } from './dist/runtime/presentation/yunzai-tts-reply-port.js'
 import {
@@ -50,15 +48,6 @@ import {
   createRuntimePresentationHooks
 } from './dist/runtime/runtime-presentation-hooks.js'
 import {
-  buildChatButtonContent
-} from './dist/runtime/yunzai-button-content.js'
-import {
-  materializeYunzaiForwardMessage
-} from './dist/runtime/presentation/yunzai-forward-message.js'
-import {
-  materializeYunzaiMagicSegment
-} from './dist/runtime/presentation/yunzai-magic-segment.js'
-import {
   initializeProductionYunzaiAgent
 } from './dist/runtime/production-yunzai-agent.js'
 import {
@@ -86,21 +75,35 @@ import {
   resolvePluginPath
 } from './dist/runtime/plugin-context.js'
 import {
-  configuredReasoningEffort,
-  configuredThinkingMode,
   finiteInteger,
-  finiteNumber,
-  normalizedStringList,
   normalizedText
 } from './dist/runtime/host/host-config-values.js'
 import {
-  parsePreferenceRecord,
   projectBymPolicySnapshot,
   projectButtonPolicySnapshot,
-  projectChatPreferences,
   projectPresentationSafeConfig,
   resolveTtsMode
 } from './dist/runtime/host/host-config-projection.js'
+import {
+  createHostBotRegistry
+} from './dist/runtime/host/host-bot-registry.js'
+import {
+  createHostOutbound
+} from './dist/runtime/host/host-outbound.js'
+import {
+  createHostChatPreferences
+} from './dist/runtime/host/host-preferences.js'
+import {
+  collectEventImageUrls,
+  createHostChatPolicy,
+  findAzureVoice
+} from './dist/runtime/host/host-chat-policy.js'
+import {
+  createHostTtsAdministration
+} from './dist/runtime/host/host-tts-administration.js'
+import {
+  createHostBilling
+} from './dist/runtime/host/host-billing.js'
 
 const runtimeLogger = globalThis.logger ?? Object.freeze({
   info: () => undefined,
@@ -132,167 +135,26 @@ if (!globalThis.segment) {
 
 const ttsMode = () => resolveTtsMode(Config)
 
-const rememberedBots = new Map()
-
-function rememberBot (botId, bot) {
-  if (bot === null || typeof bot !== 'object' || botId === '') return
-  rememberedBots.delete(botId)
-  rememberedBots.set(botId, bot)
-  while (rememberedBots.size > 8) {
-    const oldest = rememberedBots.keys().next().value
-    if (oldest === undefined) break
-    rememberedBots.delete(oldest)
-  }
-}
-
-function configuredBotId (event) {
-  const source = event !== null && typeof event === 'object' ? event : {}
-  let value = source.self_id ?? source.bot?.uin
-  if (value === undefined || value === null || String(value) === '') {
-    const globalBot = globalThis.Bot
-    const candidates = Array.isArray(globalBot?.uin) ? globalBot.uin : [globalBot?.uin]
-    value = Config.trssBotUin && candidates.some(item => String(item) === String(Config.trssBotUin))
-      ? Config.trssBotUin
-      : candidates.filter(item => item !== undefined && item !== null).at(-1)
-  }
-  const botId = normalizedText(String(value ?? ''), 128)
-  if (botId === '') throw new TypeError('Yunzai bot identity is unavailable')
-  rememberBot(botId, source.bot)
-  return botId
-}
-
-const botPicker = Object.freeze({
-  async pick (botId) {
-    const known = rememberedBots.get(String(botId))
-    if (known !== undefined) return known
-    const globalBot = globalThis.Bot
-    if (globalBot === null || typeof globalBot !== 'object') return null
-    const indexed = globalBot[String(botId)]
-    if (indexed !== undefined && indexed !== null) return indexed
-    if (!Array.isArray(globalBot.uin) && String(globalBot.uin ?? '') === String(botId)) {
-      return globalBot
-    }
-    return null
-  }
+const {
+  botPicker,
+  configuredBotId,
+  eventActorId,
+  eventTarget,
+  masterIds
+} = createHostBotRegistry({
+  config: Config,
+  hostBot: () => globalThis.Bot,
+  loadHostConfig: async () => (await import('../../lib/config/config.js')).default
 })
-
-async function masterIds () {
-  const hostConfig = (await import('../../lib/config/config.js')).default
-  const value = hostConfig?.masterQQ
-  return Object.freeze((Array.isArray(value) ? value : [value])
-    .filter(item => typeof item === 'string' || typeof item === 'number'))
-}
-
-function eventActorId (event) {
-  return normalizedText(String(event?.sender?.user_id ?? event?.user_id ?? ''), 128)
-}
-
-function eventTarget (event) {
-  const botId = configuredBotId(event)
-  const actorId = eventActorId(event)
-  if (event?.isGroup === true) {
-    return Object.freeze({
-      botId,
-      scope: Object.freeze({
-        kind: 'group',
-        groupId: normalizedText(String(event.group_id ?? ''), 128)
-      })
-    })
-  }
-  return Object.freeze({
-    botId,
-    scope: Object.freeze({ kind: 'private', userId: actorId })
-  })
-}
-
-function resourceValue (resource) {
-  if (resource.kind === 'buffer') return Buffer.from(resource.data)
-  if (resource.kind === 'remote_url') return resource.url
-  return resource.path
-}
-
-function textAtomValue (atom) {
-  const segment = globalThis.segment
-  if (atom.kind === 'text') return atom.text
-  if (atom.kind === 'at') {
-    const target = atom.target === 'all' ? 'all' : atom.target.userId
-    return typeof segment.at === 'function'
-      ? segment.at(target)
-      : { type: 'at', qq: target }
-  }
-  if (atom.kind === 'face') {
-    return typeof segment.face === 'function'
-      ? segment.face(atom.faceId)
-      : { type: 'face', id: atom.faceId }
-  }
-  return typeof segment.markdown === 'function'
-    ? segment.markdown(atom.markdown)
-    : { type: 'markdown', data: { content: atom.markdown } }
-}
 
 const buttonPolicy = Object.freeze({
   snapshot: () => projectButtonPolicySnapshot(Config)
 })
 
-async function outboundMessage (receiver, part) {
-  const segment = globalThis.segment
-  if (part.media === 'text') {
-    const values = part.atoms.map(textAtomValue)
-    const buttons = buildChatButtonContent(part.buttons, buttonPolicy.snapshot())
-    if (buttons !== null) values.push({ type: 'button', content: buttons })
-    return values.length === 1 ? values[0] : values
-  }
-  if (part.media === 'picture') {
-    return typeof segment.image === 'function'
-      ? segment.image(resourceValue(part.resource))
-      : { type: 'image', file: resourceValue(part.resource) }
-  }
-  if (part.media === 'voice') {
-    return typeof segment.record === 'function'
-      ? segment.record(part.hostRecord ?? resourceValue(part.resource))
-      : { type: 'record', file: part.hostRecord ?? resourceValue(part.resource) }
-  }
-  if (part.media === 'video') {
-    return typeof segment.video === 'function'
-      ? segment.video(resourceValue(part.resource))
-      : { type: 'video', file: resourceValue(part.resource) }
-  }
-  if (part.media === 'music') {
-    return materializeYunzaiMusicSegment(segment, part.provider, part.id)
-  }
-  if (part.media === 'dice') return materializeYunzaiMagicSegment(segment, 'dice')
-  if (part.media === 'rps') return materializeYunzaiMagicSegment(segment, 'rps', part.value)
-  return await materializeYunzaiForwardMessage(receiver, part)
-}
-
-const outboundHost = Object.freeze({
-  async forTarget (target) {
-    const bot = await botPicker.pick(target.botId)
-    if (bot === null) return null
-    const receiver = target.scope.kind === 'group'
-      ? await bot.pickGroup?.(target.scope.groupId)
-      : await bot.pickFriend?.(target.scope.userId)
-    if (receiver === null || typeof receiver !== 'object' ||
-      typeof receiver.sendMsg !== 'function') return null
-    return Object.freeze({
-      async dispatch (part, quoteMessageId, signal) {
-        if (signal?.aborted === true) throw signal.reason
-        const message = await outboundMessage(receiver, part)
-        if (quoteMessageId === undefined) return await receiver.sendMsg(message)
-        const reply = typeof globalThis.segment.reply === 'function'
-          ? globalThis.segment.reply(quoteMessageId)
-          : { type: 'reply', id: quoteMessageId }
-        const quoted = Array.isArray(message) ? [reply, ...message] : [reply, message]
-        return await receiver.sendMsg(quoted)
-      },
-      async recall (messageId, signal) {
-        if (signal?.aborted === true) throw signal.reason
-        return typeof receiver.recallMsg === 'function'
-          ? await receiver.recallMsg(messageId)
-          : false
-      }
-    })
-  }
+const { outboundHost } = createHostOutbound({
+  segment: () => globalThis.segment,
+  botPicker,
+  buttonPolicy
 })
 
 const presentationSettings = createPresentationSettingsPort(Object.freeze({
@@ -301,245 +163,29 @@ const presentationSettings = createPresentationSettingsPort(Object.freeze({
 }))
 const pendingConfig = createPendingIndicatorConfigPort(redisClient)
 
-const projectPreferences = record => projectChatPreferences(record, Config)
+const chatPreferences = createHostChatPreferences({ redis: redisClient, config: Config })
 
-const chatPreferences = Object.freeze({
-  async load (actorId) {
-    return projectPreferences(parsePreferenceRecord(
-      await redisClient.get(`CHATGPT:USER:${actorId}`)
-    ))
-  },
-  async patch (actorId, patch) {
-    const key = `CHATGPT:USER:${actorId}`
-    const record = parsePreferenceRecord(await redisClient.get(key))
-    for (const field of ['usePicture', 'useTTS']) {
-      if (typeof patch[field] === 'boolean') record[field] = patch[field]
-    }
-    for (const field of ['ttsRole', 'ttsRoleAzure', 'ttsRoleVoiceVox']) {
-      if (typeof patch[field] !== 'string') continue
-      const value = normalizedText(patch[field], 256)
-      if (value !== '') record[field] = value
-    }
-    await redisClient.set(key, JSON.stringify(record))
-    return projectPreferences(record)
-  }
+const azureVoice = voice => findAzureVoice(azureVoices, voice)
+
+const chatPolicy = createHostChatPolicy({
+  config: Config,
+  redis: redisClient,
+  readTextFile: async filePath => await fs.promises.readFile(filePath, 'utf8'),
+  eventActorId,
+  azureVoices
 })
 
-async function actorCast (actorId) {
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(actorId)) return ''
-  try {
-    const raw = await fs.promises.readFile(
-      resolvePluginPath(path.join('resources/ChatGPTCache/user', `${actorId}.json`)),
-      'utf8'
-    )
-    const parsed = JSON.parse(raw)
-    return normalizedText(parsed?.cast?.api, 8_192)
-  } catch {
-    return ''
-  }
-}
-
-function eventImageUrls (event) {
-  if (!Array.isArray(event?.message)) return Object.freeze([])
-  const urls = []
-  for (const segment of event.message) {
-    if (urls.length >= 8 || segment === null || typeof segment !== 'object' ||
-      segment.type !== 'image') continue
-    const value = segment.url ?? segment.file ?? segment.data?.url ?? segment.data?.file
-    if (typeof value === 'string' && value.length <= 4_096) urls.push(value)
-  }
-  return Object.freeze([...new Set(urls)])
-}
-
-async function ocrText (event) {
-  if (typeof event?.bot?.imageOcr !== 'function') return Object.freeze([])
-  const result = []
-  for (const image of eventImageUrls(event)) {
-    try {
-      const response = await event.bot.imageOcr(image)
-      const words = Array.isArray(response?.wordslist) ? response.wordslist : []
-      const text = normalizedText(words.map(item => item?.words ?? '').join('\n'), 2_000)
-      if (text !== '') result.push(text)
-    } catch {}
-  }
-  return Object.freeze(result)
-}
-
-function azureVoice (voice) {
-  return azureVoices.find(item => item.code === voice || item.name === voice)
-}
-
-async function appendAzureEmotionFeedback ({ actorId, prompt, preferences }) {
-  if (ttsMode() !== 'azure' || Config.enhanceAzureTTSEmotion !== true ||
-    Config.azureTTSEmotion !== true || preferences.useTTS !== true ||
-    azureVoice(preferences.ttsRoleAzure)?.emotion === undefined) return prompt
-  const flag = await redisClient.get(`CHATGPT:WRONG_EMOTION:${actorId}`)
-  const additions = Object.freeze({
-    1: '(上一次回复没有添加情绪，请确保接下来的对话正确使用情绪和情绪格式，回复时忽略此内容。)',
-    2: '(不要使用给出情绪范围的词和错误的情绪格式，请确保接下来的对话正确选择情绪，回复时忽略此内容。)',
-    3: '(不要给出多个情绪[]项，请确保接下来的对话给且只给出一个正确情绪项，回复时忽略此内容。)'
-  })
-  return typeof additions[flag] === 'string' ? `${prompt}${additions[flag]}` : prompt
-}
-
-const bootstrapEntryMode = Config.toggleMode === 'prefix' ? 'prefix' : 'at'
-const chatPolicy = Object.freeze({
-  entryMode: () => bootstrapEntryMode,
-  async snapshot (event) {
-    const actorId = eventActorId(event)
-    const ttl = finiteInteger(Config.conversationPreserveTime, 0, 0, 31_536_000)
-    return Object.freeze({
-      toggleMode: bootstrapEntryMode,
-      enablePrivateChat: Config.enablePrivateChat === true,
-      whitelist: normalizedStringList(Config.whitelist),
-      blacklist: normalizedStringList(Config.blacklist),
-      imgOcr: Config.imgOcr === true,
-      groupMerge: Config.groupMerge === true,
-      enableGroupContext: Config.enableGroupContext === true,
-      thinkingMode: configuredThinkingMode(Config.apiThinkingMode),
-      reasoningEffort: configuredReasoningEffort(Config.apiReasoningEffort),
-      ...(ttl > 0 ? { sessionTtlSeconds: ttl } : {}),
-      assistantLabel: normalizedText(Config.assistantLabel, 128, 'GroupMate'),
-      promptPrefixOverride: normalizedText(Config.promptPrefixOverride, 8_192),
-      actorCastApi: await actorCast(actorId)
-    })
-  },
-  async isMuted (target) {
-    if (await redisClient.get('CHATGPT:SHUT_UP:ALL')) return true
-    const groupId = target.scope.kind === 'group' || target.scope.kind === 'group_user'
-      ? target.scope.groupId
-      : ''
-    return groupId !== '' && Boolean(await redisClient.get(`CHATGPT:SHUT_UP:${groupId}`))
-  },
-  ocrText,
-  appendAzureEmotionFeedback,
-  clearAzureEmotionFeedback: async actorId => {
-    await redisClient.del(`CHATGPT:WRONG_EMOTION:${actorId}`)
-  }
+const ttsAdministration = createHostTtsAdministration({
+  config: Config,
+  setTtsMode: mode => { Config.ttsMode = mode },
+  vitsSpeakers,
+  convertSpeaker,
+  azureVoices,
+  voiceVoxVoices
 })
+const ttsConfigured = ttsAdministration.isConfigured
 
-function ttsConfigured (mode) {
-  if (mode === 'azure') return normalizedText(Config.azureTTSKey, 16_384) !== ''
-  if (mode === 'voicevox') return normalizedText(Config.voicevoxSpace, 2_048) !== ''
-  return normalizedText(Config.ttsSpace, 2_048) !== ''
-}
-
-function missingTtsConfiguration (mode, operation) {
-  if (operation === 'enable') {
-    if (mode === 'azure') return '您没有配置Azure Key，请前往锅巴面板进行配置'
-    if (mode === 'voicevox') return '您没有配置VoiceVox API，请前往锅巴面板进行配置'
-    return '您没有配置VITS API，请前往锅巴面板进行配置'
-  }
-  if (mode === 'azure') return '您没有配置azure 密钥，请前往后台管理或锅巴面板进行配置'
-  if (mode === 'voicevox') return '您没有配置voicevox API，请前往后台管理或锅巴面板进行配置'
-  return '您没有配置vits-uma-genshin-honkai API，请前往后台管理或锅巴面板进行配置'
-}
-
-function selectVoice (mode, requested) {
-  const voice = normalizedText(requested, 256, '随机')
-  if (mode === 'vits-uma-genshin-honkai') {
-    const selected = voice === '随机' ? '随机' : convertSpeaker(voice)
-    return selected === '随机' || vitsSpeakers.includes(selected)
-      ? Object.freeze({
-          kind: 'selected',
-          storedVoice: selected,
-          message: `当前语音模式为${mode},您的默认语音角色已被设置为 "${selected}" `
-        })
-      : Object.freeze({ kind: 'unsupported', message: `抱歉，"${selected}"我还不认识呢` })
-  }
-  if (mode === 'azure') {
-    if (voice === '随机') {
-      return Object.freeze({
-        kind: 'selected', storedVoice: '随机',
-        message: `当前语音模式为${mode},您的默认语音角色已被设置为 "随机" `
-      })
-    }
-    const selected = azureVoices.find(item => item.name === voice)
-    if (selected === undefined) {
-      return Object.freeze({
-        kind: 'unsupported',
-        message: `抱歉，没有"${voice}"这个角色，目前azure模式下支持的角色有${azureVoices.map(item => item.name).join('、')}`
-      })
-    }
-    const emotion = selected.emotion !== undefined && Config.azureTTSEmotion === true
-      ? '，此角色支持多情绪配置，建议重新使用设定并结束对话以获得最佳体验！'
-      : ''
-    return Object.freeze({
-      kind: 'selected',
-      storedVoice: selected.code,
-      message: `当前语音模式为${mode},您的默认语音角色已被设置为 ${voice}-${selected.gender}-${selected.languageDetail} ${emotion}`
-    })
-  }
-  if (voice === '随机') {
-    return Object.freeze({
-      kind: 'selected', storedVoice: '随机',
-      message: `当前语音模式为${mode},您的默认语音角色已被设置为 "随机" `
-    })
-  }
-  const matched = /^(.*?)-(.*)$/.exec(voice)
-  const name = matched?.[1] ?? voice
-  const style = matched?.[2]
-  const selected = voiceVoxVoices.find(item => item.name === name)
-  if (selected === undefined) {
-    return Object.freeze({
-      kind: 'unsupported',
-      message: `抱歉，没有"${name}"这个角色，目前voicevox模式下支持的角色有${voiceVoxVoices.map(item => item.name).join('、')}`
-    })
-  }
-  if (style !== undefined && !selected.styles.some(item => item.name === style)) {
-    return Object.freeze({
-      kind: 'unsupported',
-      message: `抱歉，"${name}"这个角色没有"${style}"这个风格，目前支持的风格有${selected.styles.map(item => item.name).join('、')}`
-    })
-  }
-  const storedVoice = `${selected.name}${style === undefined ? '' : `-${style}`}`
-  return Object.freeze({
-    kind: 'selected',
-    storedVoice,
-    message: `当前语音模式为${mode},您的默认语音角色已被设置为 "${storedVoice}" `
-  })
-}
-
-const ttsAdministration = Object.freeze({
-  getMode: ttsMode,
-  setMode: mode => { Config.ttsMode = mode },
-  isConfigured: ttsConfigured,
-  selectVoice,
-  missingConfigurationMessage: missingTtsConfiguration
-})
-
-function formatDateOnly (date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-` +
-    String(date.getDate()).padStart(2, '0')
-}
-
-const billing = Object.freeze({
-  async queryLastHundredDays (now) {
-    const endpoint = normalizedText(Config.openAiBaseUrl, 2_048).replace(/\/+$/, '')
-    const headers = Object.freeze({ Authorization: `Bearer ${Config.apiKey}` })
-    const subscriptionResponse = await newFetch(`${endpoint}/dashboard/billing/subscription`, {
-      method: 'GET', headers
-    })
-    if (!subscriptionResponse.ok) throw new Error('billing subscription request failed')
-    const subscription = await subscriptionResponse.json()
-    const end = new Date(now)
-    end.setDate(end.getDate() + 1)
-    const start = new Date(end)
-    start.setDate(start.getDate() - 100)
-    const usageResponse = await newFetch(
-      `${endpoint}/dashboard/billing/usage?start_date=${formatDateOnly(start)}&end_date=${formatDateOnly(end)}`,
-      { method: 'GET', headers }
-    )
-    if (!usageResponse.ok) throw new Error('billing usage request failed')
-    const usage = await usageResponse.json()
-    const hardLimitUsd = Number(subscription?.hard_limit_usd)
-    const totalUsageUsd = Number(usage?.total_usage) / 100
-    const expiresAt = new Date(Number(subscription?.access_until) * 1_000)
-    if (!Number.isFinite(hardLimitUsd) || !Number.isFinite(totalUsageUsd) ||
-      Number.isNaN(expiresAt.getTime())) throw new Error('billing response is invalid')
-    return Object.freeze({ hardLimitUsd, totalUsageUsd, expiresAt })
-  }
-})
+const billing = createHostBilling({ config: Config, fetch: newFetch })
 
 const bymPolicy = Object.freeze({
   snapshot: () => projectBymPolicySnapshot(Config)
@@ -1342,7 +988,7 @@ const productionAgent = initializeProductionYunzaiAgent({
     redis: redisClient,
     getMasterIds: masterIds,
     getBotId: configuredBotId,
-    getImages: async event => eventImageUrls(event),
+    getImages: async event => collectEventImageUrls(event),
     synthesizeAudio: async (event, text, voice, signal) => {
       const mode = ttsMode()
       const selectedVoice = await resolveToolVoice({ requested: voice, mode,

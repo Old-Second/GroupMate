@@ -40,15 +40,27 @@ test('Yunzai magic segment materializer falls back to standard OneBot v11 segmen
 })
 
 test('all production Yunzai outbound paths share the typed magic segment materializer', async () => {
-  const [entry, serviceBridge, toolRuntime] = await Promise.all([
+  // The entry point used to own outbound materialization; it now binds the host globals to
+  // `src/runtime/host/host-outbound.ts`, so that module is this check's production root. The
+  // assertions on the dice and rps call sites are unchanged.
+  const [entry, outbound, serviceBridge, toolRuntime] = await Promise.all([
     readFile(join(process.cwd(), 'index.js'), 'utf8'),
+    readFile(join(process.cwd(), 'src/runtime/host/host-outbound.ts'), 'utf8'),
     readFile(join(process.cwd(), 'src/runtime/agent-service-bridge.ts'), 'utf8'),
     readFile(join(process.cwd(), 'src/runtime/tools/yunzai-tool-runtime.ts'), 'utf8')
   ])
 
   assert.match(
     entry,
-    /from '\.\/dist\/runtime\/presentation\/yunzai-magic-segment\.js'/
+    /from '\.\/dist\/runtime\/host\/host-outbound\.js'/
+  )
+  assert.doesNotMatch(
+    entry,
+    /yunzai-magic-segment\.js/
+  )
+  assert.match(
+    outbound,
+    /from '\.\.\/presentation\/yunzai-magic-segment\.js'/
   )
   assert.match(
     serviceBridge,
@@ -59,7 +71,7 @@ test('all production Yunzai outbound paths share the typed magic segment materia
     /from '\.\.\/presentation\/yunzai-magic-segment\.js'/
   )
 
-  for (const source of [entry, serviceBridge, toolRuntime]) {
+  for (const source of [outbound, serviceBridge, toolRuntime]) {
     assert.match(
       source,
       /part\.media === 'dice'\) return materializeYunzaiMagicSegment\(segment, 'dice'\)/
