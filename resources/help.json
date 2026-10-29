@@ -72,6 +72,17 @@
         "#chatgpt允许私聊",
         "#chatgpt禁止私聊"
       ]
+    },
+    {
+      "icon": "fas fa-stethoscope",
+      "title": "主人诊断",
+      "text": "仅机器人主人：运行状态、累计指标与按群按人用量",
+      "list": [
+        "#GroupMate状态",
+        "#GroupMate指标",
+        "#GroupMate用量",
+        "#GroupMate诊断 <runRef>"
+      ]
     }
   ],
   "配置": [

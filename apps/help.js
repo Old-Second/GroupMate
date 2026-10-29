@@ -148,6 +148,31 @@ const helpData = [
         desc: '应用到 OpenAI-compatible API'
       }
     ]
+  },
+  {
+    group: '诊断',
+    list: [
+      {
+        icon: 'eye',
+        title: '#GroupMate状态',
+        desc: '仅主人：并发、内存与累计摘要'
+      },
+      {
+        icon: 'list',
+        title: '#GroupMate指标',
+        desc: '仅主人：全部计数与耗时分位'
+      },
+      {
+        icon: 'token',
+        title: '#GroupMate用量',
+        desc: '仅主人：按天按群按人的 Token 与费用'
+      },
+      {
+        icon: 'queue',
+        title: '#GroupMate诊断【runRef】',
+        desc: '仅主人：回放脱敏运行轨迹'
+      }
+    ]
   }
 ]
 
