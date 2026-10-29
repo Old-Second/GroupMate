@@ -227,7 +227,8 @@ export function deriveMemoryCandidateProvenanceV1(jobValue, candidateValue) {
 const AUTHORIZATION_PATTERN = /(?:authorization\s*[:=]\s*(?:bearer|basic)\s+\S{6,}|bearer\s+[A-Za-z0-9._~+/=-]{8,})/iu;
 const COOKIE_PATTERN = /(?:cookie|set-cookie|session[_ -]?id|会话(?:令牌|标识))\s*[:=：]\s*\S{6,}/iu;
 const PASSWORD_PATTERN = /(?:password|passwd|pwd|密码|登录口令)\s*(?:是|为|[:=：])\s*\S{4,}/iu;
-const VERIFICATION_CODE_PATTERN = /(?:验证码|校验码|动态口令|otp|verification\s*code)\s*(?:是|为|[:=：])?\s*\d{4,8}\b/iu;
+// 验证码既可能写成 ASCII/全角数字，也可能写成中文数字，三种形状都要拦住。
+const VERIFICATION_CODE_PATTERN = /(?:验证码|校验码|动态口令|otp|verification\s*code)\s*(?:是|为|[:=：])?\s*(?:\d{4,8}\b|[０-９]{4,8}|[零一二三四五六七八九〇两]{4,8})/iu;
 const API_KEY_PATTERN = /(?:\bsk-[A-Za-z0-9_-]{8,}|(?:api[ _-]*key|secret[ _-]*key|api\s*密钥|接口密钥)\s*(?:是|为|[:=：])\s*\S{6,})/iu;
 export function memoryCredentialRejectionReasonV1(value) {
     if (typeof value !== 'string')

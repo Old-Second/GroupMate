@@ -40,12 +40,19 @@ function groundedSelfExcerpt (source: string, candidate: string): boolean {
       (candidate.endsWith('.') && /^\s/u.test(suffix)))
 }
 
+// 身份标识：联系方式、证件号、生物特征，以及门牌级住址。地址只认带门牌号的写法，
+// 这样「我住在南方的城市」这类粗粒度地点仍可记忆，而「幸福路18号3单元」被拒。
+const IDENTIFIER_EXCERPT = /(?:住址|家庭地址|户籍|门牌|邮政编码|邮编|手机号|电话号|联系电话|座机|微信号|QQ\s*号|邮箱|身份证|护照|驾驶证|社保号|车牌|指纹|虹膜|声纹|生物特征|[0-9０-９]{1,5}\s*(?:单元|室|栋|幢|号楼|号院)|(?:路|街道|街|大道|巷|弄|村|小区)\s*[0-9０-９]{1,5}\s*号|\b(?:home\s*address|phone\s*number|passport|id\s*card|fingerprint)\b)/iu
+// 信仰：宗教与政治立场。两个二字教名会跨词边界误配（仿佛教育、知道教学），所以排除那几个前缀。
+const BELIEF_EXCERPT = /(?:宗教|信仰|无神论|教徒|教堂|清真寺|寺庙|道观|基督|天主|东正教|伊斯兰|穆斯林|犹太|印度教|锡克|(?<!仿)佛教|(?<![知报])道教|政治立场|政治倾向|政治观点|政治主张|政党|党派|党员|入党|左派|右派|保守派|自由派|选举|投票给|\b(?:religion|religious|atheist|political\s*(?:stance|views?|party|affiliation))\b)/iu
+
 function excludedSelfExcerpt (text: string): boolean {
   // These conservative checks narrow the model's labels; a "personal" label cannot waive them.
   return /[?？]/u.test(text) ||
     /^(?:我(?:的)?(?:朋友|同事|同学|家人|邻居)|我的(?:父母|父亲|母亲|孩子)|My\s+(?:friend|colleague|parent|child)\b)/iu.test(text) ||
     /(?:如果|假如|假设|要是|开玩笑|虚构|今天|刚刚|刚才|此刻|目前心情|\b(?:if|would|hypothetical|fictional|today|just now)\b)/iu.test(text) ||
-    /(?:糖尿病|癌症|抑郁症|艾滋|病史|诊断|疾病|治疗|药物|性取向|性生活|怀孕|收入|工资|负债|债务|存款|余额|银行卡|\b(?:diagnosed|diabetes|cancer|HIV|salary|income|debt|bank account|pregnant|sexual)\b)/iu.test(text)
+    /(?:糖尿病|癌症|抑郁症|艾滋|病史|诊断|疾病|治疗|药物|性取向|性生活|怀孕|收入|工资|负债|债务|存款|余额|银行卡|\b(?:diagnosed|diabetes|cancer|HIV|salary|income|debt|bank account|pregnant|sexual)\b)/iu.test(text) ||
+    IDENTIFIER_EXCERPT.test(text) || BELIEF_EXCERPT.test(text)
 }
 
 /** Uses the project model adapter; no tools, history, images, reasoning or model-granted authority. */
