@@ -22,7 +22,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
-      - run: pnpm install --frozen-lockfile --ignore-scripts --no-optional
+      # 不能加 --no-optional：ajv-formats 把 ajv 声明为可选 peer，跳过后
+      # .pnpm/ajv-formats@2.1.1_ajv@8.12.0 里不会链入 ajv，Fastify 的
+      # error serializer 一加载就 Cannot find module 'ajv/dist/compile/codegen'
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm run lint
       - run: pnpm test
       - run: node scripts/check-dist-drift.mjs
