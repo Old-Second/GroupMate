@@ -52,7 +52,8 @@ const denialMessages: Readonly<Record<ToolDenyCode, string>> = Object.freeze({
   self_unmute_denied: '普通成员不能通过工具解除自己的禁言。',
   self_mute_duration_exceeded: '自我禁言最多 60 秒。',
   role_hierarchy_denied: '不能操作权限不低于自己的群成员。',
-  unknown_policy_profile: '工具权限策略配置无效。'
+  unknown_policy_profile: '工具权限策略配置无效。',
+  batch_dependency_pending: '需要先拿到依赖工具的成功结果，下一轮再调用本工具。'
 })
 
 const mediaActions: Readonly<Record<string, IntentAction>> = Object.freeze({

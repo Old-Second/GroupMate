@@ -171,6 +171,7 @@ export function visibleDefinition (input: {
   readonly network?: 'none' | 'fixed_hosts' | 'open_http'
   readonly maxOutputBytes?: number
   readonly resourceKeys: typeof currentChannelResourceKeys
+  readonly batchDependencies?: readonly string[]
   readonly execute: ToolDefinition['execute']
 }): ToolDefinition {
   return Object.freeze({
@@ -181,6 +182,9 @@ export function visibleDefinition (input: {
     timeoutMs: 30_000, maxOutputBytes: input.maxOutputBytes ?? 16 * 1024,
     network: input.network ?? 'none', permission: 'current_channel',
     executionClass: 'visible_output', retrySafe: false,
+    ...(input.batchDependencies === undefined
+      ? {}
+      : { batchDependencies: Object.freeze([...input.batchDependencies]) }),
     resourceKeys: input.resourceKeys,
     resolveTarget: (_toolInput: Readonly<Record<string, unknown>>, facts: ToolRuntimeFacts) => currentChannelTarget(facts),
     execute: input.execute

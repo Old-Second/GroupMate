@@ -18,6 +18,7 @@ export type ToolPermissionKind =
 export interface ToolSchedulingMetadata<Input = Readonly<Record<string, unknown>>> {
   readonly executionClass: ToolExecutionClass
   readonly retrySafe: boolean
+  readonly batchDependencies?: readonly string[]
   resourceKeys(input: Input, facts: ToolRuntimeFacts): readonly string[]
 }
 

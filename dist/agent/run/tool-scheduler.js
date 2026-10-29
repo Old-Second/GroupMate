@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+import { completedPreparedCall } from '../tools/prepared-capability.js';
 import { parseToolResult } from '../tools/tool-result.js';
 import { boundedMonotonicDurationMs } from './run-budget.js';
 const MAX_TOOL_TIMEOUT_MS = 30_000;
@@ -70,6 +71,49 @@ function parallelEligible(capability) {
     return capability.executionClass === 'read_only' && capability.retrySafe &&
         capability.resourceKeys.length > 0;
 }
+function canonicalName(snapshot, call) {
+    try {
+        return snapshot.resolveCall(call).canonicalName;
+    }
+    catch {
+        return null;
+    }
+}
+function batchToolNames(snapshot, calls) {
+    const names = new Set();
+    for (const call of calls) {
+        const name = canonicalName(snapshot, call);
+        if (name !== null)
+            names.add(name);
+    }
+    return names;
+}
+// 同一批里既有依赖工具又有消费它结果的工具时，消费方的参数必然是在看到结果之前猜的。
+function pendingDependencies(snapshot, call, batchNames) {
+    const name = canonicalName(snapshot, call);
+    if (name === null)
+        return [];
+    let declared;
+    try {
+        declared = snapshot.resolve(name).definition.batchDependencies;
+    }
+    catch {
+        return [];
+    }
+    if (declared === undefined)
+        return [];
+    return declared.filter(dependency => dependency !== name && batchNames.has(dependency));
+}
+function dependencyPendingResult(dependencies) {
+    return parseToolResult({
+        status: 'denied',
+        effect: 'none',
+        reasonCode: 'batch_dependency_pending',
+        userMessage: '需要先单独调用' + dependencies.join('、') +
+            '并拿到成功结果，下一轮再用结果里的参数调用本工具。',
+        retryable: false
+    });
+}
 function conflicts(keys, capability) {
     return capability.resourceKeys.some(key => keys.has(key));
 }
@@ -131,8 +175,14 @@ export class ToolScheduler {
         if (new Set(callIds).size !== callIds.length) {
             return Object.freeze({ kind: 'failed', code: 'duplicate_call_id' });
         }
+        const batchNames = batchToolNames(context.snapshot, calls);
         const prepared = [];
         for (const call of calls) {
+            const pending = pendingDependencies(context.snapshot, call, batchNames);
+            if (pending.length > 0) {
+                prepared.push(completedPreparedCall(call.callId, canonicalName(context.snapshot, call) ?? call.toolName, dependencyPendingResult(pending)));
+                continue;
+            }
             prepared.push(await this.#runtime.prepare(call, context.context, context.snapshot));
         }
         const batch = frozenBatch(prepared);

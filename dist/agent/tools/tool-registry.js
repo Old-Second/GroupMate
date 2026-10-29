@@ -72,6 +72,9 @@ function cloneDefinition(source) {
         permission: source.permission,
         executionClass: source.executionClass,
         retrySafe: source.retrySafe,
+        ...(source.batchDependencies === undefined
+            ? {}
+            : { batchDependencies: Object.freeze([...source.batchDependencies]) }),
         ...(source.crossChannelAccess === undefined
             ? {}
             : { crossChannelAccess: Object.freeze({ ...source.crossChannelAccess }) }),
@@ -104,7 +107,8 @@ function manifestEntry(definition) {
         }),
         schedulingHash: sha256({
             executionClass: definition.executionClass,
-            retrySafe: definition.retrySafe
+            retrySafe: definition.retrySafe,
+            batchDependencies: definition.batchDependencies ?? null
         })
     });
 }

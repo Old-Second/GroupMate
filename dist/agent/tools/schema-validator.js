@@ -238,6 +238,14 @@ export function validateToolDefinition(definition) {
         (!definition.readOnly && definition.idempotency !== 'call' && definition.idempotency !== 'semantic')) {
         throw new ToolInputError('invalid_definition');
     }
+    const dependencies = definition.batchDependencies;
+    if (dependencies !== undefined && (!Array.isArray(dependencies) ||
+        dependencies.length === 0 || dependencies.length > 8 ||
+        dependencies.some(name => !toolNamePattern.test(name)) ||
+        new Set(dependencies).size !== dependencies.length ||
+        dependencies.includes(definition.name))) {
+        throw new ToolInputError('invalid_definition');
+    }
     const access = definition.crossChannelAccess;
     const validCrossChannelAccess = isRecord(access) &&
         Object.keys(access).sort().join(',') === 'group,private' &&

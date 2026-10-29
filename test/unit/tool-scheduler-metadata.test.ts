@@ -139,6 +139,25 @@ test('every production tool has explicit bounded scheduling metadata', () => {
   }
 })
 
+test('declared batch dependencies name real tools and keep sending pictures behind the current search', () => {
+  const definitions = productionDefinitions()
+  const names = new Set(definitions.map(item => item.name))
+  for (const definition of definitions) {
+    const dependencies = definition.batchDependencies
+    if (dependencies === undefined) continue
+    assert.equal(Object.isFrozen(dependencies), true, definition.name)
+    assert.ok(dependencies.length >= 1 && dependencies.length <= 8, definition.name)
+    assert.equal(new Set(dependencies).size, dependencies.length, definition.name)
+    for (const dependency of dependencies) {
+      assert.ok(names.has(dependency), definition.name + ' -> ' + dependency)
+      assert.notEqual(dependency, definition.name, definition.name)
+    }
+  }
+  assert.deepEqual(byName('sendPicture').batchDependencies, ['searchImage'])
+  assert.equal(byName('searchImage').batchDependencies, undefined)
+  assert.equal(byName('sendAvatar').batchDependencies, undefined)
+})
+
 test('resource keys serialize current-channel conflicts without exposing sensitive values', () => {
   const currentOutput = byName('sendPicture').resourceKeys(validInputs.sendPicture, facts)
   const memberMutation = byName('editCard').resourceKeys(validInputs.editCard, facts)

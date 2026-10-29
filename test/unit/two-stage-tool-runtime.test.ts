@@ -267,6 +267,92 @@ async function readyBatch (
   return { batch: result.batch, tools }
 }
 
+function dependencySnapshot (): ToolSnapshot {
+  const producer: ToolDefinition = Object.freeze({
+    name: 'searchImage', version: 1, aliases: Object.freeze([]), description: 'fixture search',
+    inputSchema: schema, effect: 'read_only', risk: 'low', readOnly: true, destructive: false,
+    idempotency: 'none', openWorld: false, timeoutMs: 1_000, maxOutputBytes: 4_096,
+    network: 'none', permission: 'any_user', executionClass: 'read_only', retrySafe: true,
+    resourceKeys: () => Object.freeze(['read:222222222222222222222222']),
+    resolveTarget: () => Object.freeze({ kind: 'none' as const }),
+    execute: async () => success('candidate')
+  })
+  const consumer: ToolDefinition = Object.freeze({
+    name: 'sendPicture', version: 1, aliases: Object.freeze([]), description: 'fixture send',
+    inputSchema: schema, effect: 'visible_output', risk: 'medium', readOnly: false,
+    destructive: false, idempotency: 'call', openWorld: false, timeoutMs: 1_000,
+    maxOutputBytes: 4_096, network: 'none', permission: 'current_channel',
+    executionClass: 'visible_output', retrySafe: false,
+    batchDependencies: Object.freeze(['searchImage']),
+    resourceKeys: () => Object.freeze(['current:333333333333333333333333']),
+    resolveTarget: () => Object.freeze({ kind: 'group' as const, groupId: '9' }),
+    execute: async () => success('sent')
+  })
+  return new ToolRegistry([producer, consumer]).createSnapshot({
+    id: 'snapshot-1', facts: baseFacts, enabledTools: ['searchImage', 'sendPicture']
+  })
+}
+
+function dependencyCall (callId: string, requestedName: string): ToolCall {
+  return call(callId, requestedName, Object.freeze({
+    executionClass: requestedName === 'searchImage' ? 'read_only' : 'visible_output',
+    retrySafe: requestedName === 'searchImage',
+    resourceKeys: Object.freeze([`read:${callId.padEnd(24, '0').slice(0, 24)}`]),
+    delayMs: 0, approval: false, retryOnce: false
+  }))
+}
+
+test('a consumer batched with the tool it depends on is denied before it can guess arguments', async () => {
+  const runtime = new FakeRuntime()
+  const scheduler = new ToolScheduler({ runtime })
+  const tools = dependencySnapshot()
+  const result = await scheduler.preflight([
+    dependencyCall('send', 'sendPicture'), dependencyCall('search', 'searchImage')
+  ], { snapshot: tools, context: preparation(), remainingToolCalls: 8 })
+
+  assert.equal(result.kind, 'ready')
+  if (result.kind !== 'ready') throw new Error('batch was not ready')
+  assert.equal(runtime.preparations, 1)
+  const denied = result.batch.calls[0]
+  assert.equal(denied?.kind, 'completed')
+  if (denied?.kind !== 'completed') throw new Error('dependency was not denied')
+  assert.equal(denied.toolName, 'sendPicture')
+  assert.equal(denied.result.status, 'denied')
+  if (denied.result.status !== 'denied') throw new Error('dependency result is not a denial')
+  assert.equal(denied.result.reasonCode, 'batch_dependency_pending')
+  assert.equal(denied.result.effect, 'none')
+  assert.match(denied.result.userMessage, /searchImage/)
+  assert.equal(result.batch.calls[1]?.kind, 'ready')
+
+  const executed = await scheduler.execute(result.batch, {
+    snapshot: tools, contextFor: async () => execution(), signal: new AbortController().signal
+  })
+  assert.equal(runtime.executions, 1)
+  assert.deepEqual(executed.results.map(item => item.toolName), ['sendPicture', 'searchImage'])
+  assert.equal(executed.results[0]?.result.status, 'denied')
+  assert.deepEqual(executed.results[0]?.attemptObservations, [])
+  assert.equal(executed.results[1]?.result.status, 'success')
+})
+
+test('the same consumer runs once its dependency is no longer in the batch', async () => {
+  const runtime = new FakeRuntime()
+  const scheduler = new ToolScheduler({ runtime })
+  const tools = dependencySnapshot()
+  const result = await scheduler.preflight(
+    [dependencyCall('send', 'sendPicture')],
+    { snapshot: tools, context: preparation(), remainingToolCalls: 8 }
+  )
+
+  assert.equal(result.kind, 'ready')
+  if (result.kind !== 'ready') throw new Error('batch was not ready')
+  assert.equal(runtime.preparations, 1)
+  assert.equal(result.batch.calls[0]?.kind, 'ready')
+  const executed = await scheduler.execute(result.batch, {
+    snapshot: tools, contextFor: async () => execution(), signal: new AbortController().signal
+  })
+  assert.equal(executed.results[0]?.result.status, 'success')
+})
+
 test('preflights an entire approval batch before any capability runs', async () => {
   const runtime = new FakeRuntime()
   const scheduler = new ToolScheduler({ runtime })

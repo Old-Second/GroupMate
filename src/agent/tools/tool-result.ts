@@ -37,6 +37,7 @@ export type ToolDenyCode =
   | 'self_mute_duration_exceeded'
   | 'role_hierarchy_denied'
   | 'unknown_policy_profile'
+  | 'batch_dependency_pending'
 
 export type ToolErrorCode =
   | 'configuration_missing'
@@ -67,7 +68,8 @@ const denyCodes: ReadonlySet<ToolDenyCode> = new Set([
   'self_unmute_denied',
   'self_mute_duration_exceeded',
   'role_hierarchy_denied',
-  'unknown_policy_profile'
+  'unknown_policy_profile',
+  'batch_dependency_pending'
 ])
 
 const errorCodes: ReadonlySet<ToolErrorCode> = new Set([
