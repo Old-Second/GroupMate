@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "baselineCommit": "a8d6279654dacb8d83b6555edd74f1035be2cd65",
-  "baselineSha256": "3d295282ce593c0d5541a789d080753a263d6828b6dfae695c7bb378605ca985",
+  "baselineCommit": "5bf84e2c05f43c118f28ca0d21480a0474708203",
+  "baselineSha256": "5a7287db38ca41e301e9955fb1e4967ba393de9b978ddece79028eb48b77af80",
   "generator": "src/verification/host-bootstrap-baseline.ts",
   "configFixtures": {
     "empty": {},

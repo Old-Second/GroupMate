@@ -2,66 +2,24 @@
 // so the TypeScript replacements can be held to it row by row. The legacy source is read from a
 // pinned commit rather than the working tree: that keeps this reproducible after the helpers are
 // deleted from `index.js`, which is the whole point of a migration baseline.
-import { execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import {
+  encodeValue,
+  legacyIndexSource,
+  sliceBlock,
+  sourceSha256,
+  writeFixture,
+  type Encoded
+} from './host-bootstrap-fixture.js'
 
-export const BASELINE_COMMIT = 'a8d6279654dacb8d83b6555edd74f1035be2cd65'
+export {
+  decodeValue,
+  encodeValue,
+  serializeFixture,
+  type Encoded
+} from './host-bootstrap-fixture.js'
+
+export const BASELINE_COMMIT = '5bf84e2c05f43c118f28ca0d21480a0474708203'
 export const FIXTURE_PATH = 'test/fixtures/host-bootstrap/batch-1-config-projection.json'
-
-export type Encoded =
-  | null
-  | boolean
-  | number
-  | string
-  | readonly Encoded[]
-  | { readonly [key: string]: Encoded }
-
-const SPECIALS: ReadonlyMap<string, unknown> = new Map<string, unknown>([
-  ['undefined', undefined],
-  ['NaN', Number.NaN],
-  ['Infinity', Number.POSITIVE_INFINITY],
-  ['-Infinity', Number.NEGATIVE_INFINITY],
-  ['-0', -0]
-])
-
-// Truncation limits like 16384 characters only get probed by inputs that actually exceed them, and
-// the committed fixture has a hard 64 KiB budget. Single-character runs therefore travel folded.
-const RUN_THRESHOLD = 64
-
-function repeatedUnit (value: string): string | null {
-  const unit = [...value][0]
-  if (unit === undefined) return null
-  const count = value.length / unit.length
-  if (!Number.isInteger(count) || count < RUN_THRESHOLD) return null
-  return unit.repeat(count) === value ? unit : null
-}
-
-export function encodeValue (value: unknown): Encoded {
-  if (value === undefined) return { '@': 'undefined' }
-  if (typeof value === 'number') {
-    if (Number.isNaN(value)) return { '@': 'NaN' }
-    if (value === Number.POSITIVE_INFINITY) return { '@': 'Infinity' }
-    if (value === Number.NEGATIVE_INFINITY) return { '@': '-Infinity' }
-    if (value === 0 && Object.is(value, -0)) return { '@': '-0' }
-    return value
-  }
-  if (typeof value === 'string') {
-    const unit = repeatedUnit(value)
-    return unit === null
-      ? value
-      : { '@': 'repeat', unit, count: value.length / unit.length }
-  }
-  if (value === null || typeof value === 'boolean') return value
-  if (Array.isArray(value)) return value.map(encodeValue)
-  if (typeof value === 'object') {
-    const result: Record<string, Encoded> = {}
-    for (const [key, item] of Object.entries(value)) result[key] = encodeValue(item)
-    return result
-  }
-  return { '@': `unsupported:${typeof value}` }
-}
 
 export interface LegacyHostApi {
   normalizedText: (value: unknown, maximum: number, fallback?: string) => string
@@ -89,17 +47,13 @@ const FUNCTION_SLICES: readonly string[] = Object.freeze([
 ])
 const FROZEN_SLICES: readonly string[] = Object.freeze(['buttonPolicy', 'bymPolicy'])
 
-function sliceBlock (source: string, opening: string, closing: string, name: string): string {
-  const start = source.indexOf(opening)
-  if (start < 0) throw new Error(`baseline index.js has no ${name} declaration`)
-  const end = source.indexOf(closing, start)
-  if (end < 0) throw new Error(`baseline ${name} declaration is unterminated`)
-  return source.slice(start, end + closing.length)
+function sliceFunction (source: string, name: string): string {
+  return sliceBlock(source, `\nfunction ${name} (`, '\n}\n', name)
 }
 
 export function legacyHostApi (source: string, config: unknown): LegacyHostApi {
   const blocks = [
-    ...FUNCTION_SLICES.map(name => sliceBlock(source, `\nfunction ${name} (`, '\n}\n', name)),
+    ...FUNCTION_SLICES.map(name => sliceFunction(source, name)),
     ...FROZEN_SLICES.map(
       name => sliceBlock(source, `\nconst ${name} = Object.freeze({`, '\n})\n', name)
     )
@@ -108,27 +62,6 @@ export function legacyHostApi (source: string, config: unknown): LegacyHostApi {
   const factory = new Function('Config', `${blocks.join('\n')}\nreturn { ${names} }`) as
     (hostConfig: unknown) => LegacyHostApi
   return factory(config)
-}
-
-export function decodeValue (value: Encoded): unknown {
-  if (value === null || typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.map(decodeValue)
-  const tag = (value as { readonly '@'?: unknown })['@']
-  if (typeof tag === 'string') {
-    if (tag === 'repeat') {
-      const unit = (value as { readonly unit?: unknown }).unit
-      const count = (value as { readonly count?: unknown }).count
-      if (typeof unit !== 'string' || typeof count !== 'number') {
-        throw new TypeError('malformed repeat encoding')
-      }
-      return unit.repeat(count)
-    }
-    if (!SPECIALS.has(tag)) throw new TypeError(`unknown encoded tag: ${tag}`)
-    return SPECIALS.get(tag)
-  }
-  const result: Record<string, unknown> = {}
-  for (const [key, item] of Object.entries(value)) result[key] = decodeValue(item as Encoded)
-  return result
 }
 
 const DECOMPOSED = 'é̂cole'
@@ -333,7 +266,8 @@ export interface BaselineFixture {
   readonly baselineCommit: string
   readonly baselineSha256: string
   readonly generator: string
-  readonly configFixtures: Readonly<Record<string, Encoded>>
+  readonly sectionName: 'configFixtures'
+  readonly section: Readonly<Record<string, Encoded>>
   readonly rows: readonly BaselineRow[]
 }
 
@@ -345,49 +279,14 @@ export function captureBaseline (source: string): BaselineFixture {
   return Object.freeze({
     schemaVersion: 1,
     baselineCommit: BASELINE_COMMIT,
-    baselineSha256: createHash('sha256').update(source).digest('hex'),
+    baselineSha256: sourceSha256(source),
     generator: 'src/verification/host-bootstrap-baseline.ts',
-    configFixtures: Object.freeze(configFixtures),
+    sectionName: 'configFixtures',
+    section: Object.freeze(configFixtures),
     rows: buildRows(source)
   })
 }
 
-// One line per row keeps the committed fixture inside the 64 KiB fixture budget while still giving
-// a reviewable diff: a changed expectation shows up as exactly one changed line.
-export function serializeFixture (fixture: BaselineFixture): string {
-  const configFixtures = Object.entries(fixture.configFixtures)
-    .map(([name, value]) => `    ${JSON.stringify(name)}: ${JSON.stringify(value)}`)
-  return [
-    '{',
-    `  "schemaVersion": ${JSON.stringify(fixture.schemaVersion)},`,
-    `  "baselineCommit": ${JSON.stringify(fixture.baselineCommit)},`,
-    `  "baselineSha256": ${JSON.stringify(fixture.baselineSha256)},`,
-    `  "generator": ${JSON.stringify(fixture.generator)},`,
-    '  "configFixtures": {',
-    configFixtures.join(',\n'),
-    '  },',
-    '  "rows": [',
-    fixture.rows.map(row => `    ${JSON.stringify(row)}`).join(',\n'),
-    '  ]',
-    '}',
-    ''
-  ].join('\n')
-}
-
 export function main (): void {
-  const source = execFileSync('git', ['show', `${BASELINE_COMMIT}:index.js`], {
-    encoding: 'utf8',
-    maxBuffer: 8 * 1024 * 1024
-  })
-  const fixture = captureBaseline(source)
-  mkdirSync(dirname(FIXTURE_PATH), { recursive: true })
-  writeFileSync(FIXTURE_PATH, serializeFixture(fixture), 'utf8')
-  process.stdout.write(`${JSON.stringify(Object.freeze({
-    fixture: FIXTURE_PATH,
-    baselineCommit: fixture.baselineCommit,
-    baselineSha256: fixture.baselineSha256,
-    configFixtures: Object.keys(fixture.configFixtures).length,
-    rows: fixture.rows.length
-  }), null, 2)}\n`)
+  writeFixture(FIXTURE_PATH, captureBaseline(legacyIndexSource(BASELINE_COMMIT)))
 }
-

@@ -24,9 +24,11 @@ import {
 } from '../../dist/runtime/host/host-config-projection.js'
 
 // Regenerate with `node scripts/capture-host-bootstrap-baseline.mjs`; both values are pinned here
-// so a regenerated fixture cannot quietly move the baseline it claims to reproduce.
-const BASELINE_COMMIT = 'a8d6279654dacb8d83b6555edd74f1035be2cd65'
-const BASELINE_SHA256 = '3d295282ce593c0d5541a789d080753a263d6828b6dfae695c7bb378605ca985'
+// so a regenerated fixture cannot quietly move the baseline it claims to reproduce. The commit is
+// the `groupmate` tip this migration started from rather than an agent branch, so the fixture stays
+// re-derivable from the mainline once that tip is pushed.
+const BASELINE_COMMIT = '5bf84e2c05f43c118f28ca0d21480a0474708203'
+const BASELINE_SHA256 = '5a7287db38ca41e301e9955fb1e4967ba393de9b978ddece79028eb48b77af80'
 
 const CALLERS = Object.freeze({
   normalizedText: (args) => normalizedText(args[0], args[1], args[2]),
