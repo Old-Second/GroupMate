@@ -3,6 +3,8 @@ import { types as utilTypes } from 'node:util'
 import type { PersonalMemoryCommandPortV1 } from './personal-memory-command.js'
 import type { MemoryCandidateModelV1 } from '../agent/memory/OpenAiMemoryCandidateExtractor.js'
 import type { PostReplyMemoryCandidatePortV1, ShadowMemoryAdmissionDiagnosticV1 } from './ProductionShadowMemory.js'
+import type { GroupMemoryObservationPortV1 } from './group-memory-observation.js'
+import type { GroupMemoryLearningDiagnosticV1 } from './GroupMemoryLearning.js'
 
 export type ProductionPersonalMemoryModeV1 = 'off' | 'explicit' | 'shadow' | 'automatic'
 
@@ -22,6 +24,9 @@ export interface ProductionPersonalMemoryRuntimeV1 {
   readonly commands: PersonalMemoryCommandPortV1
   readonly postReplyCandidate?: PostReplyMemoryCandidatePortV1
   readonly waitForCandidateIdle?: () => Promise<void>
+  /** Present only when group learning is composed; it never replies or blocks the host. */
+  readonly groupObservation?: GroupMemoryObservationPortV1
+  readonly waitForGroupLearningIdle?: () => Promise<void>
   readonly close: () => Promise<void>
 }
 
@@ -37,6 +42,9 @@ export interface ProductionPersonalMemoryRuntimeOptionsV1 {
   readonly candidateAdmission?: (diagnostic: ShadowMemoryAdmissionDiagnosticV1) => void
   /** Reports a committed canonical write whose derived lexical projection could not be rebuilt. */
   readonly derivedIndexFailure?: (operation: string) => void
+  /** Owner switch for automatic group memory candidates; administrators still review every one. */
+  readonly groupLearningEnabled?: () => boolean
+  readonly groupLearningDiagnostic?: (diagnostic: GroupMemoryLearningDiagnosticV1) => void
 }
 
 export interface ProductionPersonalMemoryRuntimeModuleV1 {
@@ -100,6 +108,8 @@ export async function initializeProductionPersonalMemoryRuntimeV1 (
     ...(options.candidateModel === undefined ? {} : { candidateModel: options.candidateModel }),
     ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot }),
     ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission }),
-    ...(options.derivedIndexFailure === undefined ? {} : { derivedIndexFailure: options.derivedIndexFailure })
+    ...(options.derivedIndexFailure === undefined ? {} : { derivedIndexFailure: options.derivedIndexFailure }),
+    ...(options.groupLearningEnabled === undefined ? {} : { groupLearningEnabled: options.groupLearningEnabled }),
+    ...(options.groupLearningDiagnostic === undefined ? {} : { groupLearningDiagnostic: options.groupLearningDiagnostic })
   }))
 }

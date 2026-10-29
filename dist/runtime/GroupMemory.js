@@ -8,6 +8,7 @@ import { createMemoryExportCommandV1, memoryExportStableResultHashV1 } from '../
 import { createMemoryLifecycleAuthorityRootV1, issueMemoryLifecycleActorCapabilityV1 } from '../agent/memory/memory-lifecycle-authority.js';
 import { buildMemoryCorrectionBundleV1, buildMemoryProposalApprovalBundleV1, buildMemoryProposalDraftV2, buildMemoryRenewalBundleV1 } from '../agent/memory/memory-lifecycle-builder.js';
 import { createMemoryLifecycleCommandV1 } from '../agent/memory/memory-lifecycle-command.js';
+import { MEMORY_PROPOSAL_DEADLINE_DAYS_V2 } from '../agent/memory/memory-lifecycle-domain.js';
 import { memoryNamespaceRefV1, parseMemoryNamespaceV1 } from '../agent/memory/memory-namespace.js';
 import { MEMORY_RESOURCE_LIMITS, memoryTextWithinLimits } from '../agent/memory/memory-resource-limits.js';
 import { parseMemoryRetrievalRequestV2, retrieveMemoryV2 } from '../agent/memory/memory-retrieval.js';
@@ -18,6 +19,7 @@ const ADMIN_ACTIONS = [
 const HELP = ['群记忆命令：',
     '#群记忆 状态', '#群记忆 开启 / 关闭（群管理员；默认开启）',
     '#群记忆 列表 [页码]', '#群记忆 记住 <规则|共同偏好|文化|群体事实> <以本群或我们群开头的内容>',
+    '#群记忆 候选（群管理员；含从群聊自动发现的待审核候选）', '#群记忆 通过 / 拒绝 <@编号>（群管理员）',
     '#群记忆 更正 <@编号> <新内容>', '#群记忆 续期 <@编号> [天数]',
     '#群记忆 遗忘 <@编号>', '#群记忆 导出（群主，私发文件）',
     '#群记忆 删除全部 确认（群主）',
@@ -137,6 +139,13 @@ export function createGroupMemoryV1(options) {
     const controlBase = (auth) => ({ schemaVersion: 1, botInstanceId: options.botInstanceId,
         accountId: auth.accountId, sceneRef: auth.access.sceneRef, namespaceRef: auth.namespaceRef,
         generation: auth.generation, actorRef: auth.actorRef, access: auth.access, actor: auth.actor });
+    const discard = (auth) => {
+        // Dropping buffered observations is best effort: a failure here must not change the command's outcome.
+        try {
+            options.discardObservedMessages?.(auth.accountId, auth.namespace.scope.kind === 'group' ? auth.namespace.scope.groupId : '');
+        }
+        catch { /* buffered messages stay until the next write rechecks policy */ }
+    };
     const requireAdmin = (auth) => {
         if (auth.role === 'member')
             throw new GroupMemoryError('只有当前群管理员或群主可以修改群记忆。');
@@ -227,6 +236,8 @@ export function createGroupMemoryV1(options) {
         const result = options.policy.decide(policyScope(event), feature, enabled, auth.actorRef, auth.now);
         if (result.status === 'capacity')
             throw new GroupMemoryError('群记忆开关容量已满，操作未执行。');
+        if (!enabled)
+            discard(auth);
         const label = FEATURE_LABELS[feature];
         if (!enabled) {
             return `当前群的${label}已关闭，不再注入对话或记录新内容；已有内容保留，可用“#${label} 开启”恢复。`;
@@ -236,6 +247,13 @@ export function createGroupMemoryV1(options) {
             : `当前群的${label}已开启。`;
     };
     const cultureProposal = async (auth, selector) => {
+        const result = await pendingProposal(auth, selector);
+        if (result.kind !== 'group_culture' || cultureKindV1(result.text) === null) {
+            throw new GroupMemoryError('这不是当前群可审核的文化候选。');
+        }
+        return result;
+    };
+    const pendingProposal = async (auth, selector) => {
         if (!/^@[0-9a-f]{8}$/u.test(selector))
             throw new GroupMemoryError('请使用候选列表里的唯一 @编号。');
         const matches = options.database.prepare(`SELECT proposal_id FROM proposals
@@ -246,10 +264,59 @@ export function createGroupMemoryV1(options) {
         const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect',
             proposalId: String(matches[0].proposal_id) });
         if (result.status !== 'found' || result.operation !== 'proposal.inspect' ||
-            result.value.kind !== 'group_culture' || cultureKindV1(result.value.text) === null) {
-            throw new GroupMemoryError('这不是当前群可审核的文化候选。');
-        }
+            result.effectiveState !== 'pending')
+            throw new GroupMemoryError('候选不存在或已过期。');
         return result.value;
+    };
+    /** Model candidates and member proposals both enter pending; labels let administrators tell them apart. */
+    const candidateLine = (proposal) => {
+        const origin = proposal.proposedBy.kind === 'model' ? '[自动]' : '[成员提议]';
+        const conflict = proposal.conflict.state === 'none' ? '' : '（与已有记录相近，请核对）';
+        const until = new Date(Date.parse(proposal.proposedAt) + MEMORY_PROPOSAL_DEADLINE_DAYS_V2 * 86400000)
+            .toISOString().slice(0, 10);
+        return `@${proposal.proposalId.slice(-8)} ${origin} ${[...proposal.text].slice(0, 120).join('')}${conflict}（${until} 前审核）`;
+    };
+    const listCandidates = async (auth, culture) => {
+        const rows = options.database.prepare(`SELECT proposal_id FROM proposals WHERE namespace_ref = ?
+      AND namespace_generation = ? AND state = 'pending' AND proposed_at_ms > ?
+      AND (? = 0 OR json_extract(proposal_wire, '$.kind') = 'group_culture')
+      ORDER BY proposed_at_ms, proposal_id LIMIT 32`).all(auth.namespaceRef, auth.generation, Date.parse(auth.now) - MEMORY_PROPOSAL_DEADLINE_DAYS_V2 * 86400000, culture ? 1 : 0);
+        const items = [];
+        for (const row of rows) {
+            const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect', proposalId: String(row.proposal_id) });
+            if (result.status !== 'found' || result.operation !== 'proposal.inspect' || result.effectiveState !== 'pending')
+                continue;
+            const proposal = result.value;
+            // Classified culture is reviewed through #群文化 so its own switch and subtype rule apply.
+            if ((cultureKindV1(proposal.text) !== null) !== culture)
+                continue;
+            items.push(candidateLine(proposal));
+        }
+        return items;
+    };
+    const approveProposal = async (auth, proposal) => {
+        // Administrators may save rules directly, so a model candidate needs only a current administrator.
+        // Classified culture always needs someone other than its proposer and its quoted speakers.
+        if ((proposal.proposedBy.kind === 'user' || cultureKindV1(proposal.text) !== null) &&
+            (proposal.initiatedByActorRef === auth.actorRef ||
+                proposal.sources.some(source => source.actor.userId === auth.source.actor.userId))) {
+            throw new GroupMemoryError('该候选需要另一位当前管理员审核，不能自行通过。');
+        }
+        // One current description per subtype. Conflicting proposals stay pending until explicit correction/forget.
+        if (cultureKindV1(proposal.text) !== null) {
+            const rows = options.database.prepare(`SELECT p.revision_wire FROM heads h JOIN revision_payloads p
+        ON p.namespace_ref = h.namespace_ref AND p.namespace_generation = h.namespace_generation
+        AND p.memory_id = h.memory_id AND p.revision = h.current_revision
+        WHERE h.namespace_ref = ? AND h.namespace_generation = ? AND h.valid_until_ms > ?
+        AND json_extract(p.revision_wire, '$.record.kind') = 'group_culture' LIMIT 64`).all(auth.namespaceRef, auth.generation, Date.parse(auth.now));
+            if (rows.some(row => cultureKindV1(JSON.parse(String(row.revision_wire)).record.text) === cultureKindV1(proposal.text))) {
+                throw new GroupMemoryError('该类别已有文化描述，候选保持待审核。请明确更正或遗忘旧描述后再审核，不能覆盖。');
+            }
+        }
+        const approval = buildMemoryProposalApprovalBundleV1({ commandRef: ref(auth, 'proposal.approve'), operation: 'proposal.approve',
+            namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation, proposal,
+            approvedByActorRef: auth.actorRef, freshNow: auth.now, evidenceSource: auth.source, reason: null });
+        await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal);
     };
     const cultureCommand = async (auth, body, reply) => {
         let match = /^提议\s+(主题偏好|语言约定|梗说明)\s+([\s\S]+)$/u.exec(body);
@@ -271,17 +338,8 @@ export function createGroupMemoryV1(options) {
         }
         if (body === '候选') {
             requireAdmin(auth);
-            const rows = options.database.prepare(`SELECT proposal_id FROM proposals WHERE namespace_ref = ?
-        AND namespace_generation = ? AND state = 'pending' AND json_extract(proposal_wire, '$.kind') = 'group_culture'
-        ORDER BY proposed_at_ms, proposal_id LIMIT 32`).all(auth.namespaceRef, auth.generation);
-            const items = [];
-            for (const row of rows) {
-                const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect', proposalId: String(row.proposal_id) });
-                if (result.status === 'found' && result.operation === 'proposal.inspect' && cultureKindV1(result.value.text) !== null) {
-                    items.push(`@${result.value.proposalId.slice(-8)} ${result.value.text}`);
-                }
-            }
-            await reply(items.length === 0 ? '当前群没有文化候选。' : items.join('\n'));
+            const items = await listCandidates(auth, true);
+            await reply(items.length === 0 ? '当前群没有文化候选。' : `当前群文化候选（[自动] 来自群聊，仅供审核）：\n${items.join('\n')}`);
             return true;
         }
         match = /^(通过|拒绝)\s+(\S+)$/u.exec(body);
@@ -293,22 +351,7 @@ export function createGroupMemoryV1(options) {
                 await reply('已拒绝当前群的文化候选。');
                 return true;
             }
-            if (proposal.initiatedByActorRef === auth.actorRef || proposal.sources.some(source => source.actor.userId === auth.source.actor.userId)) {
-                throw new GroupMemoryError('文化候选需要另一位当前管理员审核，不能自行通过。');
-            }
-            // One current description per subtype. Conflicting proposals stay pending until explicit correction/forget.
-            const rows = options.database.prepare(`SELECT p.revision_wire FROM heads h JOIN revision_payloads p
-        ON p.namespace_ref = h.namespace_ref AND p.namespace_generation = h.namespace_generation
-        AND p.memory_id = h.memory_id AND p.revision = h.current_revision
-        WHERE h.namespace_ref = ? AND h.namespace_generation = ? AND h.valid_until_ms > ?
-        AND json_extract(p.revision_wire, '$.record.kind') = 'group_culture' LIMIT 64`).all(auth.namespaceRef, auth.generation, Date.parse(auth.now));
-            if (rows.some(row => cultureKindV1(JSON.parse(String(row.revision_wire)).record.text) === cultureKindV1(proposal.text))) {
-                throw new GroupMemoryError('该类别已有文化描述，候选保持待审核。请明确更正或遗忘旧描述后再审核，不能覆盖。');
-            }
-            const approval = buildMemoryProposalApprovalBundleV1({ commandRef: ref(auth, 'proposal.approve'), operation: 'proposal.approve',
-                namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation, proposal,
-                approvedByActorRef: auth.actorRef, freshNow: auth.now, evidenceSource: auth.source, reason: null });
-            await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal);
+            await approveProposal(auth, proposal);
             await reply('已保存当前群的文化描述；仅作参考，不代表全群共识或群规则。');
             return true;
         }
@@ -403,6 +446,7 @@ export function createGroupMemoryV1(options) {
                     if (auth.role !== 'owner')
                         throw new GroupMemoryError('只有当前群主可以删除全部群记忆。');
                     await mutate(auth, 'namespace.delete', null);
+                    discard(auth);
                     const complete = await options.completeNamespaceDeletion(auth.namespace);
                     await request.replyText(complete ? '当前群记忆已全部删除，正文与检索索引已清理。' : '当前群记忆已停止召回，正文清理尚未完成。');
                 }
@@ -418,7 +462,27 @@ export function createGroupMemoryV1(options) {
                         }
                     };
                     let match = /^记住\s+(规则|共同偏好|文化|群体事实)\s+([\s\S]+)$/u.exec(body);
-                    if (match !== null) {
+                    const review = /^(通过|拒绝)\s+(\S+)$/u.exec(body);
+                    if (body === '候选') {
+                        const items = await listCandidates(auth, false);
+                        await request.replyText(items.length === 0 ? '当前群没有待审核的群记忆候选。'
+                            : `当前群记忆候选（[自动] 来自群聊，模型生成不代表群共识；通过后才会召回）：\n${items.join('\n')}`);
+                    }
+                    else if (review !== null) {
+                        const proposal = await pendingProposal(auth, review[2]);
+                        if (cultureKindV1(proposal.text) !== null)
+                            throw new GroupMemoryError('分类文化候选请使用“#群文化 通过/拒绝 @编号”审核。');
+                        if (review[1] === '拒绝') {
+                            await mutate(auth, 'proposal.reject', null, proposal);
+                            await request.replyText('已拒绝当前群的这条候选。');
+                        }
+                        else {
+                            requireWritable();
+                            await approveProposal(auth, proposal);
+                            await request.replyText(`已保存当前群记忆：${proposal.text}`);
+                        }
+                    }
+                    else if (match !== null) {
                         requireWritable();
                         const text = groupMemoryTextV1(match[2]);
                         if (cultureKindV1(text) !== null)

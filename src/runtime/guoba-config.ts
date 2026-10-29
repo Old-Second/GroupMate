@@ -207,6 +207,13 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
     return value
   }
 
+  if (key === 'groupMemoryLearningEnabled') {
+    if (typeof value !== 'boolean') {
+      throw new TypeError('群记忆自动候选开关配置无效。')
+    }
+    return value
+  }
+
   if (key === 'hostImageLinkRefresh') {
     if (typeof value !== 'boolean') {
       throw new TypeError('历史图片链接续签配置无效。')

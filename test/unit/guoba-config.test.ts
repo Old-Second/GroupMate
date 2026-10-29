@@ -262,6 +262,16 @@ test('normalizes the conversation preference owner switch as a live boolean', ()
   assert.equal(guobaConfigSaveMessage(['conversationPreferencesEnabled']), '保存成功~')
 })
 
+test('normalizes the group memory learning owner switch as a live boolean', () => {
+  assert.equal(normalizeGuobaConfigValue('groupMemoryLearningEnabled', true), true)
+  assert.equal(normalizeGuobaConfigValue('groupMemoryLearningEnabled', false), false)
+  assert.throws(
+    () => normalizeGuobaConfigValue('groupMemoryLearningEnabled', 'off'),
+    /群记忆自动候选开关配置无效/
+  )
+  assert.equal(guobaConfigSaveMessage(['groupMemoryLearningEnabled']), '保存成功~')
+})
+
 test('normalizes the three observability levels fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'off'), 'off')
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'basic'), 'basic')

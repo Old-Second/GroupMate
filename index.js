@@ -71,6 +71,9 @@ import {
   configureProductionPersonalMemoryCommandPortV1
 } from './dist/runtime/personal-memory-command.js'
 import {
+  configureProductionGroupMemoryObservationPortV1
+} from './dist/runtime/group-memory-observation.js'
+import {
   resolveYunzaiGroupHistoryCursor
 } from './dist/runtime/agent-service-bridge.js'
 import {
@@ -1293,6 +1296,10 @@ try {
     derivedIndexFailure: operation => runtimeLogger.error(Object.freeze({
       event: 'groupmate.personal_memory.lexical_rebuild_failure', operation
     })),
+    groupLearningEnabled: () => Config.groupMemoryLearningEnabled !== false,
+    groupLearningDiagnostic: diagnostic => runtimeLogger.info(Object.freeze({
+      event: 'groupmate.group_memory.learning', ...diagnostic
+    })),
     candidateModel: Object.freeze({
       adapter: modelPort,
       model: () => normalizedText(Config.model, 128),
@@ -1315,6 +1322,9 @@ try {
   if (personalMemoryRuntime !== null) {
     configureProductionPersonalMemoryOperationsPortV1(personalMemoryRuntime.operations)
     configureProductionPersonalMemoryCommandPortV1(personalMemoryRuntime.commands)
+    if (personalMemoryRuntime.groupObservation !== undefined) {
+      configureProductionGroupMemoryObservationPortV1(personalMemoryRuntime.groupObservation)
+    }
   }
 } catch {
   const failedRuntime = personalMemoryRuntime

@@ -75,6 +75,7 @@ import {
 import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sqlite-personal-memory-deletion.js'
 import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js'
 import { createGroupMemoryV1 } from './GroupMemory.js'
+import { createGroupMemoryLearningV1 } from './GroupMemoryLearning.js'
 import { openGroupMemoryPolicyStoreV1, type GroupMemoryPolicyStoreV1 } from './GroupMemoryPolicy.js'
 import { parseMemoryRetrievalResultV2, type MemoryRetrievalCandidateV2 } from '../agent/memory/memory-retrieval.js'
 import { createProductionMemoryRetentionV1 } from './ProductionMemoryRetention.js'
@@ -556,6 +557,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
   let shadow: ReturnType<typeof createProductionShadowMemoryV1> | undefined
   let retention: ReturnType<typeof createProductionMemoryRetentionV1> | undefined
   let groupPolicy: GroupMemoryPolicyStoreV1 | null = null
+  let groupLearning: ReturnType<typeof createGroupMemoryLearningV1> | undefined
   try {
     canonical = openSqliteMemoryDatabaseV3({
       location: canonicalLocation,
@@ -713,8 +715,18 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         maxCandidates: boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS),
         maxTokens: boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS), maxBytes: 32768
       }),
-      recallTimeoutMs: () => boundedInteger(options.recallTimeoutMs, DEFAULT_RECALL_TIMEOUT_MS, MAX_RECALL_TIMEOUT_MS)
+      recallTimeoutMs: () => boundedInteger(options.recallTimeoutMs, DEFAULT_RECALL_TIMEOUT_MS, MAX_RECALL_TIMEOUT_MS),
+      // Resolved at call time; the learner is composed below and may be absent.
+      discardObservedMessages: (accountId, groupId) => { groupLearning?.discard(accountId, groupId) }
     })
+    // Automatic group candidates reuse the extraction model and stay pending for administrator review.
+    groupLearning = options.candidateModel === undefined || options.candidateBot === undefined ? undefined
+      : createGroupMemoryLearningV1({ botInstanceId: options.botInstanceId, database: canonical.database,
+        policy: groupPolicy, lifecycle, model: options.candidateModel, bot: options.candidateBot, now: nowIso,
+        enabled: () => ['shadow', 'automatic'].includes(options.deploymentMode()) &&
+          (options.groupLearningEnabled?.() ?? true),
+        ...(options.groupLearningDiagnostic === undefined ? {} : { onDiagnostic: options.groupLearningDiagnostic })
+      })
     let closed = false
     retention.start()
     return Object.freeze({
@@ -797,10 +809,15 @@ export async function createProductionPersonalMemoryRuntimeV1 (
       ...(shadow === undefined ? {} : {
         postReplyCandidate: shadow.postReplyCandidate, waitForCandidateIdle: shadow.waitForIdle
       }),
+      ...(groupLearning === undefined ? {} : {
+        groupObservation: Object.freeze({ observe: groupLearning.observe }),
+        waitForGroupLearningIdle: groupLearning.waitForIdle
+      }),
       close: async () => {
         if (closed) return
         closed = true
         await retention?.close()
+        await groupLearning?.close()
         await shadow?.close()
         await projector.waitForIdle().catch(() => undefined)
         exportDeliveryRuntime.close()
@@ -811,6 +828,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
     })
   } catch (error) {
     try { await retention?.close() } catch {}
+    try { await groupLearning?.close() } catch { /* construction already failed; report the original error */ }
     try { await shadow?.close() } catch {}
     try { groupPolicy?.close() } catch {}
     try { lexical?.close() } catch {}

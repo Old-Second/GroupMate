@@ -136,6 +136,7 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
             ]
         }),
         field('conversationPreferencesEnabled', '个人对话偏好', '默认开启：用户可用“#对话偏好”设置机器人回复本人时的称呼、语气（活泼、温柔、正式、冷静）和详略（简短、详细）。偏好只在本人的普通对话中作为不可信资料注入当前请求附近，不进入系统设定，也不影响随机参与、他人对话、人设、群规则和工具权限；称呼经长度、换行、指令式写法和输入/输出屏蔽词检查。关闭后立即停止注入和新设置，已存偏好保留，用户仍可查看和清除。', 'Switch'),
+        field('groupMemoryLearningEnabled', '群记忆自动候选', '默认开启，仅在长期记忆为影子或自动模式时运行：每群攒够 20 条纯文字消息（至少 2 人发言）后抽取一次，每群至少间隔 30 分钟、每天最多 3 次，全部群每天最多 30 次。只生成关于本群整体的规则、共同偏好、语言约定、梗说明和群体事实候选，不收个人信息、单人观点、玩笑和临时安排；候选需当前群管理员用“#群记忆 候选/通过”或“#群文化 候选/通过”审核后才会召回，7 天未审核自动过期，每群最多 8 条待审自动候选。群管理员“#群记忆 关闭”“#群文化 关闭”同样停止自动候选。每次抽取是一次额外模型调用，用量单独记录。修改后立即生效。', 'Switch'),
         divider('工具与搜索'),
         field('disabledTools', '隐藏指定工具', '填入工具名，例如 searchVideo；下一次请求生效。用于停用故障服务或不需要的能力，移除后恢复发现。', 'Select', {
             mode: 'multiple', options: CONFIGURABLE_TOOL_NAMES.map(value => ({ label: value, value }))

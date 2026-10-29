@@ -380,7 +380,9 @@ const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
   personalMemoryMode: 'automatic',
   personalMemoryRecallMaxItems: 6,
   personalMemoryRecallMaxTokens: 1_200,
-  personalMemoryRecallTimeoutMs: 150
+  personalMemoryRecallTimeoutMs: 150,
+  // Reviewed owner switch: automatic group candidates stay pending for administrator review.
+  groupMemoryLearningEnabled: true
 })
 
 const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([

@@ -184,6 +184,8 @@ const defaultConfig = {
   personalMemoryRecallTimeoutMs: 150,
   // 个人对话偏好（称呼/语气/详略）：只对本人普通对话生效；关闭后停止注入，已存偏好保留。
   conversationPreferencesEnabled: true,
+  // 群记忆自动候选：从群聊发现关于本群的稳定信息，只生成待管理员审核的候选；有独立模型用量。
+  groupMemoryLearningEnabled: true,
   toolPrivateSendPolicy: 'master', // 工具发起私聊：disabled/master/everyone。
   toolCrossGroupSendPolicy: 'disabled', // 工具跨群发送：disabled/master/everyone。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。
