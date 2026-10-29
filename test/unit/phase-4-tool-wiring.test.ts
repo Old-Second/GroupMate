@@ -661,6 +661,7 @@ test('prepared message evidence supplies quote images and current intent without
   const messageEvidence = Object.freeze({
     schemaVersion: 1 as const,
     prompt,
+    speakerText: '这条消息是什么意思？',
     imageUrls: Object.freeze(['https://evidence.example/image.png']),
     currentMessageId: 'current-evidence',
     quotedMessageId: 'quoted-evidence',

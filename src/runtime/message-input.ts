@@ -66,6 +66,12 @@ export type DeepReadonly<T> =
 export interface PreparedYunzaiMessageEvidenceV1 {
   readonly schemaVersion: 1
   readonly prompt: string
+  /**
+   * What this speaker wrote themselves: no quoted message, no OCR transcription, no model prefix.
+   * The prompt wraps a reply into a quoted-context envelope, so it cannot be used where only the
+   * speaker's own assertion may be read.
+   */
+  readonly speakerText: string
   readonly mentionedUserIds?: readonly string[]
   readonly imageUrls: readonly string[]
   readonly currentMessageId: string | null
@@ -493,9 +499,12 @@ export async function prepareYunzaiMessageEvidence (input: {
     currentPrompt
   })
   const quotedMessage = copyQuotedMessage(messageInput.quotedMessage)
+  // Built from the original prompt, so an OCR transcription of an image never becomes own evidence.
+  const speaker = normalizeMessageContent(input.event.message, { textOverride: input.currentPrompt })
   return Object.freeze({
     schemaVersion: 1 as const,
     prompt: messageInput.prompt,
+    speakerText: speaker.text === '' ? input.currentPrompt : speaker.text,
     ...(messageInput.mentionedUserIds === undefined ? {} : {
       mentionedUserIds: Object.freeze([...messageInput.mentionedUserIds])
     }),

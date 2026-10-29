@@ -534,6 +534,7 @@ function evidence (): PreparedYunzaiMessageEvidenceV1 {
   return Object.freeze({
     schemaVersion: 1,
     prompt: '测试',
+    speakerText: '测试',
     imageUrls: Object.freeze([]),
     currentMessageId: 'message-current',
     quotedMessageId: 'message-quoted',

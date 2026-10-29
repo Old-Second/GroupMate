@@ -110,7 +110,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     const now = options.now()
     const snapshot = await abortable(participants.resolve({ event, accountId, observedAt: now,
       refreshCurrentRole, freshAuthority,
-      messageEvidence: { schemaVersion: 1, prompt: text, imageUrls: [], currentMessageId: messageId,
+      messageEvidence: { schemaVersion: 1, prompt: text, speakerText: text, imageUrls: [], currentMessageId: messageId,
         quotedMessageId: null, hasReply: false, replyResolved: true,
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] } }, signal), signal)
     if (signal.aborted || snapshot?.scene.kind !== 'group' ||

@@ -255,7 +255,7 @@ function assertPreparedEvidence (
   evidence: PreparedYunzaiMessageEvidenceV1
 ): PreparedYunzaiMessageEvidenceV1 {
   const required = [
-    'schemaVersion', 'prompt', 'imageUrls', 'currentMessageId', 'quotedMessageId',
+    'schemaVersion', 'prompt', 'speakerText', 'imageUrls', 'currentMessageId', 'quotedMessageId',
     'hasReply', 'replyResolved', 'currentSegmentCount', 'replySegmentCount', 'ocrTexts'
   ]
   const allowed = new Set([...required, 'quotedMessage', 'mentionedUserIds'])
@@ -265,6 +265,7 @@ function assertPreparedEvidence (
     throw new TypeError('prepared message evidence is invalid')
   }
   if (evidence.schemaVersion !== 1 || typeof evidence.prompt !== 'string' ||
+    typeof evidence.speakerText !== 'string' ||
     !Array.isArray(evidence.imageUrls) ||
     evidence.imageUrls.some(value => typeof value !== 'string') ||
     (evidence.currentMessageId !== null && typeof evidence.currentMessageId !== 'string') ||

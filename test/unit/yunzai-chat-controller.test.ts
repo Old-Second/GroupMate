@@ -155,6 +155,7 @@ function preparedRequest (prompt: string, forcePicture: boolean): Readonly<{
   const evidence = Object.freeze({
     schemaVersion: 1 as const,
     prompt,
+    speakerText: prompt,
     imageUrls: Object.freeze(['https://example.com/current.png', 'https://example.com/quote.png']),
     currentMessageId: 'message-1',
     quotedMessageId: 'quoted-1',

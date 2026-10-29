@@ -115,6 +115,7 @@ function messageEvidence(text, currentMessageId) {
     return Object.freeze({
         schemaVersion: 1,
         prompt: text,
+        speakerText: text,
         imageUrls: Object.freeze([]),
         currentMessageId,
         quotedMessageId: null,

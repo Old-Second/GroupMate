@@ -385,9 +385,12 @@ export async function prepareYunzaiMessageEvidence(input) {
         currentPrompt
     });
     const quotedMessage = copyQuotedMessage(messageInput.quotedMessage);
+    // Built from the original prompt, so an OCR transcription of an image never becomes own evidence.
+    const speaker = normalizeMessageContent(input.event.message, { textOverride: input.currentPrompt });
     return Object.freeze({
         schemaVersion: 1,
         prompt: messageInput.prompt,
+        speakerText: speaker.text === '' ? input.currentPrompt : speaker.text,
         ...(messageInput.mentionedUserIds === undefined ? {} : {
             mentionedUserIds: Object.freeze([...messageInput.mentionedUserIds])
         }),

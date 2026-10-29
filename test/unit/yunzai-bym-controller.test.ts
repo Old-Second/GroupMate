@@ -205,6 +205,7 @@ function fixture (input: Readonly<{
         const evidence: PreparedYunzaiMessageEvidenceV1 = Object.freeze({
           schemaVersion: 1,
           prompt: evidencePrompt,
+          speakerText: evidencePrompt,
           imageUrls: Object.freeze([]),
           currentMessageId: 'message-1',
           quotedMessageId: null,

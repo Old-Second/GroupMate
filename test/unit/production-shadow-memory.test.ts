@@ -20,7 +20,7 @@ function input (prompt: string, overrides: Partial<Input> = {}): Input {
       route: { schemaVersion: 1, requestKind: 'ordinary_chat', profile: 'ordinary',
         presentationIntent: { schemaVersion: 1, kind: 'ordinary', forcePicture: false }, actorId: '20002',
         sessionAddress: { botId: '10001', scope: { kind: 'private', userId: '20002' } } },
-      evidence: { schemaVersion: 1, prompt, imageUrls: [], currentMessageId: `shadow-${id}`,
+      evidence: { schemaVersion: 1, prompt, speakerText: prompt, imageUrls: [], currentMessageId: `shadow-${id}`,
         quotedMessageId: null, hasReply: false, replyResolved: true,
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] }
     },
@@ -438,22 +438,42 @@ test('an in-flight automatic extraction cannot approve after deployment mode is 
   assert.equal(db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 0)
 })
 
-test('unknown delivery, secrets, quoted/media evidence and oversized input are rejected before persistence/network', async t => {
+test('unknown delivery, secrets, commands and oversized input are rejected before persistence/network', async t => {
   const { directory, runtime, send, requests } = await setup(t)
   await send('#长期记忆 开启')
   const unknown = input('我喜欢红茶', { presentation: { schemaVersion: 1, outcome: 'unknown', deliveries: [
     { kind: 'outcome_unknown', media: 'text', attempt: 1, code: 'unknown_host_result' }
   ] } })
-  const quoted = input('我喜欢红茶')
-  const media = input('我喜欢红茶')
+  const blank = input('我喜欢红茶')
   for (const request of [unknown, input('我的密码是 hunter2'), input('我'.repeat(600)),
-    { ...quoted, prepared: { ...quoted.prepared, evidence: { ...quoted.prepared.evidence, hasReply: true } } },
-    { ...media, prepared: { ...media.prepared, evidence: { ...media.prepared.evidence, ocrTexts: ['我喜欢红茶'] } } }]) {
+    input('#长期记忆 列表'),
+    { ...blank, prepared: { ...blank.prepared, evidence: { ...blank.prepared.evidence, speakerText: '   ' } } }]) {
     await runtime.postReplyCandidate!.enqueue(request)
   }
   await runtime.waitForCandidateIdle!()
   assert.equal(requests.length, 0)
   assert.equal(existsSync(path.join(directory, 'personal-memory-extraction.sqlite')), false)
+})
+
+test('a reply or image message is extracted from the speaker\'s own words only', async t => {
+  const { runtime, send, requests } = await setup(t)
+  await send('#长期记忆 开启')
+  const quoted = input('我喜欢红茶')
+  const media = input('我喜欢绿茶')
+  await runtime.postReplyCandidate!.enqueue({ ...quoted, prepared: { ...quoted.prepared,
+    evidence: { ...quoted.prepared.evidence, hasReply: true, quotedMessageId: 'quoted-1',
+      prompt: '以下 JSON 是用户提供的 QQ 消息上下文。\n{"quotedMessage":{"content":"我喜欢咖啡"},"currentRequest":{"content":"我喜欢红茶"}}' } } })
+  await runtime.waitForCandidateIdle!()
+  await runtime.postReplyCandidate!.enqueue({ ...media, prepared: { ...media.prepared,
+    evidence: { ...media.prepared.evidence, imageUrls: ['https://example.invalid/a.png'],
+      ocrTexts: ['我喜欢可乐'] } } })
+  await runtime.waitForCandidateIdle!()
+  const sources = requests.map(request =>
+    (JSON.parse(request.messages[1]!.content!) as { currentMessage: string }).currentMessage)
+  assert.deepEqual(sources, ['我喜欢红茶', '我喜欢绿茶'])
+  for (const source of sources) {
+    for (const excluded of ['咖啡', '可乐', 'quotedMessage']) assert.ok(!source.includes(excluded))
+  }
 })
 
 test('an existing approved identical fact is deduplicated and changed facts stay conflicted pending candidates', async t => {

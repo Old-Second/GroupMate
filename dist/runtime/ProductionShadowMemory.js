@@ -76,7 +76,8 @@ export function createProductionShadowMemoryV1(options) {
                 event: { isGroup: true, group_id: job.source.scene.groupId, user_id: job.subject.userId,
                     self_id: job.namespace.accountId, sender: member, bot },
                 accountId: job.namespace.accountId, observedAt: options.now(),
-                messageEvidence: { schemaVersion: 1, prompt: job.source.normalizedText, imageUrls: [],
+                messageEvidence: { schemaVersion: 1, prompt: job.source.normalizedText,
+                    speakerText: job.source.normalizedText, imageUrls: [],
                     currentMessageId: job.source.messageId, quotedMessageId: null, hasReply: false,
                     replyResolved: true, currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] }
             }, signal), signal);
@@ -249,10 +250,11 @@ export function createProductionShadowMemoryV1(options) {
             !input.presentation.deliveries.some(delivery => delivery.kind === 'sent'))
             return;
         const evidence = input.prepared.evidence;
-        const prompt = evidence.prompt.normalize('NFC').replace(/\r\n?/g, '\n').trim();
-        // Never persist truncated evidence, credentials, image/OCR/quoted assertions or command messages.
-        if (evidence.currentMessageId === null || evidence.hasReply || evidence.imageUrls.length !== 0 ||
-            evidence.ocrTexts.length !== 0 || prompt.startsWith('#') || prompt === '' ||
+        const prompt = evidence.speakerText.normalize('NFC').replace(/\r\n?/g, '\n').trim();
+        // Only this speaker's own words are evidence: a quoted message, an image and its OCR
+        // transcription are excluded by using `speakerText` instead of the model prompt. Still never
+        // persist truncated evidence, credentials or command messages.
+        if (evidence.currentMessageId === null || prompt.startsWith('#') || prompt === '' ||
             Buffer.byteLength(prompt, 'utf8') > 1_024 || [...prompt].length > 500 ||
             memoryCredentialRejectionReasonV1(prompt) !== null) {
             report('evidence', 'rejected');

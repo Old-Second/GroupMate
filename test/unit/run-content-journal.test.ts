@@ -525,6 +525,7 @@ test('Yunzai bridge journals the exact normalized request once before run claim 
   const messageEvidence: PreparedYunzaiMessageEvidenceV1 = Object.freeze({
     schemaVersion: 1,
     prompt: '记录完整标准化请求',
+    speakerText: '记录完整标准化请求',
     imageUrls: Object.freeze([]),
     currentMessageId: 'message-journal',
     quotedMessageId: null,
