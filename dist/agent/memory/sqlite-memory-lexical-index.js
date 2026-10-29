@@ -2,8 +2,39 @@ import { types as utilTypes } from 'node:util';
 import { parseCanonicalMemoryRecordV1 } from './memory-canonical-wire.js';
 import { createMemoryLexicalIndexPortV1, memoryLexicalBodyHashV1 } from './memory-lexical-index.js';
 import { normalizeMemoryLexicalTextV1 } from './memory-lexical-normalizer.js';
+import { memoryLexicalBoundedMatchV1 } from './memory-lexical-query-shape.js';
 import { inspectMemoryArray, inspectMemoryRecord, invalidMemoryValue } from './memory-namespace.js';
 export const MEMORY_LEXICAL_PROJECTION_BATCH_RECORDS_V1 = 32;
+const LEXICAL_VOCAB_TABLE = 'groupmate_memory_lexical_vocab';
+/**
+ * 读取 token 的文档频次。fts5vocab 建在 `temp` 里，不进持久 schema，因此不影响 schema 指纹；
+ * 连接内只建一次，本机 4 096 条实测建表 ≤0.4 ms、单次频次查询 p50 0.15～0.43 ms、p95 最高 1.4 ms。
+ */
+function createTokenFrequencyReader(options) {
+    let ready = false;
+    return (tokens) => {
+        const frequencies = new Map();
+        if (tokens.length === 0)
+            return frequencies;
+        if (!ready) {
+            options.database.exec(`DROP TABLE IF EXISTS temp.${LEXICAL_VOCAB_TABLE};
+CREATE VIRTUAL TABLE temp.${LEXICAL_VOCAB_TABLE}
+  USING fts5vocab(main, memory_lexical_search, row)`);
+            ready = true;
+        }
+        const placeholders = tokens.map(() => '?').join(', ');
+        const rows = options.database.prepare(`
+      SELECT term, doc FROM temp.${LEXICAL_VOCAB_TABLE} WHERE term IN (${placeholders})
+    `).all(...tokens);
+        for (const row of rows) {
+            if (typeof row.term !== 'string' || typeof row.doc !== 'number' ||
+                !Number.isSafeInteger(row.doc) || row.doc < 0)
+                return invalidMemoryValue();
+            frequencies.set(row.term, row.doc);
+        }
+        return frequencies;
+    };
+}
 const MEMORY_ID = /^memory:[0-9a-f]{64}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const LEXICAL_CONTENT = /[A-Za-z0-9\p{Script=Han}\p{Extended_Pictographic}]/u;
@@ -103,13 +134,15 @@ function stateValue(value) {
         return 'rebuilding';
     return invalidMemoryValue();
 }
-function searchResult(options, request) {
+function searchResult(options, documentFrequencies, request) {
     const state = options.database.prepare(`
-    SELECT status, source_last_sequence
+    SELECT status, source_last_sequence, indexed_records
     FROM lexical_index_state WHERE singleton = 1
   `).get();
     if (state === undefined || typeof state.source_last_sequence !== 'number' ||
-        !Number.isSafeInteger(state.source_last_sequence) || state.source_last_sequence < 0) {
+        !Number.isSafeInteger(state.source_last_sequence) || state.source_last_sequence < 0 ||
+        typeof state.indexed_records !== 'number' ||
+        !Number.isSafeInteger(state.indexed_records) || state.indexed_records < 0) {
         return invalidMemoryValue();
     }
     let normalized;
@@ -129,6 +162,7 @@ function searchResult(options, request) {
         });
     }
     const placeholders = request.namespaceRefs.map(() => '?').join(', ');
+    const match = memoryLexicalBoundedMatchV1(normalized.tokens, documentFrequencies(normalized.tokens), state.indexed_records);
     const rows = options.database.prepare(`
     SELECT d.namespace_ref, d.namespace_generation, d.memory_id,
       d.memory_revision, d.revision_hash, d.updated_at_ms, d.body,
@@ -140,7 +174,7 @@ function searchResult(options, request) {
       AND d.namespace_ref IN (${placeholders})
     ORDER BY lexical_score ASC, d.updated_at_ms DESC, d.document_id ASC
     LIMIT ?
-  `).all(normalized.query, ...request.namespaceRefs, request.maxHits);
+  `).all(match, ...request.namespaceRefs, request.maxHits);
     const hits = rows.map((row, index) => {
         if (typeof row.namespace_ref !== 'string' ||
             typeof row.namespace_generation !== 'number' ||
@@ -173,8 +207,9 @@ function searchResult(options, request) {
 }
 export function createSqliteMemoryLexicalIndexV1(optionsValue) {
     const options = parseOptions(optionsValue);
+    const documentFrequencies = createTokenFrequencyReader(options);
     const port = createMemoryLexicalIndexPortV1({
-        search: async (request) => searchResult(options, request)
+        search: async (request) => searchResult(options, documentFrequencies, request)
     });
     const insertDocuments = (documents) => {
         const insert = options.database.prepare(`
