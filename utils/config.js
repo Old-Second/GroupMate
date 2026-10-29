@@ -65,6 +65,9 @@ const defaultConfig = {
   helloUseGroupContext: true,
   helloInterval: 3,
   helloProbability: 50,
+  // 主动打招呼的实际发送配额。两个窗口都是滑动窗口，计数存在 Redis，重启不重置。
+  greetingDailyPerGroup: 2,
+  proactiveHourlyGlobal: 30,
   emojiBaseURL: 'https://www.gstatic.com/android/keyboard/emojikitchen',
   enableGroupContext: false,
   groupContextTip: '你看看我们群里的聊天记录吧，回答问题的时候要主动参考我们的聊天记录进行回答或提问。但要看清楚哦，不要把我和其他人弄混啦，也不要把自己看晕啦~~',

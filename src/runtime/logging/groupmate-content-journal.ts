@@ -8,6 +8,7 @@ import {
 } from './content-journal-outbound-projector.js'
 import { projectParticipationObservation, type ProjectedJournalEvent } from './content-journal-projection.js'
 import type { ParticipationObservation } from '../participation/ParticipationShadow.js'
+import type { GreetingQuotaDecision } from '../activities/GreetingQuota.js'
 import {
   projectRequestJournalEvent,
   projectRunJournalEvent
@@ -19,12 +20,19 @@ import type {
 
 export type { GroupMateOutboundJournalEvent } from './content-journal-outbound-projector.js'
 
+export interface GroupMateGreetingQuotaJournalEvent {
+  readonly botId: string
+  readonly groupId: string
+  readonly decision: GreetingQuotaDecision
+}
+
 export interface GroupMateContentJournal {
   recordRequest(request: YunzaiAgentRequestDraft): void
   recordRunEvent(event: RunContentJournalEvent): void
   recordOutbound(event: GroupMateOutboundJournalEvent): void
   recordNetworkDiagnostic?(event: PolicyNetworkDiagnostic): void
   recordParticipation?(event: ParticipationObservation): void
+  recordGreetingQuota?(event: GroupMateGreetingQuotaJournalEvent): void
   drain(): Promise<void>
 }
 
@@ -81,6 +89,19 @@ export function createGroupMateContentJournal (
         ...(typeof event.httpStatus === 'number' && Number.isSafeInteger(event.httpStatus) && event.httpStatus >= 100 && event.httpStatus <= 599
           ? { httpStatus: event.httpStatus } : {}),
         ...(isNetworkPolicyErrorCode(event.errorCode) ? { errorCode: event.errorCode } : {})
+      }) }))
+    },
+    recordGreetingQuota (event: GroupMateGreetingQuotaJournalEvent): void {
+      const decision = event.decision
+      if (!/^[0-9]{1,20}$/.test(event.botId) || !/^[0-9]{1,20}$/.test(event.groupId) ||
+        !['allowed', 'rejected'].includes(decision.kind) ||
+        ![decision.dailyUsed, decision.dailyLimit, decision.hourlyUsed, decision.hourlyLimit]
+          .every(value => Number.isSafeInteger(value) && value >= 0)) return
+      safeRecordEvent(Object.freeze({ type: 'greeting.quota', payload: Object.freeze({
+        botId: event.botId, groupId: event.groupId, decision: decision.kind,
+        dailyUsed: decision.dailyUsed, dailyLimit: decision.dailyLimit,
+        hourlyUsed: decision.hourlyUsed, hourlyLimit: decision.hourlyLimit,
+        ...(decision.kind === 'rejected' ? { reason: decision.reason } : {})
       }) }))
     },
     async drain (): Promise<void> {

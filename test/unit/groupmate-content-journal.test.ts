@@ -1022,6 +1022,29 @@ test('model and network diagnostics keep a typed projection when callers include
   assert.doesNotMatch(JSON.stringify(events), /fixture-secret|Authorization|config/)
 })
 
+test('greeting quota decisions project a fixed field set and drop malformed ones', () => {
+  const { journal, events } = inMemoryContentJournal()
+  const usage = { dailyUsed: 2, dailyLimit: 2, hourlyUsed: 5, hourlyLimit: 30 }
+  journal.recordGreetingQuota?.({ botId: '10000', groupId: '90000',
+    decision: { kind: 'allowed', ...usage } })
+  journal.recordGreetingQuota?.({ botId: '10000', groupId: '90000',
+    decision: { kind: 'rejected', reason: 'daily_group', ...usage } })
+  assert.equal(events[0]?.type, 'greeting.quota')
+  assert.match(JSON.stringify(events[0]), /"decision":"allowed"/)
+  assert.doesNotMatch(JSON.stringify(events[0]), /reason/)
+  assert.match(JSON.stringify(events[1]), /"reason":"daily_group"/)
+  assert.match(JSON.stringify(events[1]), /"dailyLimit":2/)
+  for (const malformed of [
+    { botId: 'bot', groupId: '90000', decision: { kind: 'allowed' as const, ...usage } },
+    { botId: '10000', groupId: '', decision: { kind: 'allowed' as const, ...usage } },
+    { botId: '10000', groupId: '90000', decision: { kind: 'allowed' as const, ...usage, dailyUsed: -1 } },
+    { botId: '10000', groupId: '90000', decision: { kind: 'unknown', ...usage } }
+  ]) {
+    journal.recordGreetingQuota?.(malformed as Parameters<NonNullable<GroupMateContentJournal['recordGreetingQuota']>>[0])
+  }
+  assert.equal(events.length, 2)
+})
+
 test('rejects unbounded hostile and binary generic content with fixed failure evidence', () => {
   const { journal, events } = inMemoryContentJournal()
   const invalidRequests: ModelRequest[] = []

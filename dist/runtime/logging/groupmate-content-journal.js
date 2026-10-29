@@ -50,6 +50,20 @@ export function createGroupMateContentJournal(diskLog) {
                     ...(isNetworkPolicyErrorCode(event.errorCode) ? { errorCode: event.errorCode } : {})
                 }) }));
         },
+        recordGreetingQuota(event) {
+            const decision = event.decision;
+            if (!/^[0-9]{1,20}$/.test(event.botId) || !/^[0-9]{1,20}$/.test(event.groupId) ||
+                !['allowed', 'rejected'].includes(decision.kind) ||
+                ![decision.dailyUsed, decision.dailyLimit, decision.hourlyUsed, decision.hourlyLimit]
+                    .every(value => Number.isSafeInteger(value) && value >= 0))
+                return;
+            safeRecordEvent(Object.freeze({ type: 'greeting.quota', payload: Object.freeze({
+                    botId: event.botId, groupId: event.groupId, decision: decision.kind,
+                    dailyUsed: decision.dailyUsed, dailyLimit: decision.dailyLimit,
+                    hourlyUsed: decision.hourlyUsed, hourlyLimit: decision.hourlyLimit,
+                    ...(decision.kind === 'rejected' ? { reason: decision.reason } : {})
+                }) }));
+        },
         async drain() {
             try {
                 await diskLog.drain();

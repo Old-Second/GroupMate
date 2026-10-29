@@ -187,6 +187,8 @@ export function buildGuobaSchemas ({
     field('initiativeChatGroups', '定时主动聊天群', '定时发送主动话题的群号列表，使用逗号、分号、竖线或空格分隔。'),
     field('helloProbability', '主动聊天触发概率', '每次定时任务实际发送主动消息的概率，单位为百分比。', 'InputNumber', { min: 0, max: 100 }),
     field('helloInterval', '主动聊天间隔小时', '定时任务在 7:00 到 23:00 之间使用的小时步长；修改后需重启以重建任务。', 'InputNumber', { min: 1, max: 24 }),
+    field('greetingDailyPerGroup', '主动聊天每群每日上限', '同一群在滑动 24 小时内实际发送主动消息的次数上限，最多 8 次。到达上限后不再生成也不再发送，设为 0 则完全停止主动聊天。计数存在 Redis，重启不重置。', 'InputNumber', { min: 0, max: 8 }),
+    field('proactiveHourlyGlobal', '主动聊天每小时全局上限', '全部群在滑动 1 小时内实际发送主动消息的次数上限，最多 30 次。', 'InputNumber', { min: 0, max: 30 }),
     field('helloPrompt', '主动打招呼提示词', '定时主动聊天时用于生成短消息的提示词。', 'InputTextArea'),
     field('helloUseGroupContext', '主动聊天结合群聊', '开启后主动聊天会读取最近群聊记录来承接当前话题；条数取“群聊上下文条数”且最多 20 条，该值为 0 时不读取。读取失败或关闭时退回普通开场。记录只作为不可信聊天数据使用，仍会增加 Token 消耗。', 'Switch'),
     field('enableBYM', '开启随机参与群聊', '按概率观察普通群消息并自然参与，固定使用当前 OpenAI-compatible API。', 'Switch'),

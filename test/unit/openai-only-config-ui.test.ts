@@ -232,6 +232,8 @@ const requiredGuobaFields = [
   'helloUseGroupContext',
   'helloInterval',
   'helloProbability',
+  'greetingDailyPerGroup',
+  'proactiveHourlyGlobal',
   'emojiBaseURL',
   'enableBYM',
   'bymRecognizeLeadingAlias',
@@ -286,7 +288,8 @@ const expectedGuobaGroups = [
   {
     label: '群聊参与',
     fields: [
-      'initiativeChatGroups', 'helloProbability', 'helloInterval', 'helloPrompt', 'helloUseGroupContext',
+      'initiativeChatGroups', 'helloProbability', 'helloInterval',
+      'greetingDailyPerGroup', 'proactiveHourlyGlobal', 'helloPrompt', 'helloUseGroupContext',
       'enableBYM', 'bymRecognizeLeadingAlias', 'participationMode', 'participationActiveGroups', 'bymRate', 'bymDisableGroup', 'bymThinkingMode',
       'bymReasoningEffort', 'bymPreset', 'bymFuckList', 'bymFuckBlacklist',
       'bymFuckPrompt', 'bymFuckRecall', 'bymFuckRecallTime'

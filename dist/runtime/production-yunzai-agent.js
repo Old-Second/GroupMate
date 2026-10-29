@@ -9,6 +9,7 @@ import { ActivityStore } from './activities/ActivityStore.js';
 import { GroupActivityService } from './activities/GroupActivityService.js';
 import { ActivityWorker } from './activities/ActivityWorker.js';
 import { createActivityDispatch } from './activities/YunzaiActivityDispatch.js';
+import { GreetingQuota } from './activities/GreetingQuota.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
 import { bindYunzaiShutdownSignals, createYunzaiAgentServiceBridge } from './agent-service-bridge.js';
 import { prepareYunzaiMessageEvidence } from './message-input.js';
@@ -537,6 +538,9 @@ export function createProductionYunzaiAgent(options) {
     });
     const approvalControlPresenter = createApprovalControlPresenter({ outboundFactory });
     const activityStore = new ActivityStore(options.bridge.redis);
+    const greetingQuota = new GreetingQuota({ client: options.bridge.redis, now: () => now().getTime(),
+        dailyPerGroup: () => options.bridge.config.greetingDailyPerGroup,
+        hourlyGlobal: () => options.bridge.config.proactiveHourlyGlobal });
     const groupActivities = new GroupActivityService(activityStore, () => now().getTime());
     const activities = new ActivityWorker({ store: activityStore, now: () => now().getTime(),
         acquire: createActivityDispatch({ botPicker: options.botPicker, outboundFactory, admission,
@@ -783,6 +787,14 @@ export function createProductionYunzaiAgent(options) {
                 lease = await admission.tryAcquire({ botId, scope: { kind: 'group', groupId: String(groupId) } }, signal);
                 if (lease === null) {
                     await ticket.finish(false);
+                    return null;
+                }
+                // Charge the quota last: a lease is revocable, a spent daily slot is not.
+                const quota = await greetingQuota.charge(botId, String(groupId));
+                contentJournal?.recordGreetingQuota?.({ botId, groupId: String(groupId), decision: quota });
+                if (quota.kind !== 'allowed') {
+                    await ticket.finish(false);
+                    await lease.release();
                     return null;
                 }
                 return Object.freeze({ current: ticket.current,
