@@ -9,11 +9,6 @@
       "count": 3
     }
   },
-  "src/agent/memory/OpenAiMemoryCandidateExtractor.ts": {
-    "no-empty": {
-      "count": 1
-    }
-  },
   "src/agent/memory/memory-canonical-wire.ts": {
     "no-empty": {
       "count": 3

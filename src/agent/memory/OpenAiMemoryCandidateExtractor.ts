@@ -116,8 +116,8 @@ export function createOpenAiMemoryCandidateExtractorV1 (options: MemoryCandidate
         const calculated = calculateModelCost(price, turn.usage)
         cost = start?.catalogVersion !== end?.catalogVersion && calculated.kind === 'exact'
           ? Object.freeze({ ...calculated, kind: 'upper_bound' as const }) : calculated
-      } catch {}
-      try { options.onUsage?.(turn.usage, cost) } catch {}
+      } catch { /* 报价查询失败就保留上面不含单价的用量，不影响抽取结果。 */ }
+      try { options.onUsage?.(turn.usage, cost) } catch { /* 记账回调的异常不能影响抽取结果。 */ }
       if (signal?.aborted === true) throw new DOMException('aborted', 'AbortError')
       if (turn.finishReason !== 'stop' || turn.toolCalls.length !== 0 || turn.refusal !== undefined ||
         Buffer.byteLength(turn.text, 'utf8') > 8_192) {
