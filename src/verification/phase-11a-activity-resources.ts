@@ -289,7 +289,9 @@ export async function main (): Promise<void> {
   let commit = 'unknown'
   try {
     commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 5_000 }).trim()
-  } catch {}
+  } catch {
+    // 提交号只是给记录贴标签，取不到就留 unknown，不要让它影响测量结果。
+  }
   process.stdout.write(JSON.stringify({ passed, pairs: rows.length, freshProcesses: 2 * rows.length,
     method: 'four_scenarios_five_pairs_baseline_candidate_fake_redis_no_host_provider_qq',
     commit, node: process.version, platform: process.platform, architecture: process.arch,
