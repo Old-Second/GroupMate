@@ -109,6 +109,7 @@ function decide (input: {
   facts?: ToolRuntimeFacts
   target?: ToolTarget
   intent?: IntentEvidence
+  targetFacts?: 'resolved' | 'unresolved'
 }): ToolPolicyDecision {
   return new ToolPolicyEngine().decide({
     profile: (input.profile ?? 'compatible') as ToolPolicyProfile,
@@ -116,7 +117,8 @@ function decide (input: {
     input: input.args ?? {},
     facts: input.facts ?? baseFacts,
     target: input.target ?? { kind: 'none' },
-    intent: input.intent ?? intent('查询天气')
+    intent: input.intent ?? intent('查询天气'),
+    ...(input.targetFacts === undefined ? {} : { targetFacts: input.targetFacts })
   })
 }
 
@@ -456,6 +458,60 @@ test('management policy enforces actor, target and bot hierarchy before profile 
     target: { kind: 'private', userId: '8' },
     intent: intent('把用户 8 踢出群', { mentions: ['8'] })
   }).kind, 'deny')
+})
+
+test('unresolved target facts defer the role hierarchy instead of reading the placeholder as authority', () => {
+  const other = { kind: 'member', groupId: '9', userId: '8' } as const
+  const mute = intent('禁言他 300 秒', { mentions: ['8'] })
+  const kick = intent('把他踢出群', { mentions: ['8'] })
+  // What a batch-level preparation context actually carries: no target was
+  // resolved, so the role is a placeholder rather than an ordinary member.
+  const unknownTarget: ToolRuntimeFacts = {
+    ...baseFacts,
+    actor: { ...baseFacts.actor, role: 'admin' },
+    actorGroupRole: 'admin',
+    targetRole: 'none'
+  }
+  const ownerUnknownTarget: ToolRuntimeFacts = {
+    ...unknownTarget,
+    actor: { ...unknownTarget.actor, role: 'owner' },
+    actorGroupRole: 'owner'
+  }
+
+  for (const facts of [unknownTarget, ownerUnknownTarget]) {
+    assert.equal(decide({
+      definition: tools.mute, facts, args: { seconds: 300 }, target: other, intent: mute,
+      targetFacts: 'unresolved'
+    }).kind, 'allow')
+    assert.equal(decide({
+      definition: tools.mute, facts, args: { seconds: 300 }, target: other, intent: mute,
+      targetFacts: 'resolved'
+    }).kind, 'deny')
+  }
+  assert.equal(decide({
+    definition: tools.kick, facts: ownerUnknownTarget, target: other, intent: kick,
+    targetFacts: 'unresolved'
+  }).kind, 'allow')
+  assert.equal(decide({
+    definition: tools.kick, facts: ownerUnknownTarget, target: other, intent: kick,
+    targetFacts: 'resolved'
+  }).kind, 'deny')
+
+  // Deferral is limited to the target role: every actor-side judgment still
+  // happens before a capability is prepared, and the boundary keeps refusing a
+  // target that outranks the actor.
+  assert.deepEqual(decide({
+    definition: tools.mute, args: { seconds: 300 }, target: other, intent: mute,
+    facts: { ...baseFacts, targetRole: 'none' }, targetFacts: 'unresolved'
+  }), {
+    kind: 'deny', reasonCode: 'permission_denied', userMessage: '当前身份不能执行该操作。'
+  })
+  assert.deepEqual(decide({
+    definition: tools.kick, target: other, intent: kick,
+    facts: { ...ownerUnknownTarget, targetRole: 'admin' }, targetFacts: 'resolved'
+  }), {
+    kind: 'deny', reasonCode: 'role_hierarchy_denied', userMessage: '不能操作权限不低于自己的群成员。'
+  })
 })
 
 test('title and message management enforce capability and current-message protection', () => {

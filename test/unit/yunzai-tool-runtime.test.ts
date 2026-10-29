@@ -252,47 +252,39 @@ test('each authorized management capability calls one narrow host method', async
 })
 
 /**
- * Preparation shares one context for the whole batch, and that context resolves
- * facts for the target `{ kind: 'none' }`, so `targetRole` is still unknown when
- * the hierarchy gate runs. The gate refuses rather than defers, which is why a
- * kick never reaches execution even for an authorized actor. The direction is
- * fail-closed - no side effect leaks - but `docs/tools.md:13` promises the
- * capability to an authority holder, so the refusal is a gap, not the contract.
+ * Preparation shares one context for the whole batch, so its facts are resolved
+ * for no target and `targetRole` is still unknown when the hierarchy gate runs.
+ * The gate therefore defers the role comparison to the execution boundary, which
+ * resolves the member itself - that is the only stage that can tell an ordinary
+ * member from an administrator, and it refuses there instead.
  */
-test('a kick is refused while the target role is unknown and admitted once it is resolved', async () => {
+test('a kick reaches the host once the boundary resolves an ordinary member', async () => {
   const host = createHost({ roles: { [ACTOR_ID]: 'owner', [TARGET_ID]: 'member', [BOT_ID]: 'owner' } })
-  const { bridge, run } = await prepareRun({
-    host, masterIds: [ACTOR_ID], prompt: `踢出 QQ:${TARGET_ID}`
+  const outcome = await runTool({
+    host, masterIds: [ACTOR_ID], prompt: `踢出 QQ:${TARGET_ID}`,
+    tool: 'kickOut', arguments: { userId: TARGET_ID }
   })
-  const call = Object.freeze({
-    runId: 'run-kick', callId: 'run-kick-call', snapshotId: run.snapshot.id,
-    requestedName: 'kickOut', arguments: Object.freeze({ userId: TARGET_ID })
-  })
-  const signal = new AbortController().signal
-  const checkpoint = { runId: call.runId } as RunCheckpoint
 
-  const refused = await executeTool(bridge, run, call)
-  assert.equal(denial(refused), 'role_hierarchy_denied')
-  assert.equal(refused.preparedKind, 'completed')
-  assert.equal(host.calls.length, 0)
-
-  const resolved = await run.binding.contextFor(
-    Object.freeze({
-      target: Object.freeze({ kind: 'member', groupId: GROUP_ID, userId: TARGET_ID })
-    }) as SerializablePreparedCapability,
-    checkpoint,
-    signal
-  )
-  const prepared = await bridge.runtime.prepare(call, resolved, run.snapshot)
-  assert.equal(prepared.kind, 'ready')
-  if (prepared.kind !== 'ready') return
-  const result = await bridge.runtime.executePrepared(
-    prepared.capability, resolved, run.snapshot, signal
-  )
-
-  assert.equal(result.status, 'success', JSON.stringify(result))
-  assert.deepEqual(host.calls.map(hostCall => hostCall.name), ['kickMember'])
+  assert.equal(outcome.preparedKind, 'ready')
+  assert.equal(outcome.result?.status, 'success', JSON.stringify(outcome.result))
+  assert.deepEqual(host.calls.map(call => call.name), ['kickMember'])
   assert.deepEqual(host.calls[0]?.args, [Number(TARGET_ID)])
+})
+
+test('an authority holder who is not a bot master can manage an ordinary member', async () => {
+  for (const actorRole of ['owner', 'admin'] as const) {
+    const host = createHost({
+      roles: { [ACTOR_ID]: actorRole, [TARGET_ID]: 'member', [BOT_ID]: 'admin' }
+    })
+    const outcome = await runTool({
+      host, prompt: `禁言 QQ:${TARGET_ID} 60 秒`, tool: 'jinyan',
+      arguments: { userId: TARGET_ID, seconds: 60 }, runId: `run-mute-${actorRole}`
+    })
+
+    assert.equal(outcome.result?.status, 'success', `${actorRole}: ${JSON.stringify(outcome.result)}`)
+    assert.deepEqual(host.calls.map(call => call.name), ['muteMember'], actorRole)
+    assert.deepEqual(host.calls[0]?.args, [Number(TARGET_ID), 60], actorRole)
+  }
 })
 
 
@@ -324,10 +316,18 @@ const denials: readonly DenialCase[] = Object.freeze([
     reasonCode: 'permission_denied', stage: 'completed'
   },
   {
-    label: 'an authority holder who is not a bot master cannot mute a third party',
-    roles: OWNER_BOT, prompt: `禁言 QQ:${TARGET_ID} 60 秒`, tool: 'jinyan',
+    label: 'an administrator cannot mute a peer administrator',
+    roles: { [ACTOR_ID]: 'admin', [TARGET_ID]: 'admin', [BOT_ID]: 'admin' },
+    prompt: `禁言 QQ:${TARGET_ID} 60 秒`, tool: 'jinyan',
     arguments: { userId: TARGET_ID, seconds: 60 },
-    reasonCode: 'role_hierarchy_denied', stage: 'completed'
+    reasonCode: 'role_hierarchy_denied', stage: 'ready'
+  },
+  {
+    label: 'a kick refuses a target who is not an ordinary member',
+    roles: { [ACTOR_ID]: 'owner', [TARGET_ID]: 'admin', [BOT_ID]: 'owner' },
+    masterIds: [ACTOR_ID], prompt: `踢出 QQ:${TARGET_ID}`, tool: 'kickOut',
+    arguments: { userId: TARGET_ID },
+    reasonCode: 'role_hierarchy_denied', stage: 'ready'
   },
   {
     label: 'a bot without group authority exposes no management tool at all',

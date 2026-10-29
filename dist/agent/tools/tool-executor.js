@@ -210,7 +210,8 @@ export class ToolExecutor {
                 input,
                 facts: context.facts,
                 target,
-                intent: context.intent
+                intent: context.intent,
+                targetFacts: 'unresolved'
             });
         }
         catch {
@@ -326,7 +327,8 @@ export class ToolExecutor {
                 input: prepared.canonicalArguments,
                 facts: freshContext.facts,
                 target,
-                intent: freshContext.intent
+                intent: freshContext.intent,
+                targetFacts: 'resolved'
             });
         }
         catch {

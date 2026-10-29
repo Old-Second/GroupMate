@@ -21,6 +21,18 @@ export interface ToolPolicyInput {
   readonly facts: ToolRuntimeFacts
   readonly target: ToolTarget
   readonly intent: IntentEvidence
+  /**
+   * Whether the target-derived fields of `facts` were resolved for `target`.
+   *
+   * Preparation decides a whole batch from one context, so its facts are
+   * resolved for no target at all: `targetExists` and `targetIsBotMaster` then
+   * carry optimistic placeholders that only the execution boundary can refute,
+   * while `targetRole` carries a pessimistic `'none'` that would refuse every
+   * hierarchy-bound capability. Pass `'unresolved'` there so the role is treated
+   * as unknown instead of as authority. Omitting the field keeps the facts
+   * authoritative, which is the stricter of the two readings.
+   */
+  readonly targetFacts?: 'resolved' | 'unresolved'
 }
 
 const denialMessages: Readonly<Record<ToolDenyCode, string>> = Object.freeze({
@@ -121,8 +133,9 @@ function hasManagementCapability (facts: ToolRuntimeFacts): boolean {
   return facts.botGroupRole === 'owner' || facts.botGroupRole === 'admin'
 }
 
-function actorCanManageMember (facts: ToolRuntimeFacts): boolean {
+function actorCanManageMember (facts: ToolRuntimeFacts, targetRoleKnown: boolean): boolean {
   if (facts.actor.isBotMaster) return true
+  if (!targetRoleKnown) return facts.actorGroupRole === 'owner' || facts.actorGroupRole === 'admin'
   if (facts.actorGroupRole === 'owner') return facts.targetRole === 'admin' || facts.targetRole === 'member'
   if (facts.actorGroupRole === 'admin') return facts.targetRole === 'member'
   return false
@@ -130,6 +143,7 @@ function actorCanManageMember (facts: ToolRuntimeFacts): boolean {
 
 function hardManagementGate (input: ToolPolicyInput): ToolPolicyDecision | null {
   const { definition, facts, target, intent } = input
+  const targetRoleKnown = input.targetFacts !== 'unresolved'
   const expectedTargetKind = definition.name === 'handleMsg' ? 'message' : 'member'
   if (target.kind !== expectedTargetKind) return deny('target_invalid')
   if (facts.channel.kind !== 'group' || target.groupId !== facts.channel.groupId) return deny('target_invalid')
@@ -153,10 +167,12 @@ function hardManagementGate (input: ToolPolicyInput): ToolPolicyDecision | null 
       return null
     }
     if (isSelf && definition.name === 'editCard') return null
-    if (!actorCanManageMember(facts)) return deny(
+    if (!actorCanManageMember(facts, targetRoleKnown)) return deny(
       facts.actorGroupRole === 'member' && !facts.actor.isBotMaster ? 'permission_denied' : 'role_hierarchy_denied'
     )
-    if (definition.name === 'kickOut' && facts.targetRole !== 'member') return deny('role_hierarchy_denied')
+    if (targetRoleKnown && definition.name === 'kickOut' && facts.targetRole !== 'member') {
+      return deny('role_hierarchy_denied')
+    }
   }
 
   if (definition.name === 'kickOut' && !facts.actor.isBotMaster && facts.actorGroupRole !== 'owner') {

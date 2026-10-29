@@ -39,11 +39,17 @@ export interface ToolPreparationContext {
   readonly runId: string
   readonly runRef?: string
   readonly profile: ToolPolicyProfile
+  /**
+   * Actor, channel and bot facts for the whole planned batch. One context serves
+   * every call in it, so the target-derived fields describe no single call
+   * target; the execution boundary re-resolves them per prepared capability.
+   */
   readonly facts: ToolRuntimeFacts
   readonly intent: IntentEvidence
   readonly now: string
 }
 
+/** Facts here are resolved for the prepared capability's own target. */
 export interface ToolExecutionContext extends ToolPreparationContext {
   readonly approval?: ApprovalDecision
 }

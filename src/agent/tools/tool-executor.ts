@@ -318,7 +318,8 @@ export class ToolExecutor implements ToolRuntime {
         input,
         facts: context.facts,
         target,
-        intent: context.intent
+        intent: context.intent,
+        targetFacts: 'unresolved'
       })
     } catch {
       decision = {
@@ -448,7 +449,8 @@ export class ToolExecutor implements ToolRuntime {
         input: prepared.canonicalArguments,
         facts: freshContext.facts,
         target,
-        intent: freshContext.intent
+        intent: freshContext.intent,
+        targetFacts: 'resolved'
       })
     } catch {
       decision = {

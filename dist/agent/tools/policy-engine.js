@@ -94,9 +94,11 @@ export function intentActionForToolCapability(toolName, input) {
 function hasManagementCapability(facts) {
     return facts.botGroupRole === 'owner' || facts.botGroupRole === 'admin';
 }
-function actorCanManageMember(facts) {
+function actorCanManageMember(facts, targetRoleKnown) {
     if (facts.actor.isBotMaster)
         return true;
+    if (!targetRoleKnown)
+        return facts.actorGroupRole === 'owner' || facts.actorGroupRole === 'admin';
     if (facts.actorGroupRole === 'owner')
         return facts.targetRole === 'admin' || facts.targetRole === 'member';
     if (facts.actorGroupRole === 'admin')
@@ -105,6 +107,7 @@ function actorCanManageMember(facts) {
 }
 function hardManagementGate(input) {
     const { definition, facts, target, intent } = input;
+    const targetRoleKnown = input.targetFacts !== 'unresolved';
     const expectedTargetKind = definition.name === 'handleMsg' ? 'message' : 'member';
     if (target.kind !== expectedTargetKind)
         return deny('target_invalid');
@@ -138,10 +141,11 @@ function hardManagementGate(input) {
         }
         if (isSelf && definition.name === 'editCard')
             return null;
-        if (!actorCanManageMember(facts))
+        if (!actorCanManageMember(facts, targetRoleKnown))
             return deny(facts.actorGroupRole === 'member' && !facts.actor.isBotMaster ? 'permission_denied' : 'role_hierarchy_denied');
-        if (definition.name === 'kickOut' && facts.targetRole !== 'member')
+        if (targetRoleKnown && definition.name === 'kickOut' && facts.targetRole !== 'member') {
             return deny('role_hierarchy_denied');
+        }
     }
     if (definition.name === 'kickOut' && !facts.actor.isBotMaster && facts.actorGroupRole !== 'owner') {
         return deny('permission_denied');
