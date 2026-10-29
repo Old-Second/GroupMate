@@ -26,16 +26,18 @@ export function GetUser(user) {
 }
 // 添加用户token
 export async function AddUser(data) {
-    const userIndex = users.user.findIndex(item => String(item.user) === String(data.user))
-    if (userIndex >= 0) {
-        if (!users.user[userIndex].token.includes(data.token)) {
-            users.user[userIndex].token.push(data.token)
-        }
+    const sameUser = users.user.filter(item => String(item.user) === String(data.user))
+    if (sameUser.length > 0) {
+        const record = sameUser[0]
+        // 旧实现每次登录都追加一条记录，历史重复记录会让按 token 查到的权限和按
+        // 账号查到的权限不一致，借本次登录把同一账号的记录合并掉
+        record.token = [...new Set(sameUser.flatMap(item => item.token).concat(data.token))]
         // 登录时重新核验过身份，权限以本次结果为准，避免旧记录留着已经失效的 admin
-        users.user[userIndex].autho = data.autho
+        record.autho = data.autho
         if (data.label) {
-            users.user[userIndex].label = data.label
+            record.label = data.label
         }
+        users.user = users.user.filter(item => item === record || !sameUser.includes(item))
     } else {
         users.user.push({
             user: data.user,

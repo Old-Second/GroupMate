@@ -42,6 +42,27 @@ test('a replayed token is not stored twice and an unrelated label survives the l
   assert.equal(UserInfo('token-user')?.label, '备注')
 })
 
+test('a login merges the duplicate records the old implementation left behind', async () => {
+  await reset([
+    { user: '10001', autho: 'admin', token: ['token-admin'], label: '', tiem: 0 },
+    { user: '10001', autho: 'user', token: ['token-user'], label: '', tiem: 0 },
+    { user: '10002', autho: 'user', token: ['token-other'], label: '', tiem: 0 }
+  ])
+
+  await AddUser({ user: '10001', token: 'token-fresh', autho: 'user' })
+
+  const records = persisted()
+  assert.deepEqual(records.map(record => record.user), ['10001', '10002'])
+  assert.deepEqual(records[0].token, ['token-admin', 'token-user', 'token-fresh'])
+  // 按 token 查和按账号查必须给出同一个权限
+  for (const token of ['token-admin', 'token-user', 'token-fresh']) {
+    assert.equal(UserInfo(token)?.autho, 'user', token)
+  }
+  assert.equal(GetUser('10001')?.autho, 'user')
+  assert.equal(GetUser('10002')?.autho, 'user')
+  assert.deepEqual(records[1].token, ['token-other'])
+})
+
 test('a user lookup matches the requested account only', async () => {
   await reset([
     { user: '10001', autho: 'admin', token: ['token-admin'], label: '', tiem: 0 },
