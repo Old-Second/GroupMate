@@ -38,6 +38,7 @@ import type {
 import type { TtsPresentationDiagnosticPort } from '../../src/runtime/presentation/tts-reply-presentation.js'
 import {
   createRuntimePresentationHooks,
+  PLAIN_TEXT_PRESENTATION_HOOKS,
   type PresentationInput,
   type RuntimePresentationHooks
 } from '../../src/runtime/runtime-presentation-hooks.js'
@@ -887,6 +888,28 @@ test('ordinary profile preserves citation reasoning suggestions and trusted butt
       reasoningView: { text: '内联推理', truncated: false }
     }
   )
+})
+
+test('inline thinking separation keeps every part of the visible answer around it', async () => {
+  const runtimeHooks = createRuntimePresentationHooks({
+    loadPostprocessors: async () => Object.freeze([]),
+    convertText: async ({ text }) => Object.freeze([{ kind: 'text' as const, text }]),
+    notifyResponsePost: () => undefined
+  })
+  for (const hooks of [runtimeHooks, PLAIN_TEXT_PRESENTATION_HOOKS]) {
+    assert.deepEqual(
+      await hooks.postprocess({ text: '现在是几点？<think>需要问时间</think>' }),
+      { text: '现在是几点？', reasoningView: { text: '需要问时间', truncated: false } }
+    )
+    assert.deepEqual(
+      await hooks.postprocess({ text: '前半句。<think>第一段</think>后半句。<think>第二段</think>结尾。' }),
+      { text: '前半句。后半句。结尾。', reasoningView: { text: '第一段\n第二段', truncated: false } }
+    )
+    assert.deepEqual(
+      await hooks.postprocess({ text: '没有闭合标签的<think>保持原样' }),
+      { text: '没有闭合标签的<think>保持原样' }
+    )
+  }
 })
 
 test('ordinary success appends one selected execution trace after text, TTS or picture', async () => {

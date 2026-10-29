@@ -71,14 +71,14 @@ function separateInlineThinking (text: string): {
   readonly text: string
   readonly thinking: string
 } {
-  const match = /<think>(.*?)<\/think>/s.exec(text)
-  if (match === null || match.index === undefined) {
-    return Object.freeze({ text, thinking: '' })
-  }
-  return Object.freeze({
-    text: text.slice(match.index + match[0].length),
-    thinking: match[1] ?? ''
+  const blocks: string[] = []
+  // 只摘掉 <think> 段本身；它之前和多段之间的正文都属于最终回复，不能丢。
+  const body = text.replace(/<think>(.*?)<\/think>/gs, (_full: string, inner: string) => {
+    blocks.push(inner)
+    return ''
   })
+  if (blocks.length === 0) return Object.freeze({ text, thinking: '' })
+  return Object.freeze({ text: body, thinking: blocks.join('\n') })
 }
 
 export function createRuntimePresentationHooks (
