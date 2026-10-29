@@ -401,6 +401,23 @@ test('chat controller gives the Yunzai loader mutable rule clones', () => {
   assert.equal(Object.isFrozen(controller.rules[0]), true)
 })
 
+test('prefix entry rule excludes only the chatgpt command family', () => {
+  const rule = buildYunzaiChatRules('prefix', ['api', 'API']).find(item => item.fnc === 'chatgpt')
+  assert.notEqual(rule, undefined)
+  const reg = new RegExp(String(rule?.reg))
+
+  for (const msg of ['#chat 你好', '#chat你好', '#图片chat 你好', '#chat1 你好']) {
+    assert.equal(reg.test(msg), true, msg)
+  }
+  // 紧跟 g/p/t 的正文此前被字符类 [^gpt] 整条吃掉，是沉默失败而不是未命中
+  for (const msg of ['#chatplease help', '#chatgood morning', '#chattest', '#图片chatglm 是什么']) {
+    assert.equal(reg.test(msg), true, msg)
+  }
+  for (const msg of ['#chatgpt帮助', '#chatgpt图片模式', '#chat', '#chatgpt']) {
+    assert.equal(reg.test(msg), false, msg)
+  }
+})
+
 test('chat and chat1 preserve every command at permission OCR quote and force-picture gate', async () => {
   const expectedMethods = [
     'hostRules', 'chatgpt', 'chatgpt1', 'getAllConversations', 'destroyConversations',

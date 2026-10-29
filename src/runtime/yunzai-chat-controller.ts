@@ -253,7 +253,7 @@ export function buildYunzaiChatRules (
   return Object.freeze([
     freezeRule({ reg: '^#(图片)?chat1[\\s\\S]*', fnc: 'chatgpt1' }),
     freezeRule({
-      reg: entryMode === 'at' ? '^[^#][\\s\\S]*' : '^#(图片)?chat[^gpt][\\s\\S]*',
+      reg: entryMode === 'at' ? '^[^#][\\s\\S]*' : '^#(图片)?chat(?!gpt)[\\s\\S]+',
       fnc: 'chatgpt',
       log: false
     }),
