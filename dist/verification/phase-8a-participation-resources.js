@@ -52,7 +52,13 @@ function sample(scenario, sampleId) {
     maxRSS = Math.max(maxRSS, process.memoryUsage().rss);
     global.gc?.();
     const retained = process.memoryUsage();
-    const processPeak = process.resourceUsage().maxRSS * (process.platform === 'darwin' ? 1 : 1_024);
+    // libuv normalizes `ru_maxrss` to KiB on every supported platform, darwin included.
+    // Measured here on darwin arm64 (libuv 1.51.0, Node 22.23.1): after allocating
+    // 320 MiB, `maxRSS * 1024` reads 360.64 MiB against `memoryUsage().rss` 360.63 MiB
+    // and `ps -o rss` 360.91 MiB, while reading it as bytes gives 0.35 MiB. Treating it
+    // as bytes on darwin made this term 1024x too small, so it never won the maximum and
+    // `peakDelta` silently degraded to the largest sampled RSS.
+    const processPeak = process.resourceUsage().maxRSS * 1_024;
     maxRSS = Math.max(maxRSS, retained.rss, processPeak);
     const stats = candidate.state.stats();
     candidate.close();
