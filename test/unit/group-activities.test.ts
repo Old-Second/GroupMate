@@ -271,6 +271,72 @@ test('older terminal snapshots do not show pending countdowns or future occurren
     assert.equal(list.activities[0].remaining, 0)
   }
 })
+test('a settled poll leaves no future occurrences in its durable record or in either projection', async () => {
+  const f = fixture()
+  const id = (await f.perform('poll', { ...poll, closesAt: '2026-10-12T00:00:10Z' })).id
+  assert.equal((await f.store.read()).records[0].remaining, 1)
+  f.advance(10000)
+  const w = worker(f)
+  assert.equal(await w.create().tick(), 1)
+  const record = (await f.store.read()).records[0]
+  assert.equal(record.state, 'completed')
+  assert.equal(record.remaining, 0)
+  const summary = await f.perform('poll', { ...poll, id, operation: 'status' })
+  assert.equal(summary.remaining, 0)
+  assert.equal(summary.secondsLeft, 0)
+  assert.equal((await f.perform('poll', { ...poll, operation: 'list' })).activities[0].remaining, 0)
+})
+test('leaving an active state zeroes the pending count while a recoverable one keeps it', async () => {
+  const unknown = fixture()
+  await unknown.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
+  await unknown.store.update(data => { data.records[0].state = 'dispatching'; data.records[0].token = 'a'.repeat(32); data.records[0].leaseUntil = unknown.now() + 1000 })
+  unknown.advance(10000)
+  assert.equal(await worker(unknown).create().tick(), 0)
+  assert.deepEqual([(await unknown.store.read()).records[0].state, (await unknown.store.read()).records[0].remaining], ['indeterminate', 0])
+
+  const stale = fixture()
+  await stale.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
+  stale.advance(10000 + 86400001)
+  assert.equal(await worker(stale).create().tick(), 0)
+  assert.deepEqual([(await stale.store.read()).records[0].state, (await stale.store.read()).records[0].remaining], ['expired', 0])
+
+  const deferred = fixture()
+  await deferred.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
+  deferred.advance(10000)
+  assert.equal(await worker(deferred, { authorize: async () => 'unavailable' }).create().tick(), 0)
+  assert.deepEqual([(await deferred.store.read()).records[0].state, (await deferred.store.read()).records[0].remaining], ['pending', 3])
+})
+test('cancelling during send zeroes the pending count before the dispatch is finalized', async () => {
+  const f = fixture()
+  const id = await f.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
+  f.advance(10000)
+  let duringSend: number | undefined
+  const w = worker(f, { deliver: async (text: string) => {
+    await f.perform('reminder', { operation: 'cancel', id })
+    duringSend = (await f.store.read()).records[0].remaining
+    assert.match(text, /记得喝水/)
+    return 'sent'
+  } })
+  assert.equal(await w.create().tick(), 1)
+  assert.equal(duringSend, 0)
+  const record = (await f.store.read()).records[0]
+  assert.equal(record.state, 'cancelled')
+  assert.equal(record.remaining, 0)
+  assert.equal((await f.perform('reminder', { operation: 'status', id })).remaining, 0)
+})
+test('an absolute local due time notifies once and reaches the same zeroed terminal state', async () => {
+  const f = fixture()
+  const id = await f.created({ ...reminder, delaySeconds: 0, at: '2026-10-12T08:00:30' })
+  const w = worker(f)
+  assert.equal(await w.create().tick(), 0)
+  f.advance(30000)
+  assert.equal(await w.create().tick(), 1)
+  assert.match(w.messages[0], /记得喝水/)
+  const summary = await f.perform('reminder', { operation: 'status', id })
+  assert.equal(summary.state, 'completed')
+  assert.equal(summary.remaining, 0)
+  assert.equal((await f.store.read()).records[0].remaining, 0)
+})
 test('cancel during send does not promise recall and suppresses every later recurrence', async () => {
   const f = fixture()
   const id = await f.created({ ...reminder, intervalSeconds: 60, occurrences: 3 })
