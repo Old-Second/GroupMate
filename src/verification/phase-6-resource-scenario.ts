@@ -970,6 +970,17 @@ interface HostFixture {
   readonly visibleMessages: unknown[]
 }
 
+// The member map must cover every actor the scenarios actually send from: a
+// missing member fails the scene dependency before the run starts, so the
+// sample would measure a rejected request instead of the intended path.
+const TRACE_DIAGNOSTIC_RUNS = 64
+const PICTURE_RUNS = 3
+const SCENARIO_ACTOR_IDS: readonly string[] = Object.freeze([
+  'single', 'dual-a', 'dual-b', 'visible', 'trace-basic',
+  ...Array.from({ length: TRACE_DIAGNOSTIC_RUNS }, (_, index) => `trace-${index}`),
+  ...Array.from({ length: PICTURE_RUNS }, (_, index) => `picture-${index}`)
+])
+
 function hostFixture (): HostFixture {
   const visibleMessages: unknown[] = []
   const members = new Map<unknown, Readonly<Record<string, unknown>>>([
@@ -978,7 +989,7 @@ function hostFixture (): HostFixture {
     })],
     ['7', Object.freeze({ user_id: '7', role: 'owner', nickname: 'owner' })],
     ['8', Object.freeze({ user_id: '8', role: 'member', nickname: 'member' })],
-    ...['single', 'dual-a', 'dual-b', 'visible', 'picture', 'trace', 'failed', 'cancelled'].map(userId => [userId, Object.freeze({ user_id: userId, role: 'member' })] as const)
+    ...SCENARIO_ACTOR_IDS.map(userId => [userId, Object.freeze({ user_id: userId, role: 'member' })] as const)
   ])
   const group = Object.freeze({
     getMemberMap: async () => members,
@@ -1392,6 +1403,13 @@ export async function runPhase6ResourceScenario (
   const cpuStart = process.cpuUsage()
   const wallStart = performance.now()
 
+  // A request rejected before its run starts is still "handled" by the error
+  // fallback, so a sample could silently measure the rejection path instead.
+  const startedRunCount = (): number => {
+    const entry = redis.resourceUsage().find(item => item.kind === 'run_reference')
+    return typeof entry?.records === 'number' ? entry.records : 0
+  }
+
   const runChat = async (
     actorId: string,
     marker: string,
@@ -1409,6 +1427,7 @@ export async function runPhase6ResourceScenario (
       } : {}) }
     )
     const event = options.activeOrdinary ? { ...baseEvent, atme: true } : baseEvent
+    const runsBefore = startedRunCount()
     if (options.activeParticipation) {
       const before = primary.dispatches.length
       if (options.activeOrdinary) await graph.chatController.chatgpt(event)
@@ -1418,6 +1437,7 @@ export async function runPhase6ResourceScenario (
       const handled = await graph.chatController.chatgpt1(event)
       if (!handled) throw new Error('resource chat scenario was not handled')
     }
+    if (startedRunCount() <= runsBefore) throw new Error('resource chat scenario did not start a run')
     observations.push(memoryUsage().rss)
   }
 
@@ -1483,12 +1503,12 @@ export async function runPhase6ResourceScenario (
       }
     }
     if (scenario === 'traceDiagnostic') {
-      for (let index = 0; index < 64; index += 1) {
+      for (let index = 0; index < TRACE_DIAGNOSTIC_RUNS; index += 1) {
         await runChat(`trace-${index}`, `trace diagnostic ${index}`)
       }
       await primary.graph.observability.hub.drain()
       const recent = await primary.graph.observability.traceStore.listRecent(1)
-      if ((await primary.graph.observability.traceStore.usage()).records !== 64 ||
+      if ((await primary.graph.observability.traceStore.usage()).records !== TRACE_DIAGNOSTIC_RUNS ||
         recent[0] === undefined) throw new Error('diagnostic trace capacity was not filled')
       collect?.()
       baselineRssBytes = memoryUsage().rss
@@ -1509,7 +1529,7 @@ export async function runPhase6ResourceScenario (
       if (replies.length !== 2) throw new Error('diagnostic queries did not reply')
     }
     if (scenario === 'pictureSuccess' || scenario === 'pictureFailure') {
-      for (let index = 0; index < 3; index += 1) {
+      for (let index = 0; index < PICTURE_RUNS; index += 1) {
         await runChat(`picture-${index}`, `picture ${index}`, true)
       }
     }
