@@ -208,11 +208,17 @@ export function createProductionShadowMemoryV1(options) {
                                 : { status: 'unchanged', outcome: 'shadow', proposalId: duplicate.proposalId };
                         const result = await sink.submit(input, signal);
                         if ((result.status === 'stored' || result.status === 'unchanged') && result.outcome === 'approved') {
-                            // Canonical approval remains authoritative if a rebuildable projection is unavailable.
+                            // Canonical approval remains authoritative if a rebuildable projection is unavailable,
+                            // but an approved memory that never reached the index must not fail silently.
                             try {
                                 await options.onApproved?.();
                             }
-                            catch { }
+                            catch {
+                                try {
+                                    options.onDerivedIndexFailure?.('candidate.approved');
+                                }
+                                catch { }
+                            }
                         }
                         return result;
                     } }

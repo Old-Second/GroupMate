@@ -164,7 +164,13 @@ export function createGroupMemoryV1(options) {
             try {
                 await options.rebuildLexical();
             }
-            catch { }
+            catch {
+                // The reply must still report the committed canonical write, but the drift is observable.
+                try {
+                    options.onDerivedIndexFailure?.(operation);
+                }
+                catch { }
+            }
         }
     };
     const records = async (auth, page) => {

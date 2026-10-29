@@ -43,6 +43,8 @@ interface ShadowOptions {
   readonly bot?: (accountId: string) => unknown
   readonly onAdmission?: (diagnostic: ShadowMemoryAdmissionDiagnosticV1) => void
   readonly onApproved?: () => Promise<void>
+  /** Reports an approved candidate whose derived lexical projection could not be rebuilt. */
+  readonly onDerivedIndexFailure?: (operation: string) => void
 }
 
 async function abortable<T> (pending: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -218,8 +220,11 @@ export function createProductionShadowMemoryV1 (options: ShadowOptions) {
             : { status: 'unchanged', outcome: 'shadow', proposalId: duplicate.proposalId }
           const result = await sink.submit(input, signal)
           if ((result.status === 'stored' || result.status === 'unchanged') && result.outcome === 'approved') {
-            // Canonical approval remains authoritative if a rebuildable projection is unavailable.
-            try { await options.onApproved?.() } catch {}
+            // Canonical approval remains authoritative if a rebuildable projection is unavailable,
+            // but an approved memory that never reached the index must not fail silently.
+            try { await options.onApproved?.() } catch {
+              try { options.onDerivedIndexFailure?.('candidate.approved') } catch {}
+            }
           }
           return result
         } }

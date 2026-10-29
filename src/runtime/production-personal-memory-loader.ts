@@ -35,6 +35,8 @@ export interface ProductionPersonalMemoryRuntimeOptionsV1 {
   readonly candidateModel?: MemoryCandidateModelV1
   readonly candidateBot?: (accountId: string) => unknown
   readonly candidateAdmission?: (diagnostic: ShadowMemoryAdmissionDiagnosticV1) => void
+  /** Reports a committed canonical write whose derived lexical projection could not be rebuilt. */
+  readonly derivedIndexFailure?: (operation: string) => void
 }
 
 export interface ProductionPersonalMemoryRuntimeModuleV1 {
@@ -97,6 +99,7 @@ export async function initializeProductionPersonalMemoryRuntimeV1 (
     recallTimeoutMs: options.recallTimeoutMs,
     ...(options.candidateModel === undefined ? {} : { candidateModel: options.candidateModel }),
     ...(options.candidateBot === undefined ? {} : { candidateBot: options.candidateBot }),
-    ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission })
+    ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission }),
+    ...(options.derivedIndexFailure === undefined ? {} : { derivedIndexFailure: options.derivedIndexFailure })
   }))
 }

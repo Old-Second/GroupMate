@@ -1290,6 +1290,9 @@ try {
     candidateAdmission: diagnostic => runtimeLogger.info(Object.freeze({
       event: 'groupmate.personal_memory.shadow_admission', ...diagnostic
     })),
+    derivedIndexFailure: operation => runtimeLogger.error(Object.freeze({
+      event: 'groupmate.personal_memory.lexical_rebuild_failure', operation
+    })),
     candidateModel: Object.freeze({
       adapter: modelPort,
       model: () => normalizedText(Config.model, 128),

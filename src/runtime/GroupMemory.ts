@@ -32,6 +32,11 @@ interface GroupMemoryOptions {
   readonly exportDelivery: PersonalMemoryExportDeliveryV1
   readonly retriever: MemoryRetrievalAdapterV2
   readonly rebuildLexical: () => Promise<number>
+  /**
+   * Reports that a canonical write committed but its derived lexical projection did not. Recall
+   * degrades silently without this signal, so the failure must leave a durable trace.
+   */
+  readonly onDerivedIndexFailure?: (operation: string) => void
   readonly completeNamespaceDeletion: (namespace: MemoryNamespaceV1) => Promise<boolean>
   readonly recallLimits: () => { readonly maxCandidates: number; readonly maxTokens: number; readonly maxBytes: number }
   readonly recallTimeoutMs: () => number
@@ -175,7 +180,10 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     // Canonical receipts remain truthful even if the derived index is temporarily unavailable.
     // Pending/rejected proposals do not change recallable heads; avoid rebuilding the full FTS graph.
     if (operation !== 'proposal.create' && operation !== 'proposal.reject') {
-      try { await options.rebuildLexical() } catch {}
+      try { await options.rebuildLexical() } catch {
+        // The reply must still report the committed canonical write, but the drift is observable.
+        try { options.onDerivedIndexFailure?.(operation) } catch {}
+      }
     }
   }
   const records = async (auth: Auth, page: number) => {

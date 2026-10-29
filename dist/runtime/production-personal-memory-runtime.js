@@ -546,7 +546,8 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
             enrollment, lifecycle, model: options.candidateModel, now: nowIso,
             onApproved: async () => { await projector.rebuild(); },
             ...(options.candidateBot === undefined ? {} : { bot: options.candidateBot }),
-            ...(options.candidateAdmission === undefined ? {} : { onAdmission: options.candidateAdmission })
+            ...(options.candidateAdmission === undefined ? {} : { onAdmission: options.candidateAdmission }),
+            ...(options.derivedIndexFailure === undefined ? {} : { onDerivedIndexFailure: options.derivedIndexFailure })
         });
         await shadow?.resume();
         const operations = createOperationsPort({
@@ -582,6 +583,7 @@ export async function createProductionPersonalMemoryRuntimeV1(options) {
                 canonical: createSqliteMemoryCanonicalRehydratorV1({ database: canonical.database, now: nowIso }), now: nowIso }),
             rebuildLexical: async () => await projector.rebuild(),
             completeNamespaceDeletion: deletionCleanup.resume,
+            ...(options.derivedIndexFailure === undefined ? {} : { onDerivedIndexFailure: options.derivedIndexFailure }),
             recallLimits: () => ({
                 maxCandidates: boundedInteger(options.recallMaxItems, DEFAULT_RECALL_ITEMS, MAX_RECALL_ITEMS),
                 maxTokens: boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS), maxBytes: 32768
