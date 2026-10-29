@@ -12,7 +12,7 @@ import { memoryNamespaceRefV1, parseMemoryNamespaceV1 } from '../agent/memory/me
 import { MEMORY_RESOURCE_LIMITS, memoryTextWithinLimits } from '../agent/memory/memory-resource-limits.js';
 import { parseMemoryRetrievalRequestV2, retrieveMemoryV2 } from '../agent/memory/memory-retrieval.js';
 import { createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js';
-import { groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1 } from './group-memory-candidates.js';
+import { GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1, groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1 } from './group-memory-candidates.js';
 const ADMIN_ACTIONS = [
     'propose_create', 'list_safe', 'inspect_full', 'approve', 'reject', 'correct', 'renew', 'forget'
 ];
@@ -271,8 +271,8 @@ export function createGroupMemoryV1(options) {
         const selectors = body.split(/\s+/u).filter(value => value !== '');
         if (selectors.length === 1 && (selectors[0] === '全部' || selectors[0] === '所有'))
             return rows;
-        if (selectors.length > rows.length)
-            throw new GroupMemoryError('编号数量超出候选列表。');
+        if (selectors.length > GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1)
+            throw new GroupMemoryError('一次最多处理一个候选列表的编号。');
         const picked = new Map();
         for (const selector of selectors) {
             const legacy = /^@[0-9a-f]{8}$/u.exec(selector) === null ? []

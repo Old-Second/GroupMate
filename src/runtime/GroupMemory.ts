@@ -18,7 +18,7 @@ import { parseMemoryRetrievalRequestV2, retrieveMemoryV2, type MemoryRetrievalAd
 import type { PersonalMemoryCommandPortV1, PersonalMemoryCommandRequestV1 } from './personal-memory-command.js'
 import type { PersonalMemoryExportDeliveryV1 } from './yunzai-personal-memory-controller.js'
 import { createYunzaiSceneParticipantDirectoryV1, type YunzaiPersonalMemoryRecallInputV1 } from './yunzai-scene-participant-directory.js'
-import { groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1, type GroupMemoryCandidateRowV1 } from './group-memory-candidates.js'
+import { GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1, groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1, type GroupMemoryCandidateRowV1 } from './group-memory-candidates.js'
 import type { GroupMemoryFeatureV1, GroupMemoryPolicyStoreV1, GroupMemoryPolicyV1 } from './GroupMemoryPolicy.js'
 
 interface GroupMemoryOptions {
@@ -275,7 +275,7 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     if (rows.length === 0) throw new GroupMemoryError('当前群没有待审核的候选。')
     const selectors = body.split(/\s+/u).filter(value => value !== '')
     if (selectors.length === 1 && (selectors[0] === '全部' || selectors[0] === '所有')) return rows
-    if (selectors.length > rows.length) throw new GroupMemoryError('编号数量超出候选列表。')
+    if (selectors.length > GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1) throw new GroupMemoryError('一次最多处理一个候选列表的编号。')
     const picked = new Map<string, GroupMemoryCandidateRowV1>()
     for (const selector of selectors) {
       const legacy = /^@[0-9a-f]{8}$/u.exec(selector) === null ? []
