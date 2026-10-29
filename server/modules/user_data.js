@@ -26,9 +26,16 @@ export function GetUser(user) {
 }
 // 添加用户token
 export async function AddUser(data) {
-    const userIndex = users.user.findIndex(user => user === data.user)
+    const userIndex = users.user.findIndex(item => String(item.user) === String(data.user))
     if (userIndex >= 0) {
-        users.user[userIndex].token.push(data.token)
+        if (!users.user[userIndex].token.includes(data.token)) {
+            users.user[userIndex].token.push(data.token)
+        }
+        // 登录时重新核验过身份，权限以本次结果为准，避免旧记录留着已经失效的 admin
+        users.user[userIndex].autho = data.autho
+        if (data.label) {
+            users.user[userIndex].label = data.label
+        }
     } else {
         users.user.push({
             user: data.user,
