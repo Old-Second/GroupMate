@@ -424,6 +424,63 @@ test('frozen observation policy uses the locked SHA-256 sample and off fails clo
   }), /invalid/i)
 })
 
+test('a configured success sample rate is frozen into the policy and bounded', () => {
+  const unsampled = '00000000000000000000000000000000'
+
+  assert.deepEqual(createFrozenObservationPolicy({
+    levelAtStart: 'basic',
+    runRef: unsampled,
+    successSampleRatePercent: 100
+  }), {
+    schemaVersion: 1,
+    levelAtStart: 'basic',
+    sampledSuccess: true,
+    successSampleRatePercent: 100
+  })
+  assert.deepEqual(createFrozenObservationPolicy({
+    levelAtStart: 'basic',
+    runRef,
+    successSampleRatePercent: 0
+  }), {
+    schemaVersion: 1,
+    levelAtStart: 'basic',
+    sampledSuccess: false,
+    successSampleRatePercent: 0
+  })
+
+  // The default rate keeps the original three-key shape, so a rollback can read it.
+  assert.deepEqual(createFrozenObservationPolicy({
+    levelAtStart: 'basic',
+    runRef,
+    successSampleRatePercent: 5
+  }), createFrozenObservationPolicy({ levelAtStart: 'basic', runRef }))
+
+  for (const rate of [-1, 101, 1.5, Number.NaN]) {
+    assert.throws(() => createFrozenObservationPolicy({
+      levelAtStart: 'basic',
+      runRef,
+      successSampleRatePercent: rate
+    }), /sample rate is invalid/)
+  }
+  assert.throws(() => parseFrozenObservationPolicy({
+    schemaVersion: 1,
+    levelAtStart: 'basic',
+    sampledSuccess: true,
+    successSampleRatePercent: 101
+  }), /invalid/i)
+  assert.deepEqual(parseFrozenObservationPolicy({
+    schemaVersion: 1,
+    levelAtStart: 'basic',
+    sampledSuccess: true,
+    successSampleRatePercent: 42
+  }), {
+    schemaVersion: 1,
+    levelAtStart: 'basic',
+    sampledSuccess: true,
+    successSampleRatePercent: 42
+  })
+})
+
 test('observation counter sentinels are field-specific and initial values are exact', () => {
   const initial = createInitialRunObservationCounters()
   assert.deepEqual({

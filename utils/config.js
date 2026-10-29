@@ -49,6 +49,10 @@ const defaultConfig = {
   proxy: '',
   debug: true,
   observabilityLevel: 'basic',
+  // 成功运行的轨迹采样百分比；0 不保留成功样本，100 全部保留。
+  observationSuccessSampleRate: 5,
+  // 按群/按人/按天的 Token 与费用聚合；只在内存窗口内，展示时只给掩码尾号。
+  usageAggregationEnabled: true,
   diskLogEnabled: true,
   defaultTimeoutMs: 120000,
   chromeTimeoutMS: 120000,

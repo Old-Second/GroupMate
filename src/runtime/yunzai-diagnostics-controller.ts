@@ -11,21 +11,39 @@ export interface DiagnosticYunzaiEvent {
 
 interface OwnerDiagnosticsPort {
   status(input: { readonly authorized: boolean }): Promise<OwnerDiagnosticResponse>
+  metricsReport(input: { readonly authorized: boolean }): Promise<OwnerDiagnosticResponse>
+  usageReport(input: { readonly authorized: boolean }): Promise<OwnerDiagnosticResponse>
   inspect(input: {
     readonly authorized: boolean
     readonly runRef: string
   }): Promise<OwnerDiagnosticResponse>
 }
 
-export class YunzaiDiagnosticsController {
-  readonly #diagnostics: Pick<OwnerDiagnostics, 'status' | 'inspect'> | OwnerDiagnosticsPort
+type DiagnosticsSource =
+  | Pick<OwnerDiagnostics, 'status' | 'metricsReport' | 'usageReport' | 'inspect'>
+  | OwnerDiagnosticsPort
 
-  constructor (diagnostics: Pick<OwnerDiagnostics, 'status' | 'inspect'> | OwnerDiagnosticsPort) {
+export class YunzaiDiagnosticsController {
+  readonly #diagnostics: DiagnosticsSource
+
+  constructor (diagnostics: DiagnosticsSource) {
     this.#diagnostics = diagnostics
   }
 
   async handleStatus (event: DiagnosticYunzaiEvent): Promise<boolean> {
     const result = await this.#diagnostics.status({ authorized: event.authorized })
+    await event.replyText(result.text)
+    return true
+  }
+
+  async handleMetrics (event: DiagnosticYunzaiEvent): Promise<boolean> {
+    const result = await this.#diagnostics.metricsReport({ authorized: event.authorized })
+    await event.replyText(result.text)
+    return true
+  }
+
+  async handleUsage (event: DiagnosticYunzaiEvent): Promise<boolean> {
+    const result = await this.#diagnostics.usageReport({ authorized: event.authorized })
     await event.replyText(result.text)
     return true
   }

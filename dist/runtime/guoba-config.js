@@ -253,6 +253,19 @@ export function normalizeGuobaConfigValue(key, value) {
         }
         return value;
     }
+    if (key === 'observationSuccessSampleRate') {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+            value < 0 || value > 100) {
+            throw new TypeError('成功轨迹采样率配置无效，应为 0-100。');
+        }
+        return value;
+    }
+    if (key === 'usageAggregationEnabled') {
+        if (typeof value !== 'boolean') {
+            throw new TypeError('用量聚合配置无效。');
+        }
+        return value;
+    }
     if (key === 'turnConfirm') {
         if (typeof value !== 'boolean') {
             throw new TypeError('正在思考提示配置无效。');

@@ -36,13 +36,15 @@ export function buildGuobaSchemas({ vitsRoleOptions, voicevoxRoleOptions, azureR
         divider('网络与调试'),
         field('proxy', '代理服务器', '供网络请求和 Chromium 使用的 HTTP 或 SOCKS5 代理地址；普通网络请求立即生效，Chromium 启动参数需重启后生效。'),
         field('defaultTimeoutMs', '默认请求超时毫秒', 'OpenAI-compatible 等普通网络请求的默认超时时间。', 'InputNumber', { min: 1 }),
-        field('observabilityLevel', '可观测性级别', '关闭时不采集运行事实并同步清理已保留轨迹；基础模式仅保留脱敏的失败、异常和 5% 成功样本；诊断模式保留更多脱敏轨迹。Redis 轨迹最长保留 7 天，最多 2048 条且总量硬上限 16 MiB。', 'Select', {
+        field('observabilityLevel', '可观测性级别', '关闭时不采集运行事实并同步清理已保留轨迹；基础模式仅保留脱敏的失败、异常和按「成功轨迹采样率」抽取的成功样本（默认 5%）；诊断模式保留更多脱敏轨迹。Redis 轨迹最长保留 7 天，最多 2048 条且总量硬上限 16 MiB。', 'Select', {
             options: [
                 { label: '完全关闭', value: 'off' },
                 { label: '基础', value: 'basic' },
                 { label: '诊断', value: 'diagnostic' }
             ]
         }),
+        field('observationSuccessSampleRate', '成功轨迹采样率', '成功运行保留脱敏轨迹的百分比，范围 0-100，默认 5。失败与取消的运行始终保留，诊断级别保留全部，所以本项只影响成功样本。采样率在运行开始时冻结进该运行的策略，修改后只影响新运行，已有运行的校验不受影响。', 'InputNumber', { min: 0, max: 100 }),
+        field('usageAggregationEnabled', '按群与按人用量聚合', '默认开启：在内存窗口里按计费日（北京时间）、按群、按人汇总 Token 与参考费用，供“#GroupMate用量”查看。最多保留 7 天，每天最多 32 个群与 64 个人，超出部分只计溢出次数。身份不写入指标标签、不落盘、不进 Redis 轨迹，展示时只给掩码尾号；关闭或把可观测性切到完全关闭都会立即清空该窗口。', 'Switch'),
         field('diskLogEnabled', '完整内容落盘日志', '开启后将完整业务内容写入独立落盘日志；最长保留 30 天，单文件 32 MiB 轮转，目录总量硬上限 512 MiB。该日志与 Redis 脱敏可观测轨迹彼此独立，修改后需重启。', 'Switch'),
         field('debug', '调试日志', '独立控制旧业务调试日志，不会改变脱敏观测级别、轨迹采样或清理屏障。', 'Switch'),
         divider('模型与会话'),

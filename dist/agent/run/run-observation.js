@@ -18,6 +18,8 @@ export const DURATION_BUCKET_BOUNDS_MS = Object.freeze([
     120_000,
     'inf'
 ]);
+export const DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT = 5;
+export const MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT = 100;
 const COUNTER_KEYS = Object.freeze([
     'schemaVersion',
     'providerAttempts',
@@ -341,32 +343,49 @@ export function createFrozenObservationPolicy(input) {
     if (typeof input.runRef !== 'string' || !RUN_REF_PATTERN.test(input.runRef)) {
         throw new TypeError('run reference is invalid');
     }
+    const rate = input.successSampleRatePercent ?? DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT;
+    if (!Number.isSafeInteger(rate) || rate < 0 ||
+        rate > MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT) {
+        throw new TypeError('observation success sample rate is invalid');
+    }
     let sampledSuccess = false;
     if (input.levelAtStart !== 'off') {
         const hash = createHash('sha256')
             .update(`groupmate:success:v1:${input.runRef}`, 'ascii')
             .digest();
-        sampledSuccess = hash.readUInt32BE(0) % 100 < 5;
+        sampledSuccess = hash.readUInt32BE(0) % 100 < rate;
     }
     return Object.freeze({
         schemaVersion: 1,
         levelAtStart: input.levelAtStart,
-        sampledSuccess
+        sampledSuccess,
+        // The field is written only when the rate differs from the historical default,
+        // so a default deployment keeps producing byte-identical policies and a
+        // rollback to a version that rejects unknown keys still reads them.
+        ...(rate === DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT ? {} : { successSampleRatePercent: rate })
     });
 }
 export function parseFrozenObservationPolicy(value) {
-    const policy = exactOwnData(value, ['schemaVersion', 'levelAtStart', 'sampledSuccess'], 'observation policy');
+    const legacy = value === null || typeof value !== 'object' ||
+        !Object.hasOwn(value, 'successSampleRatePercent');
+    const policy = exactOwnData(value, legacy
+        ? ['schemaVersion', 'levelAtStart', 'sampledSuccess']
+        : ['schemaVersion', 'levelAtStart', 'sampledSuccess', 'successSampleRatePercent'], 'observation policy');
+    const rate = legacy ? undefined : policy.successSampleRatePercent;
     if (policy.schemaVersion !== 1 ||
         (policy.levelAtStart !== 'off' && policy.levelAtStart !== 'basic' &&
             policy.levelAtStart !== 'diagnostic') ||
         typeof policy.sampledSuccess !== 'boolean' ||
-        (policy.levelAtStart === 'off' && policy.sampledSuccess)) {
+        (policy.levelAtStart === 'off' && policy.sampledSuccess) ||
+        (rate !== undefined && (!Number.isSafeInteger(rate) || Number(rate) < 0 ||
+            Number(rate) > MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT))) {
         throw new TypeError('observation policy is invalid');
     }
     return Object.freeze({
         schemaVersion: 1,
         levelAtStart: policy.levelAtStart,
-        sampledSuccess: policy.sampledSuccess
+        sampledSuccess: policy.sampledSuccess,
+        ...(rate === undefined ? {} : { successSampleRatePercent: Number(rate) })
     });
 }
 export function createInitialRunObservationCounters() {

@@ -12,6 +12,7 @@ import {
 import {
   ProductionObservabilityRuntime
 } from '../../src/runtime/production-yunzai-agent.js'
+import type { RunContentJournalEvent } from '../../src/agent/run/run-content-journal.js'
 import { RunProgressPresenter } from '../../src/runtime/run-progress-presenter.js'
 import { FakeRedis } from '../helpers/fake-redis.js'
 import {
@@ -238,4 +239,78 @@ test('production source has no discard publisher and every terminal fact uses th
   assert.match(bridge, /type: 'terminal_snapshot'/)
   assert.match(bridge, /type: 'terminal_commit'/)
   assert.match(root, /if \(!this\.gate\.allow\(event\)\) return/)
+})
+
+function terminalCommittedEvent (runRef: string): RunContentJournalEvent {
+  return Object.freeze({
+    type: 'run.terminal_committed',
+    occurredAt: '2026-07-16T00:00:00.000Z',
+    runRef,
+    requestRef: 'b'.repeat(32),
+    checkpoint: Object.freeze({
+      sessionAddress: Object.freeze({
+        botId: '555500007777',
+        scope: Object.freeze({ kind: 'group', groupId: '987654321012' })
+      }),
+      presentationRoute: Object.freeze({ actorId: '123456789034' }),
+      usage: Object.freeze({
+        schemaVersion: 1,
+        availability: 'complete',
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cacheHitTokens: 50,
+        cacheMissTokens: 50,
+        turnsWithUsage: 1,
+        turnsWithoutUsage: 0,
+        cacheUsageComplete: true
+      })
+    }),
+    receipt: Object.freeze({})
+  }) as unknown as RunContentJournalEvent
+}
+
+test('the run journal fans out to the fixed price counter and the usage window', async () => {
+  const redis = new FakeRedis(() => NOW)
+  const root = runtime(redis)
+  const runRef = traceRunRef(false, 400)
+
+  root.acceptRunJournalEvent(Object.freeze({
+    type: 'model.resolution',
+    occurredAt: '2026-07-16T00:00:00.000Z',
+    runRef,
+    requestRef: 'b'.repeat(32),
+    capabilitySource: 'catalog',
+    priceStatus: 'missing_or_expired'
+  }) as unknown as RunContentJournalEvent)
+  root.acceptRunJournalEvent(terminalCommittedEvent(runRef))
+
+  const snapshot = await root.metrics.snapshot()
+  const price = snapshot.counters.find(point => point.name === 'groupmate.agent.model_price')
+  assert.equal(price?.value, 1)
+  assert.deepEqual(price?.labels, [{ name: 'status', value: 'missing_or_expired' }])
+  assert.equal(root.usage?.snapshot().observedRuns, 1)
+  assert.equal(root.usage?.snapshot().groups[0]?.maskedId, '****1012')
+  assert.equal(JSON.stringify(root.usage?.snapshot()).includes('987654321012'), false)
+
+  await root.updateLevel('off')
+  assert.deepEqual(root.usage?.snapshot().days, [])
+  assert.equal(root.usage?.snapshot().windowResetCount, 1)
+  root.acceptRunJournalEvent(terminalCommittedEvent(traceRunRef(false, 500)))
+  assert.equal(root.usage?.snapshot().observedRuns, 0)
+})
+
+test('turning usage aggregation off removes the window instead of emptying it', () => {
+  const redis = new FakeRedis(() => NOW)
+  const root = new ProductionObservabilityRuntime({
+    redis,
+    runStore: new RedisRunStore({ client: redis }),
+    admission: new RunAdmission({ client: redis, generateId: () => 'lease-id' }),
+    initialLevel: 'basic',
+    usageAggregation: false,
+    now: () => new Date(NOW)
+  })
+
+  root.acceptRunJournalEvent(terminalCommittedEvent(traceRunRef(false, 600)))
+  assert.equal(root.usage, undefined)
 })

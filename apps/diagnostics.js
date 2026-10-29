@@ -21,6 +21,8 @@ export class diagnostics extends plugin {
       priority: 1142,
       rule: [
         { reg: '^#GroupMate状态$', fnc: 'status', permission: 'master' },
+        { reg: '^#GroupMate指标$', fnc: 'metrics', permission: 'master' },
+        { reg: '^#GroupMate用量$', fnc: 'usage', permission: 'master' },
         { reg: '^#GroupMate诊断\\s+([0-9a-f]{32})$', fnc: 'diagnose', permission: 'master' }
       ]
     })
@@ -28,6 +30,18 @@ export class diagnostics extends plugin {
 
   async status (event) {
     return await getProductionYunzaiAgent().diagnosticsController.handleStatus(
+      projectDiagnosticEvent(event)
+    )
+  }
+
+  async metrics (event) {
+    return await getProductionYunzaiAgent().diagnosticsController.handleMetrics(
+      projectDiagnosticEvent(event)
+    )
+  }
+
+  async usage (event) {
+    return await getProductionYunzaiAgent().diagnosticsController.handleUsage(
       projectDiagnosticEvent(event)
     )
   }

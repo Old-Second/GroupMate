@@ -93,7 +93,7 @@ test('security audit rejects trace-wide Redis commands and dynamic metric identi
   assert.equal(metrics.passed, false)
 })
 
-test('security audit freezes all 14 instruments and their label names', async () => {
+test('security audit freezes all 15 instruments and their label names', async () => {
   const metricsPath = 'src/runtime/observability/metrics-registry.ts'
   const current = await source(metricsPath)
   const instrument = await auditPhase6SecurityBoundaries(root, fixture(
@@ -119,6 +119,30 @@ test('security audit freezes all 14 instruments and their label names', async ()
     `${metricsPath}:labels:groupmate.agent.runs`
   ))
   assert.equal(labels.passed, false)
+})
+
+test('security audit requires authorization before every report read', async () => {
+  const ownerPath = 'src/runtime/observability/owner-diagnostics.ts'
+  const current = await source(ownerPath)
+
+  const metrics = await auditPhase6SecurityBoundaries(root, fixture(
+    ownerPath,
+    current.replace(
+      "if (!input.authorized) return this.#finish('metrics'",
+      "if (input.authorized) return this.#finish('metrics'"
+    )
+  ))
+  assert.ok(metrics.forbiddenProductionEdges.includes(`${ownerPath}:metrics_auth_order`))
+
+  const usage = await auditPhase6SecurityBoundaries(root, fixture(
+    ownerPath,
+    current.replace(
+      "if (!input.authorized) return this.#finish('usage'",
+      "if (input.authorized) return this.#finish('usage'"
+    )
+  ))
+  assert.ok(usage.forbiddenProductionEdges.includes(`${ownerPath}:usage_auth_order`))
+  assert.equal(usage.passed, false)
 })
 
 test('security audit rejects prefix lookup, raw Hub events and legacy presentation edges', async () => {

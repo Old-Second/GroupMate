@@ -78,6 +78,7 @@ const EXPECTED_METRICS = Object.freeze({
         'groupmate.agent.tool_executions',
         'groupmate.agent.approvals',
         'groupmate.agent.admission_rejections',
+        'groupmate.agent.model_price',
         'groupmate.presentation.deliveries',
         'groupmate.observation.failures'
     ]),
@@ -102,6 +103,7 @@ const EXPECTED_METRIC_LABELS = Object.freeze({
     'groupmate.agent.approvals': Object.freeze(['decision']),
     'groupmate.agent.admission': Object.freeze(['state']),
     'groupmate.agent.admission_rejections': Object.freeze(['reason']),
+    'groupmate.agent.model_price': Object.freeze(['status']),
     'groupmate.presentation.deliveries': Object.freeze(['media', 'outcome']),
     'groupmate.observation.failures': Object.freeze(['sink']),
     'groupmate.observation.store_records': Object.freeze(['kind']),
@@ -412,12 +414,24 @@ export async function auditPhase6SecurityBoundaries(projectRoot, options = {}) {
         finding(forbiddenProductionEdges, ownerPath, 'missing');
     }
     else {
-        const status = methodSection(owner, 'async status (', 'async inspect (');
-        const inspect = methodSection(owner, 'async inspect (', '#finish (');
+        const status = methodSection(owner, 'async status (', 'async metricsReport (');
+        const metricsReport = methodSection(owner, 'async metricsReport (', 'async usageReport (');
+        const usageReport = methodSection(owner, 'async usageReport (', 'async inspect (');
+        const inspect = methodSection(owner, 'async inspect (', '#costLines (');
         const statusAuth = status.indexOf('if (!input.authorized)');
         const statusRead = status.indexOf('this.#metrics.snapshot()');
         if (statusAuth < 0 || statusRead < 0 || statusAuth > statusRead) {
             finding(forbiddenProductionEdges, ownerPath, 'status_auth_order');
+        }
+        const metricsAuth = metricsReport.indexOf('if (!input.authorized)');
+        const metricsRead = metricsReport.indexOf('this.#metrics.snapshot()');
+        if (metricsAuth < 0 || metricsRead < 0 || metricsAuth > metricsRead) {
+            finding(forbiddenProductionEdges, ownerPath, 'metrics_auth_order');
+        }
+        const usageAuth = usageReport.indexOf('if (!input.authorized)');
+        const usageRead = usageReport.indexOf('this.#usage()');
+        if (usageAuth < 0 || usageRead < 0 || usageAuth > usageRead) {
+            finding(forbiddenProductionEdges, ownerPath, 'usage_auth_order');
         }
         const inspectAuth = inspect.indexOf('if (!input.authorized)');
         const inspectRead = inspect.indexOf('this.#traceStore.load(input.runRef)');
@@ -432,7 +446,7 @@ export async function auditPhase6SecurityBoundaries(projectRoot, options = {}) {
     }
     const diagnosticsPath = 'apps/diagnostics.js';
     const diagnostics = await readSource(diagnosticsPath);
-    if (diagnostics === null || diagnostics.match(/permission:\s*'master'/g)?.length !== 2 ||
+    if (diagnostics === null || diagnostics.match(/permission:\s*'master'/g)?.length !== 4 ||
         !diagnostics.includes('authorized: event?.isMaster === true') ||
         !diagnostics.includes('([0-9a-f]{32})')) {
         finding(forbiddenProductionEdges, diagnosticsPath, 'authorization_projection');

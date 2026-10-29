@@ -48,6 +48,7 @@ export type MetricCounterNameV1 =
   | 'groupmate.agent.tool_executions'
   | 'groupmate.agent.approvals'
   | 'groupmate.agent.admission_rejections'
+  | 'groupmate.agent.model_price'
   | 'groupmate.presentation.deliveries'
   | 'groupmate.observation.failures'
 
@@ -82,6 +83,7 @@ export interface MetricLabelDomainsV1 {
   readonly approvalDecision: 'requested' | 'approved' | 'denied' | 'expired' | 'other'
   readonly admissionState: 'active' | 'queued'
   readonly admissionRejection: AdmissionRejectionReason | 'other'
+  readonly priceStatus: 'available' | 'missing_or_expired'
   readonly deliveryMedia: PresentationDeliveryMedia | 'other'
   readonly deliveryOutcome: SafeDeliveryObservationV1['outcome'] | 'other'
   readonly sink: ObservationSinkName
@@ -106,6 +108,7 @@ export type MetricLabelV1 =
   | { readonly name: 'decision'; readonly value: MetricLabelDomainsV1['approvalDecision'] }
   | { readonly name: 'state'; readonly value: MetricLabelDomainsV1['admissionState'] }
   | { readonly name: 'reason'; readonly value: MetricLabelDomainsV1['admissionRejection'] }
+  | { readonly name: 'status'; readonly value: MetricLabelDomainsV1['priceStatus'] }
   | { readonly name: 'media'; readonly value: MetricLabelDomainsV1['deliveryMedia'] }
   | { readonly name: 'sink'; readonly value: MetricLabelDomainsV1['sink'] }
   | { readonly name: 'kind'; readonly value: MetricLabelDomainsV1['storeKind'] }
@@ -125,6 +128,7 @@ export const METRIC_LABEL_NAMES_V1 = Object.freeze({
   'groupmate.agent.approvals': Object.freeze(['decision']),
   'groupmate.agent.admission': Object.freeze(['state']),
   'groupmate.agent.admission_rejections': Object.freeze(['reason']),
+  'groupmate.agent.model_price': Object.freeze(['status']),
   'groupmate.presentation.deliveries': Object.freeze(['media', 'outcome']),
   'groupmate.observation.failures': Object.freeze(['sink']),
   'groupmate.observation.store_records': Object.freeze(['kind']),
@@ -160,7 +164,13 @@ export interface MetricHistogramPoint {
 
 export interface MetricsSnapshotV1 {
   readonly schemaVersion: 1
+  /**
+   * Start of the current counting window, not process start. Switching
+   * observability off clears every fact and opens a new window; `windowResetCount`
+   * makes that visible so an "accumulated since" reading cannot drift silently.
+   */
   readonly startedAt: string
+  readonly windowResetCount: number
   readonly counters: readonly MetricCounterPoint[]
   readonly gauges: readonly MetricGaugePoint[]
   readonly histograms: readonly MetricHistogramPoint[]
@@ -185,7 +195,7 @@ interface MutableHistogram {
 }
 
 const SNAPSHOT_KEYS = Object.freeze([
-  'schemaVersion', 'startedAt', 'counters', 'gauges', 'histograms'
+  'schemaVersion', 'startedAt', 'windowResetCount', 'counters', 'gauges', 'histograms'
 ])
 const COUNTER_POINT_KEYS = Object.freeze(['name', 'labels', 'value'])
 const GAUGE_POINT_KEYS = Object.freeze(['name', 'labels', 'value'])
@@ -201,6 +211,7 @@ const COUNTER_NAMES = new Set<MetricCounterNameV1>([
   'groupmate.agent.tool_executions',
   'groupmate.agent.approvals',
   'groupmate.agent.admission_rejections',
+  'groupmate.agent.model_price',
   'groupmate.presentation.deliveries',
   'groupmate.observation.failures'
 ])
@@ -226,6 +237,7 @@ const ADMISSION_STATES = new Set(['active', 'queued'])
 const ADMISSION_REJECTIONS = new Set([
   'queue_full', 'queue_aborted', 'not_applicable', 'unavailable'
 ])
+const PRICE_STATUSES = new Set(['available', 'missing_or_expired'])
 const DELIVERY_MEDIA = new Set(['text', 'picture', 'voice', 'forward'])
 const DELIVERY_OUTCOMES = new Set(['sent', 'failed_definite', 'outcome_unknown'])
 const SINK_NAMES = new Set(['metrics', 'trace', 'log'])
@@ -397,6 +409,9 @@ function parseLabelValue (
   if (instrument === 'groupmate.agent.admission_rejections' && name === 'reason') {
     return externalDomain(value, ADMISSION_REJECTIONS, 'admission rejection')
   }
+  if (instrument === 'groupmate.agent.model_price' && name === 'status') {
+    return internalDomain(value, PRICE_STATUSES, 'model price status')
+  }
   if (instrument === 'groupmate.presentation.deliveries') {
     if (name === 'media') return externalDomain(value, DELIVERY_MEDIA, 'delivery media')
     if (name === 'outcome') {
@@ -554,6 +569,10 @@ export function parseMetricsSnapshot (value: unknown): MetricsSnapshotV1 {
   return Object.freeze({
     schemaVersion: 1,
     startedAt: canonicalTimestamp(input.startedAt, 'metrics start timestamp'),
+    windowResetCount: nonNegativeInteger(
+      input.windowResetCount,
+      'metrics window reset count'
+    ),
     counters,
     gauges,
     histograms
@@ -625,6 +644,7 @@ export class MetricsRegistry implements ObservationSubscriber {
   #currentLevel: FrozenObservationPolicyV1['levelAtStart'] = 'basic'
   #generation = 0
   #startedAt: string
+  #windowResetCount = 0
 
   constructor (options: {
     readonly admission: AdmissionGaugeSource
@@ -730,6 +750,18 @@ export class MetricsRegistry implements ObservationSubscriber {
     this.#addCounter('groupmate.observation.failures', [failure.sink], 1)
   }
 
+  /**
+   * Price resolution outcome per provider request. The catalog has a hard review
+   * date after which every quote resolves to nothing; without this counter the
+   * resulting `unavailable` cost would be indistinguishable from a missing model.
+   */
+  recordModelPriceStatus (status: MetricLabelDomainsV1['priceStatus']): void {
+    if (this.#currentLevel === 'off') return
+    this.#addCounter('groupmate.agent.model_price', [
+      internalDomain(status, PRICE_STATUSES, 'model price status')
+    ], 1)
+  }
+
   setCurrentLevel (level: FrozenObservationPolicyV1['levelAtStart']): void {
     if (typeof level !== 'string' || !OBSERVATION_LEVELS.has(level)) {
       throw new TypeError('metrics observation level is invalid')
@@ -774,6 +806,7 @@ export class MetricsRegistry implements ObservationSubscriber {
     return parseMetricsSnapshot({
       schemaVersion: 1,
       startedAt: this.#startedAt,
+      windowResetCount: this.#windowResetCount,
       counters: includeFacts
         ? [...this.#counters.values()].map(point => ({
             name: point.name,
@@ -991,6 +1024,7 @@ export class MetricsRegistry implements ObservationSubscriber {
 
   #clearFacts (): void {
     this.#generation += 1
+    this.#windowResetCount += 1
     this.#counters.clear()
     this.#histograms.clear()
     this.#requestIds.clear()

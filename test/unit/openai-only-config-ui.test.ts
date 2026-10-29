@@ -124,6 +124,8 @@ const requiredGuobaFields = [
   'proxy',
   'defaultTimeoutMs',
   'observabilityLevel',
+  'observationSuccessSampleRate',
+  'usageAggregationEnabled',
   'enableToolbox',
   'closeBrowserAfterRender',
   'apiKey',
@@ -257,7 +259,8 @@ const expectedGuobaGroups = [
   {
     label: '网络与调试',
     fields: [
-      'proxy', 'defaultTimeoutMs', 'observabilityLevel', 'diskLogEnabled', 'debug'
+      'proxy', 'defaultTimeoutMs', 'observabilityLevel', 'observationSuccessSampleRate',
+      'usageAggregationEnabled', 'diskLogEnabled', 'debug'
     ]
   },
   {

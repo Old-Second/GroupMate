@@ -353,7 +353,7 @@ function deferred<T> (): {
   return { promise, resolve }
 }
 
-test('metric contract fixes fourteen instruments, labels and shared buckets', async () => {
+test('metric contract fixes fifteen instruments, labels and shared buckets', async () => {
   assert.equal(FORBIDDEN_METRIC_LABELS_EXCLUDED, true)
   assert.deepEqual(DURATION_BUCKET_BOUNDS_MS, [
     10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
@@ -369,6 +369,7 @@ test('metric contract fixes fourteen instruments, labels and shared buckets', as
     'groupmate.agent.approvals': ['decision'],
     'groupmate.agent.admission': ['state'],
     'groupmate.agent.admission_rejections': ['reason'],
+    'groupmate.agent.model_price': ['status'],
     'groupmate.presentation.deliveries': ['media', 'outcome'],
     'groupmate.observation.failures': ['sink'],
     'groupmate.observation.store_records': ['kind'],
@@ -388,7 +389,8 @@ test('metric contract fixes fourteen instruments, labels and shared buckets', as
     rss: () => 800
   })
   const snapshot = await registry.snapshot()
-  assert.equal(Object.keys(METRIC_LABEL_NAMES_V1).length, 14)
+  assert.equal(Object.keys(METRIC_LABEL_NAMES_V1).length, 15)
+  assert.equal(snapshot.windowResetCount, 0)
   assert.equal(gauge(snapshot, 'groupmate.agent.admission', 'state=active'), 2)
   assert.equal(gauge(snapshot, 'groupmate.agent.admission', 'state=queued'), 3)
   assert.equal(gauge(snapshot, 'groupmate.observation.store_records', 'kind=tombstone'), 4)
@@ -665,6 +667,7 @@ test('off level collects no facts and snapshots only admission and RSS', async (
   })
   const snapshot = await registry.snapshot()
   assert.equal(usageCalls, 0)
+  assert.equal(snapshot.windowResetCount, 1)
   assert.deepEqual(snapshot.counters, [])
   assert.deepEqual(snapshot.histograms, [])
   assert.deepEqual(snapshot.gauges.map(point => [point.name, labels(point), point.value]), [
@@ -672,6 +675,69 @@ test('off level collects no facts and snapshots only admission and RSS', async (
     ['groupmate.agent.admission', 'state=queued', 8],
     ['groupmate.process.rss', '', 9]
   ])
+})
+
+test('each off transition opens a new counting window and says how many times', async () => {
+  let tick = 0
+  const registry = new MetricsRegistry({
+    admission: { activeCount: 0, queuedCount: 0 },
+    runStoreUsage: async () => ({
+      schemaVersion: 1,
+      tombstoneRecords: 0,
+      tombstoneBytes: 0
+    }),
+    traceStoreUsage: async () => ({ records: 0, bytes: 0 }),
+    now: () => new Date(Date.parse(STARTED_AT) + (tick += 1_000)),
+    rss: () => 1
+  })
+  const opened = (await registry.snapshot()).startedAt
+
+  registry.observe(requestEvent())
+  registry.setCurrentLevel('off')
+  registry.setCurrentLevel('basic')
+  registry.observe(requestEvent('d'.repeat(32)))
+  const reopened = await registry.snapshot()
+
+  assert.equal(reopened.windowResetCount, 1)
+  assert.notEqual(reopened.startedAt, opened)
+  assert.ok(reopened.counters.length + reopened.histograms.length > 0)
+
+  registry.setCurrentLevel('off')
+  registry.setCurrentLevel('diagnostic')
+  assert.equal((await registry.snapshot()).windowResetCount, 2)
+})
+
+test('the model price counter separates an available quote from a missing one', async () => {
+  const registry = new MetricsRegistry({
+    admission: { activeCount: 0, queuedCount: 0 },
+    runStoreUsage: async () => ({
+      schemaVersion: 1,
+      tombstoneRecords: 0,
+      tombstoneBytes: 0
+    }),
+    traceStoreUsage: async () => ({ records: 0, bytes: 0 }),
+    now: () => new Date(STARTED_AT),
+    rss: () => 1
+  })
+
+  registry.recordModelPriceStatus('available')
+  registry.recordModelPriceStatus('available')
+  registry.recordModelPriceStatus('missing_or_expired')
+  const snapshot = await registry.snapshot()
+
+  assert.equal(counter(snapshot, 'groupmate.agent.model_price', 'status=available'), 2)
+  assert.equal(
+    counter(snapshot, 'groupmate.agent.model_price', 'status=missing_or_expired'),
+    1
+  )
+  assert.throws(
+    () => registry.recordModelPriceStatus('unknown' as 'available'),
+    TypeError
+  )
+
+  registry.setCurrentLevel('off')
+  registry.recordModelPriceStatus('available')
+  assert.deepEqual((await registry.snapshot()).counters, [])
 })
 
 test('an in-flight usage snapshot cannot cross the synchronous off boundary', async () => {
@@ -708,6 +774,7 @@ test('metrics parser exact-validates type, label order, domains and buckets', ()
   const valid = {
     schemaVersion: 1,
     startedAt: STARTED_AT,
+    windowResetCount: 0,
     counters: [{
       name: 'groupmate.agent.runs',
       labels: [
@@ -835,7 +902,9 @@ test('metrics parser exact-validates type, label order, domains and buckets', ()
         labels: [],
         value: 'not_attempted'
       }]
-    }
+    },
+    { ...valid, windowResetCount: -1 },
+    { ...valid, windowResetCount: 1.5 }
   ]
   for (const value of invalid) {
     assert.throws(() => parseMetricsSnapshot(value), TypeError)

@@ -104,3 +104,34 @@ test('gate uses lazy TTL, access-order capacity, and byte-equal candidate policy
   now += 600_001
   assert.equal(gate.allow(presentationEvent(latest)), false)
 })
+
+test('the gate recomputes the sample from the rate recorded in the policy', () => {
+  const runRef = traceRunRef(false, 100)
+  const sampled = createFrozenObservationPolicy({ levelAtStart: 'basic', runRef })
+  const gate = new RunObservationPolicyGate()
+
+  // An absent rate and an explicit historical default are the same policy.
+  gate.register(runRef, sampled)
+  gate.register(runRef, Object.freeze({ ...sampled, successSampleRatePercent: 5 }))
+
+  // A claimed retention that the recorded rate cannot produce is rejected.
+  assert.throws(() => gate.register(runRef, Object.freeze({
+    schemaVersion: 1 as const,
+    levelAtStart: 'basic' as const,
+    sampledSuccess: !sampled.sampledSuccess,
+    successSampleRatePercent: 5
+  })), RunObservationPolicyMismatchError)
+
+  const everything = createFrozenObservationPolicy({
+    levelAtStart: 'basic',
+    runRef,
+    successSampleRatePercent: 100
+  })
+  assert.equal(everything.sampledSuccess, true)
+  const reopened = new RunObservationPolicyGate()
+  reopened.register(runRef, everything)
+  assert.throws(() => reopened.register(runRef, Object.freeze({
+    ...everything,
+    successSampleRatePercent: 0
+  })), RunObservationPolicyMismatchError)
+})

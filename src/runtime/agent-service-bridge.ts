@@ -49,7 +49,14 @@ import type { ApprovalInterruption } from '../agent/run/interruption.js'
 import { RunAdmission } from '../agent/run/run-admission.js'
 import { createDefaultRunBudget } from '../agent/run/run-budget.js'
 import { RunEngine } from '../agent/run/run-engine.js'
-import { detachedRunContentSnapshot } from '../agent/run/run-content-journal.js'
+import {
+  detachedRunContentSnapshot,
+  type RunContentJournalEvent
+} from '../agent/run/run-content-journal.js'
+import {
+  DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT,
+  MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT
+} from '../agent/run/run-observation.js'
 import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js'
 import { createRequestRef } from '../agent/run/run-reference.js'
 import type { TraceCandidateProjectionFailureCode, TraceCandidateV1 } from '../agent/run/run-trace.js'
@@ -257,6 +264,7 @@ export interface YunzaiAgentServiceBridgeDependencies {
     publish(event: ObservationEventV1): void
     acceptCommittedTraceCandidate(candidate: TraceCandidateV1): void
     acceptTraceProjectionFailure(code: TraceCandidateProjectionFailureCode): void
+    acceptRunJournalEvent?(event: RunContentJournalEvent): void
   }>
 }
 
@@ -1929,11 +1937,18 @@ export function createYunzaiAgentServiceBridge (
     }
   })
   const contentJournal = dependencies.contentJournal
-  const runContentJournal = contentJournal === undefined
+  const journalObservations = dependencies.observations
+  const runContentJournal = contentJournal === undefined &&
+    journalObservations?.acceptRunJournalEvent === undefined
     ? undefined
     : Object.freeze({
-        record: (event: Parameters<GroupMateContentJournal['recordRunEvent']>[0]) => {
-          contentJournal.recordRunEvent(event)
+        record: (event: RunContentJournalEvent) => {
+          contentJournal?.recordRunEvent(event)
+          try {
+            journalObservations?.acceptRunJournalEvent?.(event)
+          } catch {
+            // Usage aggregation cannot affect a committed terminal run.
+          }
         }
       })
   const hostImageLinks = configBoolean(options.config, 'hostImageLinkRefresh', true)
@@ -2133,6 +2148,13 @@ export function createYunzaiAgentServiceBridge (
     now,
     generateId,
     observationLevel: () => options.config.observabilityLevel,
+    observationSuccessSampleRate: () => configInteger(
+      options.config,
+      'observationSuccessSampleRate',
+      DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT,
+      0,
+      MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT
+    ),
     monotonicNow: options.monotonicNow,
     onTerminalSnapshot: snapshot => {
       try {

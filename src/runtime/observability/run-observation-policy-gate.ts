@@ -1,4 +1,5 @@
 import {
+  DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT,
   createFrozenObservationPolicy,
   parseFrozenObservationPolicy,
   type FrozenObservationPolicyV1
@@ -49,7 +50,14 @@ function safeNow (now: () => number): number {
 }
 
 function canonicalPolicy (policy: FrozenObservationPolicyV1): string {
-  return JSON.stringify(policy)
+  // A legacy checkpoint carries no rate; compare against the historical default so
+  // an absent field and an explicit 5 stay the same policy.
+  return JSON.stringify([
+    policy.schemaVersion,
+    policy.levelAtStart,
+    policy.sampledSuccess,
+    policy.successSampleRatePercent ?? DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
+  ])
 }
 
 function eventRunRef (event: ObservationEventV1): string | 'unavailable' {
@@ -74,7 +82,10 @@ export class RunObservationPolicyGate {
     const policy = parseFrozenObservationPolicy(value)
     const deterministic = createFrozenObservationPolicy({
       levelAtStart: policy.levelAtStart,
-      runRef
+      runRef,
+      ...(policy.successSampleRatePercent === undefined
+        ? {}
+        : { successSampleRatePercent: policy.successSampleRatePercent })
     })
     if (canonicalPolicy(policy) !== canonicalPolicy(deterministic)) {
       this.#entries.delete(runRef)

@@ -68,7 +68,17 @@ export interface FrozenObservationPolicyV1 {
   readonly schemaVersion: 1
   readonly levelAtStart: 'off' | 'basic' | 'diagnostic'
   readonly sampledSuccess: boolean
+  /**
+   * Success sampling percentage frozen at run start. Absent when the run used the
+   * historical 5% default, so a default deployment keeps writing the original
+   * three-key policy. Verification recomputes `sampledSuccess` from the recorded
+   * rate, so changing the configuration never invalidates an existing checkpoint.
+   */
+  readonly successSampleRatePercent?: number
 }
+
+export const DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT = 5
+export const MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT = 100
 
 export interface RunObservationCountersV1 {
   readonly schemaVersion: 1
@@ -507,6 +517,7 @@ export function parseRunTraceMetricSummary (
 export function createFrozenObservationPolicy (input: {
   readonly levelAtStart: 'off' | 'basic' | 'diagnostic'
   readonly runRef: string
+  readonly successSampleRatePercent?: number
 }): FrozenObservationPolicyV1 {
   if (!['off', 'basic', 'diagnostic'].includes(input.levelAtStart)) {
     throw new TypeError('observation level is invalid')
@@ -514,39 +525,56 @@ export function createFrozenObservationPolicy (input: {
   if (typeof input.runRef !== 'string' || !RUN_REF_PATTERN.test(input.runRef)) {
     throw new TypeError('run reference is invalid')
   }
+  const rate = input.successSampleRatePercent ?? DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
+  if (!Number.isSafeInteger(rate) || rate < 0 ||
+    rate > MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT) {
+    throw new TypeError('observation success sample rate is invalid')
+  }
   let sampledSuccess = false
   if (input.levelAtStart !== 'off') {
     const hash = createHash('sha256')
       .update(`groupmate:success:v1:${input.runRef}`, 'ascii')
       .digest()
-    sampledSuccess = hash.readUInt32BE(0) % 100 < 5
+    sampledSuccess = hash.readUInt32BE(0) % 100 < rate
   }
   return Object.freeze({
     schemaVersion: 1,
     levelAtStart: input.levelAtStart,
-    sampledSuccess
+    sampledSuccess,
+    // The field is written only when the rate differs from the historical default,
+    // so a default deployment keeps producing byte-identical policies and a
+    // rollback to a version that rejects unknown keys still reads them.
+    ...(rate === DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT ? {} : { successSampleRatePercent: rate })
   })
 }
 
 export function parseFrozenObservationPolicy (
   value: unknown
 ): FrozenObservationPolicyV1 {
+  const legacy = value === null || typeof value !== 'object' ||
+    !Object.hasOwn(value, 'successSampleRatePercent')
   const policy = exactOwnData(
     value,
-    ['schemaVersion', 'levelAtStart', 'sampledSuccess'],
+    legacy
+      ? ['schemaVersion', 'levelAtStart', 'sampledSuccess']
+      : ['schemaVersion', 'levelAtStart', 'sampledSuccess', 'successSampleRatePercent'],
     'observation policy'
   )
+  const rate = legacy ? undefined : policy.successSampleRatePercent
   if (policy.schemaVersion !== 1 ||
     (policy.levelAtStart !== 'off' && policy.levelAtStart !== 'basic' &&
       policy.levelAtStart !== 'diagnostic') ||
     typeof policy.sampledSuccess !== 'boolean' ||
-    (policy.levelAtStart === 'off' && policy.sampledSuccess)) {
+    (policy.levelAtStart === 'off' && policy.sampledSuccess) ||
+    (rate !== undefined && (!Number.isSafeInteger(rate) || Number(rate) < 0 ||
+      Number(rate) > MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT))) {
     throw new TypeError('observation policy is invalid')
   }
   return Object.freeze({
     schemaVersion: 1,
     levelAtStart: policy.levelAtStart as FrozenObservationPolicyV1['levelAtStart'],
-    sampledSuccess: policy.sampledSuccess
+    sampledSuccess: policy.sampledSuccess,
+    ...(rate === undefined ? {} : { successSampleRatePercent: Number(rate) })
   })
 }
 

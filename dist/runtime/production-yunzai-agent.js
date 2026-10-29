@@ -33,6 +33,7 @@ import { createYunzaiBymController } from './yunzai-bym-controller.js';
 import { createYunzaiChatController } from './yunzai-chat-controller.js';
 import { prepareYunzaiPresentationRequest } from './yunzai-request-adapter.js';
 import { MetricsRegistry } from './observability/metrics-registry.js';
+import { UsageAggregator, usageAggregationEnabled } from './usage/usage-aggregator.js';
 import { ObservationHub } from './observability/observation-hub.js';
 import { createProviderIsolationIdSource } from './provider-isolation-id.js';
 import { RedisTraceStore } from './observability/redis-trace-store.js';
@@ -144,6 +145,8 @@ export class ProductionObservabilityRuntime {
     metrics;
     traceRecorder;
     traceStore;
+    /** Absent when per-identity usage aggregation is turned off. */
+    usage;
     #now;
     #logger;
     #requestObservationMonitor;
@@ -155,6 +158,9 @@ export class ProductionObservabilityRuntime {
         this.#logger = options.logger;
         this.#requestObservationMonitor = options.requestObservationMonitor;
         this.#currentLevel = options.initialLevel;
+        if (options.usageAggregation !== false) {
+            this.usage = new UsageAggregator({ now: options.now });
+        }
         this.traceStore = new RedisTraceStore({
             client: options.redis,
             now: () => {
@@ -285,6 +291,33 @@ export class ProductionObservabilityRuntime {
         }
         catch { }
     }
+    /**
+     * Run-journal fan-out. Price resolution becomes a fixed low-cardinality counter;
+     * identity stays inside the bounded usage window and never reaches a label.
+     */
+    acceptRunJournalEvent(event) {
+        if (event?.type === 'model.resolution') {
+            try {
+                this.metrics.recordModelPriceStatus(event.priceStatus === 'available' ? 'available' : 'missing_or_expired');
+            }
+            catch {
+                this.#reportDirectFailure('metrics', 'rejected');
+            }
+            return;
+        }
+        try {
+            this.usage?.record(event);
+        }
+        catch {
+            this.#reportDirectFailure('metrics', 'rejected');
+        }
+    }
+    pipelineSnapshot() {
+        return Object.freeze({
+            hub: this.hub.snapshot(),
+            recorder: this.traceRecorder.snapshot()
+        });
+    }
     async updateLevel(level) {
         if (level === 'off') {
             this.#setLevel('off');
@@ -310,6 +343,7 @@ export class ProductionObservabilityRuntime {
         this.gate.setCurrentLevel(level);
         this.metrics.setCurrentLevel(level);
         this.traceRecorder.setCurrentLevel(level);
+        this.usage?.setCurrentLevel(level);
     }
     #ensureBarrier() {
         if (this.#barrierPromise !== null)
@@ -499,6 +533,7 @@ export function createProductionYunzaiAgent(options) {
         logger: options.bridge.logger,
         requestObservationMonitor: options.requestObservations,
         initialLevel: preInitializationLevel ?? configuredObservabilityLevel(options.bridge.config.observabilityLevel),
+        usageAggregation: usageAggregationEnabled(options.bridge.config),
         now
     });
     const rawOutboundFactory = createYunzaiOutboundPortFactory(options.outboundHost);
@@ -573,7 +608,8 @@ export function createProductionYunzaiAgent(options) {
         observations: Object.freeze({
             publish: event => observability.publish(event),
             acceptCommittedTraceCandidate: candidate => (observability.acceptCommittedTraceCandidate(candidate)),
-            acceptTraceProjectionFailure: code => observability.acceptTraceProjectionFailure(code)
+            acceptTraceProjectionFailure: code => observability.acceptTraceProjectionFailure(code),
+            acceptRunJournalEvent: event => observability.acceptRunJournalEvent(event)
         })
     });
     const promptScreening = Object.freeze({
@@ -753,6 +789,10 @@ export function createProductionYunzaiAgent(options) {
         metrics: observability.metrics,
         traceStore: observability.traceStore,
         currentLevel: () => observability.currentLevel(),
+        ...(observability.usage === undefined
+            ? {}
+            : { usage: () => observability.usage.snapshot() }),
+        pipeline: () => observability.pipelineSnapshot(),
         logger: options.bridge.logger
     }));
     const conversationPreferenceController = createConversationPreferenceController({
@@ -830,7 +870,8 @@ export function createProductionYunzaiAgent(options) {
             gate: observability.gate,
             metrics: observability.metrics,
             traceRecorder: observability.traceRecorder,
-            traceStore: observability.traceStore
+            traceStore: observability.traceStore,
+            ...(observability.usage === undefined ? {} : { usage: observability.usage })
         }),
         shutdown: async (reason = 'process_shutdown') => {
             lifecycle.shutdownPromise ??= (async () => {

@@ -20,15 +20,20 @@ function event (input: Partial<DiagnosticYunzaiEvent> = {}): {
   }
 }
 
+const unexpected = Object.freeze({
+  status: async () => { throw new Error('unexpected status') },
+  metricsReport: async () => { throw new Error('unexpected metrics') },
+  usageReport: async () => { throw new Error('unexpected usage') },
+  inspect: async () => { throw new Error('unexpected inspect') }
+})
+
 test('status delegates authorization and replies exactly once', async () => {
   const calls: boolean[] = []
   const controller = new YunzaiDiagnosticsController(Object.freeze({
+    ...unexpected,
     status: async ({ authorized }: { readonly authorized: boolean }) => {
       calls.push(authorized)
       return Object.freeze({ schemaVersion: 1 as const, kind: 'status' as const, text: 'status' })
-    },
-    inspect: async () => {
-      throw new Error('unexpected inspect')
     }
   }))
   const current = event({ authorized: false })
@@ -38,12 +43,33 @@ test('status delegates authorization and replies exactly once', async () => {
   assert.deepEqual(current.replies, ['status'])
 })
 
+test('each report command delegates authorization and replies exactly once', async () => {
+  const calls: string[] = []
+  const controller = new YunzaiDiagnosticsController(Object.freeze({
+    ...unexpected,
+    metricsReport: async ({ authorized }: { readonly authorized: boolean }) => {
+      calls.push(`metrics:${authorized}`)
+      return Object.freeze({ schemaVersion: 1 as const, kind: 'metrics' as const, text: 'm' })
+    },
+    usageReport: async ({ authorized }: { readonly authorized: boolean }) => {
+      calls.push(`usage:${authorized}`)
+      return Object.freeze({ schemaVersion: 1 as const, kind: 'usage' as const, text: 'u' })
+    }
+  }))
+  const metrics = event({ authorized: false })
+  const usage = event()
+
+  assert.equal(await controller.handleMetrics(metrics.value), true)
+  assert.equal(await controller.handleUsage(usage.value), true)
+  assert.deepEqual(calls, ['metrics:false', 'usage:true'])
+  assert.deepEqual(metrics.replies, ['m'])
+  assert.deepEqual(usage.replies, ['u'])
+})
+
 test('inspect passes the unmodified command argument and replies exactly once', async () => {
   const calls: Array<{ authorized: boolean; runRef: string }> = []
   const controller = new YunzaiDiagnosticsController(Object.freeze({
-    status: async () => {
-      throw new Error('unexpected status')
-    },
+    ...unexpected,
     inspect: async (input: { readonly authorized: boolean; readonly runRef: string }) => {
       calls.push(input)
       return Object.freeze({

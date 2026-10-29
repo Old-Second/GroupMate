@@ -59,6 +59,8 @@ import {
   type RunStore
 } from '../agent/run/run-store.js'
 import {
+  DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT,
+  MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT,
   createFrozenObservationPolicy,
   type FrozenObservationPolicyV1
 } from '../agent/run/run-observation.js'
@@ -273,6 +275,7 @@ export interface AgentServiceOptions {
   readonly generateId?: () => string
   readonly createRunRef?: () => string
   readonly observationLevel?: () => unknown
+  readonly observationSuccessSampleRate?: () => unknown
   readonly monotonicNow?: () => number | 'unavailable'
   readonly onTerminalSnapshot?: (snapshot: RunTerminalSnapshotV2) => void
   readonly onTerminalCommitReceipt?: (receipt: TerminalCommitReceiptV1) => void
@@ -506,6 +509,19 @@ function safeObservationLevel (
       : 'basic'
   } catch {
     return 'basic'
+  }
+}
+
+function safeSuccessSampleRate (read: (() => unknown) | undefined): number {
+  if (read === undefined) return DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
+  try {
+    const value = read()
+    return Number.isSafeInteger(value) && Number(value) >= 0 &&
+      Number(value) <= MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT
+      ? Number(value)
+      : DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
+  } catch {
+    return DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
   }
 }
 
@@ -1007,6 +1023,7 @@ export class AgentService {
   readonly #generateId: () => string
   readonly #createRunRef: () => string
   readonly #observationLevel?: () => unknown
+  readonly #observationSuccessSampleRate?: () => unknown
   readonly #monotonicNow: () => number | 'unavailable'
   readonly #onTerminalSnapshot?: AgentServiceOptions['onTerminalSnapshot']
   readonly #onTerminalCommitReceipt?: AgentServiceOptions['onTerminalCommitReceipt']
@@ -1042,6 +1059,7 @@ export class AgentService {
     this.#generateId = options.generateId ?? randomUUID
     this.#createRunRef = options.createRunRef ?? createRunRef
     this.#observationLevel = options.observationLevel
+    this.#observationSuccessSampleRate = options.observationSuccessSampleRate
     this.#monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()))
     this.#onTerminalSnapshot = options.onTerminalSnapshot
     this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt
@@ -1309,6 +1327,7 @@ export class AgentService {
       )
     }
     const levelAtStart = safeObservationLevel(this.#observationLevel)
+    const successSampleRatePercent = safeSuccessSampleRate(this.#observationSuccessSampleRate)
     let runRef = this.#createRunRef()
     let request = freezeRequest(draft, runRef)
     const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal)
@@ -1444,7 +1463,8 @@ export class AgentService {
         for (let attempt = 0; attempt < 2; attempt += 1) {
           const observationPolicy = createFrozenObservationPolicy({
             levelAtStart,
-            runRef
+            runRef,
+            successSampleRatePercent
           })
           try {
             result = await this.#engine.start({

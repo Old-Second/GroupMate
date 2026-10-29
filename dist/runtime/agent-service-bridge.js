@@ -14,6 +14,7 @@ import { RunAdmission } from '../agent/run/run-admission.js';
 import { createDefaultRunBudget } from '../agent/run/run-budget.js';
 import { RunEngine } from '../agent/run/run-engine.js';
 import { detachedRunContentSnapshot } from '../agent/run/run-content-journal.js';
+import { DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT, MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT } from '../agent/run/run-observation.js';
 import { RUN_RESOURCE_LIMITS } from '../agent/run/run-limits.js';
 import { createRequestRef } from '../agent/run/run-reference.js';
 import { RedisRunStore } from '../agent/run/redis-run-store.js';
@@ -1381,11 +1382,19 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         }
     });
     const contentJournal = dependencies.contentJournal;
-    const runContentJournal = contentJournal === undefined
+    const journalObservations = dependencies.observations;
+    const runContentJournal = contentJournal === undefined &&
+        journalObservations?.acceptRunJournalEvent === undefined
         ? undefined
         : Object.freeze({
             record: (event) => {
-                contentJournal.recordRunEvent(event);
+                contentJournal?.recordRunEvent(event);
+                try {
+                    journalObservations?.acceptRunJournalEvent?.(event);
+                }
+                catch {
+                    // Usage aggregation cannot affect a committed terminal run.
+                }
             }
         });
     const hostImageLinks = configBoolean(options.config, 'hostImageLinkRefresh', true)
@@ -1562,6 +1571,7 @@ export function createYunzaiAgentServiceBridge(options, dependencies) {
         now,
         generateId,
         observationLevel: () => options.config.observabilityLevel,
+        observationSuccessSampleRate: () => configInteger(options.config, 'observationSuccessSampleRate', DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT, 0, MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT),
         monotonicNow: options.monotonicNow,
         onTerminalSnapshot: snapshot => {
             try {

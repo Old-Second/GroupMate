@@ -1,4 +1,4 @@
-import { createFrozenObservationPolicy, parseFrozenObservationPolicy } from '../../agent/run/run-observation.js';
+import { DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT, createFrozenObservationPolicy, parseFrozenObservationPolicy } from '../../agent/run/run-observation.js';
 import { RUN_REF_PATTERN } from '../../agent/run/run-reference.js';
 import { parseTraceCandidate } from '../../agent/run/run-trace.js';
 import { parseObservationEvent } from './observation-event.js';
@@ -25,7 +25,14 @@ function safeNow(now) {
     }
 }
 function canonicalPolicy(policy) {
-    return JSON.stringify(policy);
+    // A legacy checkpoint carries no rate; compare against the historical default so
+    // an absent field and an explicit 5 stay the same policy.
+    return JSON.stringify([
+        policy.schemaVersion,
+        policy.levelAtStart,
+        policy.sampledSuccess,
+        policy.successSampleRatePercent ?? DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT
+    ]);
 }
 function eventRunRef(event) {
     return event.value.runRef;
@@ -46,7 +53,10 @@ export class RunObservationPolicyGate {
         const policy = parseFrozenObservationPolicy(value);
         const deterministic = createFrozenObservationPolicy({
             levelAtStart: policy.levelAtStart,
-            runRef
+            runRef,
+            ...(policy.successSampleRatePercent === undefined
+                ? {}
+                : { successSampleRatePercent: policy.successSampleRatePercent })
         });
         if (canonicalPolicy(policy) !== canonicalPolicy(deterministic)) {
             this.#entries.delete(runRef);

@@ -121,16 +121,20 @@ test('owner diagnostics is a thin production-root shell with fixed master rules'
   ])
   const declaration = exportedClass(diagnostics.file)
   assert.equal(declaration.name?.text, 'diagnostics')
-  assert.deepEqual(methodNames(declaration), ['status', 'diagnose'])
+  assert.deepEqual(methodNames(declaration), ['status', 'metrics', 'usage', 'diagnose'])
   assert.match(diagnostics.source, /name:\s*'GroupMate 主人诊断'/)
   assert.match(diagnostics.source, /event:\s*'message'/)
   assert.match(diagnostics.source, /reg:\s*'\^#GroupMate状态\$'/)
+  assert.match(diagnostics.source, /reg:\s*'\^#GroupMate指标\$'/)
+  assert.match(diagnostics.source, /reg:\s*'\^#GroupMate用量\$'/)
   assert.match(
     diagnostics.source,
     /reg:\s*'\^#GroupMate诊断\\\\s\+\(\[0-9a-f\]\{32\}\)\$'/
   )
-  assert.equal((diagnostics.source.match(/permission:\s*'master'/g) ?? []).length, 2)
+  assert.equal((diagnostics.source.match(/permission:\s*'master'/g) ?? []).length, 4)
   assert.match(diagnostics.source, /\.diagnosticsController\.handleStatus\(/)
+  assert.match(diagnostics.source, /\.diagnosticsController\.handleMetrics\(/)
+  assert.match(diagnostics.source, /\.diagnosticsController\.handleUsage\(/)
   assert.match(diagnostics.source, /\.diagnosticsController\.handleInspect\(/)
   for (const forbidden of [
     'Config', 'Redis', 'MetricsRegistry', 'TraceStore', 'OwnerDiagnostics',

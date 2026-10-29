@@ -10,7 +10,7 @@ import { publicModelImageUrl } from '../agent/model/model-adapter.js';
 import { recoveredLegacyRoute } from '../agent/contracts/interaction.js';
 import { RunAdmissionRejectionError } from '../agent/run/run-admission.js';
 import { RunReferenceConflictError } from '../agent/run/run-store.js';
-import { createFrozenObservationPolicy } from '../agent/run/run-observation.js';
+import { DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT, MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT, createFrozenObservationPolicy } from '../agent/run/run-observation.js';
 import { createRunRef } from '../agent/run/run-reference.js';
 import { isTerminalRunStatus } from '../agent/run/run-state.js';
 import { parseAgentSessionState } from '../agent/session/agent-session-state.js';
@@ -262,6 +262,20 @@ function safeObservationLevel(read) {
     }
     catch {
         return 'basic';
+    }
+}
+function safeSuccessSampleRate(read) {
+    if (read === undefined)
+        return DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT;
+    try {
+        const value = read();
+        return Number.isSafeInteger(value) && Number(value) >= 0 &&
+            Number(value) <= MAXIMUM_SUCCESS_SAMPLE_RATE_PERCENT
+            ? Number(value)
+            : DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT;
+    }
+    catch {
+        return DEFAULT_SUCCESS_SAMPLE_RATE_PERCENT;
     }
 }
 function freezeRequest(draft, runRef) {
@@ -679,6 +693,7 @@ export class AgentService {
     #generateId;
     #createRunRef;
     #observationLevel;
+    #observationSuccessSampleRate;
     #monotonicNow;
     #onTerminalSnapshot;
     #onTerminalCommitReceipt;
@@ -713,6 +728,7 @@ export class AgentService {
         this.#generateId = options.generateId ?? randomUUID;
         this.#createRunRef = options.createRunRef ?? createRunRef;
         this.#observationLevel = options.observationLevel;
+        this.#observationSuccessSampleRate = options.observationSuccessSampleRate;
         this.#monotonicNow = options.monotonicNow ?? (() => Math.trunc(performance.now()));
         this.#onTerminalSnapshot = options.onTerminalSnapshot;
         this.#onTerminalCommitReceipt = options.onTerminalCommitReceipt;
@@ -931,6 +947,7 @@ export class AgentService {
             })), requestObservationContext, 'failed_request_validation', 'not_applicable', 'not_attempted', 'not_attempted');
         }
         const levelAtStart = safeObservationLevel(this.#observationLevel);
+        const successSampleRatePercent = safeSuccessSampleRate(this.#observationSuccessSampleRate);
         let runRef = this.#createRunRef();
         let request = freezeRequest(draft, runRef);
         const linked = linkedAbortSignal(options.signal, this.#lifecycleController.signal);
@@ -1029,7 +1046,8 @@ export class AgentService {
                 for (let attempt = 0; attempt < 2; attempt += 1) {
                     const observationPolicy = createFrozenObservationPolicy({
                         levelAtStart,
-                        runRef
+                        runRef,
+                        successSampleRatePercent
                     });
                     try {
                         result = await this.#engine.start({

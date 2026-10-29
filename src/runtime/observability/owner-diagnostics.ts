@@ -1,16 +1,35 @@
 import { RUN_REF_PATTERN } from '../../agent/run/run-reference.js'
+import type { PresentationModelCostV1 } from '../../agent/contracts/presentation-trace.js'
 import type { ObservabilityLevel } from './trace-policy.js'
-import type { MetricsSnapshotV1 } from './metrics-registry.js'
+import type {
+  MetricCounterNameV1,
+  MetricCounterPoint,
+  MetricHistogramPoint,
+  MetricLabelV1,
+  MetricsSnapshotV1
+} from './metrics-registry.js'
+import type { ObservationHubSnapshotV1 } from './observation-hub.js'
 import { replayTrace, type TraceReplayReportV1 } from './trace-replay.js'
-import type { TraceLookupResult, TraceSummaryV1 } from './trace-store.js'
+import type {
+  TraceLookupResult,
+  TraceRecorderSnapshotV1,
+  TraceSummaryV1
+} from './trace-store.js'
+import type { UsageAggregateSnapshotV1, UsageTotalsV1 } from '../usage/usage-aggregator.js'
 
 const STATUS_MAXIMUM_CODE_POINTS = 2_000
 const INSPECT_MAXIMUM_CODE_POINTS = 4_000
+const REPORT_MAXIMUM_CODE_POINTS = 4_000
 const RECENT_TRACE_LIMIT = 5
 const INSPECT_EVENT_LIMIT = 20
+const COUNTER_ROW_LIMIT = 40
+const PICO_YUAN_PER_YUAN = 1_000_000_000_000n
+const PICO_YUAN_PER_MICRO_YUAN = 1_000_000n
 
 export type OwnerDiagnosticResponseKind =
   | 'status'
+  | 'metrics'
+  | 'usage'
   | 'found'
   | 'not_retained'
   | 'expired'
@@ -23,6 +42,11 @@ export interface OwnerDiagnosticResponse {
   readonly schemaVersion: 1
   readonly kind: OwnerDiagnosticResponseKind
   readonly text: string
+}
+
+export interface ObservationPipelineSnapshotV1 {
+  readonly hub: ObservationHubSnapshotV1
+  readonly recorder: TraceRecorderSnapshotV1
 }
 
 interface OwnerMetricsPort {
@@ -42,6 +66,9 @@ export interface OwnerDiagnosticsOptions {
   readonly metrics: OwnerMetricsPort
   readonly traceStore: OwnerTraceStorePort
   readonly currentLevel: () => ObservabilityLevel
+  /** Absent when per-identity aggregation is turned off. */
+  readonly usage?: () => UsageAggregateSnapshotV1
+  readonly pipeline?: () => ObservationPipelineSnapshotV1
   readonly logger?: OwnerDiagnosticLogger
 }
 
@@ -98,6 +125,105 @@ function sumRows (rows: readonly { readonly count: number }[]): number {
   return rows.reduce((total, row) => total + row.count, 0)
 }
 
+/** Pico-yuan to yuan with micro-yuan precision; the input is always non-negative. */
+function formatPicoYuan (picoYuan: string): string {
+  let value: bigint
+  try {
+    value = BigInt(picoYuan)
+  } catch {
+    return '不可用'
+  }
+  const micro = (value % PICO_YUAN_PER_YUAN) / PICO_YUAN_PER_MICRO_YUAN
+  return `${value / PICO_YUAN_PER_YUAN}.${String(micro).padStart(6, '0')}`
+}
+
+function costText (cost: PresentationModelCostV1): string {
+  if (cost.kind === 'unavailable') return '不可用'
+  const label = cost.kind === 'upper_bound' ? '上界' : '参考'
+  return `${label} ${formatPicoYuan(cost.picoYuan)} 元（${cost.catalogVersion}）`
+}
+
+function availabilityLabel (availability: UsageTotalsV1['availability']): string {
+  if (availability === 'complete') return '完整'
+  return availability === 'partial' ? '部分' : '不可用'
+}
+
+function labelText (labels: readonly MetricLabelV1[]): string {
+  return labels.map(label => `${label.name}=${label.value}`).join(',')
+}
+
+function pointsOf (
+  snapshot: MetricsSnapshotV1,
+  name: MetricCounterNameV1
+): readonly MetricCounterPoint[] {
+  return snapshot.counters.filter(point => point.name === name)
+}
+
+function sumByLabel (
+  points: readonly MetricCounterPoint[],
+  labelName: MetricLabelV1['name']
+): readonly (readonly [string, number])[] {
+  const totals = new Map<string, number>()
+  for (const point of points) {
+    const value = point.labels.find(label => label.name === labelName)?.value
+    if (value === undefined) continue
+    totals.set(value, (totals.get(value) ?? 0) + point.value)
+  }
+  return [...totals.entries()].sort((left, right) => (
+    right[1] - left[1] || left[0].localeCompare(right[0])
+  ))
+}
+
+function breakdown (
+  points: readonly MetricCounterPoint[],
+  labelName: MetricLabelV1['name']
+): string {
+  const rows = sumByLabel(points, labelName)
+  if (rows.length === 0) return '无'
+  return rows.map(([value, count]) => `${value} ${count}`).join(' / ')
+}
+
+function tokenTotal (
+  snapshot: MetricsSnapshotV1,
+  direction: 'input' | 'output'
+): number {
+  return pointsOf(snapshot, 'groupmate.agent.tokens')
+    .filter(point => point.labels.some(label => (
+      label.name === 'direction' && label.value === direction
+    )) && point.labels.some(label => (
+      label.name === 'source' && label.value === 'provider'
+    )))
+    .reduce((total, point) => total + point.value, 0)
+}
+
+/** Bucket upper bound that first covers the quantile; never an interpolated value. */
+function quantileBound (point: MetricHistogramPoint, quantile: number): string {
+  if (point.count === 0) return '无'
+  const target = Math.max(1, Math.ceil(point.count * quantile))
+  for (const bucket of point.buckets) {
+    if (bucket.cumulativeCount >= target) {
+      return bucket.upperBoundMs === 'inf' ? '超出最大桶' : `≤${bucket.upperBoundMs}ms`
+    }
+  }
+  return '超出最大桶'
+}
+
+function histogramLine (point: MetricHistogramPoint): string {
+  const mean = point.count === 0 ? '无' : `${Math.round(point.sumMs / point.count)}ms`
+  return `${point.name}{${labelText(point.labels)}} ${point.count} 次 均值 ${mean} ` +
+    `p50 ${quantileBound(point, 0.5)} p95 ${quantileBound(point, 0.95)} ` +
+    `不可用 ${point.unavailableCount}`
+}
+
+function totalsText (totals: UsageTotalsV1): string {
+  return `运行 ${totals.runs} 输入 ${totals.inputTokens} 输出 ${totals.outputTokens} ` +
+    `缓存命中 ${totals.cacheHitTokens} 费用 ${costText(totals.cost)}`
+}
+
+function windowLine (startedAt: string, resetCount: number): string {
+  return `计数窗口：${startedAt} 起（重置 ${resetCount} 次）`
+}
+
 function replayText (report: TraceReplayReportV1): string {
   const phases = report.phases.slice(0, INSPECT_EVENT_LIMIT)
   const phaseLines = phases.map((phase, index) => `${index + 1}. ${phase}`)
@@ -125,12 +251,16 @@ export class OwnerDiagnostics {
   readonly #metrics: OwnerMetricsPort
   readonly #traceStore: OwnerTraceStorePort
   readonly #currentLevel: () => ObservabilityLevel
+  readonly #usage?: () => UsageAggregateSnapshotV1
+  readonly #pipeline?: () => ObservationPipelineSnapshotV1
   readonly #logger?: OwnerDiagnosticLogger
 
   constructor (options: OwnerDiagnosticsOptions) {
     this.#metrics = options.metrics
     this.#traceStore = options.traceStore
     this.#currentLevel = options.currentLevel
+    this.#usage = options.usage
+    this.#pipeline = options.pipeline
     this.#logger = options.logger
   }
 
@@ -185,8 +315,135 @@ export class OwnerDiagnostics {
       `活动任务：${gauge(snapshot, 'groupmate.agent.admission', 'state', 'active')}`,
       `排队任务：${gauge(snapshot, 'groupmate.agent.admission', 'state', 'queued')}`,
       `RSS：${gauge(snapshot, 'groupmate.process.rss')} 字节`,
+      ...(level === 'off'
+        ? []
+        : [
+            windowLine(snapshot.startedAt, snapshot.windowResetCount),
+            `运行：${breakdown(pointsOf(snapshot, 'groupmate.agent.runs'), 'outcome')}`,
+            `上报 Token：输入 ${tokenTotal(snapshot, 'input')} / ` +
+              `输出 ${tokenTotal(snapshot, 'output')}`,
+            `报价：${breakdown(pointsOf(snapshot, 'groupmate.agent.model_price'), 'status')}`,
+            ...this.#costLines()
+          ]),
       ...traceLines
     ].join('\n'), STATUS_MAXIMUM_CODE_POINTS))
+  }
+
+  /** Full counter and histogram read-out; `#GroupMate状态` only carries a digest. */
+  async metricsReport (input: {
+    readonly authorized: boolean
+  }): Promise<OwnerDiagnosticResponse> {
+    if (!input.authorized) return this.#finish('metrics', response(
+      'forbidden',
+      '仅机器人主人可以查看 GroupMate 指标',
+      REPORT_MAXIMUM_CODE_POINTS
+    ))
+
+    let level: ObservabilityLevel
+    let snapshot: MetricsSnapshotV1
+    try {
+      level = this.#currentLevel()
+      snapshot = await this.#metrics.snapshot()
+    } catch {
+      return this.#finish('metrics', response(
+        'unavailable',
+        'GroupMate 指标暂不可用',
+        REPORT_MAXIMUM_CODE_POINTS
+      ))
+    }
+    if (level === 'off') return this.#finish('metrics', response(
+      'metrics',
+      ['GroupMate 指标', '可观测性：关闭', '计数：关闭'].join('\n'),
+      REPORT_MAXIMUM_CODE_POINTS
+    ))
+
+    const counters = [...snapshot.counters]
+      .sort((left, right) => (
+        right.value - left.value ||
+        left.name.localeCompare(right.name) ||
+        labelText(left.labels).localeCompare(labelText(right.labels))
+      ))
+    const shown = counters.slice(0, COUNTER_ROW_LIMIT)
+    const remaining = counters.length - shown.length
+    return this.#finish('metrics', response('metrics', [
+      'GroupMate 指标',
+      `可观测性：${levelLabel(level)}`,
+      windowLine(snapshot.startedAt, snapshot.windowResetCount),
+      '计数：',
+      ...(shown.length === 0
+        ? ['无']
+        : shown.map(point => `${point.name}{${labelText(point.labels)}} ${point.value}`)),
+      ...(remaining > 0 ? [`其余 ${remaining} 个计数未展开`] : []),
+      '耗时：',
+      ...(snapshot.histograms.length === 0
+        ? ['无']
+        : [...snapshot.histograms]
+            .sort((left, right) => (
+              left.name.localeCompare(right.name) ||
+              labelText(left.labels).localeCompare(labelText(right.labels))
+            ))
+            .map(histogramLine)),
+      ...this.#pipelineLines()
+    ].join('\n'), REPORT_MAXIMUM_CODE_POINTS))
+  }
+
+  /**
+   * Per-identity token and cost totals. Rows carry masked trailing digits only:
+   * two rows with the same mask are two different groups or people.
+   */
+  async usageReport (input: {
+    readonly authorized: boolean
+  }): Promise<OwnerDiagnosticResponse> {
+    if (!input.authorized) return this.#finish('usage', response(
+      'forbidden',
+      '仅机器人主人可以查看 GroupMate 用量',
+      REPORT_MAXIMUM_CODE_POINTS
+    ))
+    if (this.#usage === undefined) return this.#finish('usage', response(
+      'unavailable',
+      '用量聚合未启用，可在锅巴打开「按群与按人用量聚合」',
+      REPORT_MAXIMUM_CODE_POINTS
+    ))
+
+    let level: ObservabilityLevel
+    let usage: UsageAggregateSnapshotV1
+    try {
+      level = this.#currentLevel()
+      usage = this.#usage()
+    } catch {
+      return this.#finish('usage', response(
+        'unavailable',
+        'GroupMate 用量暂不可用',
+        REPORT_MAXIMUM_CODE_POINTS
+      ))
+    }
+    if (level === 'off') return this.#finish('usage', response(
+      'usage',
+      ['GroupMate 用量', '可观测性：关闭', '聚合：关闭'].join('\n'),
+      REPORT_MAXIMUM_CODE_POINTS
+    ))
+
+    return this.#finish('usage', response('usage', [
+      'GroupMate 用量',
+      `可观测性：${levelLabel(level)}`,
+      windowLine(usage.windowStartedAt, usage.windowResetCount),
+      `累计：${totalsText(usage.total)}`,
+      `用量完整度：${availabilityLabel(usage.total.availability)}`,
+      `已统计运行：${usage.observedRuns}（拒绝 ${usage.rejectedRuns}）`,
+      '按天：',
+      ...(usage.days.length === 0
+        ? ['无']
+        : usage.days.map(row => `${row.day} ${totalsText(row.totals)}`)),
+      '按群（掩码尾号）：',
+      ...(usage.groups.length === 0
+        ? ['无']
+        : usage.groups.map(row => `${row.maskedId} ${row.day} ${totalsText(row.totals)}`)),
+      '按人（掩码尾号）：',
+      ...(usage.actors.length === 0
+        ? ['无']
+        : usage.actors.map(row => `${row.maskedId} ${row.day} ${totalsText(row.totals)}`)),
+      `维度溢出：群 ${usage.droppedGroupRuns} / 人 ${usage.droppedActorRuns}`
+    ].join('\n'), REPORT_MAXIMUM_CODE_POINTS))
   }
 
   async inspect (input: {
@@ -237,8 +494,42 @@ export class OwnerDiagnostics {
     ))
   }
 
+  #costLines (): readonly string[] {
+    if (this.#usage === undefined) return Object.freeze([])
+    try {
+      const usage = this.#usage()
+      return Object.freeze([
+        `累计费用：${costText(usage.total.cost)}`,
+        `已统计运行：${usage.observedRuns}`
+      ])
+    } catch {
+      return Object.freeze(['累计费用：不可用'])
+    }
+  }
+
+  #pipelineLines (): readonly string[] {
+    if (this.#pipeline === undefined) return Object.freeze([])
+    let pipeline: ObservationPipelineSnapshotV1
+    try {
+      pipeline = this.#pipeline()
+    } catch {
+      return Object.freeze(['管道：不可用'])
+    }
+    return Object.freeze([
+      '管道：',
+      `进行中 ${pipeline.hub.normalInFlight} 等待 ${pipeline.hub.normalPending} ` +
+        `保留槽 ${pipeline.hub.reservedInFlight}`,
+      ...pipeline.hub.sinks.map(sink => (
+        `${sink.name} 接受 ${sink.accepted} 丢弃 ${sink.dropped} ` +
+        `失败 ${sink.failed} 隔离 ${sink.quarantined}`
+      )),
+      `轨迹记录：候选等待 ${pipeline.recorder.committedCandidateWait} ` +
+        `呈现等待 ${pipeline.recorder.presentationWait}`
+    ])
+  }
+
   #finish (
-    operation: 'status' | 'inspect',
+    operation: 'status' | 'inspect' | 'metrics' | 'usage',
     value: OwnerDiagnosticResponse
   ): OwnerDiagnosticResponse {
     try {

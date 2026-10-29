@@ -762,7 +762,10 @@ function validateCheckpointV2OrLater (
   const observationPolicy = parseFrozenObservationPolicy(parsed.observationPolicy)
   const expectedObservationPolicy = createFrozenObservationPolicy({
     levelAtStart: observationPolicy.levelAtStart,
-    runRef: parsed.runRef
+    runRef: parsed.runRef,
+    ...(observationPolicy.successSampleRatePercent === undefined
+      ? {}
+      : { successSampleRatePercent: observationPolicy.successSampleRatePercent })
   })
   if (expectedObservationPolicy.sampledSuccess !== observationPolicy.sampledSuccess) {
     throw new TypeError('run checkpoint observation policy sample is invalid')

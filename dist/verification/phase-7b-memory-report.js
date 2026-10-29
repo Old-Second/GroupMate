@@ -805,7 +805,7 @@ const PHASE_7B_EXPECTED_BRIDGE_DEPENDENCIES = Object.freeze([
     {
         name: 'observations',
         optional: true,
-        type: 'Readonly<{publish(event:ObservationEventV1):void;acceptCommittedTraceCandidate(candidate:TraceCandidateV1):void;acceptTraceProjectionFailure(code:TraceCandidateProjectionFailureCode):void;}>'
+        type: 'Readonly<{publish(event:ObservationEventV1):void;acceptCommittedTraceCandidate(candidate:TraceCandidateV1):void;acceptTraceProjectionFailure(code:TraceCandidateProjectionFailureCode):void;acceptRunJournalEvent?(event:RunContentJournalEvent):void;}>'
     }
 ]);
 const PHASE_7B_EXPECTED_OUTBOX_FIELDS = Object.freeze([
