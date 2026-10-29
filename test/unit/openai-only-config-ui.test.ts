@@ -168,6 +168,7 @@ const requiredGuobaFields = [
   'personalMemoryMaintenanceAction',
   'conversationPreferencesEnabled',
   'groupMemoryLearningEnabled',
+  'groupMemoryAutoApprovalEnabled',
   'toolPrivateSendPolicy',
   'toolCrossGroupSendPolicy',
   'enableToolVideoDownload',
@@ -305,7 +306,8 @@ const expectedGuobaGroups = [
       'personalMemoryMode', 'semanticSummaryGroups',
       'personalMemoryRecallMaxItems', 'personalMemoryRecallMaxTokens',
       'personalMemoryRecallTimeoutMs', 'personalMemoryOperationsStatus',
-      'personalMemoryMaintenanceAction', 'conversationPreferencesEnabled', 'groupMemoryLearningEnabled'
+      'personalMemoryMaintenanceAction', 'conversationPreferencesEnabled', 'groupMemoryLearningEnabled',
+      'groupMemoryAutoApprovalEnabled'
     ]
   },
   {

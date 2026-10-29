@@ -214,6 +214,13 @@ export function normalizeGuobaConfigValue (key: string, value: unknown): unknown
     return value
   }
 
+  if (key === 'groupMemoryAutoApprovalEnabled') {
+    if (typeof value !== 'boolean') {
+      throw new TypeError('自动候选公示期默示通过开关配置无效。')
+    }
+    return value
+  }
+
   if (key === 'hostImageLinkRefresh') {
     if (typeof value !== 'boolean') {
       throw new TypeError('历史图片链接续签配置无效。')

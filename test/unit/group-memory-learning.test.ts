@@ -25,6 +25,9 @@ function turn (text: string): ModelTurn {
 interface SetupOptions {
   readonly mode?: 'explicit' | 'shadow' | 'automatic'
   readonly enabled?: () => boolean
+  readonly implicitApproval?: () => boolean
+  /** Replaces the host group send used for the candidate notice. */
+  readonly notify?: () => void
   readonly reply?: (request: ModelRequest) => string
   readonly clock?: { now: number }
 }
@@ -34,17 +37,27 @@ async function setup (t: TestContext, setupOptions: SetupOptions = {}) {
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   const requests: ModelRequest[] = []
   const diagnostics: any[] = []
+  const notices: string[] = []
   const roles = new Map<string, string>([[ADMIN, 'admin'], [OTHER_ADMIN, 'admin'], [BOT, 'member']])
   let joined = 1700000000
-  const bot = { sendApi: async (_method: string, input: any) => ({
-    user_id: input.user_id, group_id: input.group_id,
-    role: roles.get(String(input.user_id)) ?? 'member', join_time: joined }) }
+  const bot = {
+    sendApi: async (_method: string, input: any) => ({
+      user_id: input.user_id, group_id: input.group_id,
+      role: roles.get(String(input.user_id)) ?? 'member', join_time: joined }),
+    // The proactive candidate notice goes out through the ordinary host group send.
+    sendGroupMsg: async (groupId: string | number, message: unknown) => {
+      setupOptions.notify?.()
+      notices.push(`${String(groupId)}|${String(message)}`)
+      return 'sent'
+    }
+  }
   const runtime = await createProductionPersonalMemoryRuntimeV1({
     botInstanceId: 'groupmate-production', storageDirectory: directory,
     deploymentMode: () => setupOptions.mode ?? 'automatic',
     recallMaxItems: () => 6, recallMaxTokens: () => 1_200, recallTimeoutMs: () => 150,
     candidateBot: () => bot,
     groupLearningEnabled: setupOptions.enabled ?? (() => true),
+    groupLearningImplicitApproval: setupOptions.implicitApproval ?? (() => true),
     groupLearningDiagnostic: value => diagnostics.push(value),
     candidateModel: { model: () => 'test-model', adapter: { complete: async request => {
       requests.push(request)
@@ -87,7 +100,7 @@ async function setup (t: TestContext, setupOptions: SetupOptions = {}) {
         currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] } }) as any
   }
   const pending = () => Number(db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n)
-  return { runtime, db, requests, diagnostics, roles, say, window, send, recall, pending, directory,
+  return { runtime, db, requests, diagnostics, notices, roles, say, window, send, recall, pending, directory,
     setJoined: (value: number) => { joined = value } }
 }
 
@@ -105,25 +118,32 @@ test('an automatic group candidate stays pending until a current administrator a
   assert.equal(wire.proposedBy.kind, 'model')
   assert.equal(wire.kind, 'group_rule')
   assert.equal(wire.sensitivity, 'group')
+  // Created while the notice window is on, so the consent it accepts is the group's own policy.
+  assert.equal(wire.consentRequirement, 'group_policy')
+  assert.match(wire.consentPolicyRef, /^policy:group-memory-auto-approval\.v1:[0-9a-f]{64}$/)
   assert.deepEqual(wire.sources.map((source: any) => source.sourceKind), ['group_history', 'group_history'])
   assert.deepEqual(wire.sources.map((source: any) => source.actor.userId), [ADMIN, MEMBERS[0]])
   assert.equal(Date.parse(wire.suggestedRetention.validUntil) > Date.parse(wire.proposedAt), true)
   assert.equal((await f.recall('刷屏')).candidates?.length ?? 0, 0)
+  // The group is told once, with the same short numbers the review command accepts.
+  assert.equal(f.notices.length, 1)
+  assert.match(f.notices[0]!, new RegExp(`^${GROUP}\\|`))
+  assert.match(f.notices[0]!, /^\d+\. 本群禁止刷屏 \[自动\]（公示后 24 小时内无人处理将自动保存）$/mu)
+  assert.match(f.notices[0]!, /#群记忆 通过 全部/)
   assert.match(await f.send('#群记忆 候选', MEMBERS[1]!), /只有当前群管理员/)
   const listed = await f.send('#群记忆 候选')
-  assert.match(listed, /\[自动\] 本群禁止刷屏/)
-  assert.match(listed, /前审核/)
-  const id = /@[0-9a-f]{8}/u.exec(listed)![0]
-  assert.match(await f.send(`#群记忆 通过 ${id}`, MEMBERS[1]!), /只有当前群管理员/)
+  assert.match(listed, /^1\. 本群禁止刷屏 \[自动\]/mu)
+  assert.doesNotMatch(listed, /@[0-9a-f]{8}/u)
+  assert.match(await f.send('#群记忆 通过 1', MEMBERS[1]!), /只有当前群管理员/)
   f.roles.set(ADMIN, 'member')
   // The cached event role is not authority; every review refreshes the current role.
-  assert.match(await f.send(`#群记忆 通过 ${id}`), /只有当前群管理员/)
+  assert.match(await f.send('#群记忆 通过 1'), /只有当前群管理员/)
   f.roles.set(ADMIN, 'admin')
-  assert.match(await f.send(`#群记忆 通过 ${id}`), /已保存当前群记忆：本群禁止刷屏/)
+  assert.match(await f.send('#群记忆 通过 1'), /已保存 1 条：\n本群禁止刷屏/)
   assert.equal(f.pending(), 0)
   const recalled = await f.recall('刷屏')
   assert.deepEqual(recalled.candidates.map((c: any) => c.text), ['本群禁止刷屏'])
-  assert.equal(recalled.candidates[0].consent, 'explicit')
+  assert.equal(recalled.candidates[0].consent, 'group_policy')
   assert.match(JSON.stringify(projectMemoryRetrievalContextV2(recalled)), /group_memory_record/)
   const memory = /@[0-9a-f]{8}/u.exec(await f.send('#群记忆 列表'))![0]
   assert.match(await f.send(`#群记忆 遗忘 ${memory}`), /已遗忘/)
@@ -152,30 +172,63 @@ test('rejected, duplicate and conflicting candidates never overwrite existing gr
   assert.equal(wire.conflict.relatedMemoryIds.length, 1)
   const listed = await f.send('#群记忆 候选')
   assert.match(listed, /与已有记录相近/)
-  const id = /@[0-9a-f]{8}/u.exec(listed)![0]
-  assert.match(await f.send(`#群记忆 拒绝 ${id}`), /已拒绝/)
+  assert.match(await f.send('#群记忆 拒绝 1'), /已拒绝 1 条/)
   assert.equal(f.db.prepare('SELECT count(*) AS n FROM heads').get()?.n, 1)
   assert.deepEqual((await f.recall('刷屏')).candidates.map((c: any) => c.text), ['本群禁止刷屏'])
 })
 
-test('classified culture candidates are reviewed through #群文化 by another administrator', async t => {
+test('a model culture candidate appears in one list and any current administrator may approve it', async t => {
   const f = await setup(t, { reply: () => JSON.stringify({ candidates: [
     { category: '梗说明', text: '本群使用“星球梗”指代熬夜', evidence: ['m1'], confidence: 0.9 },
     { category: '梗说明', text: '本群使用星球梗指代熬夜', evidence: ['m1', 'm2'], confidence: 0.9 }
   ] }) })
   await f.window([[ADMIN, '本群使用星球梗指代熬夜'], [MEMBERS[0]!, '哈哈对，星球梗就是指代熬夜']])
   assert.equal(f.pending(), 1)
-  assert.match(await f.send('#群记忆 候选'), /没有待审核/)
-  const listed = await f.send('#群文化 候选')
-  assert.match(listed, /\[自动\] 本群梗说明：本群使用星球梗指代熬夜/)
-  const id = /@[0-9a-f]{8}/u.exec(listed)![0]
-  assert.match(await f.send(`#群记忆 通过 ${id}`), /请使用“#群文化 通过/)
-  // The speaker whose message is the evidence cannot approve that culture description.
-  assert.match(await f.send(`#群文化 通过 ${id}`), /另一位当前管理员/)
-  assert.match(await f.send(`#群文化 通过 ${id}`, OTHER_ADMIN), /不代表全群共识/)
+  // Rule-class and culture-class candidates share one numbered list and one set of ordinals.
+  const merged = await f.send('#群记忆 候选')
+  assert.match(merged, /^1\. \[文化\] 本群梗说明：本群使用星球梗指代熬夜 \[自动\]/mu)
+  assert.match(await f.send('#群文化 候选'), /^1\. \[文化\] 本群梗说明：/mu)
+  // A model candidate has no self-nomination problem, so the evidence speaker may approve it.
+  const saved = await f.send('#群文化 通过 1')
+  assert.match(saved, /已保存 1 条/)
+  assert.match(saved, /不代表全群共识/)
   const recalled = await f.recall('星球梗')
   assert.equal(recalled.candidates.length, 1)
   assert.match(JSON.stringify(projectMemoryRetrievalContextV2(recalled)), /不证明全群共识/)
+})
+
+test('one command reviews several candidates and reports each refusal by number', async t => {
+  const f = await setup(t, { reply: () => JSON.stringify({ candidates: [
+    { category: '规则', text: '本群禁止刷屏', evidence: ['m1', 'm2'], confidence: 0.9 },
+    { category: '群体事实', text: '本群成立于2019年', evidence: ['m3', 'm4'], confidence: 0.9 },
+    { category: '梗说明', text: '本群使用星球梗指代熬夜', evidence: ['m5', 'm6'], confidence: 0.9 }
+  ] }) })
+  await f.window([[ADMIN, '本群禁止刷屏'], [MEMBERS[0]!, '本群禁止刷屏'],
+    [ADMIN, '本群成立于2019年'], [MEMBERS[1]!, '对，本群成立于2019年'],
+    [ADMIN, '本群使用星球梗指代熬夜'], [MEMBERS[2]!, '星球梗指代熬夜']])
+  assert.equal(f.pending(), 3)
+  assert.match(await f.send('#群记忆 通过 9'), /请使用候选列表里的编号/)
+  // A selected subset leaves the rest pending, and the remaining candidates renumber from one.
+  const some = await f.send('#群记忆 通过 1 3')
+  assert.match(some, /已保存 2 条/)
+  assert.match(some, /本群禁止刷屏/)
+  assert.match(some, /\[文化\] 本群梗说明/)
+  assert.equal(f.pending(), 1)
+  assert.match(await f.send('#群记忆 候选'), /^1\. 本群成立于2019年/mu)
+  assert.match(await f.send('#群记忆 拒绝 全部'), /已拒绝 1 条/)
+  assert.equal(f.pending(), 0)
+  assert.match(await f.send('#群记忆 通过 全部'), /当前群没有待审核的候选/)
+})
+
+test('an unreachable group notice leaves the candidate waiting for a person', async t => {
+  const f = await setup(t, { notify: () => { throw new Error('offline') } })
+  await f.window()
+  assert.equal(f.pending(), 1)
+  assert.equal(f.notices.length, 0)
+  assert.ok(f.diagnostics.some(item => item.stage === 'notice' && item.outcome === 'failed'))
+  // Nothing was announced, so the window never started and the candidate waits for an administrator.
+  assert.match(await f.send('#群记忆 候选'), /公示后 24 小时/)
+  assert.match(await f.send('#群记忆 通过 1'), /已保存 1 条/)
 })
 
 test('administrator and owner switches stop candidate generation before any model call', async t => {
@@ -378,4 +431,150 @@ test('daily caps hold per group and globally across groups', async t => {
   await fill('40005')
   assert.equal(scheduled(), 1)
   assert.equal(learner.inspect().bufferedMessages <= 20 * 2, true)
+})
+
+/**
+ * The notice window and implicit approval are time dependent, so these use the
+ * learner directly against a controlled clock instead of the production runtime.
+ */
+async function harness (t: TestContext, options: {
+  readonly candidates?: () => readonly unknown[]
+  readonly implicitApproval?: () => boolean
+  readonly notify?: () => void
+} = {}) {
+  const { createGroupMemoryLearningV1 } = await import('../../src/runtime/GroupMemoryLearning.js')
+  const { openGroupMemoryPolicyStoreV1 } = await import('../../src/runtime/GroupMemoryPolicy.js')
+  const { openSqliteMemoryDatabaseV3 } = await import('../../src/agent/memory/sqlite-memory-database.js')
+  const { createSqliteMemoryLifecycleAdapterV1 } = await import('../../src/agent/memory/sqlite-memory-lifecycle.js')
+  const { createMemoryLifecyclePortV1 } = await import('../../src/agent/memory/memory-lifecycle-port.js')
+  const directory = mkdtempSync(path.join(tmpdir(), 'groupmate-group-learning-notice-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const clock = { now: Date.parse('2026-10-28T01:00:00.000Z') }
+  const now = () => new Date(clock.now).toISOString()
+  const canonical = openSqliteMemoryDatabaseV3({ location: path.join(directory, 'canonical.sqlite'), now, manifests: [] })
+  t.after(() => canonical.close())
+  const policy = openGroupMemoryPolicyStoreV1(path.join(directory, 'policy.sqlite'))
+  t.after(() => policy.close())
+  const adapter = createSqliteMemoryLifecycleAdapterV1({ database: canonical.database, now })
+  const lifecycle = createMemoryLifecyclePortV1({ now, execute: adapter.execute })
+  const notices: string[] = []
+  const stages: any[] = []
+  const bot = { sendApi: async (_method: string, input: any) => ({ user_id: input.user_id, role: 'member', join_time: 1700000000 }) }
+  let batch = 0
+  const learner = createGroupMemoryLearningV1({ botInstanceId: 'groupmate-production', database: canonical.database,
+    policy, lifecycle, bot: () => bot, enabled: () => true, now,
+    implicitApprovalEnabled: options.implicitApproval ?? (() => true),
+    notify: async (_bot, groupId, text) => { options.notify?.(); notices.push(`${groupId}|${text}`) },
+    onDiagnostic: value => stages.push(value),
+    limits: { groupCooldownMs: 1_000, groupDailyExtractions: 10 },
+    model: { model: () => 'test-model', adapter: { complete: async () => {
+      batch += 1
+      return turn(JSON.stringify({ candidates: options.candidates?.() ??
+        [{ category: '规则', text: `本群禁止刷屏第${batch}条`, evidence: ['m1', 'm2'], confidence: 0.9 }] }))
+    } } } })
+  t.after(async () => await learner.close())
+  let sequence = 0
+  const say = (userId: string, text: string) => {
+    learner.observe({ isGroup: true, self_id: BOT, group_id: GROUP, user_id: userId,
+      message_id: `notice-${++sequence}`, msg: text, sender: { user_id: userId } })
+  }
+  const window = async (lines: readonly [string, string][]) => {
+    for (const [userId, text] of lines) say(userId, text)
+    for (let i = lines.length; i < 20; i += 1) say(MEMBERS[i % MEMBERS.length]!, `普通闲聊第${sequence}句`)
+    await learner.waitForIdle()
+  }
+  const rows = (state = 'pending') => canonical.database
+    .prepare('SELECT proposal_id, state, proposal_wire FROM proposals WHERE state = ?').all(state)
+  const heads = () => canonical.database.prepare(`SELECT json_extract(p.revision_wire, '$.record.text') AS text,
+      json_extract(p.revision_wire, '$.record.consent.state') AS consent,
+      json_extract(p.revision_wire, '$.record.consent.approvedByActorRef') AS approver
+    FROM heads h JOIN revision_payloads p ON p.memory_id = h.memory_id AND p.revision = h.current_revision`).all()
+  return { learner, canonical, policy, clock, notices, stages, say, window, rows, heads }
+}
+
+test('an announced candidate saves itself once the veto window passes', async t => {
+  const f = await harness(t)
+  await f.window([[ADMIN, '本群禁止刷屏第1条'], [MEMBERS[0]!, '对，本群禁止刷屏第1条']])
+  assert.equal(f.rows().length, 1)
+  assert.equal(f.notices.length, 1)
+  const proposer = JSON.parse(String(f.rows()[0]!.proposal_wire)).initiatedByActorRef
+  // Inside the window an ordinary message triggers no approval.
+  f.clock.now += 6 * 3_600_000
+  f.say(MEMBERS[1]!, '随便聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows().length, 1)
+  assert.equal(f.heads().length, 0)
+  f.clock.now += 19 * 3_600_000
+  f.say(MEMBERS[1]!, '又聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows().length, 0)
+  assert.equal(f.rows('approved').length, 1)
+  const head = f.heads()[0]!
+  assert.equal(head.text, '本群禁止刷屏第1条')
+  // The authority is the owner's standing policy, recorded as a distinct non-human approver.
+  assert.equal(head.consent, 'group_policy')
+  assert.match(String(head.approver), /^actor:[0-9a-f]{64}$/)
+  assert.notEqual(head.approver, proposer)
+  assert.equal(f.learner.inspect().implicitApprovals, 1)
+  assert.deepEqual(f.stages.filter(item => item.stage === 'approval'),
+    [{ stage: 'approval', outcome: 'accepted', candidates: 1 }])
+})
+
+test('rejection inside the window and a closed group both stop implicit approval', async t => {
+  const f = await harness(t)
+  await f.window([[ADMIN, '本群禁止刷屏第1条'], [MEMBERS[0]!, '对，本群禁止刷屏第1条']])
+  assert.equal(f.rows().length, 1)
+  // Clearing the group's buffer also clears its notice window.
+  f.learner.discard('10001', GROUP)
+  f.clock.now += 25 * 3_600_000
+  f.say(MEMBERS[1]!, '随便聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows().length, 1)
+  assert.equal(f.heads().length, 0)
+})
+
+test('the owner switch turns the window off and candidates fall back to explicit approval', async t => {
+  let implicit = true
+  const f = await harness(t, { implicitApproval: () => implicit })
+  await f.window([[ADMIN, '本群禁止刷屏第1条'], [MEMBERS[0]!, '对，本群禁止刷屏第1条']])
+  assert.equal(JSON.parse(String(f.rows()[0]!.proposal_wire)).consentRequirement, 'group_policy')
+  implicit = false
+  f.clock.now += 25 * 3_600_000
+  f.say(MEMBERS[1]!, '随便聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows().length, 1)
+  assert.equal(f.heads().length, 0)
+  // A candidate created with the window off only ever accepts an administrator's message.
+  // The sweep trigger above must age out of the buffer first, or it would shift the evidence numbering.
+  f.clock.now += 7 * 3_600_000
+  await f.window([[ADMIN, '本群禁止刷屏第2条'], [MEMBERS[0]!, '对，本群禁止刷屏第2条']])
+  const created = f.rows().map(row => JSON.parse(String(row.proposal_wire)))
+  assert.deepEqual(created.map(value => value.consentRequirement).sort(), ['explicit', 'group_policy'])
+  assert.equal(created.find(value => value.consentRequirement === 'explicit').consentPolicyRef, null)
+})
+
+test('a candidate marked as conflicting always waits for a person', async t => {
+  let batch = 0
+  const f = await harness(t, { candidates: () => {
+    batch += 1
+    return [{ category: '规则', text: batch === 1 ? '本群禁止刷屏' : '本群禁止在晚上刷屏',
+      evidence: ['m1', 'm2'], confidence: 0.9 }]
+  } })
+  await f.window([[ADMIN, '本群禁止刷屏'], [MEMBERS[0]!, '对，本群禁止刷屏']])
+  f.clock.now += 25 * 3_600_000
+  f.say(MEMBERS[1]!, '随便聊一句')
+  await f.learner.waitForIdle()
+  assert.deepEqual(f.heads().map(row => row.text), ['本群禁止刷屏'])
+  // The sweep trigger above must age out of the buffer before the next window is collected.
+  f.clock.now += 7 * 3_600_000
+  await f.window([[ADMIN, '本群禁止在晚上刷屏'], [MEMBERS[0]!, '对，本群禁止在晚上刷屏']])
+  const pending = f.rows()
+  assert.equal(pending.length, 1)
+  assert.equal(JSON.parse(String(pending[0]!.proposal_wire)).conflict.state, 'possible')
+  assert.match(f.notices.at(-1)!, /与已有记录相近，需管理员确认/)
+  f.clock.now += 25 * 3_600_000
+  f.say(MEMBERS[1]!, '再聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows().length, 1)
+  assert.equal(f.heads().length, 1)
 })

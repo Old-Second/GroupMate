@@ -42,6 +42,9 @@ export async function initializeProductionPersonalMemoryRuntimeV1(options) {
         ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission }),
         ...(options.derivedIndexFailure === undefined ? {} : { derivedIndexFailure: options.derivedIndexFailure }),
         ...(options.groupLearningEnabled === undefined ? {} : { groupLearningEnabled: options.groupLearningEnabled }),
+        ...(options.groupLearningImplicitApproval === undefined
+            ? {}
+            : { groupLearningImplicitApproval: options.groupLearningImplicitApproval }),
         ...(options.groupLearningDiagnostic === undefined ? {} : { groupLearningDiagnostic: options.groupLearningDiagnostic })
     }));
 }

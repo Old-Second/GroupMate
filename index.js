@@ -1297,6 +1297,7 @@ try {
       event: 'groupmate.personal_memory.lexical_rebuild_failure', operation
     })),
     groupLearningEnabled: () => Config.groupMemoryLearningEnabled !== false,
+    groupLearningImplicitApproval: () => Config.groupMemoryAutoApprovalEnabled !== false,
     groupLearningDiagnostic: diagnostic => runtimeLogger.info(Object.freeze({
       event: 'groupmate.group_memory.learning', ...diagnostic
     })),

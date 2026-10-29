@@ -186,6 +186,8 @@ const defaultConfig = {
   conversationPreferencesEnabled: true,
   // 群记忆自动候选：从群聊发现关于本群的稳定信息，只生成待管理员审核的候选；有独立模型用量。
   groupMemoryLearningEnabled: true,
+  // 自动候选公示期默示通过：机器人在群里公示候选，24 小时内无管理员处理则保存；关闭后必须管理员手动通过。
+  groupMemoryAutoApprovalEnabled: true,
   toolPrivateSendPolicy: 'master', // 工具发起私聊：disabled/master/everyone。
   toolCrossGroupSendPolicy: 'disabled', // 工具跨群发送：disabled/master/everyone。
   enableToolVideoDownload: false, // 是否允许智能模式下载并发送视频文件。默认只发链接和信息。

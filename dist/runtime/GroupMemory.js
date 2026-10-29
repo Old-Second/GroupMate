@@ -8,18 +8,19 @@ import { createMemoryExportCommandV1, memoryExportStableResultHashV1 } from '../
 import { createMemoryLifecycleAuthorityRootV1, issueMemoryLifecycleActorCapabilityV1 } from '../agent/memory/memory-lifecycle-authority.js';
 import { buildMemoryCorrectionBundleV1, buildMemoryProposalApprovalBundleV1, buildMemoryProposalDraftV2, buildMemoryRenewalBundleV1 } from '../agent/memory/memory-lifecycle-builder.js';
 import { createMemoryLifecycleCommandV1 } from '../agent/memory/memory-lifecycle-command.js';
-import { MEMORY_PROPOSAL_DEADLINE_DAYS_V2 } from '../agent/memory/memory-lifecycle-domain.js';
 import { memoryNamespaceRefV1, parseMemoryNamespaceV1 } from '../agent/memory/memory-namespace.js';
 import { MEMORY_RESOURCE_LIMITS, memoryTextWithinLimits } from '../agent/memory/memory-resource-limits.js';
 import { parseMemoryRetrievalRequestV2, retrieveMemoryV2 } from '../agent/memory/memory-retrieval.js';
 import { createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js';
+import { groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1 } from './group-memory-candidates.js';
 const ADMIN_ACTIONS = [
     'propose_create', 'list_safe', 'inspect_full', 'approve', 'reject', 'correct', 'renew', 'forget'
 ];
 const HELP = ['群记忆命令：',
     '#群记忆 状态', '#群记忆 开启 / 关闭（群管理员；默认开启）',
     '#群记忆 列表 [页码]', '#群记忆 记住 <规则|共同偏好|文化|群体事实> <以本群或我们群开头的内容>',
-    '#群记忆 候选（群管理员；含从群聊自动发现的待审核候选）', '#群记忆 通过 / 拒绝 <@编号>（群管理员）',
+    '#群记忆 候选（群管理员；一个列表列出全部待审候选，含从群聊自动发现的）',
+    '#群记忆 通过 / 拒绝 <编号…|全部>（群管理员；编号用候选列表里的 1、2、3）',
     '#群记忆 更正 <@编号> <新内容>', '#群记忆 续期 <@编号> [天数]',
     '#群记忆 遗忘 <@编号>', '#群记忆 导出（群主，私发文件）',
     '#群记忆 删除全部 确认（群主）',
@@ -135,7 +136,8 @@ export function createGroupMemoryV1(options) {
             normalizedText: boundedExcerpt(text), observedAt: now, resourceRefs: [] });
         return { namespace, namespaceRef, generation, accountId, now, actorRef, access, actor, source, role };
     };
-    const ref = (auth, op) => `command:${digest(`${auth.source.sourceId}\0${auth.access.sceneRef}\0${op}`)}`;
+    // One command may review several candidates, so the aggregate discriminates the command ref.
+    const ref = (auth, op, aggregate = '') => `command:${digest(`${auth.source.sourceId}\0${auth.access.sceneRef}\0${op}\0${aggregate}`)}`;
     const controlBase = (auth) => ({ schemaVersion: 1, botInstanceId: options.botInstanceId,
         accountId: auth.accountId, sceneRef: auth.access.sceneRef, namespaceRef: auth.namespaceRef,
         generation: auth.generation, actorRef: auth.actorRef, access: auth.access, actor: auth.actor });
@@ -150,8 +152,8 @@ export function createGroupMemoryV1(options) {
         if (auth.role === 'member')
             throw new GroupMemoryError('只有当前群管理员或群主可以修改群记忆。');
     };
-    const mutate = async (auth, operation, material, before) => {
-        const command = createMemoryLifecycleCommandV1({ commandRef: ref(auth, operation), operation,
+    const mutate = async (auth, operation, material, before, authority, aggregate = '') => {
+        const command = createMemoryLifecycleCommandV1({ commandRef: ref(auth, operation, aggregate), operation,
             initiatedByActorRef: auth.actorRef, namespaceRef: auth.namespaceRef,
             expectedNamespaceGeneration: auth.generation,
             aggregateRef: before === undefined ? null : 'proposalId' in before ? before.proposalId : before.memoryId,
@@ -163,7 +165,7 @@ export function createGroupMemoryV1(options) {
             newPurgeAt: operation === 'record.renew' && material !== null && 'kind' in material && material.kind === 'revision_change_v1'
                 ? material.revision.record.retention.purgeAt : null, material });
         const result = await options.lifecycle.execute({ schemaVersion: 1, command, access: auth.access,
-            authority: { kind: 'actor', capability: auth.actor } });
+            authority: authority ?? { kind: 'actor', capability: auth.actor } });
         if (!['stored', 'unchanged', 'deletion_pending', 'deletion_complete'].includes(result.status)) {
             throw new GroupMemoryError(result.status === 'conflict' ? '群记忆已发生变化，请重新查看后再操作。' : '群记忆操作未完成，请核实权限、容量和有效期。');
         }
@@ -246,58 +248,55 @@ export function createGroupMemoryV1(options) {
             ? '当前群的群文化已开启；群记忆仍处于关闭状态，需先发送“#群记忆 开启”才会生效。'
             : `当前群的${label}已开启。`;
     };
-    const cultureProposal = async (auth, selector) => {
-        const result = await pendingProposal(auth, selector);
-        if (result.kind !== 'group_culture' || cultureKindV1(result.text) === null) {
-            throw new GroupMemoryError('这不是当前群可审核的文化候选。');
+    const requireWritable = (event) => {
+        if (!memoryEnabled(event)) {
+            throw new GroupMemoryError('当前群记忆已由管理员关闭；群管理员可发送“#群记忆 开启”恢复。');
         }
-        return result;
     };
-    const pendingProposal = async (auth, selector) => {
-        if (!/^@[0-9a-f]{8}$/u.test(selector))
-            throw new GroupMemoryError('请使用候选列表里的唯一 @编号。');
-        const matches = options.database.prepare(`SELECT proposal_id FROM proposals
-      WHERE namespace_ref = ? AND namespace_generation = ? AND state = 'pending'
-      AND substr(proposal_id, -8) = ? LIMIT 2`).all(auth.namespaceRef, auth.generation, selector.slice(1));
-        if (matches.length !== 1)
-            throw new GroupMemoryError('候选不存在或编号不唯一。');
-        const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect',
-            proposalId: String(matches[0].proposal_id) });
+    const implicitApproval = () => {
+        try {
+            return options.implicitApprovalEnabled?.() ?? false;
+        }
+        catch {
+            return false;
+        }
+    };
+    const candidateRows = (auth, culture) => listGroupMemoryCandidateRowsV1(options.database, auth.namespaceRef, auth.generation, Date.parse(auth.now))
+        .filter(row => !culture || row.culture);
+    /** Resolves `1`, a legacy `@3f9a1b2c` or `全部` against one ordered snapshot of the pending list. */
+    const selectCandidates = (auth, body, culture) => {
+        const rows = candidateRows(auth, culture);
+        if (rows.length === 0)
+            throw new GroupMemoryError('当前群没有待审核的候选。');
+        const selectors = body.split(/\s+/u).filter(value => value !== '');
+        if (selectors.length === 1 && (selectors[0] === '全部' || selectors[0] === '所有'))
+            return rows;
+        if (selectors.length > rows.length)
+            throw new GroupMemoryError('编号数量超出候选列表。');
+        const picked = new Map();
+        for (const selector of selectors) {
+            const legacy = /^@[0-9a-f]{8}$/u.exec(selector) === null ? []
+                : rows.filter(row => row.proposalId.slice(-8) === selector.slice(1));
+            const row = /^[1-9][0-9]?$/u.test(selector) ? rows.find(item => item.ordinal === Number(selector))
+                : legacy.length === 1 ? legacy[0] : undefined;
+            if (row === undefined)
+                throw new GroupMemoryError('请使用候选列表里的编号（1、2、3），或“全部”。');
+            picked.set(row.proposalId, row);
+        }
+        return [...picked.values()];
+    };
+    const pendingProposal = async (auth, proposalId) => {
+        const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect', proposalId });
         if (result.status !== 'found' || result.operation !== 'proposal.inspect' ||
             result.effectiveState !== 'pending')
             throw new GroupMemoryError('候选不存在或已过期。');
         return result.value;
     };
-    /** Model candidates and member proposals both enter pending; labels let administrators tell them apart. */
-    const candidateLine = (proposal) => {
-        const origin = proposal.proposedBy.kind === 'model' ? '[自动]' : '[成员提议]';
-        const conflict = proposal.conflict.state === 'none' ? '' : '（与已有记录相近，请核对）';
-        const until = new Date(Date.parse(proposal.proposedAt) + MEMORY_PROPOSAL_DEADLINE_DAYS_V2 * 86400000)
-            .toISOString().slice(0, 10);
-        return `@${proposal.proposalId.slice(-8)} ${origin} ${[...proposal.text].slice(0, 120).join('')}${conflict}（${until} 前审核）`;
-    };
-    const listCandidates = async (auth, culture) => {
-        const rows = options.database.prepare(`SELECT proposal_id FROM proposals WHERE namespace_ref = ?
-      AND namespace_generation = ? AND state = 'pending' AND proposed_at_ms > ?
-      AND (? = 0 OR json_extract(proposal_wire, '$.kind') = 'group_culture')
-      ORDER BY proposed_at_ms, proposal_id LIMIT 32`).all(auth.namespaceRef, auth.generation, Date.parse(auth.now) - MEMORY_PROPOSAL_DEADLINE_DAYS_V2 * 86400000, culture ? 1 : 0);
-        const items = [];
-        for (const row of rows) {
-            const result = await options.control.execute({ ...controlBase(auth), operation: 'proposal.inspect', proposalId: String(row.proposal_id) });
-            if (result.status !== 'found' || result.operation !== 'proposal.inspect' || result.effectiveState !== 'pending')
-                continue;
-            const proposal = result.value;
-            // Classified culture is reviewed through #群文化 so its own switch and subtype rule apply.
-            if ((cultureKindV1(proposal.text) !== null) !== culture)
-                continue;
-            items.push(candidateLine(proposal));
-        }
-        return items;
-    };
     const approveProposal = async (auth, proposal) => {
-        // Administrators may save rules directly, so a model candidate needs only a current administrator.
-        // Classified culture always needs someone other than its proposer and its quoted speakers.
-        if ((proposal.proposedBy.kind === 'user' || cultureKindV1(proposal.text) !== null) &&
+        // A member proposal still needs someone other than its proposer and its quoted speakers.
+        // A model candidate has no self-nomination problem: its evidence is ordinary group chat and an
+        // administrator may save the same sentence directly, so any current administrator can approve it.
+        if (proposal.proposedBy.kind === 'user' &&
             (proposal.initiatedByActorRef === auth.actorRef ||
                 proposal.sources.some(source => source.actor.userId === auth.source.actor.userId))) {
             throw new GroupMemoryError('该候选需要另一位当前管理员审核，不能自行通过。');
@@ -313,12 +312,58 @@ export function createGroupMemoryV1(options) {
                 throw new GroupMemoryError('该类别已有文化描述，候选保持待审核。请明确更正或遗忘旧描述后再审核，不能覆盖。');
             }
         }
-        const approval = buildMemoryProposalApprovalBundleV1({ commandRef: ref(auth, 'proposal.approve'), operation: 'proposal.approve',
+        const policyConsent = proposal.consentRequirement !== 'explicit';
+        const approval = buildMemoryProposalApprovalBundleV1({ commandRef: ref(auth, 'proposal.approve', proposal.proposalId), operation: 'proposal.approve',
             namespaceRef: auth.namespaceRef, namespaceGeneration: auth.generation, proposal,
-            approvedByActorRef: auth.actorRef, freshNow: auth.now, evidenceSource: auth.source, reason: null });
-        await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal);
+            approvedByActorRef: auth.actorRef, freshNow: auth.now,
+            // Candidates created while the notice window is on carry `group_policy` consent, which admits
+            // no message source; the administrator applies that policy early rather than granting consent.
+            evidenceSource: policyConsent ? null : auth.source,
+            reason: policyConsent ? '群管理员在公示期内确认自动候选' : null });
+        await mutate(auth, 'proposal.approve', approval.consentEvidence, proposal, policyConsent
+            ? { kind: 'policy', capability: issueGroupMemoryPolicyApprovalCapabilityV1(root, {
+                    proposal, namespace: auth.namespace, namespaceRef: auth.namespaceRef, generation: auth.generation,
+                    botInstanceId: options.botInstanceId, accountId: auth.accountId, sceneRef: auth.access.sceneRef,
+                    actorRef: auth.actorRef, actorUserId: auth.source.actor.userId, now: auth.now
+                }) }
+            : undefined, proposal.proposalId);
     };
-    const cultureCommand = async (auth, body, reply) => {
+    /** One command reviews several candidates; each outcome is echoed by text, never by ordinal alone. */
+    const reviewCandidates = async (auth, body, approve, culture, event, reply) => {
+        requireAdmin(auth);
+        const rows = selectCandidates(auth, body, culture);
+        const done = [];
+        const failed = [];
+        let savedCulture = false;
+        for (const row of rows) {
+            try {
+                const proposal = await pendingProposal(auth, row.proposalId);
+                if (!approve) {
+                    await mutate(auth, 'proposal.reject', null, proposal, undefined, proposal.proposalId);
+                }
+                else {
+                    requireWritable(event);
+                    if (row.culture && !cultureEnabled(event)) {
+                        throw new GroupMemoryError('当前群文化已由管理员关闭；群管理员可发送“#群文化 开启”后再审核文化候选。');
+                    }
+                    await approveProposal(auth, proposal);
+                    savedCulture = savedCulture || row.culture;
+                }
+                done.push(`${row.culture ? '[文化] ' : ''}${proposal.text}`);
+            }
+            catch (error) {
+                failed.push(`${row.ordinal}. ${error instanceof GroupMemoryError ? error.message : '操作未完成。'}`);
+            }
+        }
+        const verb = approve ? '已保存' : '已拒绝';
+        const lines = done.length === 0 ? [] : [`${verb} ${done.length} 条：`, ...done];
+        if (savedCulture)
+            lines.push('文化描述仅作参考，不代表全群共识或群规则。');
+        if (failed.length > 0)
+            lines.push(`${done.length === 0 ? '' : '\n'}未处理 ${failed.length} 条：`, ...failed);
+        await reply(lines.join('\n'));
+    };
+    const cultureCommand = async (auth, body, event, reply) => {
         let match = /^提议\s+(主题偏好|语言约定|梗说明)\s+([\s\S]+)$/u.exec(body);
         if (match !== null) {
             const kind = Object.keys(CULTURE_LABELS).find(k => CULTURE_LABELS[k] === match[1]);
@@ -333,26 +378,20 @@ export function createGroupMemoryV1(options) {
                 confidence: 0.5, sensitivity: 'group', conflict: { state: 'none', relatedMemoryIds: [], note: null },
                 customTtlDays: CULTURE_TTL_DAYS[kind], consentRequirement: 'explicit', consentPolicyRef: null, consentPolicyGeneration: null });
             await mutate(auth, 'proposal.create', proposal);
-            await reply(`已提交文化候选 @${proposal.proposalId.slice(-8)}，待另一位管理员审核；尚未保存为可召回记忆，也不代表群共识。`);
+            await reply('已提交文化候选，待另一位管理员审核；发送“#群文化 候选”查看编号。尚未保存为可召回记忆，也不代表群共识。');
             return true;
         }
         if (body === '候选') {
             requireAdmin(auth);
-            const items = await listCandidates(auth, true);
-            await reply(items.length === 0 ? '当前群没有文化候选。' : `当前群文化候选（[自动] 来自群聊，仅供审核）：\n${items.join('\n')}`);
+            const items = candidateRows(auth, true).map(row => groupMemoryCandidateLineV1(row, implicitApproval()));
+            await reply(items.length === 0 ? '当前群没有文化候选。'
+                : `当前群文化候选（编号与“#群记忆 候选”一致；[自动] 来自群聊，仅供审核）：\n${items.join('\n')}\n` +
+                    '审核：#群文化 通过 1 3 / #群文化 拒绝 全部');
             return true;
         }
-        match = /^(通过|拒绝)\s+(\S+)$/u.exec(body);
+        match = /^(通过|拒绝)\s+([\s\S]+)$/u.exec(body);
         if (match !== null) {
-            requireAdmin(auth);
-            const proposal = await cultureProposal(auth, match[2]);
-            if (match[1] === '拒绝') {
-                await mutate(auth, 'proposal.reject', null, proposal);
-                await reply('已拒绝当前群的文化候选。');
-                return true;
-            }
-            await approveProposal(auth, proposal);
-            await reply('已保存当前群的文化描述；仅作参考，不代表全群共识或群规则。');
+            await reviewCandidates(auth, match[2], match[1] === '通过', true, event, reply);
             return true;
         }
         return false;
@@ -388,14 +427,14 @@ export function createGroupMemoryV1(options) {
                 if (isCulture && !cultureEnabled(event)) {
                     throw new GroupMemoryError('当前群文化或群记忆已由管理员关闭；群管理员可发送“#群文化 开启”或“#群记忆 开启”恢复。');
                 }
-                if (isCulture && await cultureCommand(auth, body, request.replyText))
+                if (isCulture && await cultureCommand(auth, body, event, request.replyText))
                     return true;
                 if (isCulture && !/^(?:列表|更正|续期|遗忘|帮助|状态|$)/u.test(body)) {
-                    await request.replyText('群文化命令：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号；列表；更正/续期/遗忘 @编号；状态；开启/关闭（群管理员）。仅文字描述，不代表群共识。');
+                    await request.replyText('群文化命令：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 <编号…|全部>；列表；更正/续期/遗忘 @编号；状态；开启/关闭（群管理员）。仅文字描述，不代表群共识。');
                     return true;
                 }
                 if (body === '帮助' || body === '') {
-                    await request.replyText(isCulture ? '群文化：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 @编号。已保存的描述可用列表、更正、续期、遗忘管理；群管理员可开启/关闭，默认开启；不代表群共识。' : HELP);
+                    await request.replyText(isCulture ? '群文化：提议 <主题偏好|语言约定|梗说明> <本群…>；候选；通过/拒绝 <编号…|全部>。已保存的描述可用列表、更正、续期、遗忘管理；群管理员可开启/关闭，默认开启；不代表群共识。' : HELP);
                 }
                 else if (/^列表(?:\s+[1-9][0-9]{0,2})?$/u.test(body)) {
                     const page = Number(body.split(/\s+/u)[1] ?? 1);
@@ -455,35 +494,20 @@ export function createGroupMemoryV1(options) {
                 }
                 else {
                     requireAdmin(auth);
-                    // A closed group keeps list, forget, export and delete-all; it accepts no new or changed content.
-                    const requireWritable = () => {
-                        if (!memoryEnabled(event)) {
-                            throw new GroupMemoryError('当前群记忆已由管理员关闭；群管理员可发送“#群记忆 开启”恢复。');
-                        }
-                    };
                     let match = /^记住\s+(规则|共同偏好|文化|群体事实)\s+([\s\S]+)$/u.exec(body);
-                    const review = /^(通过|拒绝)\s+(\S+)$/u.exec(body);
+                    const review = /^(通过|拒绝)\s+([\s\S]+)$/u.exec(body);
                     if (body === '候选') {
-                        const items = await listCandidates(auth, false);
-                        await request.replyText(items.length === 0 ? '当前群没有待审核的群记忆候选。'
-                            : `当前群记忆候选（[自动] 来自群聊，模型生成不代表群共识；通过后才会召回）：\n${items.join('\n')}`);
+                        // One list for both kinds: administrators no longer have to check 群记忆 and 群文化 separately.
+                        const items = candidateRows(auth, false).map(row => groupMemoryCandidateLineV1(row, implicitApproval()));
+                        await request.replyText(items.length === 0 ? '当前群没有待审核的候选。'
+                            : `当前群待审候选（[自动] 来自群聊，模型生成不代表群共识；通过后才会召回）：\n${items.join('\n')}\n` +
+                                '审核：#群记忆 通过 1 3 / #群记忆 通过 全部 / #群记忆 拒绝 全部');
                     }
                     else if (review !== null) {
-                        const proposal = await pendingProposal(auth, review[2]);
-                        if (cultureKindV1(proposal.text) !== null)
-                            throw new GroupMemoryError('分类文化候选请使用“#群文化 通过/拒绝 @编号”审核。');
-                        if (review[1] === '拒绝') {
-                            await mutate(auth, 'proposal.reject', null, proposal);
-                            await request.replyText('已拒绝当前群的这条候选。');
-                        }
-                        else {
-                            requireWritable();
-                            await approveProposal(auth, proposal);
-                            await request.replyText(`已保存当前群记忆：${proposal.text}`);
-                        }
+                        await reviewCandidates(auth, review[2], review[1] === '通过', false, event, request.replyText);
                     }
                     else if (match !== null) {
-                        requireWritable();
+                        requireWritable(event);
                         const text = groupMemoryTextV1(match[2]);
                         if (cultureKindV1(text) !== null)
                             throw new GroupMemoryError('分类文化描述请使用群文化提议并由另一位管理员审核。');
@@ -504,7 +528,7 @@ export function createGroupMemoryV1(options) {
                         await request.replyText(`已保存当前群记忆：${text}`);
                     }
                     else if ((match = /^更正\s+(\S+)\s+([\s\S]+)$/u.exec(body)) !== null) {
-                        requireWritable();
+                        requireWritable(event);
                         const text = groupMemoryTextV1(match[2]);
                         const before = await revision(auth, match[1]);
                         if (isCulture && before.record.kind !== 'group_culture')
@@ -520,7 +544,7 @@ export function createGroupMemoryV1(options) {
                         await request.replyText('当前群记忆已更正。');
                     }
                     else if ((match = /^续期\s+(\S+)(?:\s+([0-9]+))?$/u.exec(body)) !== null) {
-                        requireWritable();
+                        requireWritable(event);
                         const days = Number(match[2] ?? 30);
                         if (!Number.isSafeInteger(days) || days < 1 || days > 1825)
                             throw new GroupMemoryError('续期天数必须为 1 到 1825。');

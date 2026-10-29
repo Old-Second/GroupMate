@@ -76,6 +76,7 @@ import { createSqlitePersonalMemoryDeletionCleanupV1 } from '../agent/memory/sql
 import { createProductionShadowMemoryV1 } from './ProductionShadowMemory.js'
 import { createGroupMemoryV1 } from './GroupMemory.js'
 import { createGroupMemoryLearningV1 } from './GroupMemoryLearning.js'
+import { sendYunzaiGroupMessage } from './yunzai-bot-registry.js'
 import { openGroupMemoryPolicyStoreV1, type GroupMemoryPolicyStoreV1 } from './GroupMemoryPolicy.js'
 import { parseMemoryRetrievalResultV2, type MemoryRetrievalCandidateV2 } from '../agent/memory/memory-retrieval.js'
 import { createProductionMemoryRetentionV1 } from './ProductionMemoryRetention.js'
@@ -716,6 +717,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         maxTokens: boundedInteger(options.recallMaxTokens, DEFAULT_RECALL_TOKENS, MAX_RECALL_TOKENS), maxBytes: 32768
       }),
       recallTimeoutMs: () => boundedInteger(options.recallTimeoutMs, DEFAULT_RECALL_TIMEOUT_MS, MAX_RECALL_TIMEOUT_MS),
+      implicitApprovalEnabled: () => (options.groupLearningImplicitApproval?.() ?? true),
       // Resolved at call time; the learner is composed below and may be absent.
       discardObservedMessages: (accountId, groupId) => { groupLearning?.discard(accountId, groupId) }
     })
@@ -725,6 +727,9 @@ export async function createProductionPersonalMemoryRuntimeV1 (
         policy: groupPolicy, lifecycle, model: options.candidateModel, bot: options.candidateBot, now: nowIso,
         enabled: () => ['shadow', 'automatic'].includes(options.deploymentMode()) &&
           (options.groupLearningEnabled?.() ?? true),
+        implicitApprovalEnabled: () => (options.groupLearningImplicitApproval?.() ?? true),
+        rebuildLexical: async () => await projector.rebuild(),
+        notify: async (bot, groupId, text) => { await sendYunzaiGroupMessage(bot as Record<string, any>, groupId, text) },
         ...(options.groupLearningDiagnostic === undefined ? {} : { onDiagnostic: options.groupLearningDiagnostic })
       })
     let closed = false

@@ -173,14 +173,17 @@ test('culture requires independent current admin review and remains descriptive 
   const f = await fixture(t)
   f.setRole('member')
   const proposed = await f.send('#群文化 提议 主题偏好 本群偏好讨论望远镜')
-  const proposal = /@[0-9a-f]{8}/u.exec(proposed)![0]
   assert.match(proposed, /尚未保存/)
   assert.equal((await f.recall('望远镜')).candidates?.length ?? 0, 0)
-  assert.match(await f.send(`#群文化 通过 ${proposal}`, '40004', '30003'), /只有当前群/)
+  assert.match(await f.send('#群文化 通过 1', '40004', '30003'), /只有当前群/)
   f.setRole('admin')
-  assert.match(await f.send(`#群文化 通过 ${proposal}`), /不能自行通过/)
-  assert.match(await f.send('#群文化 候选'), /望远镜/)
-  assert.match(await f.send(`#群文化 通过 ${proposal}`, '40004', '30003'), /不代表全群共识/)
+  assert.match(await f.send('#群文化 通过 1'), /不能自行通过/)
+  const list = await f.send('#群文化 候选')
+  assert.match(list, /望远镜/)
+  // Short ordinals replace the eight hex digit handle, and both review surfaces number them alike.
+  assert.match(list, /^1\. \[文化\] /mu)
+  assert.doesNotMatch(list, /@[0-9a-f]{8}/u)
+  assert.match(await f.send('#群文化 通过 1', '40004', '30003'), /不代表全群共识/)
   const recalled = await f.recall('望远镜')
   assert.equal(recalled.candidates.length, 1)
   const culture = projectCultureRecordV1(recalled.candidates[0])!
@@ -198,7 +201,8 @@ test('culture requires independent current admin review and remains descriptive 
 
 test('culture conflict remains pending; explicit correction, renewal, forgetting and authority invalidation work', async t => {
   const f = await fixture(t)
-  const propose = async (text: string) => /@[0-9a-f]{8}/u.exec(await f.send(`#群文化 提议 语言约定 ${text}`))![0]
+  // A single pending candidate is always ordinal 1; approving or rejecting it renumbers the rest.
+  const propose = async (text: string) => { await f.send(`#群文化 提议 语言约定 ${text}`); return '1' }
   const first = await propose('本群使用短句')
   await f.send(`#群文化 通过 ${first}`, '40004', '30003')
   const initial = await f.recall('短句')
@@ -249,11 +253,13 @@ test('culture pending and approved caps are atomic canonical limits without redu
   }
   assert.match(await f.send('#群文化 提议 梗说明 本群使用第32种星球梗'), /未完成/)
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 32)
-  const candidate = /@[0-9a-f]{8}/u.exec(await f.send('#群文化 候选'))![0]
-  assert.match(await f.send(`#群文化 拒绝 ${candidate}`), /已拒绝/)
+  const candidates = await f.send('#群文化 候选')
+  // The list is bounded at 16 lines so one group message stays readable; the rest surface after review.
+  assert.equal(candidates.match(/^\d+\. /gmu)?.length, 16)
+  assert.match(await f.send('#群文化 拒绝 1'), /已拒绝 1 条/)
   assert.match(await f.send('#群文化 提议 梗说明 本群使用新星球梗'), /已提交/)
-  for (const row of f.db.prepare("SELECT proposal_id FROM proposals WHERE state = 'pending'").all()) {
-    await f.send(`#群文化 拒绝 @${String(row.proposal_id).slice(-8)}`)
+  while (Number(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n) > 0) {
+    assert.match(await f.send('#群文化 拒绝 全部'), /已拒绝/)
   }
   for (let i = 0; i < 64; i += 1) {
     // Existing manual admin assertions retain their semantics; they also obey the shared culture cap.
@@ -268,8 +274,8 @@ test('culture pending and approved caps are atomic canonical limits without redu
 
 test('culture disabled recall and live dependency authority fail closed while legacy culture remains', async t => {
   const f = await fixture(t)
-  const proposal = /@[0-9a-f]{8}/u.exec(await f.send('#群文化 提议 主题偏好 本群喜欢讨论望远镜'))![0]
-  await f.send(`#群文化 通过 ${proposal}`, '40004', '30003')
+  await f.send('#群文化 提议 主题偏好 本群喜欢讨论望远镜')
+  await f.send('#群文化 通过 1', '40004', '30003')
   await f.send('#群记忆 记住 文化 本群每周读科幻小说')
   const initial = await f.recall('望远镜')
   const refs = initial.candidates.map((c: any) => ({ namespaceRef: c.namespaceRef, memoryId: c.memoryId,

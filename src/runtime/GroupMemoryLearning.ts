@@ -5,15 +5,16 @@ import { createMemoryAccessCapabilityIssuerV1, issueMemoryAccessCapabilityV1 } f
 import { memoryCredentialRejectionReasonV1 } from '../agent/memory/memory-candidate-pipeline.js'
 import { createMemorySourceV1, createQqIdentitySnapshotV1, type MemoryKindV1, type MemorySourceV1 } from '../agent/memory/memory-domain.js'
 import { createMemoryLifecycleAuthorityRootV1, issueMemoryLifecycleActorCapabilityV1 } from '../agent/memory/memory-lifecycle-authority.js'
-import { buildMemoryProposalDraftV2 } from '../agent/memory/memory-lifecycle-builder.js'
+import { buildMemoryProposalApprovalBundleV1, buildMemoryProposalDraftV2 } from '../agent/memory/memory-lifecycle-builder.js'
 import { createMemoryLifecycleCommandV1 } from '../agent/memory/memory-lifecycle-command.js'
-import { MEMORY_PROPOSAL_DEADLINE_DAYS_V2 } from '../agent/memory/memory-lifecycle-domain.js'
+import { MEMORY_PROPOSAL_DEADLINE_DAYS_V2, parseMemoryProposalV2 } from '../agent/memory/memory-lifecycle-domain.js'
 import type { MemoryLifecyclePortV1 } from '../agent/memory/memory-lifecycle-port.js'
 import { memoryNamespaceRefV1, parseMemoryNamespaceV1, type MemoryNamespaceV1 } from '../agent/memory/memory-namespace.js'
 import type { MemoryCandidateModelV1 } from '../agent/memory/OpenAiMemoryCandidateExtractor.js'
 import { calculateModelCost } from '../agent/model/model-cost.js'
 import { groupMemoryTextV1 } from './GroupMemory.js'
-import type { GroupMemoryPolicyStoreV1 } from './GroupMemoryPolicy.js'
+import { GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1, groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1 } from './group-memory-candidates.js'
+import type { GroupMemoryPolicyStoreV1, GroupMemoryPolicyV1 } from './GroupMemoryPolicy.js'
 import { createYunzaiSceneParticipantDirectoryV1 } from './yunzai-scene-participant-directory.js'
 
 export const GROUP_MEMORY_LEARNING_LIMITS_V1 = Object.freeze({
@@ -33,14 +34,18 @@ export const GROUP_MEMORY_LEARNING_LIMITS_V1 = Object.freeze({
   evidenceSources: 4,
   extractionTimeoutMs: 30_000,
   maxOutputTokens: 512,
-  minimumConfidence: 0.6
+  minimumConfidence: 0.6,
+  /** Veto window between the group notice and implicit approval. */
+  implicitApprovalWindowMs: GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1 * 3_600_000,
+  /** Lower bound between two implicit-approval checks of the same group. */
+  implicitSweepIntervalMs: 10 * 60_000
 })
 
 export type GroupMemoryLearningLimitsV1 = { readonly [K in keyof typeof GROUP_MEMORY_LEARNING_LIMITS_V1]: number }
 
 /** Fixed stages and counters only; never message text, identities or model output. */
 export interface GroupMemoryLearningDiagnosticV1 {
-  readonly stage: 'schedule' | 'scope' | 'capacity' | 'extraction' | 'usage' | 'submission'
+  readonly stage: 'schedule' | 'scope' | 'capacity' | 'extraction' | 'usage' | 'submission' | 'notice' | 'approval'
   readonly outcome: 'accepted' | 'skipped' | 'rejected' | 'failed' | 'timeout'
   readonly candidates?: number
   readonly inputTokens?: number | null
@@ -62,6 +67,15 @@ interface GroupMemoryLearningOptionsV1 {
   readonly enabled: () => boolean
   readonly bot: (accountId: string) => unknown
   readonly now: () => string
+  /** An implicitly approved candidate becomes recallable, so the derived index is rebuilt. */
+  readonly rebuildLexical?: () => Promise<number>
+  /**
+   * Owner switch for the public-notice window. When it is off, or no notice can
+   * be delivered, candidates keep requiring an administrator's explicit approval.
+   */
+  readonly implicitApprovalEnabled?: () => boolean
+  /** Posts one group notice listing the pending candidates and how to review them. */
+  readonly notify?: (bot: unknown, groupId: string, text: string) => Promise<void>
   readonly limits?: Partial<GroupMemoryLearningLimitsV1>
   readonly onDiagnostic?: (diagnostic: GroupMemoryLearningDiagnosticV1) => void
 }
@@ -84,6 +98,18 @@ interface GroupBatch {
   readonly groupName: string | null
   readonly messages: readonly ObservedMessage[]
 }
+
+/** A group reference without messages: enough to resolve the scene and review its candidates. */
+interface GroupRef {
+  readonly key: string
+  readonly accountId: string
+  readonly groupId: string
+  readonly groupName: string | null
+}
+
+type Task =
+  | { readonly kind: 'extract'; readonly batch: GroupBatch }
+  | { readonly kind: 'sweep'; readonly group: GroupRef }
 
 type Category = '规则' | '共同偏好' | '群体事实' | '主题偏好' | '语言约定' | '梗说明'
 const CATEGORY_KINDS: Readonly<Record<Category, MemoryKindV1>> = Object.freeze({
@@ -259,25 +285,43 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
   const issuer = createMemoryAccessCapabilityIssuerV1(() => true)
   const root = createMemoryLifecycleAuthorityRootV1(() => true)
   const buffers = new Map<string, { accountId: string, groupId: string, groupName: string | null, messages: ObservedMessage[] }>()
-  const tracked = new Map<string, { day: string, count: number, lastMs: number }>()
+  const tracked = new Map<string, { day: string, count: number, lastMs: number, noticeMs: number, sweepMs: number }>()
   const global = { day: '', count: 0 }
-  const queue: GroupBatch[] = []
+  const queue: Task[] = []
   let active: Promise<void> | null = null
   let activeController: AbortController | null = null
   let activeKey: string | null = null
   let closed = false
+  let notices = 0
+  let implicitApprovals = 0
   const report = (diagnostic: GroupMemoryLearningDiagnosticV1): void => {
     try { options.onDiagnostic?.(Object.freeze(diagnostic)) } catch { /* diagnostics are observability only; a failing sink never changes learning behavior */ }
   }
   const enabled = (): boolean => {
     try { return !closed && options.enabled() } catch { return false }
   }
-  const policyOpen = (accountId: string, groupId: string, culture: boolean): boolean => {
-    try {
-      const policy = options.policy.read({ botInstanceId: options.botInstanceId, accountId, groupId })
-      return policy.group_memory.enabled && (!culture || policy.group_culture.enabled)
-    } catch { return false }
+  const readPolicy = (accountId: string, groupId: string): GroupMemoryPolicyV1 | null => {
+    try { return options.policy.read({ botInstanceId: options.botInstanceId, accountId, groupId }) } catch { return null }
   }
+  const policyOpen = (accountId: string, groupId: string, culture: boolean): boolean => {
+    const policy = readPolicy(accountId, groupId)
+    return policy !== null && policy.group_memory.enabled && (!culture || policy.group_culture.enabled)
+  }
+  /**
+   * Implicit approval needs both the owner switch and a way to announce the
+   * candidates: without a delivered notice there was no veto window, so the
+   * candidate keeps requiring an administrator.
+   */
+  const implicitApprovalOpen = (): boolean => {
+    if (options.notify === undefined) return false
+    try { return options.implicitApprovalEnabled?.() === true } catch { return false }
+  }
+  // Binds the consent to this group's switch state, so a later close/reopen invalidates it.
+  const consentPolicyRef = (accountId: string, groupId: string): string =>
+    `policy:group-memory-auto-approval.v1:${digest(`${options.botInstanceId}\0${accountId}\0${groupId}`)}`
+  /** The store reports 0 for an untouched default-on group; consent generations must be positive. */
+  const consentPolicyGeneration = (policy: GroupMemoryPolicyV1): number => policy.group_memory.generation + 1
+
   // Reserve the budget at scheduling time so failures and timeouts still count.
   const reserve = (key: string, nowMs: number): boolean => {
     const day = beijingDay(nowMs)
@@ -290,7 +334,7 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
         // A full tracker refuses new groups rather than resetting another group's counters.
         if (tracked.size >= limits.trackedGroups) return false
       }
-      entry = { day, count: 0, lastMs: 0 }
+      entry = { day, count: 0, lastMs: 0, noticeMs: 0, sweepMs: 0 }
       tracked.set(key, entry)
     }
     if (entry.day !== day) { entry.day = day; entry.count = 0 }
@@ -300,6 +344,21 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
     global.count += 1
     return true
   }
+  /**
+   * Queues an implicit-approval check for a group whose notice window has
+   * elapsed. Event driven and debounced per group, so a quiet group simply
+   * keeps its candidates pending until an administrator acts or they expire.
+   */
+  const scheduleSweep = (group: GroupRef, nowMs: number): void => {
+    if (!implicitApprovalOpen() || queue.length >= limits.queuedBatches) return
+    const entry = tracked.get(group.key)
+    if (entry === undefined || entry.noticeMs === 0 ||
+      nowMs - entry.noticeMs < limits.implicitApprovalWindowMs ||
+      nowMs - entry.sweepMs < limits.implicitSweepIntervalMs) return
+    entry.sweepMs = nowMs
+    queue.push(Object.freeze({ kind: 'sweep' as const, group }))
+    kick()
+  }
   const observe = (event: unknown): void => {
     try {
       if (!enabled()) return
@@ -307,6 +366,7 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
       const message = eligibleMessage(event, limits, nowMs)
       if (message === null || !policyOpen(message.accountId, message.groupId, false)) return
       const key = `${message.accountId}:${message.groupId}`
+      scheduleSweep({ key, accountId: message.accountId, groupId: message.groupId, groupName: message.groupName }, nowMs)
       let buffer = buffers.get(key)
       if (buffer === undefined) {
         if (buffers.size >= limits.bufferedGroups) buffers.delete(buffers.keys().next().value!)
@@ -324,14 +384,15 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
         new Set(buffer.messages.map(item => item.userId)).size < limits.minimumSpeakers) return
       // A full window keeps sliding while the group is cooling down; skips are not logged per message.
       if (!reserve(key, nowMs)) return
-      queue.push(Object.freeze({ key, accountId: buffer.accountId, groupId: buffer.groupId,
-        groupName: buffer.groupName, messages: Object.freeze([...buffer.messages]) }))
+      queue.push(Object.freeze({ kind: 'extract' as const,
+        batch: Object.freeze({ key, accountId: buffer.accountId, groupId: buffer.groupId,
+          groupName: buffer.groupName, messages: Object.freeze([...buffer.messages]) }) }))
       buffer.messages = []
       report({ stage: 'schedule', outcome: 'accepted' })
       kick()
     } catch { /* observation runs on the host message path: a failure drops this message, never the reply */ }
   }
-  const resolveScene = async (batch: GroupBatch, signal: AbortSignal) => {
+  const resolveScene = async (batch: GroupRef, signal: AbortSignal) => {
     const bot = await options.bot(batch.accountId) as Record<string, any> | undefined
     if (bot === undefined || bot === null || signal.aborted) return null
     const now = options.now()
@@ -453,6 +514,12 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
     const evidenceIds = candidate.evidence.map(message => message.messageId).join('\0')
     const commandRef = `command:${digest(`groupmate.group-memory.learning-propose.v1\0${scene.namespaceRef}\0${scene.generation}\0${key}\0${evidenceIds}`)}`
     const model = options.model.model()
+    // The consent a candidate accepts is fixed when it is created. While the owner keeps the
+    // public-notice window on, a candidate records `group_policy`: the group's own switch state plus
+    // an announced veto window. With the window off it records `explicit`, so only an administrator's
+    // message can approve it. Either way the consent kind stays visible on the stored record.
+    const policy = readPolicy(batch.accountId, batch.groupId)
+    const implicit = implicitApprovalOpen() && policy !== null
     const proposal = buildMemoryProposalDraftV2({ commandRef, operation: 'proposal.create',
       namespaceRef: scene.namespaceRef, namespaceGeneration: scene.generation, initiatedByActorRef: actorRef,
       namespace: scene.namespace,
@@ -463,7 +530,9 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
         : { state: 'possible', relatedMemoryIds: related.map(row => row.id),
             note: '与已有同类群记忆相近或冲突，需管理员核对；不会覆盖已有记录。' },
       customTtlDays: subtype === null ? null : CULTURE_TTL_DAYS[subtype],
-      consentRequirement: 'explicit', consentPolicyRef: null, consentPolicyGeneration: null })
+      consentRequirement: implicit ? 'group_policy' : 'explicit',
+      consentPolicyRef: implicit ? consentPolicyRef(batch.accountId, batch.groupId) : null,
+      consentPolicyGeneration: implicit ? consentPolicyGeneration(policy!) : null })
     const result = await options.lifecycle.execute({ schemaVersion: 1, access, authority: { kind: 'actor', capability: actor },
       command: createMemoryLifecycleCommandV1({ commandRef, operation: 'proposal.create', initiatedByActorRef: actorRef,
         namespaceRef: scene.namespaceRef, expectedNamespaceGeneration: scene.generation, aggregateRef: null,
@@ -471,6 +540,128 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
         material: proposal }) }, signal)
     if (result.status === 'stored') return 'stored'
     return result.status === 'unchanged' ? 'skipped' : 'rejected'
+  }
+  /** One current description per culture subtype; an approval never overwrites an existing one. */
+  const cultureSubtypeTaken = (scene: Scene, text: string, nowMs: number): boolean => {
+    const subtype = cultureKindV1(text)
+    if (subtype === null) return false
+    return existing(scene, nowMs).heads.some(row => row.kind === 'group_culture' &&
+      cultureKindV1(row.text) === subtype)
+  }
+  /**
+   * Announces the pending candidates in the group and records when, so the veto
+   * window has an actual start. Without a delivered notice nothing is implicitly
+   * approved; the candidates simply wait for an administrator.
+   */
+  const notice = async (group: GroupRef, scene: Scene, signal: AbortSignal): Promise<void> => {
+    const notify = options.notify
+    if (notify === undefined) return
+    const nowMs = Date.parse(options.now())
+    const rows = listGroupMemoryCandidateRowsV1(options.database, scene.namespaceRef, scene.generation, nowMs)
+    const automatic = rows.filter(row => row.automatic)
+    if (automatic.length === 0) return
+    const bot = await options.bot(group.accountId)
+    if (bot === undefined || bot === null || signal.aborted) {
+      report({ stage: 'notice', outcome: 'failed' })
+      return
+    }
+    const implicit = implicitApprovalOpen()
+    const hours = Math.round(limits.implicitApprovalWindowMs / 3_600_000)
+    const text = [
+      `本群有 ${automatic.length} 条待审候选，是我从群聊里归纳的，不代表群共识，通过后才会用于回答：`,
+      ...automatic.map(row => groupMemoryCandidateLineV1(row, implicit)),
+      '群管理员回复「#群记忆 通过 全部」保存，「#群记忆 拒绝 全部」丢弃，也可以只写编号，例如「#群记忆 通过 1 3」。',
+      implicit
+        ? `${hours} 小时内没有管理员处理，未标注冲突的会按主人设置自动保存；随时可以用“#群记忆 遗忘”删掉。`
+        : '未处理的候选 7 天后过期，不会保存。'
+    ].join('\n')
+    try { await notify(bot, group.groupId, text) } catch {
+      // A failed notice leaves the window unstarted, so nothing is approved implicitly.
+      report({ stage: 'notice', outcome: 'failed' })
+      return
+    }
+    const entry = tracked.get(group.key)
+    if (entry !== undefined) entry.noticeMs = nowMs
+    notices += 1
+    report({ stage: 'notice', outcome: 'accepted', candidates: automatic.length })
+  }
+  /**
+   * Approves one announced candidate on the owner's standing policy. The
+   * authority is the bot master's switch, not the model and not a group
+   * administrator: the actor ref, the `group_policy` consent and the revision
+   * reason all record that, and an administrator's rejection within the window
+   * still wins.
+   */
+  const approveAnnounced = async (group: GroupRef, scene: Scene, proposalId: string,
+    signal: AbortSignal): Promise<boolean> => {
+    const row = options.database.prepare(`SELECT proposal_wire FROM proposals WHERE namespace_ref = ?
+      AND namespace_generation = ? AND proposal_id = ? AND state = 'pending'`)
+      .get(scene.namespaceRef, scene.generation, proposalId)
+    if (row === undefined) return false
+    const proposal = parseMemoryProposalV2(JSON.parse(String(row.proposal_wire)))
+    const now = options.now()
+    const policy = readPolicy(group.accountId, group.groupId)
+    // Every switch is rechecked at the write, and the consent must still bind to this group's policy.
+    if (!enabled() || signal.aborted || !implicitApprovalOpen() || policy === null ||
+      proposal.proposedBy.kind !== 'model' || proposal.consentRequirement !== 'group_policy' ||
+      proposal.consentPolicyRef !== consentPolicyRef(group.accountId, group.groupId) ||
+      proposal.consentPolicyGeneration !== consentPolicyGeneration(policy) ||
+      !policyOpen(group.accountId, group.groupId, cultureKindV1(proposal.text) !== null) ||
+      cultureSubtypeTaken(scene, proposal.text, Date.parse(now))) return false
+    const access = issueMemoryAccessCapabilityV1(issuer, { schemaVersion: 1, botInstanceId: options.botInstanceId,
+      adapter: 'qq', accountId: group.accountId, scene: { kind: 'group', groupId: group.groupId,
+        groupLifecycleId: scene.groupLifecycleId, trustedMemberUserIds: [group.accountId], observedAt: now } },
+    [scene.namespace], now)
+    const actorRef = `actor:${digest(`groupmate.group-memory.implicit-approval.v1\0${options.botInstanceId}\0${group.accountId}\0${group.groupId}`)}`
+    const commandRef = `command:${digest(`groupmate.group-memory.implicit-approve.v1\0${scene.namespaceRef}\0${scene.generation}\0${proposal.proposalId}`)}`
+    const approval = buildMemoryProposalApprovalBundleV1({ commandRef, operation: 'proposal.approve',
+      namespaceRef: scene.namespaceRef, namespaceGeneration: scene.generation, proposal,
+      approvedByActorRef: actorRef, freshNow: now, evidenceSource: null,
+      reason: '公示期内无群管理员处理，按主人设置默示通过' })
+    const result = await options.lifecycle.execute({ schemaVersion: 1, access,
+      authority: { kind: 'policy', capability: issueGroupMemoryPolicyApprovalCapabilityV1(root, {
+        proposal, namespace: scene.namespace, namespaceRef: scene.namespaceRef, generation: scene.generation,
+        botInstanceId: options.botInstanceId, accountId: group.accountId, sceneRef: access.sceneRef,
+        actorRef, actorUserId: group.accountId, now }) },
+      command: createMemoryLifecycleCommandV1({ commandRef, operation: 'proposal.approve',
+        initiatedByActorRef: actorRef, namespaceRef: scene.namespaceRef,
+        expectedNamespaceGeneration: scene.generation, aggregateRef: proposal.proposalId,
+        expectedRevision: proposal.revision, expectedAggregateHash: proposal.consentTargetHash,
+        occurredAt: now, newValidUntil: null, newPurgeAt: null, material: approval.consentEvidence }) }, signal)
+    return result.status === 'stored'
+  }
+  const handleSweep = async (group: GroupRef, signal: AbortSignal): Promise<void> => {
+    const entry = tracked.get(group.key)
+    if (entry === undefined || entry.noticeMs === 0 || !enabled() || !implicitApprovalOpen()) return
+    const nowMs = Date.parse(options.now())
+    if (nowMs - entry.noticeMs < limits.implicitApprovalWindowMs ||
+      !policyOpen(group.accountId, group.groupId, false)) return
+    const scene = await resolveScene(group, signal)
+    if (scene === null) { report({ stage: 'scope', outcome: 'rejected' }); return }
+    // A candidate marked as conflicting always waits for a person: it would otherwise replace
+    // or duplicate a record somebody already approved.
+    const due = listGroupMemoryCandidateRowsV1(options.database, scene.namespaceRef, scene.generation, nowMs)
+      .filter(row => row.automatic && row.implicitApprovable && !row.conflicting &&
+        row.proposedAtMs <= entry.noticeMs)
+      .slice(0, limits.pendingAutoCandidatesPerGroup)
+    if (due.length === 0) {
+      // Nothing announced is still undecided; wait for the next notice before checking again.
+      entry.noticeMs = 0
+      return
+    }
+    let approved = 0
+    for (const row of due) {
+      if (signal.aborted) break
+      try {
+        if (await approveAnnounced(group, scene, row.proposalId, signal)) approved += 1
+      } catch { report({ stage: 'approval', outcome: signal.aborted ? 'timeout' : 'failed' }) }
+    }
+    if (approved > 0) {
+      implicitApprovals += approved
+      // Approved candidates are recallable only once the derived index includes them.
+      try { await options.rebuildLexical?.() } catch { /* canonical receipts stay truthful; the next rebuild retries */ }
+    }
+    report({ stage: 'approval', outcome: approved === 0 ? 'skipped' : 'accepted', candidates: approved })
   }
   const handleBatch = async (batch: GroupBatch, signal: AbortSignal): Promise<void> => {
     if (!enabled() || !policyOpen(batch.accountId, batch.groupId, false)) {
@@ -497,17 +688,23 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
       } catch { report({ stage: 'submission', outcome: signal.aborted ? 'timeout' : 'failed' }) }
     }
     report({ stage: 'submission', outcome: stored === 0 ? 'skipped' : 'accepted', candidates: stored })
+    // One notice per batch that stored something: at most three per group per day, because
+    // extraction itself is capped at three. Administrators are never polled for a quiet group.
+    if (stored > 0 && !signal.aborted) await notice(batch, scene, signal)
   }
   const kick = (): void => {
     if (active !== null || closed) return
     active = (async () => {
       while (!closed && queue.length > 0) {
-        const batch = queue.shift()!
+        const task = queue.shift()!
         const controller = new AbortController()
         activeController = controller
-        activeKey = batch.key
+        activeKey = task.kind === 'extract' ? task.batch.key : task.group.key
         const timer = setTimeout(() => controller.abort(), limits.extractionTimeoutMs)
-        try { await handleBatch(batch, controller.signal) } catch { /* one failed batch is reported by handleBatch; the worker continues with the next */ } finally {
+        try {
+          if (task.kind === 'extract') await handleBatch(task.batch, controller.signal)
+          else await handleSweep(task.group, controller.signal)
+        } catch { /* one failed task is reported by its handler; the worker continues with the next */ } finally {
           clearTimeout(timer)
           activeController = null
           activeKey = null
@@ -519,12 +716,19 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
     observe,
     inspect: () => Object.freeze({ bufferedGroups: buffers.size,
       bufferedMessages: [...buffers.values()].reduce((total, buffer) => total + buffer.messages.length, 0),
-      queuedBatches: queue.length, running: active !== null, dailyExtractions: global.count }),
+      queuedBatches: queue.length, running: active !== null, dailyExtractions: global.count,
+      notices, implicitApprovals }),
     /** Forgets buffered and queued messages of one group; an in-flight batch rechecks policy before writing. */
     discard (accountId: string, groupId: string) {
       const key = `${accountId}:${groupId}`
       buffers.delete(key)
-      for (let index = queue.length - 1; index >= 0; index -= 1) if (queue[index]!.key === key) queue.splice(index, 1)
+      // A closed or cleared group loses its notice window: nothing announced before it stays approvable.
+      const entry = tracked.get(key)
+      if (entry !== undefined) entry.noticeMs = 0
+      for (let index = queue.length - 1; index >= 0; index -= 1) {
+        const task = queue[index]!
+        if ((task.kind === 'extract' ? task.batch.key : task.group.key) === key) queue.splice(index, 1)
+      }
       if (activeKey === key) activeController?.abort()
     },
     async waitForIdle () { while (active !== null) await active },

@@ -272,6 +272,16 @@ test('normalizes the group memory learning owner switch as a live boolean', () =
   assert.equal(guobaConfigSaveMessage(['groupMemoryLearningEnabled']), '保存成功~')
 })
 
+test('normalizes the implicit approval owner switch as a live boolean', () => {
+  assert.equal(normalizeGuobaConfigValue('groupMemoryAutoApprovalEnabled', true), true)
+  assert.equal(normalizeGuobaConfigValue('groupMemoryAutoApprovalEnabled', false), false)
+  assert.throws(
+    () => normalizeGuobaConfigValue('groupMemoryAutoApprovalEnabled', 1),
+    /自动候选公示期默示通过开关配置无效/
+  )
+  assert.equal(guobaConfigSaveMessage(['groupMemoryAutoApprovalEnabled']), '保存成功~')
+})
+
 test('normalizes the three observability levels fail closed', () => {
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'off'), 'off')
   assert.equal(normalizeGuobaConfigValue('observabilityLevel', 'basic'), 'basic')

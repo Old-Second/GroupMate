@@ -333,6 +333,7 @@ test('Guoba and example config expose the reviewed automatic default with bounde
     'config/config.example.json'
   ), 'utf8')) as Record<string, unknown>
   assert.deepEqual(fields.filter(phase7bMemoryControlFieldIsForbidden).sort(), [
+    'groupMemoryAutoApprovalEnabled',
     'groupMemoryLearningEnabled',
     'personalMemoryMaintenanceAction',
     'personalMemoryMode',
@@ -353,6 +354,10 @@ test('Guoba and example config expose the reviewed automatic default with bounde
   assert.equal(phase7bPersonalMemoryConfigMatchesDefaults({
     ...config,
     groupMemoryLearningEnabled: false
+  }), false)
+  assert.equal(phase7bPersonalMemoryConfigMatchesDefaults({
+    ...config,
+    groupMemoryAutoApprovalEnabled: false
   }), false)
 })
 

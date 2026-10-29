@@ -382,7 +382,9 @@ const PHASE_7B_PERSONAL_MEMORY_CONFIG_DEFAULTS = Object.freeze({
   personalMemoryRecallMaxTokens: 1_200,
   personalMemoryRecallTimeoutMs: 150,
   // Reviewed owner switch: automatic group candidates stay pending for administrator review.
-  groupMemoryLearningEnabled: true
+  groupMemoryLearningEnabled: true,
+  // Reviewed owner switch: an announced, conflict-free candidate saves itself after the veto window.
+  groupMemoryAutoApprovalEnabled: true
 })
 
 const PHASE_7B_PERSONAL_MEMORY_GUI_FIELDS = Object.freeze([

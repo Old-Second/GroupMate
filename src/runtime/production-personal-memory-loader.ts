@@ -44,6 +44,12 @@ export interface ProductionPersonalMemoryRuntimeOptionsV1 {
   readonly derivedIndexFailure?: (operation: string) => void
   /** Owner switch for automatic group memory candidates; administrators still review every one. */
   readonly groupLearningEnabled?: () => boolean
+  /**
+   * Owner switch for the public-notice window. On: an announced, conflict-free
+   * automatic candidate is saved when no administrator acts within it. Off: every
+   * candidate keeps requiring an administrator's explicit approval.
+   */
+  readonly groupLearningImplicitApproval?: () => boolean
   readonly groupLearningDiagnostic?: (diagnostic: GroupMemoryLearningDiagnosticV1) => void
 }
 
@@ -110,6 +116,9 @@ export async function initializeProductionPersonalMemoryRuntimeV1 (
     ...(options.candidateAdmission === undefined ? {} : { candidateAdmission: options.candidateAdmission }),
     ...(options.derivedIndexFailure === undefined ? {} : { derivedIndexFailure: options.derivedIndexFailure }),
     ...(options.groupLearningEnabled === undefined ? {} : { groupLearningEnabled: options.groupLearningEnabled }),
+    ...(options.groupLearningImplicitApproval === undefined
+      ? {}
+      : { groupLearningImplicitApproval: options.groupLearningImplicitApproval }),
     ...(options.groupLearningDiagnostic === undefined ? {} : { groupLearningDiagnostic: options.groupLearningDiagnostic })
   }))
 }

@@ -132,6 +132,7 @@
   "personalMemoryRecallTimeoutMs": 150,
   "conversationPreferencesEnabled": true,
   "groupMemoryLearningEnabled": true,
+  "groupMemoryAutoApprovalEnabled": true,
   "enableBYM": false,
   "bymRecognizeLeadingAlias": true,
   "participationMode": "legacy",
