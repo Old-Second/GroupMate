@@ -729,6 +729,7 @@ export async function createProductionPersonalMemoryRuntimeV1 (
           (options.groupLearningEnabled?.() ?? true),
         implicitApprovalEnabled: () => (options.groupLearningImplicitApproval?.() ?? true),
         rebuildLexical: async () => await projector.rebuild(),
+        ...(options.derivedIndexFailure === undefined ? {} : { onDerivedIndexFailure: options.derivedIndexFailure }),
         notify: async (bot, groupId, text) => { await sendYunzaiGroupMessage(bot as Record<string, any>, groupId, text) },
         ...(options.groupLearningDiagnostic === undefined ? {} : { onDiagnostic: options.groupLearningDiagnostic })
       })

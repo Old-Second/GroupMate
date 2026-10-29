@@ -370,7 +370,8 @@ export function createGroupMemoryLearningV1(options) {
             event: { isGroup: true, group_id: batch.groupId, user_id: batch.accountId, self_id: batch.accountId,
                 sender: { user_id: batch.accountId }, bot },
             accountId: batch.accountId, observedAt: now,
-            messageEvidence: { schemaVersion: 1, prompt: '群记忆自动候选', imageUrls: [], currentMessageId: null,
+            messageEvidence: { schemaVersion: 1, prompt: '群记忆自动候选', speakerText: '群记忆自动候选',
+                imageUrls: [], currentMessageId: null,
                 quotedMessageId: null, hasReply: false, replyResolved: true,
                 currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] }
         }, signal);
@@ -658,7 +659,13 @@ export function createGroupMemoryLearningV1(options) {
             try {
                 await options.rebuildLexical?.();
             }
-            catch { /* canonical receipts stay truthful; the next rebuild retries */ }
+            catch {
+                // Canonical receipts stay truthful and the next rebuild retries, but the drift is observable.
+                try {
+                    options.onDerivedIndexFailure?.('group_candidate.implicit_approval');
+                }
+                catch { /* 诊断回调异常不影响审核流程。 */ }
+            }
         }
         report({ stage: 'approval', outcome: approved === 0 ? 'skipped' : 'accepted', candidates: approved });
     };

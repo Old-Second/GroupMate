@@ -450,6 +450,7 @@ async function harness (t: TestContext, options: {
   readonly candidates?: () => readonly unknown[]
   readonly implicitApproval?: () => boolean
   readonly notify?: () => void
+  readonly rebuildLexical?: () => Promise<number>
 } = {}) {
   const { createGroupMemoryLearningV1 } = await import('../../src/runtime/GroupMemoryLearning.js')
   const { openGroupMemoryPolicyStoreV1 } = await import('../../src/runtime/GroupMemoryPolicy.js')
@@ -468,11 +469,14 @@ async function harness (t: TestContext, options: {
   const lifecycle = createMemoryLifecyclePortV1({ now, execute: adapter.execute })
   const notices: string[] = []
   const stages: any[] = []
+  const derivedFailures: string[] = []
   const bot = { sendApi: async (_method: string, input: any) => ({ user_id: input.user_id, role: 'member', join_time: 1700000000 }) }
   let batch = 0
   const learner = createGroupMemoryLearningV1({ botInstanceId: 'groupmate-production', database: canonical.database,
     policy, lifecycle, bot: () => bot, enabled: () => true, now,
     implicitApprovalEnabled: options.implicitApproval ?? (() => true),
+    ...(options.rebuildLexical === undefined ? {} : { rebuildLexical: options.rebuildLexical }),
+    onDerivedIndexFailure: operation => derivedFailures.push(operation),
     notify: async (_bot, groupId, text) => { options.notify?.(); notices.push(`${groupId}|${text}`) },
     onDiagnostic: value => stages.push(value),
     limits: { groupCooldownMs: 1_000, groupDailyExtractions: 10 },
@@ -498,7 +502,7 @@ async function harness (t: TestContext, options: {
       json_extract(p.revision_wire, '$.record.consent.state') AS consent,
       json_extract(p.revision_wire, '$.record.consent.approvedByActorRef') AS approver
     FROM heads h JOIN revision_payloads p ON p.memory_id = h.memory_id AND p.revision = h.current_revision`).all()
-  return { learner, canonical, policy, clock, notices, stages, say, window, rows, heads }
+  return { learner, canonical, policy, clock, notices, stages, derivedFailures, say, window, rows, heads }
 }
 
 test('an announced candidate saves itself once the veto window passes', async t => {
@@ -527,6 +531,17 @@ test('an announced candidate saves itself once the veto window passes', async t 
   assert.equal(f.learner.inspect().implicitApprovals, 1)
   assert.deepEqual(f.stages.filter(item => item.stage === 'approval'),
     [{ stage: 'approval', outcome: 'accepted', candidates: 1 }])
+})
+
+test('an implicit approval whose index rebuild fails still commits and reports the drift', async t => {
+  const f = await harness(t, { rebuildLexical: async () => { throw new Error('projector unavailable') } })
+  await f.window([[ADMIN, '本群禁止刷屏第1条'], [MEMBERS[0]!, '对，本群禁止刷屏第1条']])
+  f.clock.now += 25 * 3_600_000
+  f.say(MEMBERS[1]!, '随便聊一句')
+  await f.learner.waitForIdle()
+  assert.equal(f.rows('approved').length, 1)
+  assert.equal(f.heads().length, 1)
+  assert.deepEqual(f.derivedFailures, ['group_candidate.implicit_approval'])
 })
 
 test('rejection inside the window and a closed group both stop implicit approval', async t => {
