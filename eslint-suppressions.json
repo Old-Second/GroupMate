@@ -279,11 +279,6 @@
       "count": 1
     }
   },
-  "utils/common.js": {
-    "no-empty": {
-      "count": 4
-    }
-  },
   "utils/prompts.js": {
     "no-empty": {
       "count": 1
