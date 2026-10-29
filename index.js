@@ -82,6 +82,22 @@ import {
   repositoryUrl,
   resolvePluginPath
 } from './dist/runtime/plugin-context.js'
+import {
+  configuredReasoningEffort,
+  configuredThinkingMode,
+  finiteInteger,
+  finiteNumber,
+  normalizedStringList,
+  normalizedText
+} from './dist/runtime/host/host-config-values.js'
+import {
+  parsePreferenceRecord,
+  projectBymPolicySnapshot,
+  projectButtonPolicySnapshot,
+  projectChatPreferences,
+  projectPresentationSafeConfig,
+  resolveTtsMode
+} from './dist/runtime/host/host-config-projection.js'
 
 const runtimeLogger = globalThis.logger ?? Object.freeze({
   info: () => undefined,
@@ -111,55 +127,7 @@ if (!globalThis.segment) {
   }
 }
 
-function normalizedText (value, maximum, fallback = '') {
-  if (typeof value !== 'string') return fallback
-  const normalized = value.normalize('NFC').trim()
-  if (normalized === '') return fallback
-  return [...normalized].slice(0, maximum).join('')
-}
-
-function normalizedStringList (value, maximumItems = 256, maximumCharacters = 128) {
-  if (!Array.isArray(value) && typeof value !== 'string') return Object.freeze([])
-  const source = Array.isArray(value) ? value : [value]
-  const result = []
-  const seen = new Set()
-  for (const item of source) {
-    if (result.length >= maximumItems) break
-    if (typeof item !== 'string') continue
-    const normalized = normalizedText(item, maximumCharacters)
-    if (normalized === '' || seen.has(normalized)) continue
-    seen.add(normalized)
-    result.push(normalized)
-  }
-  return Object.freeze(result)
-}
-
-function finiteInteger (value, fallback, minimum, maximum) {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? Math.min(Math.max(Math.trunc(value), minimum), maximum)
-    : fallback
-}
-
-function finiteNumber (value, fallback, minimum, maximum) {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? Math.min(Math.max(value, minimum), maximum)
-    : fallback
-}
-
-function configuredThinkingMode (value) {
-  return value === 'enabled' || value === 'disabled' ? value : 'default'
-}
-
-function configuredReasoningEffort (value) {
-  return value === 'low' || value === 'medium' || value === 'high' ||
-    value === 'xhigh' || value === 'max' || value === 'ultra' ? value : 'default'
-}
-
-function ttsMode () {
-  return Config.ttsMode === 'azure' || Config.ttsMode === 'voicevox'
-    ? Config.ttsMode
-    : 'vits-uma-genshin-honkai'
-}
+const ttsMode = () => resolveTtsMode(Config)
 
 const rememberedBots = new Map()
 
@@ -260,14 +228,7 @@ function textAtomValue (atom) {
 }
 
 const buttonPolicy = Object.freeze({
-  snapshot () {
-    return Object.freeze({
-      markdownEnabled: Config.enableMd === true,
-      openAiConfigured: normalizedText(Config.apiKey, 16_384) !== '' &&
-        normalizedText(Config.openAiBaseUrl, 2_048) !== '' &&
-        normalizedText(Config.model, 256) !== ''
-    })
-  }
+  snapshot: () => projectButtonPolicySnapshot(Config)
 })
 
 async function outboundMessage (receiver, part) {
@@ -331,82 +292,13 @@ const outboundHost = Object.freeze({
   }
 })
 
-function currentPresentationConfig () {
-  return Object.freeze({
-    quoteReply: Config.quoteReply === true,
-    enableRobotAt: Config.enableRobotAt === true,
-    enableMd: Config.enableMd === true,
-    enableSuggestedResponses: Config.enableSuggestedResponses === true,
-    forwardReasoning: Config.forwardReasoning !== false,
-    blockWords: normalizedStringList(Config.blockWords),
-    promptBlockWords: normalizedStringList(Config.promptBlockWords),
-    defaultUsePicture: Config.defaultUsePicture === true,
-    defaultUseTTS: Config.defaultUseTTS === true,
-    defaultTTSRole: normalizedText(Config.defaultTTSRole, 256, '纳西妲'),
-    azureTTSSpeaker: normalizedText(Config.azureTTSSpeaker, 256, 'zh-CN-XiaochenNeural'),
-    voicevoxTTSSpeaker: normalizedText(Config.voicevoxTTSSpeaker, 256, '护士机器子T'),
-    ttsMode: ttsMode(),
-    alsoSendText: Config.alsoSendText === true,
-    ttsAutoFallbackThreshold: finiteInteger(Config.ttsAutoFallbackThreshold, 299, 1, 24_000),
-    ttsRegex: typeof Config.ttsRegex === 'string' ? Config.ttsRegex : '',
-    enhanceAzureTTSEmotion: Config.enhanceAzureTTSEmotion === true,
-    autoUsePicture: Config.autoUsePicture !== false,
-    autoUsePictureThreshold: finiteInteger(Config.autoUsePictureThreshold, 1_200, 1, 24_000),
-    cloudDPR: finiteNumber(Config.cloudDPR, 1, 0.5, 4),
-    closeBrowserAfterRender: Config.closeBrowserAfterRender !== false,
-    showQRCode: Config.showQRCode !== false,
-    live2d: Config.live2d === true,
-    live2dModel: normalizedText(Config.live2dModel, 512, '/live2d/Murasame/Murasame.model3.json'),
-    live2dOption_scale: finiteNumber(Config.live2dOption_scale, 0.1, 0, 10),
-    live2dOption_positionX: finiteNumber(Config.live2dOption_positionX, 0, -4_096, 4_096),
-    live2dOption_positionY: finiteNumber(Config.live2dOption_positionY, 0, -4_096, 4_096),
-    live2dOption_rotation: finiteNumber(Config.live2dOption_rotation, 0, -360, 360),
-    live2dOption_alpha: finiteNumber(Config.live2dOption_alpha, 1, 0, 1)
-  })
-}
-
 const presentationSettings = createPresentationSettingsPort(Object.freeze({
   loadUserJson: async actorId => await redisClient.get(`CHATGPT:USER:${actorId}`),
-  currentSafeConfig: currentPresentationConfig
+  currentSafeConfig: () => projectPresentationSafeConfig(Config)
 }))
 const pendingConfig = createPendingIndicatorConfigPort(redisClient)
 
-function defaultPreferences () {
-  return Object.freeze({
-    usePicture: Config.defaultUsePicture === true,
-    useTTS: Config.defaultUseTTS === true,
-    ttsRole: normalizedText(Config.defaultTTSRole, 256, '纳西妲'),
-    ttsRoleAzure: normalizedText(Config.azureTTSSpeaker, 256, 'zh-CN-XiaochenNeural'),
-    ttsRoleVoiceVox: normalizedText(Config.voicevoxTTSSpeaker, 256, '护士机器子T')
-  })
-}
-
-function parsePreferenceRecord (raw) {
-  if (typeof raw !== 'string') return {}
-  try {
-    const parsed = JSON.parse(raw)
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed
-      : {}
-  } catch {
-    return {}
-  }
-}
-
-function projectPreferences (record) {
-  const defaults = defaultPreferences()
-  return Object.freeze({
-    usePicture: typeof record.usePicture === 'boolean' ? record.usePicture : defaults.usePicture,
-    useTTS: typeof record.useTTS === 'boolean' ? record.useTTS : defaults.useTTS,
-    ttsRole: normalizedText(record.ttsRole, 256, defaults.ttsRole),
-    ttsRoleAzure: normalizedText(record.ttsRoleAzure, 256, defaults.ttsRoleAzure),
-    ttsRoleVoiceVox: normalizedText(
-      record.ttsRoleVoiceVox,
-      256,
-      defaults.ttsRoleVoiceVox
-    )
-  })
-}
+const projectPreferences = record => projectChatPreferences(record, Config)
 
 const chatPreferences = Object.freeze({
   async load (actorId) {
@@ -647,23 +539,7 @@ const billing = Object.freeze({
 })
 
 const bymPolicy = Object.freeze({
-  snapshot () {
-    return Object.freeze({
-      enabled: Config.enableBYM === true,
-      assistantLabel: normalizedText(Config.assistantLabel, 128, 'GroupMate'),
-      recognizeLeadingAlias: Config.bymRecognizeLeadingAlias !== false,
-      ratePercent: finiteNumber(Config.bymRate, 5, 0, 100),
-      disabledGroupIds: normalizedStringList(Config.bymDisableGroup, 256, 128),
-      thinkingMode: configuredThinkingMode(Config.bymThinkingMode),
-      reasoningEffort: configuredReasoningEffort(Config.bymReasoningEffort),
-      preset: normalizedText(Config.bymPreset, 8_192),
-      retaliationWords: normalizedStringList(Config.bymFuckList, 128, 128),
-      retaliationBlacklistActorIds: normalizedStringList(Config.bymFuckBlacklist, 256, 128),
-      retaliationPrompt: normalizedText(Config.bymFuckPrompt, 16_384),
-      retaliationRecallEnabled: Config.bymFuckRecall === true,
-      retaliationRecallSeconds: finiteInteger(Config.bymFuckRecallTime, 100, 1, 3_600)
-    })
-  }
+  snapshot: () => projectBymPolicySnapshot(Config)
 })
 
 function safeTextAtoms (value, fallback) {
