@@ -201,3 +201,18 @@ test('empty history keeps the caller prompt as the user message', () => {  const
   assert.equal(messages[1]?.role, 'user')
   assert.equal(messages[1]?.content, '随便开个话头')
 })
+
+test('an oversized configured prompt is bounded before it reaches the model request', () => {
+  const messages = buildGreetingMessages({
+    assistantLabel: '小助手',
+    helloPrompt: '界'.repeat(8_192),
+    history: EMPTY_GREETING_HISTORY
+  })
+
+  const system = String(messages[0]?.content)
+  assert.equal(system.includes('本次要求：'), true)
+  assert.equal(system.length < 2_000, true)
+  // The whole request stays far inside the auxiliary input budget for this purpose.
+  const bytes = messages.reduce((total, message) => total + Buffer.byteLength(String(message.content), 'utf8'), 0)
+  assert.equal(bytes <= 32 * 1_024, true)
+})

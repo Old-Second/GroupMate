@@ -141,3 +141,30 @@ test('auxiliary completion reads the current temperature without rebuilding', as
 
   assert.deepEqual(requests.map(request => request.temperature), [0.2, 0.8])
 })
+
+test('auxiliary completion bounds the input side and never reaches the provider when it overflows', async () => {
+  let calls = 0
+  const service = createAuxiliaryCompletionService({
+    model: 'fixture-model',
+    adapter: Object.freeze({
+      complete: async () => { calls++; return completedTurn('ok') }
+    })
+  })
+  // Three bytes per character, so 12 KiB of text stays inside the greeting budget and 16 KiB exceeds it.
+  const within = Object.freeze({
+    purpose: 'random_greeting' as const,
+    messages: Object.freeze([{ role: 'user' as const, content: '界'.repeat(4 * 1_024) }])
+  })
+  assert.equal(await service.completeText(within), 'ok')
+  const beyond = Object.freeze({
+    purpose: 'random_greeting' as const,
+    messages: Object.freeze([
+      { role: 'system' as const, content: '界'.repeat(6 * 1_024) },
+      { role: 'user' as const, content: '界'.repeat(6 * 1_024) }
+    ])
+  })
+  await assert.rejects(service.completeText(beyond), /input exceeds limit/)
+  // The suggestion budget is larger, so the same messages pass under that purpose.
+  assert.equal(await service.completeText({ ...beyond, purpose: 'suggestion' as const }), 'ok')
+  assert.equal(calls, 2)
+})

@@ -1,4 +1,11 @@
 const DEFAULT_OUTPUT_TOKENS = Object.freeze({ random_greeting: 128, suggestion: 512 });
+/**
+ * Input side of the per-call budget. This path has no RunBudget, so without a
+ * cap here a caller could hand it an unbounded prompt. Both callers build their
+ * messages from already-bounded parts and stay well inside these numbers; the
+ * caps are a hard boundary for the service, not a routine truncation point.
+ */
+const MAX_INPUT_BYTES = Object.freeze({ random_greeting: 32 * 1_024, suggestion: 64 * 1_024 });
 const PURPOSES = Object.freeze([
     'random_greeting', 'suggestion'
 ]);
@@ -44,9 +51,15 @@ function requestFor(input, options, model) {
         throw new TypeError('auxiliary output token limit is invalid');
     }
     const temperature = boundedTemperature(options.temperature);
+    const messages = Object.freeze(input.messages.map(cloneMessage));
+    const inputBytes = messages.reduce((total, message) => total +
+        Buffer.byteLength(typeof message.content === 'string' ? message.content : '', 'utf8'), 0);
+    if (inputBytes > MAX_INPUT_BYTES[input.purpose]) {
+        throw new TypeError('auxiliary completion input exceeds limit');
+    }
     return Object.freeze({
         model,
-        messages: Object.freeze(input.messages.map(cloneMessage)),
+        messages,
         tools: Object.freeze([]),
         toolMode: 'disabled',
         streaming: false,
