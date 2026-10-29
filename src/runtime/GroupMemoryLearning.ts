@@ -398,11 +398,11 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
     const now = options.now()
     const snapshot = await participants.resolve({
       event: { isGroup: true, group_id: batch.groupId, user_id: batch.accountId, self_id: batch.accountId,
-        sender: { user_id: batch.accountId }, bot } as any,
+        sender: { user_id: batch.accountId }, bot },
       accountId: batch.accountId, observedAt: now,
       messageEvidence: { schemaVersion: 1, prompt: '群记忆自动候选', imageUrls: [], currentMessageId: null,
         quotedMessageId: null, hasReply: false, replyResolved: true,
-        currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] } as any
+        currentSegmentCount: 1, replySegmentCount: 0, ocrTexts: [] }
     }, signal)
     if (snapshot?.scene.kind !== 'group' || snapshot.scene.groupId !== batch.groupId) return null
     const namespace = parseMemoryNamespaceV1({ schemaVersion: 1, botInstanceId: options.botInstanceId,
@@ -569,7 +569,7 @@ export function createGroupMemoryLearningV1 (options: GroupMemoryLearningOptions
     const hours = Math.round(limits.implicitApprovalWindowMs / 3_600_000)
     const text = [
       `本群有 ${automatic.length} 条待审候选，是我从群聊里归纳的，不代表群共识，通过后才会用于回答：`,
-      ...automatic.map(row => groupMemoryCandidateLineV1(row, implicit)),
+      ...automatic.map(row => groupMemoryCandidateLineV1(row, implicit ? hours : null)),
       '群管理员回复「#群记忆 通过 全部」保存，「#群记忆 拒绝 全部」丢弃，也可以只写编号，例如「#群记忆 通过 1 3」。',
       implicit
         ? `${hours} 小时内没有管理员处理，未标注冲突的会按主人设置自动保存；随时可以用“#群记忆 遗忘”删掉。`

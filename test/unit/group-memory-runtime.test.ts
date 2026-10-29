@@ -254,13 +254,16 @@ test('culture pending and approved caps are atomic canonical limits without redu
   assert.match(await f.send('#群文化 提议 梗说明 本群使用第32种星球梗'), /未完成/)
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 32)
   const candidates = await f.send('#群文化 候选')
-  // The list is bounded at 16 lines so one group message stays readable; the rest surface after review.
+  // One reply holds 16 lines; the ordinals still cover all 32, and the rest are one page away.
   assert.equal(candidates.match(/^\d+\. /gmu)?.length, 16)
+  assert.match(candidates, /共 32 条，发送“#群文化 候选 2”看下一页/)
+  assert.match(await f.send('#群文化 候选 2'), /^17\. /mu)
+  assert.match(await f.send('#群文化 拒绝 17'), /已拒绝 1 条/)
   assert.match(await f.send('#群文化 拒绝 1'), /已拒绝 1 条/)
   assert.match(await f.send('#群文化 提议 梗说明 本群使用新星球梗'), /已提交/)
-  while (Number(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n) > 0) {
-    assert.match(await f.send('#群文化 拒绝 全部'), /已拒绝/)
-  }
+  // `全部` covers every pending candidate, not only the first page.
+  assert.match(await f.send('#群文化 拒绝 全部'), /已拒绝 31 条/)
+  assert.equal(f.db.prepare("SELECT count(*) AS n FROM proposals WHERE state = 'pending'").get()?.n, 0)
   for (let i = 0; i < 64; i += 1) {
     // Existing manual admin assertions retain their semantics; they also obey the shared culture cap.
     assert.match(await f.send(`#群记忆 记住 文化 本群每周读第${i}种科幻小说`), /已保存/)

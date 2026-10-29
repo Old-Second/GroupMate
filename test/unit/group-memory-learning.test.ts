@@ -220,6 +220,15 @@ test('one command reviews several candidates and reports each refusal by number'
   assert.match(await f.send('#群记忆 通过 全部'), /当前群没有待审核的候选/)
 })
 
+test('the superseded eight hex digit handle still resolves a candidate', async t => {
+  const f = await setup(t)
+  await f.window()
+  // The list no longer prints it, but a command copied from an older message keeps working.
+  const handle = String(f.db.prepare('SELECT proposal_id FROM proposals').get()?.proposal_id).slice(-8)
+  assert.match(await f.send(`#群记忆 通过 @${handle}`), /已保存 1 条：\n本群禁止刷屏/)
+  assert.equal(f.pending(), 0)
+})
+
 test('an unreachable group notice leaves the candidate waiting for a person', async t => {
   const f = await setup(t, { notify: () => { throw new Error('offline') } })
   await f.window()

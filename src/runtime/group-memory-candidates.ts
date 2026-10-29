@@ -17,8 +17,16 @@ import type { MemoryNamespaceV1 } from '../agent/memory/memory-namespace.js'
  * candidate is echoed back by its text.
  */
 
-/** Keeps one list, and therefore one group message, bounded. */
-export const GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1 = 16
+/**
+ * Ordinals cover every pending candidate of a group, so a culture candidate is
+ * never hidden behind a page of rule candidates. The per-group caps are eight
+ * automatic candidates plus the classified-culture pending cap, so this bound
+ * holds the whole set.
+ */
+export const GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1 = 48
+
+/** Lines per reply, so one group message stays readable. */
+export const GROUP_MEMORY_CANDIDATE_PAGE_V1 = 16
 
 /** Veto window for candidates the bot may approve on the owner's standing policy. */
 export const GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1 = 24
@@ -70,14 +78,14 @@ export function listGroupMemoryCandidateRowsV1 (
 
 /** Fixed labels only; the candidate text is already bounded by the group memory text rules. */
 export function groupMemoryCandidateLineV1 (
-  row: GroupMemoryCandidateRowV1, implicitApprovalEnabled: boolean
+  row: GroupMemoryCandidateRowV1, implicitApprovalHours: number | null
 ): string {
   const deadline = new Date(row.proposedAtMs + MEMORY_PROPOSAL_DEADLINE_DAYS_V2 * 86_400_000)
     .toISOString().slice(0, 10)
   const note = row.conflicting
     ? '（与已有记录相近，需管理员确认）'
-    : implicitApprovalEnabled && row.automatic && row.implicitApprovable
-      ? `（公示后 ${GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1} 小时内无人处理将自动保存）`
+    : implicitApprovalHours !== null && row.automatic && row.implicitApprovable
+      ? `（公示后 ${implicitApprovalHours} 小时内无人处理将自动保存）`
       : `（${deadline} 前审核）`
   return `${row.ordinal}. ${row.culture ? '[文化] ' : ''}${[...row.text].slice(0, 120).join('')}` +
     `${row.automatic ? ' [自动]' : ' [成员提议]'}${note}`

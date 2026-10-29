@@ -18,7 +18,7 @@ import { parseMemoryRetrievalRequestV2, retrieveMemoryV2, type MemoryRetrievalAd
 import type { PersonalMemoryCommandPortV1, PersonalMemoryCommandRequestV1 } from './personal-memory-command.js'
 import type { PersonalMemoryExportDeliveryV1 } from './yunzai-personal-memory-controller.js'
 import { createYunzaiSceneParticipantDirectoryV1, type YunzaiPersonalMemoryRecallInputV1 } from './yunzai-scene-participant-directory.js'
-import { GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1, groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1, type GroupMemoryCandidateRowV1 } from './group-memory-candidates.js'
+import { GROUP_MEMORY_CANDIDATE_LIST_LIMIT_V1, GROUP_MEMORY_CANDIDATE_PAGE_V1, GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1, groupMemoryCandidateLineV1, issueGroupMemoryPolicyApprovalCapabilityV1, listGroupMemoryCandidateRowsV1, type GroupMemoryCandidateRowV1 } from './group-memory-candidates.js'
 import type { GroupMemoryFeatureV1, GroupMemoryPolicyStoreV1, GroupMemoryPolicyV1 } from './GroupMemoryPolicy.js'
 
 interface GroupMemoryOptions {
@@ -46,7 +46,6 @@ interface GroupMemoryOptions {
   /** Owner switch; only changes how a pending candidate's deadline is described. */
   readonly implicitApprovalEnabled?: () => boolean
 }
-
 
 const ADMIN_ACTIONS: readonly MemoryLifecycleActorActionV1[] = [
   'propose_create', 'list_safe', 'inspect_full', 'approve', 'reject', 'correct', 'renew', 'forget'
@@ -263,12 +262,25 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
       throw new GroupMemoryError('当前群记忆已由管理员关闭；群管理员可发送“#群记忆 开启”恢复。')
     }
   }
-  const implicitApproval = (): boolean => {
-    try { return options.implicitApprovalEnabled?.() ?? false } catch { return false }
+  /** Null when the owner switched the public-notice window off, so no line promises it. */
+  const implicitApprovalHours = (): number | null => {
+    try { return options.implicitApprovalEnabled?.() === true ? GROUP_MEMORY_IMPLICIT_APPROVAL_HOURS_V1 : null } catch { return null }
   }
   const candidateRows = (auth: Auth, culture: boolean): readonly GroupMemoryCandidateRowV1[] =>
     listGroupMemoryCandidateRowsV1(options.database, auth.namespaceRef, auth.generation, Date.parse(auth.now))
       .filter(row => !culture || row.culture)
+  /** One reply's worth of lines; ordinals keep covering the whole pending set across pages. */
+  const candidatePage = (auth: Auth, culture: boolean, page: number): readonly string[] => {
+    const hours = implicitApprovalHours()
+    return candidateRows(auth, culture).slice((page - 1) * GROUP_MEMORY_CANDIDATE_PAGE_V1,
+      page * GROUP_MEMORY_CANDIDATE_PAGE_V1).map(row => groupMemoryCandidateLineV1(row, hours))
+  }
+  const candidateFooter = (auth: Auth, culture: boolean, page: number, label: string): string => {
+    const total = candidateRows(auth, culture).length
+    const more = total > page * GROUP_MEMORY_CANDIDATE_PAGE_V1
+      ? `\n共 ${total} 条，发送“#${label} 候选 ${page + 1}”看下一页。` : ''
+    return `${more}\n审核：#${label} 通过 1 3 / #${label} 通过 全部 / #${label} 拒绝 全部`
+  }
   /** Resolves `1`, a legacy `@3f9a1b2c` or `全部` against one ordered snapshot of the pending list. */
   const selectCandidates = (auth: Auth, body: string, culture: boolean): readonly GroupMemoryCandidateRowV1[] => {
     const rows = candidateRows(auth, culture)
@@ -340,6 +352,9 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
     for (const row of rows) {
       try {
         const proposal = await pendingProposal(auth, row.proposalId)
+        if (culture && proposal.kind !== 'group_culture') {
+          throw new GroupMemoryError('这不是当前群可审核的文化候选。')
+        }
         if (!approve) {
           await mutate(auth, 'proposal.reject', null, proposal, undefined, proposal.proposalId)
         } else {
@@ -380,12 +395,14 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
       await reply('已提交文化候选，待另一位管理员审核；发送“#群文化 候选”查看编号。尚未保存为可召回记忆，也不代表群共识。')
       return true
     }
-    if (body === '候选') {
+    match = /^候选(?:\s+([1-9][0-9]?))?$/u.exec(body)
+    if (match !== null) {
       requireAdmin(auth)
-      const items = candidateRows(auth, true).map(row => groupMemoryCandidateLineV1(row, implicitApproval()))
+      const page = Number(match[1] ?? 1)
+      const items = candidatePage(auth, true, page)
       await reply(items.length === 0 ? '当前群没有文化候选。'
-        : `当前群文化候选（编号与“#群记忆 候选”一致；[自动] 来自群聊，仅供审核）：\n${items.join('\n')}\n` +
-          '审核：#群文化 通过 1 3 / #群文化 拒绝 全部')
+        : `当前群文化候选（编号与“#群记忆 候选”一致；[自动] 来自群聊，仅供审核）：\n${items.join('\n')}` +
+          candidateFooter(auth, true, page, '群文化'))
       return true
     }
     match = /^(通过|拒绝)\s+([\s\S]+)$/u.exec(body)
@@ -479,12 +496,14 @@ export function createGroupMemoryV1 (options: GroupMemoryOptions) {
           requireAdmin(auth)
           let match = /^记住\s+(规则|共同偏好|文化|群体事实)\s+([\s\S]+)$/u.exec(body)
           const review = /^(通过|拒绝)\s+([\s\S]+)$/u.exec(body)
-          if (body === '候选') {
+          const candidates = /^候选(?:\s+([1-9][0-9]?))?$/u.exec(body)
+          if (candidates !== null) {
             // One list for both kinds: administrators no longer have to check 群记忆 and 群文化 separately.
-            const items = candidateRows(auth, false).map(row => groupMemoryCandidateLineV1(row, implicitApproval()))
+            const page = Number(candidates[1] ?? 1)
+            const items = candidatePage(auth, false, page)
             await request.replyText(items.length === 0 ? '当前群没有待审核的候选。'
-              : `当前群待审候选（[自动] 来自群聊，模型生成不代表群共识；通过后才会召回）：\n${items.join('\n')}\n` +
-                '审核：#群记忆 通过 1 3 / #群记忆 通过 全部 / #群记忆 拒绝 全部')
+              : `当前群待审候选（[自动] 来自群聊，模型生成不代表群共识；通过后才会召回）：\n${items.join('\n')}` +
+                candidateFooter(auth, false, page, '群记忆'))
           } else if (review !== null) {
             await reviewCandidates(auth, review[2]!, review[1] === '通过', false, event, request.replyText)
           } else if (match !== null) {
